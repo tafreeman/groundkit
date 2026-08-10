@@ -1,6 +1,6 @@
 # ADR-0001 — Promote vs rewrite: what groundkit takes from ARP's RAG library
 
-- **Status:** Proposed (awaiting owner review before Phase 1)
+- **Status:** Accepted (owner, 2026-08-10)
 - **Date:** 2026-08-10
 - **Deciders:** Andy Freeman (owner) · Phase-0 inventory: 9-agent fan-out over
   `agentic-runtime-platform` (ARP) at branch `relock_scope`, 2026-08-10
@@ -118,5 +118,7 @@ Positive: v1 starts from tested code for its deterministic core; every known
 ARP defect has a named fix and a regression test obligation; groundkit carries
 no `agentic_v2` coupling. Negative: ported code must be re-reviewed under
 groundkit's stricter gates (mypy --strict repo-wide, no `continue-on-error`);
-divergence from ARP is permanent — fixes here do not flow back automatically
-(out of scope by design; ARP may cherry-pick).
+divergence from ARP is permanent — fixes here do not flow back (owner
+decision, 2026-08-10: no cherry-pick; ARP's `agentic_v2.rag` package is
+expected to be deprecated and removed once groundkit is established, tracked
+as separate ARP work).
