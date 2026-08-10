@@ -73,3 +73,8 @@ jobs:
         with:
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v3
+        env:
+          # Required for pull_request scans since gitleaks-action v2.3.0;
+          # push-only runs did not need it, so this first PR is where its
+          # absence surfaced.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
