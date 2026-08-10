@@ -45,6 +45,15 @@ jobs:
       # Dedicated gate step: pytest-cov does not reliably propagate the
       # fail-under exit code; `coverage report` honors [tool.coverage.report].
       - run: uv run coverage report
+      # SPEC.md §8 core-subset gate: the whole-package gate above cannot
+      # catch a well-covered peripheral module (e.g. providers/embeddings.py,
+      # an optional provider) offsetting an under-tested core module.
+      # Patterns come from pyproject.toml's [tool.groundkit.coverage]
+      # core_subset so the two gates cannot drift apart.
+      - name: Core-subset coverage gate (SPEC.md §8)
+        run: |
+          PATTERN=$(uv run python -c "import tomllib; print(','.join(tomllib.load(open('pyproject.toml', 'rb'))['tool']['groundkit']['coverage']['core_subset']))")
+          uv run coverage report --include="$PATTERN" --fail-under=80
 
   audit:
     runs-on: ubuntu-latest

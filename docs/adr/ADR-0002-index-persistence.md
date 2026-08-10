@@ -100,3 +100,19 @@ model serializes all metadata-store access; under WAL, SQLite itself would
 allow concurrent readers, but groundkit does not exploit that concurrency in
 v1 — acceptable for a single-process local service, revisited only if
 metadata-store contention is measured to matter.
+
+**Staleness window:** rebuild-at-open means a `Retriever` reflects the
+store's state only as of its `open()` call and never refreshes itself. A
+write to the same collection after `open()` — a re-ingest, an edit, a
+deletion — is invisible to that `Retriever` until it is reopened. Two
+distinct behaviors follow from this, and only one of them is the fail-closed
+outcome SPEC.md §2 requires: a hit against a document that was modified or
+deleted resolves against `get_document_sources()`, finds no stored source,
+and raises `RetrievalError` — correct, fails closed. A query that should
+match newly-ingested content has no representation at all in the stale
+in-memory BM25 index, so it silently returns zero results instead of
+erroring. Nothing in this design distinguishes "no matches" from "stale
+index" for that second case. Callers that ingest and then search against the
+same collection in one process must reopen the `Retriever` after every write
+to observe it; this is documented on the `Retriever` class itself
+(`src/groundkit/retrieval/search.py`).

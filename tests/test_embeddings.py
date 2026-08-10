@@ -413,6 +413,85 @@ class TestOpenAICompatibleEmbedder:
         # the key is ever resolved.
         assert asyncio.run(embedder.embed([])) == []
 
+    def test_configured_secret_embedded_in_base_url_query_is_scrubbed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """HIGH 1: EmbeddingConfig.base_url is free-form operator-controlled
+        str; several OpenAI-compatible/proxy endpoints carry the credential
+        in the query string (Azure-style ``?api-key=...``). The URL must be
+        scrubbed before it reaches the raised EmbeddingError, exactly like
+        the exception message already is (ADR-0001 hazard 6).
+        """
+        api_key = "sk-super-secret-value"
+        monkeypatch.setenv("GROUNDKIT_OPENAI_API_KEY", api_key)
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            raise RuntimeError("upstream rejected the request")
+
+        config = EmbeddingConfig(
+            provider="openai_compatible",
+            dimensions=2,
+            base_url=f"https://embed-proxy.example.com/openai-proxy?api-key={api_key}",
+        )
+        embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
+
+        with pytest.raises(EmbeddingError) as excinfo:
+            asyncio.run(embedder.embed(["x"]))
+
+        assert api_key not in str(excinfo.value)
+
+    def test_unrelated_query_string_credential_is_also_redacted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Proves generic query redaction, not only exact-secret replacement:
+        a token embedded in base_url that is NOT the configured api_key must
+        still be redacted, since base_url is free-form and groundkit cannot
+        know every credential shape a proxy might embed there.
+        """
+        monkeypatch.setenv("GROUNDKIT_OPENAI_API_KEY", "sk-bearer-value")
+        leaked_token = "different-leaked-token-999"  # noqa: S105 - test fixture, not a real secret
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            raise RuntimeError("upstream rejected the request")
+
+        config = EmbeddingConfig(
+            provider="openai_compatible",
+            dimensions=2,
+            base_url=f"https://embed-proxy.example.com/openai-proxy?key={leaked_token}",
+        )
+        embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
+
+        with pytest.raises(EmbeddingError) as excinfo:
+            asyncio.run(embedder.embed(["x"]))
+
+        assert leaked_token not in str(excinfo.value)
+
+    def test_scrubbed_url_keeps_scheme_host_and_path_for_debuggability(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Redaction must not destroy the operator's ability to tell which
+        endpoint failed — only the query-string VALUES are sensitive."""
+        api_key = "sk-super-secret-value"
+        monkeypatch.setenv("GROUNDKIT_OPENAI_API_KEY", api_key)
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            raise RuntimeError("upstream rejected the request")
+
+        config = EmbeddingConfig(
+            provider="openai_compatible",
+            dimensions=2,
+            base_url=f"https://embed-proxy.example.com/openai-proxy?api-key={api_key}",
+        )
+        embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
+
+        with pytest.raises(EmbeddingError) as excinfo:
+            asyncio.run(embedder.embed(["x"]))
+
+        message = str(excinfo.value)
+        assert "https://embed-proxy.example.com" in message
+        assert "/openai-proxy" in message
+        assert api_key not in message
+
 
 # ── build_embedder / EmbeddingProtocol conformance ─────────────────────────
 

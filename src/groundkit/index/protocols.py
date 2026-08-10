@@ -34,6 +34,20 @@ class MetadataStoreProtocol(Protocol):
         """Persist chunks for a document."""
         ...
 
+    async def replace_document(
+        self, source: str, document_id: str, content_hash: str, chunks: list[Chunk]
+    ) -> None:
+        """Atomically replace a document's row and its chunks in one transaction.
+
+        The durable write path. An implementation must commit the document
+        row and its chunks together or not at all: the two-call
+        ``upsert_document`` + ``add_chunks`` sequence leaves a document row
+        carrying a fresh content hash with zero chunks if it is interrupted
+        between the calls, and incremental re-index then skips that document
+        forever on hash match.
+        """
+        ...
+
     async def get_chunks(self) -> list[Chunk]:
         """Return all persisted chunks in the collection."""
         ...

@@ -31,6 +31,16 @@ class Retriever:
 
     Construct via :meth:`open`, which rebuilds the in-memory BM25 index from
     the metadata store (ADR-0002).
+
+    A ``Retriever`` reflects the store's state at ``open()`` time only and is
+    never refreshed — it must be reopened after any write to the store
+    (re-ingest, edit, deletion) to observe that write. Until reopened, a
+    stale ``Retriever`` fails closed for a hit against modified or deleted
+    content (:class:`~groundkit.errors.RetrievalError`, per the index
+    inconsistency check in :meth:`search`), but silently returns zero results
+    for a query that should match content ingested after ``open()`` — that
+    content has no representation in the stale in-memory index at all. See
+    ADR-0002's Consequences section for the full discussion.
     """
 
     def __init__(

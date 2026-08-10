@@ -134,6 +134,108 @@ def test_upsert_replaces_existing_source_and_its_chunks(tmp_path: Path) -> None:
     assert old is None
 
 
+def test_replace_document_round_trip(tmp_path: Path) -> None:
+    """replace_document writes the document row and its chunks in one commit."""
+
+    async def _run() -> tuple[str | None, list[Chunk]]:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            chunks = [
+                _make_chunk("c1", "doc-1", "hello world", chunk_index=0),
+                _make_chunk("c2", "doc-1", "second chunk", chunk_index=1, start_offset=11),
+            ]
+            await store.replace_document(
+                source="a.md", document_id="doc-1", content_hash="h1", chunks=chunks
+            )
+            doc_hash = await store.get_document_hash("a.md")
+            persisted = await store.get_chunks()
+            return doc_hash, persisted
+        finally:
+            await store.close()
+
+    doc_hash, persisted = asyncio.run(_run())
+
+    assert doc_hash == "h1"
+    assert {c.chunk_id for c in persisted} == {"c1", "c2"}
+
+
+def test_replace_document_rolls_back_document_row_on_chunk_mismatch(tmp_path: Path) -> None:
+    """A mismatched chunk's document_id must roll back the document row too.
+
+    This is exactly the atomicity ``replace_document`` exists for: under the
+    old ``upsert_document`` + ``add_chunks`` sequence, ``upsert_document``'s
+    row was already committed by the time a mismatched chunk was
+    discovered, leaving it durably orphaned with zero chunks.
+    """
+
+    async def _run() -> str | None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            mismatched = _make_chunk("c1", "wrong-doc-id", "hello world")
+            with pytest.raises(StorageError):
+                await store.replace_document(
+                    source="a.md", document_id="doc-1", content_hash="h1", chunks=[mismatched]
+                )
+            return await store.get_document_hash("a.md")
+        finally:
+            await store.close()
+
+    assert asyncio.run(_run()) is None
+
+
+def test_add_chunks_rolls_back_partial_write_on_metadata_error(tmp_path: Path) -> None:
+    """A non-serializable chunk mid-batch must not leave earlier chunks durable.
+
+    Regression test: ``_run`` used to wrap ``sqlite3.Error`` into
+    ``StorageError`` but never called ``rollback()`` — not even for a
+    ``StorageError`` raised deliberately inside ``_op`` itself, as the
+    non-serializable-metadata check does. Because this connection uses
+    sqlite3's default (legacy) transaction-control mode, the good chunk's
+    INSERT stayed uncommitted-but-visible on this connection after the bad
+    chunk failed, and would become durable on disk the moment any later,
+    unrelated ``commit()`` ran on the same connection.
+    """
+
+    async def _run() -> tuple[list[Chunk], list[Chunk]]:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            await store.upsert_document(source="a.md", document_id="doc-1", content_hash="h1")
+            good = _make_chunk("good", "doc-1", "good text", chunk_index=0)
+            bad = _make_chunk(
+                "bad",
+                "doc-1",
+                "bad text",
+                chunk_index=1,
+                start_offset=9,
+                metadata={"oops": {1, 2, 3}},  # a set is not JSON-serializable
+            )
+            with pytest.raises(StorageError):
+                await store.add_chunks([good, bad], source="a.md")
+            immediately_after_failure = await store.get_chunks()
+
+            # A later, unrelated successful write commits the shared
+            # connection — this is exactly what made an un-rolled-back
+            # partial write durable in the original defect.
+            await store.upsert_document(source="b.md", document_id="doc-2", content_hash="h2")
+            other = _make_chunk("other", "doc-2", "unrelated chunk")
+            await store.add_chunks([other], source="b.md")
+        finally:
+            await store.close()
+
+        reopened = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            after_reopen = await reopened.get_chunks()
+        finally:
+            await reopened.close()
+
+        return immediately_after_failure, after_reopen
+
+    immediately_after_failure, after_reopen = asyncio.run(_run())
+
+    assert immediately_after_failure == []
+    assert {c.chunk_id for c in after_reopen} == {"other"}
+
+
 def test_get_document_hash_unseen_source_returns_none(tmp_path: Path) -> None:
     """An unseen source has no stored hash."""
 

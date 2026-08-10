@@ -25,6 +25,7 @@ import math
 import os
 import struct
 from typing import Final, NoReturn
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -170,20 +171,27 @@ def _raise_embedding_error(url: str, exc: Exception, *, secret: str | None) -> N
     Must be called from a frame with no exception actively being handled
     (i.e. after ``exc`` has already been caught and returned as a value by
     :func:`_post_json`, not from inside a live ``except`` block) — that is
-    what keeps ``__context__`` empty. Logs the same scrubbed text at debug
-    level; never logs the unscrubbed exception.
+    what keeps ``__context__`` empty. Logs the same scrubbed text and
+    sanitized URL at debug level; never logs the unscrubbed exception or the
+    raw URL.
 
     Args:
-        url: The request URL, for the error message.
+        url: The request URL, for the error message. Sanitized via
+            :func:`_sanitize_url` before it reaches any log line or the
+            raised message — ``EmbeddingConfig.base_url`` is free-form
+            operator-controlled ``str`` and several OpenAI-compatible/proxy
+            endpoints carry a credential in the query string (ADR-0001
+            hazard 6).
         exc: The exception raised while sending or decoding the request.
         secret: The credential to scrub out of the message, or ``None``.
 
     Raises:
         EmbeddingError: Always.
     """
+    safe_url = _sanitize_url(url, secret)
     detail = _scrub(str(exc), secret)
-    logger.debug("Embedding request to %s failed: %s", url, detail)
-    raise EmbeddingError(f"Embedding request to {url} failed: {detail}") from None
+    logger.debug("Embedding request to %s failed: %s", safe_url, detail)
+    raise EmbeddingError(f"Embedding request to {safe_url} failed: {detail}") from None
 
 
 def _scrub(text: str, secret: str | None) -> str:
@@ -191,6 +199,34 @@ def _scrub(text: str, secret: str | None) -> str:
     if not secret:
         return text
     return text.replace(secret, _REDACTED_PLACEHOLDER)
+
+
+def _sanitize_url(url: str, secret: str | None) -> str:
+    """Return *url* with every query-parameter value redacted and *secret* scrubbed.
+
+    Query values are redacted unconditionally, not just when they match
+    *secret*: ``base_url`` is free-form operator-controlled configuration, so
+    an Azure-style ``?api-key=...`` or Google-style ``?key=...`` credential
+    must never reach a log line or exception message, even one this function
+    was not told to expect (ADR-0001 hazard 6 / SPEC.md §7). Scheme, host,
+    and path are left intact so the sanitized URL still names which endpoint
+    failed.
+
+    Args:
+        url: The request URL to sanitize.
+        secret: The configured credential to additionally scrub verbatim
+            from what remains, or ``None``.
+
+    Returns:
+        ``url`` with its query string's values redacted, its fragment
+        dropped, and *secret* scrubbed from the result.
+    """
+    parsed = urlsplit(url)
+    redacted_query = urlencode(
+        [(key, _REDACTED_PLACEHOLDER) for key, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+    )
+    sanitized = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, redacted_query, ""))
+    return _scrub(sanitized, secret)
 
 
 def _parse_ollama_embeddings(data: object, *, expected_count: int) -> list[list[float]]:

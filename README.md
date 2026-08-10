@@ -3,10 +3,13 @@
 Grounded, citation-verifiable hybrid retrieval: a persisted BM25 + dense index,
 a named MCP server, and a retrieval eval harness — fully local by default.
 
-> **Status: pre-alpha (Phase 0).** The spec, ADR-0001, and this skeleton exist;
-> no retrieval code has landed yet. See [SPEC.md](SPEC.md) for what is being
-> built and in what order, and [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for
-> what is deliberately out of scope.
+> **Status: Phase 1 landing.** BM25 retrieval, a persisted index, and
+> citation-bearing search work end-to-end locally with no cloud
+> credentials — see the Quickstart below. Hybrid/dense retrieval, rerank,
+> the MCP server, REST API, eval harness, and IaC are not yet built. See
+> [SPEC.md](SPEC.md) for what is being built and in what order, and
+> [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for what is deliberately out
+> of scope.
 
 ## What this will be
 
@@ -45,6 +48,13 @@ uv run ruff check . && uv run ruff format --check .
 uv run mypy
 uv run pytest --cov && uv run coverage report
 ```
+
+CI enforces an 80% coverage floor twice, so neither gate can hide the other:
+once on the whole package, and again on the SPEC.md §8 core subset —
+`retrieval/` (retrieval + citation resolution), `ingestion/chunking.py`
+(chunking), and `index/bm25.py` (scoring). The core subset is the literal
+list in `pyproject.toml`'s `[tool.groundkit.coverage]` table; optional
+providers (e.g. `providers/embeddings.py`) are excluded from it.
 
 ## Provenance
 

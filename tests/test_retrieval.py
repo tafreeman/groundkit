@@ -12,6 +12,8 @@ from groundkit.contracts import Chunk, Citation, Document
 from groundkit.errors import RetrievalError
 from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.index.protocols import MetadataStoreProtocol
+from groundkit.indexer import Indexer
+from groundkit.ingestion.loaders import FileLoader
 from groundkit.retrieval.citations import resolve_citation, verify_citation
 from groundkit.retrieval.search import MAX_TOP_K, Retriever
 
@@ -120,6 +122,11 @@ class TestRetriever:
             async def add_chunks(self, chunks: list[Chunk], source: str) -> None:
                 raise NotImplementedError
 
+            async def replace_document(
+                self, source: str, document_id: str, content_hash: str, chunks: list[Chunk]
+            ) -> None:
+                raise NotImplementedError
+
             async def get_chunks(self) -> list[Chunk]:
                 return _chunks_for(doc)
 
@@ -136,6 +143,92 @@ class TestRetriever:
             retriever = await Retriever.open(store)
             with pytest.raises(RetrievalError, match="inconsistency"):
                 await retriever.search("orphaned chunk")
+
+        asyncio.run(run())
+
+
+class TestStaleRetriever:
+    """ADR-0002: ``Retriever.open`` snapshots BM25 once and never refreshes.
+
+    Pins both halves of that deliberate, currently-undocumented-in-code
+    behavior with a real end-to-end re-ingest (``Indexer`` + a persisted
+    ``SQLiteMetadataStore``, not a hand-built stub store):
+
+    - a retriever holding a chunk whose document was re-ingested (so its
+      old ``document_id`` no longer resolves to a source) fails closed —
+      ``RetrievalError`` — exactly like the pre-existing orphaned-chunk case
+      above, just reached via a real re-ingest instead of a stub.
+    - a retriever queried for content ingested *after* it was opened finds
+      nothing and raises nothing: BM25 was never rebuilt, so the new
+      chunks were never tokenized into it. There is no signal that the
+      index is stale — this is the surprising half.
+
+    ``src/groundkit/retrieval/search.py`` is not owned by this change; its
+    class docstring still needs a staleness note (see the accompanying
+    report — that file is out of scope here).
+    """
+
+    def test_stale_retriever_raises_on_document_modified_after_open(self, tmp_path: Path) -> None:
+        """A retriever opened before a re-ingest fails closed on a doc changed underneath it."""
+
+        async def run() -> None:
+            docs_dir = tmp_path / "docs"
+            docs_dir.mkdir()
+            target = docs_dir / "doc.md"
+            target.write_text("Retrieval systems rank documents by relevance.", encoding="utf-8")
+
+            store = await SQLiteMetadataStore.open(tmp_path / "idx", "default")
+            try:
+                indexer = Indexer(store, FileLoader(allowed_base_dir=docs_dir))
+                await indexer.index_directory(str(docs_dir))
+
+                retriever = await Retriever.open(store)
+
+                # Re-ingest with different content: replace_document deletes
+                # the old document row (and its document_id) and inserts a
+                # fresh one — the stale retriever's BM25 snapshot still
+                # holds a chunk pointing at the now-gone document_id.
+                target.write_text("Something completely unrelated now.", encoding="utf-8")
+                await indexer.index_directory(str(docs_dir))
+
+                with pytest.raises(RetrievalError, match="inconsistency"):
+                    await retriever.search("relevance")
+            finally:
+                await store.close()
+
+        asyncio.run(run())
+
+    def test_stale_retriever_returns_zero_results_for_content_ingested_after_open(
+        self, tmp_path: Path
+    ) -> None:
+        """A retriever opened before a new document is ingested silently misses it: zero
+        results, no error — no signal at all that the index is stale."""
+
+        async def run() -> None:
+            docs_dir = tmp_path / "docs"
+            docs_dir.mkdir()
+            (docs_dir / "alpha.md").write_text(
+                "Retrieval systems rank documents by relevance.", encoding="utf-8"
+            )
+
+            store = await SQLiteMetadataStore.open(tmp_path / "idx", "default")
+            try:
+                indexer = Indexer(store, FileLoader(allowed_base_dir=docs_dir))
+                await indexer.index_directory(str(docs_dir))
+
+                retriever = await Retriever.open(store)
+
+                (docs_dir / "beta.md").write_text(
+                    "Zebras migrate across the savanna every dry season.", encoding="utf-8"
+                )
+                await indexer.index_directory(str(docs_dir))
+
+                response = await retriever.search("zebras savanna")
+
+                assert response.total_results == 0
+                assert response.results == []
+            finally:
+                await store.close()
 
         asyncio.run(run())
 

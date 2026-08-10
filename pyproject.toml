@@ -66,13 +66,28 @@ explicit_package_bases = true
 testpaths = ["tests"]
 addopts = "-q"
 
-# The 80% floor gates the whole package (a superset of the spec's core
-# subset — every implemented module is measured; phase-stub modules are
-# docstring-only and contribute no statements). precision = 2 so 79.99%
-# fails instead of rounding up.
+# Two coverage gates run in CI, neither able to hide the other: whole-package
+# (this table, fail_under below) and the SPEC.md §8 core subset
+# ([tool.groundkit.coverage] below, enforced by a separate `coverage report
+# --include=...` step in ci.yml so a well-covered peripheral module — e.g.
+# providers/embeddings.py, an optional provider — can never offset an
+# under-tested core module). precision = 2 so 79.99% fails instead of
+# rounding up.
 [tool.coverage.run]
 source = ["groundkit"]
 
 [tool.coverage.report]
 fail_under = 80
 precision = 2
+
+# SPEC.md §8: "coverage floor 80% on the core subset (retrieval, chunking,
+# scoring, citation resolution — subset defined in pyproject.toml when Phase
+# 1 lands, optional providers excluded, README states the subset honestly)."
+# ci.yml's core-subset gate step derives its `coverage report --include=`
+# patterns from this list so the two cannot drift out of sync.
+[tool.groundkit.coverage]
+core_subset = [
+  "src/groundkit/retrieval/*",            # search orchestration + citation resolution
+  "src/groundkit/ingestion/chunking.py",  # chunking
+  "src/groundkit/index/bm25.py",          # scoring
+]

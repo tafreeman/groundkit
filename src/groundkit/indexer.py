@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from groundkit.errors import IngestionError
 from groundkit.ingestion.chunking import RecursiveChunker
 from groundkit.ingestion.pipeline import DEFAULT_MAX_CONCURRENT, discover_files
+from groundkit.utils.path_safety import is_within_base
 
 if TYPE_CHECKING:
     from groundkit.config import ChunkingConfig
@@ -38,6 +40,10 @@ class IndexReport(BaseModel):
         documents_skipped: Documents skipped because their content hash was
             unchanged since the last run.
         chunks_written: Total chunks persisted this run.
+        documents_pruned: Stored documents deleted because their source no
+            longer exists on disk under the indexed root. Always ``0`` for
+            :meth:`Indexer.index_source` — pruning only ever runs for
+            :meth:`Indexer.index_directory`.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -46,6 +52,7 @@ class IndexReport(BaseModel):
     documents_indexed: int = Field(ge=0)
     documents_skipped: int = Field(ge=0)
     chunks_written: int = Field(ge=0)
+    documents_pruned: int = Field(default=0, ge=0)
 
 
 class Indexer:
@@ -53,6 +60,11 @@ class Indexer:
 
     Args:
         store: The collection's metadata store (durable truth, ADR-0002).
+            Typed as ``MetadataStoreProtocol``, not a concrete store: the
+            indexer writes through
+            :meth:`~groundkit.index.protocols.MetadataStoreProtocol.replace_document`,
+            whose one-commit atomicity is part of the protocol contract
+            precisely because it is the guarantee the indexer depends on.
         loader: Document loader (containment enforced by the loader itself).
         chunker: Chunker; defaults to :class:`RecursiveChunker`.
         chunking_config: Chunking settings passed to the chunker.
@@ -99,6 +111,19 @@ class Indexer:
         run with bounded concurrency; store writes are serialized by the
         store itself.
 
+        After ingesting, prunes stored documents whose source no longer
+        exists on disk (a renamed or deleted file) — otherwise a rename
+        leaves both the old and new document rows in the store forever
+        (duplicate search results, and a citation that resolves against a
+        source that no longer exists). Pruning is scoped to ``source_dir``:
+        only stored documents whose source resolves *under* ``source_dir``
+        are candidates, so indexing a subdirectory never touches documents
+        ingested from outside it (e.g. a sibling directory, or a prior
+        :meth:`index_source` call elsewhere). :meth:`index_source` never
+        prunes anything — pruning requires knowing the full set of sources
+        that should currently exist under a root, which only a directory
+        walk provides.
+
         Raises:
             IngestionError: The directory is missing, cannot be walked, or
                 any file fails to load/chunk.
@@ -130,12 +155,14 @@ class Indexer:
         indexed = sum(o[0] for o in outcomes)
         skipped = sum(o[1] for o in outcomes)
         chunks_written = sum(o[2] for o in outcomes)
+        pruned = await self._prune_missing(root, files)
         logger.info(
-            "Indexed %s: %d files, %d indexed, %d skipped, %d chunks",
+            "Indexed %s: %d files, %d indexed, %d skipped, %d pruned, %d chunks",
             source_dir,
             len(files),
             indexed,
             skipped,
+            pruned,
             chunks_written,
         )
         return IndexReport(
@@ -143,7 +170,36 @@ class Indexer:
             documents_indexed=indexed,
             documents_skipped=skipped,
             chunks_written=chunks_written,
+            documents_pruned=pruned,
         )
+
+    async def _prune_missing(self, root: Path, files: list[Path]) -> int:
+        """Delete stored documents under ``root`` whose source no longer exists on disk.
+
+        Args:
+            root: The directory just walked — the prune scope. A stored
+                document is only a deletion candidate when its source
+                resolves under ``root``.
+            files: The files just discovered under ``root``, i.e. the
+                current, authoritative set of sources that should exist.
+
+        Returns:
+            The number of documents pruned.
+        """
+
+        def _current_sources() -> set[str]:
+            return {os.path.realpath(str(path)) for path in files}
+
+        current = await asyncio.to_thread(_current_sources)
+        sources = await self._store.get_document_sources()
+
+        pruned = 0
+        for document_id, source in sources.items():
+            if source in current or not is_within_base(source, root):
+                continue
+            await self._store.delete_document(document_id)
+            pruned += 1
+        return pruned
 
     async def _process(self, source: str) -> tuple[int, int, int]:
         """Load, hash-compare, chunk, and persist one source.
@@ -174,10 +230,12 @@ class Indexer:
                     f"Chunking failed for document {doc.document_id}: {exc}"
                 ) from exc
 
-            await self._store.upsert_document(
-                source=doc.source, document_id=doc.document_id, content_hash=doc_hash
+            await self._store.replace_document(
+                source=doc.source,
+                document_id=doc.document_id,
+                content_hash=doc_hash,
+                chunks=chunks,
             )
-            await self._store.add_chunks(chunks, source=doc.source)
             indexed += 1
             chunks_written += len(chunks)
         return indexed, skipped, chunks_written
