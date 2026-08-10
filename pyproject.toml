@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "groundkit"
+version = "0.1.0.dev0"
+description = "Grounded, citation-verifiable hybrid retrieval: persisted BM25 + dense index, MCP server, and a retrieval eval harness. Local-first."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Andy Freeman" }]
+keywords = ["retrieval", "rag", "mcp", "search", "bm25", "embeddings"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: OS Independent",
+  "Typing :: Typed",
+]
+# Runtime dependencies land with the phase that needs them (SPEC.md phase plan);
+# the Phase 0 skeleton deliberately has none.
+dependencies = []
+
+[project.scripts]
+grk = "groundkit.cli:main"
+
+[dependency-groups]
+dev = [
+  "ruff>=0.12,<1",
+  "mypy>=1.13,<3",
+  "pytest>=8,<10",
+  "pytest-cov>=5,<8",
+  "pip-audit>=2.7,<3",
+  "pre-commit>=4,<6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/groundkit"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "ARG", "S", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"] # pytest asserts
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["src/groundkit", "tests"]
+mypy_path = "src"
+explicit_package_bases = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+# Coverage is measured from Phase 0 but not yet gated: the 80% floor applies to
+# the core subset (retrieval, chunking, scoring, citation resolution) and is
+# switched on in the same change that lands the first core code (Phase 1).
+[tool.coverage.run]
+source = ["groundkit"]

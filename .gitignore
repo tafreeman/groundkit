@@ -1,0 +1,35 @@
+# Secrets — names are documented in .env.example, values never committed
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Eval artifacts — generated, never committed (reports are reproducible)
+evals/results/
+
+# Local index data
+*.lance/
+*.sqlite3
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Docs build
+site/

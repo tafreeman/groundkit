@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.png binary
+*.lance binary
+*.sqlite3 binary
