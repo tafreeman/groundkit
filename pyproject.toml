@@ -20,9 +20,11 @@ classifiers = [
   "Operating System :: OS Independent",
   "Typing :: Typed",
 ]
-# Runtime dependencies land with the phase that needs them (SPEC.md phase plan);
-# the Phase 0 skeleton deliberately has none.
-dependencies = []
+# Runtime dependencies land with the phase that needs them (SPEC.md phase plan).
+dependencies = [
+  "pydantic>=2.7,<3",
+  "httpx>=0.27,<1",
+]
 
 [project.scripts]
 grk = "groundkit.cli:main"
