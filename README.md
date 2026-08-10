@@ -41,6 +41,13 @@ ingestion, metadata filtering, retrieval-quality evals, service/MCP surface,
 IaC). The per-module promote-vs-rewrite decision is recorded in
 [ADR-0001](docs/adr/ADR-0001-promote-vs-rewrite.md).
 
+**Portfolio composition:** groundkit may consume
+[executionkit](https://github.com/tafreeman/executionkit) for LLM call
+patterns at the synthesis boundary, and is gradable by
+[agentic-evalkit](https://github.com/tafreeman/agentic-evalkit) via its
+HTTP/MCP `ExecutionTarget` boundary. It imports the internals of neither
+repo.
+
 ## License
 
 MIT

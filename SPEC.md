@@ -38,7 +38,10 @@ named defect gets a fix and a regression test in the phase that ports it.
   only retrieved spans; the eval harness includes a planted-marker check for
   citation echo.
 - **Anonymization at the LLM boundary.** A redaction pass runs before any text
-  leaves the process for a cloud provider. Local mode sends nothing anywhere.
+  leaves the process for a cloud provider: names → tokens, with configurable
+  patterns. Local mode sends nothing anywhere. The boundary is documented
+  explicitly (architecture docs, Phase 7) — where text can leave the process,
+  what is redacted, and what is not.
 - **Fail closed.** Unconfigured provider → typed error. Malformed structured
   output → schema rejection, never coercion. Unknown config keys → startup
   failure. No cross-provider embedding fallback, ever: mixed semantic spaces
@@ -65,9 +68,9 @@ named defect gets a fix and a regression test in the phase that ports it.
   is not built in v1.
 - Embeddings: provider interface with **direct** Ollama (default) and
   OpenAI-compatible implementations — no LiteLLM (ADR-0001: patterns ported,
-  provider layer rewritten). BM25 ported from ARP's tested pure-Python
-  implementation; the persistence layer around it is new (library choice and
-  persistence design get their own ADR in Phase 1).
+  provider layer rewritten). BM25: pure-Python, ported from ARP's tested
+  implementation — decided in ADR-0001 (vs `rank-bm25`); the Phase 1 ADR
+  covers the persistence design around it only.
 - Observability: OpenTelemetry spans on ingest/retrieve/synthesize (ARP otel
   collector-config conventions); structured JSON logs with request ID,
   latency, result counts, typed failure codes. Never log document content or
@@ -153,8 +156,11 @@ tests on both paths.
 ## 7. Security & hygiene
 
 - `.env.example` only; pre-commit runs ruff, mypy, gitleaks.
-- SSRF guard on every configurable endpoint URL (loopback/private/link-local,
-  incl. IPv6-mapped spellings) with `redirect: error` semantics outbound.
+- SSRF guard on URL ingestion and on cloud-provider endpoint URLs
+  (loopback/private/link-local, incl. IPv6-mapped spellings) with
+  `redirect: error` semantics outbound. The local Ollama endpoint is the one
+  named, deliberate exception — it is loopback by design; the guard scopes
+  around it, not over it.
 - pip-audit in CI; direct deps pinned with bounds; uv lockfile parity check.
 - Mutating REST routes: shared-secret header, constant-time compare, disabled
   when the secret is unset; binds 127.0.0.1 by default.
@@ -185,7 +191,7 @@ changesets; each phase ends with CI green and docs updated in the same change.
 | 2 | Eval harness | golden corpus + metrics engine + BM25 baseline report as reference artifact | pending |
 | 3 | Hybrid + rerank | dense (LanceDB w/ metadata filtering), RRF, optional cross-encoder (normalized scores); each with eval delta vs baseline | pending |
 | 4 | Service + MCP | FastAPI + MCP server + CLI; `grk ingest ./docs && grk serve-mcp` connectable from Claude Desktop/Code with documented client config | pending |
-| 5 | Boundary features | optional query rewrite + cited synthesis; redaction pass; advisory faithfulness judge | pending |
+| 5 | Boundary features | optional query rewrite + cited synthesis; redaction pass (names → tokens, configurable patterns); advisory faithfulness judge | pending |
 | 6 | IaC + observability | multi-stage non-root Dockerfile; compose (service+Ollama+collector+Jaeger); k8s (deployment, service, PVC, probes); Terraform module for one concrete provider; OTel verified end-to-end in compose | pending |
 | 7 | Docs + release | MkDocs site, README live badges only, MIT, v0.1.0 tag, PyPI publish workflow | pending |
 

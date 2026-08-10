@@ -19,3 +19,7 @@ and reports its version; it does nothing else.
 - GraphRAG.
 - Broad vector-DB support — LanceDB (dense) + SQLite (metadata) behind
   interfaces; pgvector is a designed-for extension point, not a v1 feature.
+- A semantic key-value memory store — ARP's `memory.py` was dropped per
+  ADR-0001: its in-process key map is non-durable even over a persistent
+  store, the exact anti-pattern this repo bans.
+- LLM-based reranking — rerank is a local, non-LLM cross-encoder only.

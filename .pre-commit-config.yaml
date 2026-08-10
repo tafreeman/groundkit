@@ -6,12 +6,17 @@ repos:
         args: [--fix]
       - id: ruff-format
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v2.3.0
+# mypy runs as a local hook via the project venv so the checked file set and
+# dependency resolution are identical to CI (mirrors-mypy would check a
+# narrower set with a bare environment).
+  - repo: local
     hooks:
       - id: mypy
-        files: ^src/
-        args: [--strict]
+        name: mypy
+        entry: uv run mypy
+        language: system
+        types: [python]
+        pass_filenames: false
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.30.1
