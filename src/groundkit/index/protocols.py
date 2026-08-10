@@ -26,6 +26,10 @@ class MetadataStoreProtocol(Protocol):
         """Return the stored content hash for ``source``, or None if unseen."""
         ...
 
+    async def get_document_sources(self) -> dict[str, str]:
+        """Return a ``document_id -> source`` map for every stored document."""
+        ...
+
     async def add_chunks(self, chunks: list[Chunk], source: str) -> None:
         """Persist chunks for a document."""
         ...

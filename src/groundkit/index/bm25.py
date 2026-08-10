@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from groundkit.contracts import Chunk
-    from groundkit.index.metadata import SQLiteMetadataStore
+    from groundkit.index.protocols import MetadataStoreProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +136,7 @@ class BM25Index:
 
     @classmethod
     async def from_store(
-        cls, store: SQLiteMetadataStore, *, k1: float = 1.5, b: float = 0.75
+        cls, store: MetadataStoreProtocol, *, k1: float = 1.5, b: float = 0.75
     ) -> BM25Index:
         """Rebuild a fresh in-memory BM25 index from persisted chunks.
 

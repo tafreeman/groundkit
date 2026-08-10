@@ -23,13 +23,27 @@ a named MCP server, and a retrieval eval harness — fully local by default.
 
 Deterministic core, LLM at the boundary: no LLM runs in the retrieval path.
 
+## Quickstart (Phase 1: BM25 + persisted index)
+
+```bash
+uv sync
+uv run grk ingest ./docs
+uv run grk search "your query" --json
+```
+
+Ingestion is incremental (unchanged files are skipped by content hash), the
+index persists under `.groundkit/` and survives restarts, and every result
+carries a citation — source path plus character offsets — that
+`groundkit.retrieval.verify_citation` can check against the source file.
+No cloud credentials are required for any of this.
+
 ## Development
 
 ```bash
 uv sync --group dev
 uv run ruff check . && uv run ruff format --check .
 uv run mypy
-uv run pytest
+uv run pytest --cov && uv run coverage report
 ```
 
 ## Provenance

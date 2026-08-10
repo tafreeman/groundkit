@@ -180,6 +180,19 @@ class SQLiteMetadataStore:
 
         return await self._run(_op)
 
+    async def get_document_sources(self) -> dict[str, str]:
+        """Return a ``document_id -> source`` map for every stored document.
+
+        Raises:
+            StorageError: On a backend failure.
+        """
+
+        def _op() -> dict[str, str]:
+            cur = self._conn.execute("SELECT document_id, source FROM documents")
+            return {str(row[0]): str(row[1]) for row in cur.fetchall()}
+
+        return await self._run(_op)
+
     async def add_chunks(self, chunks: list[Chunk], source: str) -> None:
         """Persist chunks for a document.
 

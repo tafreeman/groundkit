@@ -172,15 +172,22 @@ class IngestionPipeline:
 
     @staticmethod
     def _discover_files(root: Path, extensions: tuple[str, ...]) -> list[Path]:
-        """Walk ``root``, skipping hidden directories, for files matching ``extensions``.
+        """Walk ``root`` for matching files (see :func:`discover_files`)."""
+        return discover_files(root, extensions)
 
-        Returns paths sorted for deterministic dispatch order.
-        """
-        matches: list[Path] = []
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-            for filename in filenames:
-                candidate = Path(dirpath) / filename
-                if candidate.suffix.lower() in extensions:
-                    matches.append(candidate)
-        return sorted(matches, key=str)
+
+def discover_files(root: Path, extensions: tuple[str, ...]) -> list[Path]:
+    """Walk ``root``, skipping hidden directories, for files matching ``extensions``.
+
+    Blocking — callers on the event loop wrap this in ``asyncio.to_thread``.
+
+    Returns paths sorted for deterministic dispatch order.
+    """
+    matches: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for filename in filenames:
+            candidate = Path(dirpath) / filename
+            if candidate.suffix.lower() in extensions:
+                matches.append(candidate)
+    return sorted(matches, key=str)

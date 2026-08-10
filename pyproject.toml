@@ -51,7 +51,9 @@ src = ["src", "tests"]
 select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "ARG", "S", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101"] # pytest asserts
+# S101: pytest asserts. ARG002: protocol-conformant test fakes must keep the
+# protocol's exact parameter names (mypy structural typing), used or not.
+"tests/**" = ["S101", "ARG002"]
 
 [tool.mypy]
 strict = true
@@ -64,8 +66,13 @@ explicit_package_bases = true
 testpaths = ["tests"]
 addopts = "-q"
 
-# Coverage is measured from Phase 0 but not yet gated: the 80% floor applies to
-# the core subset (retrieval, chunking, scoring, citation resolution) and is
-# switched on in the same change that lands the first core code (Phase 1).
+# The 80% floor gates the whole package (a superset of the spec's core
+# subset — every implemented module is measured; phase-stub modules are
+# docstring-only and contribute no statements). precision = 2 so 79.99%
+# fails instead of rounding up.
 [tool.coverage.run]
 source = ["groundkit"]
+
+[tool.coverage.report]
+fail_under = 80
+precision = 2

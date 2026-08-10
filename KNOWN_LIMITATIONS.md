@@ -2,11 +2,24 @@
 
 Honest and current, per repo policy. Updated with each phase.
 
-## Current state (Phase 0)
+## Current state (Phase 1)
 
-Nothing is implemented yet. The repo contains the spec, ADR-0001, and a typed
-skeleton whose modules are docstring-only placeholders. The `grk` CLI installs
-and reports its version; it does nothing else.
+BM25-only retrieval works end-to-end locally: `grk ingest` (file or
+directory, incremental by content hash) and `grk search` (citation-bearing
+results with character offsets) against a persisted SQLite index that
+survives restarts. Not yet built, arriving in their phases per SPEC.md §9:
+
+- Retrieval-quality eval harness and golden corpus (Phase 2).
+- Dense retrieval, hybrid fusion, rerank, and metadata filtering at search
+  time (Phase 3) — embedding providers exist and are tested, but nothing
+  consumes them yet.
+- PDF/HTML loaders and URL ingestion (with the SSRF guard) — v1 scope, not
+  yet scheduled into a phase; the loader currently reads `.md`/`.markdown`/
+  `.txt` only.
+- REST API and MCP server (Phase 4); synthesis, query rewrite, redaction
+  (Phase 5); IaC and OTel observability (Phase 6); docs site (Phase 7).
+- BM25 rebuilds in memory at open — O(corpus) startup cost, accepted and
+  bounded by ADR-0002's revisit trigger.
 
 ## Deliberately out of scope for v1 (will not be built)
 
