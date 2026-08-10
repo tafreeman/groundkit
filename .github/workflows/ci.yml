@@ -68,6 +68,11 @@ jobs:
 
   secrets:
     runs-on: ubuntu-latest
+    # Narrower than widening the workflow-level grant: only this job needs to
+    # read the PR's commit list, and only on pull_request events.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:
