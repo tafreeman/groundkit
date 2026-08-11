@@ -42,6 +42,18 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked --group dev
       - run: uv run pytest --cov --cov-report=term
+      # Dedicated gate step: pytest-cov does not reliably propagate the
+      # fail-under exit code; `coverage report` honors [tool.coverage.report].
+      - run: uv run coverage report
+      # SPEC.md §8 core-subset gate: the whole-package gate above cannot
+      # catch a well-covered peripheral module (e.g. providers/embeddings.py,
+      # an optional provider) offsetting an under-tested core module.
+      # Patterns come from pyproject.toml's [tool.groundkit.coverage]
+      # core_subset so the two gates cannot drift apart.
+      - name: Core-subset coverage gate (SPEC.md §8)
+        run: |
+          PATTERN=$(uv run python -c "import tomllib; print(','.join(tomllib.load(open('pyproject.toml', 'rb'))['tool']['groundkit']['coverage']['core_subset']))")
+          uv run coverage report --include="$PATTERN" --fail-under=80
 
   audit:
     runs-on: ubuntu-latest
@@ -56,8 +68,18 @@ jobs:
 
   secrets:
     runs-on: ubuntu-latest
+    # Narrower than widening the workflow-level grant: only this job needs to
+    # read the PR's commit list, and only on pull_request events.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v3
+        env:
+          # Required for pull_request scans since gitleaks-action v2.3.0;
+          # push-only runs did not need it, so this first PR is where its
+          # absence surfaced.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

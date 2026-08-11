@@ -6,4 +6,5 @@ that were considered; deviating from SPEC.md requires an ADR proposal first.
 
 | ADR | Title | Status |
 | --- | ----- | ------ |
-| [ADR-0001](ADR-0001-promote-vs-rewrite.md) | Promote vs rewrite: what groundkit takes from ARP's RAG library | Proposed |
+| [ADR-0001](ADR-0001-promote-vs-rewrite.md) | Promote vs rewrite: what groundkit takes from ARP's RAG library | Accepted |
+| [ADR-0002](ADR-0002-index-persistence.md) | Index persistence: SQLite truth, BM25 rebuild-at-open | Accepted |
