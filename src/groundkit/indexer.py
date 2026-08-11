@@ -41,9 +41,15 @@ class IndexReport(BaseModel):
             unchanged since the last run.
         chunks_written: Total chunks persisted this run.
         documents_pruned: Stored documents deleted because their source no
-            longer exists on disk under the indexed root. Always ``0`` for
-            :meth:`Indexer.index_source` — pruning only ever runs for
-            :meth:`Indexer.index_directory`.
+            longer has anything to index. Two distinct cases feed this
+            count: the source vanished from disk entirely (a renamed or
+            deleted file — :meth:`Indexer.index_directory` only, detected by
+            its post-pass sweep), and the source still exists but its
+            content was emptied to nothing or whitespace, so the loader
+            yields no documents for it (both :meth:`Indexer.index_directory`
+            and :meth:`Indexer.index_source`). No longer always ``0`` for
+            :meth:`Indexer.index_source`: it counts the emptied-content case
+            for the exact source it was given, but never a vanished one.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -89,16 +95,28 @@ class Indexer:
     async def index_source(self, source: str) -> IndexReport:
         """Ingest one file into the store (skipping if unchanged).
 
+        If ``source`` now loads to no content (empty or whitespace-only),
+        any document previously stored for it is deleted and counted in
+        ``documents_pruned`` — the loader yields ``[]`` in that case, so
+        without this the stale document and its chunks would remain
+        searchable forever even though the source no longer contains them.
+        This is narrower than :meth:`index_directory`'s pruning: it still
+        never chases a source that has *vanished* from disk (that requires
+        the full set of sources under a root, which only a directory walk
+        provides) — it only forgets the exact source it was explicitly given
+        once that source's content disappears.
+
         Raises:
             IngestionError: If loading or chunking fails.
             StorageError: If persisting fails.
         """
-        indexed, skipped, chunks_written = await self._process(source)
+        indexed, skipped, chunks_written, pruned = await self._process(source)
         return IndexReport(
             files_seen=1,
             documents_indexed=indexed,
             documents_skipped=skipped,
             chunks_written=chunks_written,
+            documents_pruned=pruned,
         )
 
     async def index_directory(
@@ -115,14 +133,21 @@ class Indexer:
         exists on disk (a renamed or deleted file) — otherwise a rename
         leaves both the old and new document rows in the store forever
         (duplicate search results, and a citation that resolves against a
-        source that no longer exists). Pruning is scoped to ``source_dir``:
-        only stored documents whose source resolves *under* ``source_dir``
-        are candidates, so indexing a subdirectory never touches documents
-        ingested from outside it (e.g. a sibling directory, or a prior
-        :meth:`index_source` call elsewhere). :meth:`index_source` never
-        prunes anything — pruning requires knowing the full set of sources
-        that should currently exist under a root, which only a directory
-        walk provides.
+        source that no longer exists). A second, narrower case is pruned
+        per-source inside :meth:`_process` itself, before this sweep even
+        runs: a file that still exists but whose content was emptied to
+        nothing or whitespace yields no documents from the loader, so it
+        never appears here as a "missing" source (it was discovered on
+        disk just fine) and would otherwise never be pruned at all. Pruning
+        is scoped to ``source_dir``: only stored documents whose source
+        resolves *under* ``source_dir`` are candidates, so indexing a
+        subdirectory never touches documents ingested from outside it (e.g.
+        a sibling directory, or a prior :meth:`index_source` call
+        elsewhere). :meth:`index_source` never prunes a *vanished* source —
+        that requires knowing the full set of sources that should currently
+        exist under a root, which only a directory walk provides — but it
+        does prune the emptied-content case for the exact source it is
+        given, via the same :meth:`_process` path used here.
 
         Raises:
             IngestionError: The directory is missing, cannot be walked, or
@@ -146,7 +171,7 @@ class Indexer:
 
         semaphore = asyncio.Semaphore(max_concurrent)
 
-        async def _one(path: Path) -> tuple[int, int, int]:
+        async def _one(path: Path) -> tuple[int, int, int, int]:
             async with semaphore:
                 return await self._process(str(path))
 
@@ -155,7 +180,11 @@ class Indexer:
         indexed = sum(o[0] for o in outcomes)
         skipped = sum(o[1] for o in outcomes)
         chunks_written = sum(o[2] for o in outcomes)
-        pruned = await self._prune_missing(root, files)
+        emptied_pruned = sum(o[3] for o in outcomes)
+        # Runs after every _process call has completed, so it can never see
+        # (and re-count) a document _process already deleted above.
+        missing_pruned = await self._prune_missing(root, files)
+        pruned = emptied_pruned + missing_pruned
         logger.info(
             "Indexed %s: %d files, %d indexed, %d skipped, %d pruned, %d chunks",
             source_dir,
@@ -201,11 +230,19 @@ class Indexer:
             pruned += 1
         return pruned
 
-    async def _process(self, source: str) -> tuple[int, int, int]:
+    async def _process(self, source: str) -> tuple[int, int, int, int]:
         """Load, hash-compare, chunk, and persist one source.
 
+        When the loader returns no documents for ``source`` (empty or
+        whitespace-only content), any document previously stored for that
+        exact source is deleted via :meth:`_prune_emptied_source` — the
+        ``for doc in documents`` loop below would otherwise never execute,
+        so the stale document and its chunks would remain in the store
+        forever even though the source no longer contains them.
+
         Returns:
-            ``(documents_indexed, documents_skipped, chunks_written)``.
+            ``(documents_indexed, documents_skipped, chunks_written,
+            documents_pruned)``.
         """
         try:
             documents = await self._loader.load(source)
@@ -213,6 +250,10 @@ class Indexer:
             raise
         except Exception as exc:
             raise IngestionError(f"Loader failed for {source!r}: {exc}") from exc
+
+        if not documents:
+            pruned = await self._prune_emptied_source(source)
+            return 0, 0, 0, pruned
 
         indexed = skipped = chunks_written = 0
         for doc in documents:
@@ -238,7 +279,39 @@ class Indexer:
             )
             indexed += 1
             chunks_written += len(chunks)
-        return indexed, skipped, chunks_written
+        return indexed, skipped, chunks_written, 0
+
+    async def _prune_emptied_source(self, source: str) -> int:
+        """Delete the stored document for ``source`` if one exists.
+
+        Called only when the loader just returned no documents for
+        ``source`` (empty or whitespace-only content) — the file still
+        exists on disk, so it is not a "missing source" :meth:`_prune_missing`
+        would ever catch, but it now has nothing to index.
+
+        Stored sources are realpath-normalized (:class:`FileLoader` resolves
+        every path via
+        :func:`~groundkit.utils.path_safety.ensure_within_base` before
+        storing it), so ``source`` must be realpath-resolved the same way
+        before comparing — done off the event loop, consistent with every
+        other blocking filesystem call in this module.
+
+        Args:
+            source: The path this run was asked to index, as given by the
+                caller (relative or absolute, not yet resolved).
+
+        Returns:
+            ``1`` if a stored document was found and deleted, ``0`` if
+            ``source`` was never indexed (nothing to prune).
+        """
+        resolved = await asyncio.to_thread(os.path.realpath, source)
+        sources = await self._store.get_document_sources()
+        for document_id, stored_source in sources.items():
+            if stored_source == resolved:
+                await self._store.delete_document(document_id)
+                logger.info("Emptied source, pruning stored document: %s", source)
+                return 1
+        return 0
 
 
 def _content_hash(document: Document) -> str:

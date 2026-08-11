@@ -285,3 +285,33 @@ class TestCitations:
         )
         with pytest.raises(RetrievalError, match="Cannot read"):
             asyncio.run(resolve_citation(citation, tmp_path))
+
+
+class TestCitationsInvalidUtf8:
+    """A source that becomes invalid UTF-8 after indexing must surface the
+    typed ``RetrievalError`` (SPEC.md §2), not a raw ``UnicodeDecodeError`` —
+    ``UnicodeDecodeError`` is a ``ValueError`` subclass, not an ``OSError``,
+    so a naive ``except OSError`` around the read lets it escape uncaught."""
+
+    def _write_invalid_utf8_source(self, tmp_path: Path) -> Citation:
+        path = tmp_path / "invalid.md"
+        path.write_bytes(b"\xff\xfe\x00invalid")
+        return Citation(
+            document_id="d",
+            chunk_id="c",
+            source=str(path),
+            start_offset=0,
+            end_offset=4,
+        )
+
+    def test_resolve_raises_retrieval_error_not_unicode_decode_error(self, tmp_path: Path) -> None:
+        citation = self._write_invalid_utf8_source(tmp_path)
+        with pytest.raises(RetrievalError, match="not valid UTF-8") as exc_info:
+            asyncio.run(resolve_citation(citation, tmp_path))
+        assert isinstance(exc_info.value.__cause__, UnicodeDecodeError)
+
+    def test_verify_raises_retrieval_error_not_unicode_decode_error(self, tmp_path: Path) -> None:
+        citation = self._write_invalid_utf8_source(tmp_path)
+        with pytest.raises(RetrievalError, match="not valid UTF-8") as exc_info:
+            asyncio.run(verify_citation(citation, "anything", tmp_path))
+        assert isinstance(exc_info.value.__cause__, UnicodeDecodeError)

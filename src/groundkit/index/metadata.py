@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -28,11 +29,19 @@ from pathlib import Path
 from typing import TypeVar
 
 from groundkit.contracts import Chunk
-from groundkit.errors import StorageError
+from groundkit.errors import ConfigurationError, StorageError
+from groundkit.utils.path_safety import ensure_within_base
 
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+#: Allowed characters for a collection name: ASCII letters, digits, and the
+#: conservative separators ``-``, ``_``, ``.``. The character class alone
+#: already excludes path separators (``/``, ``\``), drive/UNC prefixes
+#: (``:``), and whitespace — but a lone ``.`` or ``..`` matches this pattern
+#: too, so :func:`_validate_collection` rejects those explicitly.
+_COLLECTION_NAME_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9._-]+$")
 
 #: Schema for the persisted metadata store. ``IF NOT EXISTS`` makes this safe
 #: to run on every open, whether the file is fresh or already populated.
@@ -82,21 +91,37 @@ class SQLiteMetadataStore:
             index_dir: Directory holding the collection's persisted state.
                 Created (with parents) if it does not exist.
             collection: Collection name; backs the file ``<collection>.sqlite3``.
+                Validated against ``_COLLECTION_NAME_PATTERN`` and, once
+                resolved, checked to stay contained within ``index_dir`` —
+                an unchecked value could otherwise create or open a database
+                anywhere on disk (e.g. ``collection="../outside"`` or an
+                absolute path).
 
         Returns:
             A ready-to-use store with the schema applied.
 
         Raises:
+            ConfigurationError: ``collection`` is empty or whitespace-only,
+                contains a null byte or a path separator, is ``.`` or
+                ``..``, contains characters outside the allowed set, or
+                otherwise resolves to a database path outside ``index_dir``.
             StorageError: The directory cannot be created, the database file
                 cannot be opened, or the schema cannot be applied (e.g. a
                 corrupted file or a path occupied by something other than a
                 regular SQLite file).
         """
+        _validate_collection(collection)
         db_path = index_dir / f"{collection}.sqlite3"
 
         def _connect() -> sqlite3.Connection:
             index_dir.mkdir(parents=True, exist_ok=True)
             _chmod_best_effort(index_dir, 0o700)
+            try:
+                ensure_within_base(db_path, index_dir)
+            except ValueError as exc:
+                raise ConfigurationError(
+                    f"collection {collection!r} resolves outside index_dir {index_dir}"
+                ) from exc
             conn = sqlite3.connect(str(db_path), check_same_thread=False)
             try:
                 conn.execute("PRAGMA foreign_keys = ON")
@@ -446,6 +471,38 @@ def _row_to_chunk(row: tuple[str, str, int, str, int, int, str]) -> Chunk:
         end_offset=end_offset,
         metadata=json.loads(metadata_json),
     )
+
+
+def _validate_collection(collection: str) -> None:
+    """Validate that ``collection`` is safe to interpolate into a file path.
+
+    This is the first of two containment layers for :meth:`SQLiteMetadataStore.open`
+    (the second is the resolved-path check via
+    :func:`~groundkit.utils.path_safety.ensure_within_base`): it states the
+    contract on the name itself, up front, so a bad value fails with a
+    specific message rather than relying solely on the later path check.
+
+    Args:
+        collection: Candidate collection name.
+
+    Raises:
+        ConfigurationError: ``collection`` is empty or whitespace-only,
+            contains a null byte, is ``.`` or ``..``, or contains characters
+            outside ``_COLLECTION_NAME_PATTERN`` (which itself excludes path
+            separators, drive/UNC prefixes, and absolute paths — all of
+            those require a character the pattern disallows).
+    """
+    if "\0" in collection:
+        raise ConfigurationError("collection name must not contain a null byte")
+    if not collection.strip():
+        raise ConfigurationError("collection name must not be empty or whitespace-only")
+    if collection in (".", ".."):
+        raise ConfigurationError(f"collection name must not be {collection!r}")
+    if not _COLLECTION_NAME_PATTERN.fullmatch(collection):
+        raise ConfigurationError(
+            f"collection name {collection!r} contains characters outside the allowed "
+            "set (letters, digits, '-', '_', '.')"
+        )
 
 
 def _now_iso() -> str:

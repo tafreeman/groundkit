@@ -163,3 +163,20 @@ class TestFileLoaderErrors:
         loader = FileLoader(allowed_base_dir=sandbox)
         with pytest.raises(IngestionError, match="escapes base"):
             _load(loader, str(outside))
+
+
+class TestFileLoaderInvalidUtf8:
+    """A file that is not valid UTF-8 must raise the typed ``IngestionError``,
+    not a raw ``UnicodeDecodeError`` — ``UnicodeDecodeError`` is a
+    ``ValueError`` subclass, not an ``OSError``, so a naive ``except OSError``
+    around the read lets it escape uncaught."""
+
+    @pytest.mark.parametrize("suffix", [".md", ".txt"])
+    def test_invalid_utf8_raises_ingestion_error(self, tmp_path: Path, suffix: str) -> None:
+        bad_file = tmp_path / f"bad{suffix}"
+        bad_file.write_bytes(b"\xff\xfe\x00invalid")
+
+        loader = FileLoader(allowed_base_dir=tmp_path)
+        with pytest.raises(IngestionError, match="not valid UTF-8") as exc_info:
+            _load(loader, str(bad_file))
+        assert isinstance(exc_info.value.__cause__, UnicodeDecodeError)

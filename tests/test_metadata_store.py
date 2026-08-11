@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from groundkit.contracts import Chunk
-from groundkit.errors import StorageError
+from groundkit.errors import ConfigurationError, StorageError
 from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.index.protocols import MetadataStoreProtocol
 
@@ -365,3 +365,97 @@ def test_open_raises_storage_error_on_corrupted_file(tmp_path: Path) -> None:
 
     with pytest.raises(StorageError):
         asyncio.run(_open())
+
+
+def test_open_rejects_parent_traversal_collection_and_creates_nothing_outside(
+    tmp_path: Path,
+) -> None:
+    """'../outside' is rejected and must not create a database outside index_dir.
+
+    This is the P2 path-containment bug: an unvalidated ``collection`` used
+    to resolve ``<index_dir>/../outside.sqlite3``, landing the database one
+    level above the configured index directory.
+    """
+    index_dir = tmp_path / "index_dir"
+
+    async def _open() -> SQLiteMetadataStore:
+        return await SQLiteMetadataStore.open(index_dir, "../outside")
+
+    with pytest.raises(ConfigurationError):
+        asyncio.run(_open())
+
+    assert not (tmp_path / "outside.sqlite3").exists()
+
+
+def test_open_rejects_absolute_collection(tmp_path: Path) -> None:
+    """An absolute collection value is rejected instead of discarding index_dir.
+
+    ``Path("/a") / "/b"`` is ``Path("/b")`` — an absolute ``collection``
+    would otherwise silently ignore ``index_dir`` entirely.
+    """
+
+    async def _open(collection: str) -> SQLiteMetadataStore:
+        return await SQLiteMetadataStore.open(tmp_path, collection)
+
+    for bad in ("/etc/passwd", "C:\\Windows\\evil", "\\\\server\\share\\evil"):
+        with pytest.raises(ConfigurationError):
+            asyncio.run(_open(bad))
+
+
+def test_open_rejects_path_separator_in_collection(tmp_path: Path) -> None:
+    """A collection name containing a path separator is rejected, '/' or '\\'."""
+
+    async def _open(collection: str) -> SQLiteMetadataStore:
+        return await SQLiteMetadataStore.open(tmp_path, collection)
+
+    for bad in ("sub/dir", "sub\\dir"):
+        with pytest.raises(ConfigurationError):
+            asyncio.run(_open(bad))
+
+
+def test_open_rejects_dot_and_dotdot_collection(tmp_path: Path) -> None:
+    """A collection name of exactly '.' or '..' is rejected."""
+
+    async def _open(collection: str) -> SQLiteMetadataStore:
+        return await SQLiteMetadataStore.open(tmp_path, collection)
+
+    for bad in (".", ".."):
+        with pytest.raises(ConfigurationError):
+            asyncio.run(_open(bad))
+
+
+def test_open_rejects_empty_or_whitespace_collection(tmp_path: Path) -> None:
+    """An empty or whitespace-only collection name is rejected."""
+
+    async def _open(collection: str) -> SQLiteMetadataStore:
+        return await SQLiteMetadataStore.open(tmp_path, collection)
+
+    for bad in ("", "   ", "\t"):
+        with pytest.raises(ConfigurationError):
+            asyncio.run(_open(bad))
+
+
+def test_open_accepts_valid_collection_names_with_dash_underscore_dot(tmp_path: Path) -> None:
+    """Collection names with '-', '_', and '.' are valid and round-trip a document.
+
+    Guards against an over-tight fix: legitimate collection names like
+    ``my-docs.v2`` must keep working end to end.
+    """
+
+    async def _run(collection: str) -> tuple[str | None, list[Chunk]]:
+        store = await SQLiteMetadataStore.open(tmp_path, collection)
+        try:
+            await store.upsert_document(source="a.md", document_id="doc-1", content_hash="h1")
+            chunk = _make_chunk("c1", "doc-1", "hello")
+            await store.add_chunks([chunk], source="a.md")
+            doc_hash = await store.get_document_hash("a.md")
+            chunks = await store.get_chunks()
+            return doc_hash, chunks
+        finally:
+            await store.close()
+
+    doc_hash, chunks = asyncio.run(_run("my-docs.v2"))
+
+    assert doc_hash == "h1"
+    assert len(chunks) == 1
+    assert chunks[0].chunk_id == "c1"

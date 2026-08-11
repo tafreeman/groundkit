@@ -31,8 +31,8 @@ async def resolve_citation(citation: Citation, allowed_base_dir: Path) -> str:
 
     Raises:
         RetrievalError: The source escapes ``allowed_base_dir``, cannot be
-            read, or is shorter than the cited offsets (source changed since
-            indexing).
+            read, is not valid UTF-8, or is shorter than the cited offsets
+            (source changed since indexing).
     """
     try:
         path = ensure_within_base(citation.source, allowed_base_dir)
@@ -43,6 +43,8 @@ async def resolve_citation(citation: Citation, allowed_base_dir: Path) -> str:
         text = await asyncio.to_thread(path.read_text, "utf-8")
     except OSError as exc:
         raise RetrievalError(f"Cannot read cited source {citation.source!r}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise RetrievalError(f"Cited source {citation.source!r} is not valid UTF-8: {exc}") from exc
 
     if citation.end_offset > len(text):
         raise RetrievalError(

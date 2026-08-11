@@ -103,6 +103,8 @@ class FileLoader:
             raise
         except OSError as exc:
             raise IngestionError(f"Failed to read {source!r}: {exc}") from exc
+        except UnicodeDecodeError as exc:
+            raise IngestionError(f"{source!r} is not valid UTF-8: {exc}") from exc
 
         if not content.strip():
             logger.warning("Empty or whitespace-only file: %s", source)
@@ -125,6 +127,7 @@ class FileLoader:
         Raises:
             IngestionError: If the file is larger than ``max_bytes``.
             OSError: If the file is missing, is a directory, or unreadable.
+            UnicodeDecodeError: If the file's bytes are not valid UTF-8.
         """
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")

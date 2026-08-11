@@ -294,7 +294,7 @@ def test_indexing_subdirectory_does_not_prune_sibling_documents(
 
 
 def test_index_source_never_prunes(corpus: Path, tmp_path: Path) -> None:
-    """The single-file entry point must not prune anything, ever."""
+    """The single-file entry point must never prune a *vanished* source."""
 
     async def run() -> None:
         store = await _open(tmp_path)
@@ -309,6 +309,153 @@ def test_index_source_never_prunes(corpus: Path, tmp_path: Path) -> None:
 
             sources = list((await store.get_document_sources()).values())
             assert any(s.endswith("beta.txt") for s in sources)  # untouched
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_index_directory_prunes_emptied_file(corpus: Path, tmp_path: Path) -> None:
+    """Blanking a previously-indexed file's content must prune its stored
+    document and chunks on the next directory-index run.
+
+    Regression test for the CRITICAL defect where ``FileLoader.load``
+    returns ``[]`` for empty content, so ``Indexer._process``'s
+    ``for doc in documents`` loop never ran and never deleted the stale
+    document — and the file still exists on disk, so ``_prune_missing``
+    never saw it as "missing" either. The chunks from the old content
+    stayed searchable forever with no source text left to back them.
+    """
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            indexer = Indexer(store, FileLoader(allowed_base_dir=corpus))
+            await indexer.index_directory(str(corpus))
+            assert any("Restarts do not lose data" in c.content for c in await store.get_chunks())
+
+            (corpus / "alpha.md").write_text("", encoding="utf-8")
+
+            report = await indexer.index_directory(str(corpus))
+            assert report.documents_pruned == 1
+            assert report.documents_indexed == 0
+
+            sources = list((await store.get_document_sources()).values())
+            assert len(sources) == 2
+            assert not any(s.endswith("alpha.md") for s in sources)
+
+            remaining = await store.get_chunks()
+            assert not any("Restarts do not lose data" in c.content for c in remaining)
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_index_directory_prunes_whitespace_only_file(corpus: Path, tmp_path: Path) -> None:
+    """Whitespace-only content, not just zero bytes, must also trigger the prune."""
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            indexer = Indexer(store, FileLoader(allowed_base_dir=corpus))
+            await indexer.index_directory(str(corpus))
+
+            (corpus / "beta.txt").write_text("   \n\t  \n", encoding="utf-8")
+
+            report = await indexer.index_directory(str(corpus))
+            assert report.documents_pruned == 1
+
+            sources = list((await store.get_document_sources()).values())
+            assert not any(s.endswith("beta.txt") for s in sources)
+
+            remaining = await store.get_chunks()
+            assert not any("character offsets" in c.content for c in remaining)
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_index_source_prunes_emptied_file(corpus: Path, tmp_path: Path) -> None:
+    """The single-file entry point must prune the exact source it was given
+    when that source's content is emptied, via the same lifecycle as
+    ``index_directory`` (index, blank the file, re-index).
+    """
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            indexer = Indexer(store, FileLoader(allowed_base_dir=corpus))
+            first = await indexer.index_source(str(corpus / "alpha.md"))
+            assert first.documents_indexed == 1
+
+            (corpus / "alpha.md").write_text("   ", encoding="utf-8")
+
+            report = await indexer.index_source(str(corpus / "alpha.md"))
+            assert report.documents_indexed == 0
+            assert report.documents_skipped == 0
+            assert report.chunks_written == 0
+            assert report.documents_pruned == 1
+
+            assert await store.get_document_sources() == {}
+            assert await store.get_chunks() == []
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_index_source_empty_file_never_indexed_is_noop(corpus: Path, tmp_path: Path) -> None:
+    """An empty file that was never indexed must not error and must not
+    report a spurious prune — there is nothing stored to delete.
+    """
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            indexer = Indexer(store, FileLoader(allowed_base_dir=corpus))
+            never_indexed = corpus / "never-indexed.md"
+            never_indexed.write_text("", encoding="utf-8")
+
+            report = await indexer.index_source(str(never_indexed))
+            assert report.documents_indexed == 0
+            assert report.documents_skipped == 0
+            assert report.chunks_written == 0
+            assert report.documents_pruned == 0
+
+            assert await store.get_document_sources() == {}
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_emptying_one_file_does_not_prune_a_different_document(
+    corpus: Path, tmp_path: Path
+) -> None:
+    """Emptying one source must only ever remove *its own* stored document —
+    never another file's, even though both were discovered in the same
+    directory-index run.
+    """
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            indexer = Indexer(store, FileLoader(allowed_base_dir=corpus))
+            await indexer.index_directory(str(corpus))
+
+            (corpus / "alpha.md").write_text("", encoding="utf-8")
+            report = await indexer.index_directory(str(corpus))
+            assert report.documents_pruned == 1
+
+            sources = list((await store.get_document_sources()).values())
+            assert any(s.endswith("beta.txt") for s in sources)
+            assert any(s.endswith("gamma.md") for s in sources)
+
+            remaining_contents = " ".join(c.content for c in await store.get_chunks())
+            assert "character offsets" in remaining_contents  # beta.txt survives
+            assert "Hybrid retrieval" in remaining_contents  # sub/gamma.md survives
         finally:
             await store.close()
 
