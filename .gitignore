@@ -24,9 +24,15 @@ evals/results/
 *.lance/
 *.sqlite3
 
+# Local AI-agent context file (solo-dev machine convenience, not shipped repo
+# content). SPEC.md, KNOWN_LIMITATIONS.md and docs/adr/ are the tracked source
+# of truth; a fresh clone is governed by those.
+CLAUDE.md
+
 # Editors / OS
 .idea/
 .vscode/
+.vs/
 *.swp
 Thumbs.db
 .DS_Store
