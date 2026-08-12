@@ -60,8 +60,10 @@ named defect gets a fix and a regression test in the phase that ports it.
   is the sole proof of a backend may be `continue-on-error`.
 - Layout: `src/groundkit/` package · `tests/` mirroring modules · `docs/`
   (MkDocs, strict) · `docs/adr/` (`ADR-NNNN-<slug>.md`) · `docs/specs/`
-  (feature specs as they arrive) · `evals/` (corpus + runner; `results/`
-  gitignored) · `infra/` (created in Phase 6, not before — empty IaC dirs are
+  (feature specs as they arrive) · `evals/` (corpus data + `judgments.jsonl`
+  + generated `results/`, gitignored — the runner *code* is the
+  `groundkit.evals` package under `src/groundkit/`, §5.1, invoked via
+  `grk eval`) · `infra/` (created in Phase 6, not before — empty IaC dirs are
   decoration).
 - Storage: LanceDB (dense vectors, file-based) + SQLite (document/chunk
   metadata), both behind interfaces so pgvector can be added later; pgvector
@@ -188,7 +190,7 @@ changesets; each phase ends with CI green and docs updated in the same change.
 |---|---|---|---|
 | 0 | Inventory & spec | ADR-0001 + SPEC v1 + skeleton, gates green, owner review | done 2026-08-10 |
 | 1 | Deterministic core | ingest→chunk→BM25→embedding interface→persisted index→citation-resolving retrieval; unit tests; coverage gate on; chunker loop + loader fixes in with regression tests | done 2026-08-10 |
-| 2 | Eval harness | golden corpus + metrics engine + BM25 baseline report as reference artifact | pending |
+| 2 | Eval harness | golden corpus + metrics engine + BM25 baseline report as reference artifact | done 2026-08-11 |
 | 3 | Hybrid + rerank | dense (LanceDB w/ metadata filtering), RRF, optional cross-encoder (normalized scores); each with eval delta vs baseline | pending |
 | 4 | Service + MCP | FastAPI + MCP server + CLI; `grk ingest ./docs && grk serve-mcp` connectable from Claude Desktop/Code with documented client config | pending |
 | 5 | Boundary features | optional query rewrite + cited synthesis; redaction pass (names → tokens, configurable patterns); advisory faithfulness judge | pending |
