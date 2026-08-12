@@ -157,6 +157,27 @@ class TestJudgmentFrozenAndForbid:
 
 
 class TestLoadJudgments:
+    def test_missing_file_raises_eval_error(self, tmp_path: Path) -> None:
+        """A missing judgments file fails as EvalError, not a raw OSError.
+
+        Every caller handles GroundkitError; a bare FileNotFoundError would
+        escape that handler as an unhandled traceback.
+        """
+        with pytest.raises(EvalError, match="Cannot read judgments file"):
+            load_judgments(tmp_path / "does-not-exist.jsonl")
+
+    def test_invalid_utf8_raises_eval_error(self, tmp_path: Path) -> None:
+        """UnicodeDecodeError is a ValueError, not an OSError.
+
+        Catching only OSError would let the raw builtin escape — the same
+        defect already fixed in FileLoader and the citation resolver.
+        """
+        path = tmp_path / "judgments.jsonl"
+        path.write_bytes(b"\xff\xfe\x00not utf-8")
+        with pytest.raises(EvalError, match="not valid UTF-8") as exc_info:
+            load_judgments(path)
+        assert isinstance(exc_info.value.__cause__, UnicodeDecodeError)
+
     def test_loads_valid_sorted_file(self, tmp_path: Path) -> None:
         path = tmp_path / "judgments.jsonl"
         _write_lines(

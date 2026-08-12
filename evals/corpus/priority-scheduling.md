@@ -1,0 +1,11 @@
+# Priority Scheduling and Fairness
+
+A priority scheduler assigns each queued task a priority level and dispatches higher-priority tasks ahead of lower-priority ones whenever both are waiting. Naive priority ordering has an obvious failure mode: if high-priority work keeps arriving, a low-priority task can wait indefinitely while never getting a turn. This condition is called starvation, and any scheduler that promises fairness across priority bands has to guard against it explicitly.
+
+The standard defense is aging. A task's effective priority rises the longer it sits unscheduled, until it eventually outranks freshly arrived high-priority work and gets dispatched. Aging turns an unbounded wait into a wait bounded by a fixed number of scheduling passes, because every scheduling pass nudges the task's score upward regardless of what keeps showing up above it. Implementations typically recompute effective priority on a fixed cadence rather than continuously, to keep the comparison cheap.
+
+Aging is not the only fairness lever. Many schedulers also run a weighted round-robin pass across priority bands: instead of always draining the highest band to empty before touching the next one, the scheduler grants each band a slice of dispatch slots proportional to its configured weight, so a low band still gets guaranteed throughput even when a high band is saturated. A scheduler can combine both approaches, using weighted slices to bound how long a band waits between turns and aging inside each band so individual tasks do not stall behind newer arrivals of the same priority.
+
+Within a single priority level, task order usually falls back to arrival time. Two tasks at the same priority are dispatched strictly in the order they were enqueued, so equal-priority fairness reduces to plain FIFO and nothing more elaborate is needed there.
+
+Operators auditing fairness behavior sometimes capture a queue snapshot, a point-in-time dump of every waiting task with its priority, effective priority, and enqueue timestamp, and replay it offline to check whether the aging curve is behaving as configured. The snapshot alone proves nothing about starvation; it only becomes useful compared against a second snapshot taken later, to see whether any task's wait time is growing without bound.

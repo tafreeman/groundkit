@@ -1,0 +1,11 @@
+# Autoscaling Worker Pools Under Load
+
+A worker pool that never changes size either wastes capacity during quiet periods or falls behind during a surge, so most production queue consumers scale the number of active workers up and down automatically in response to load.
+
+The primary signal for scaling up is queue depth. The pool adds workers once queue depth has stayed above a rolling threshold for several consecutive intervals, rather than reacting to a single noisy spike — a brief burst that clears itself in one interval should not spin up capacity that then sits idle. If workers keep falling behind despite the queue building up, that backlog is itself a form of backpressure on everything upstream still trying to enqueue new work. A sustained rise in per-task processing latency independently triggers the same scale-up path even when queue depth alone has not yet crossed its threshold, since slow tasks are an early warning that a depth-based trigger would otherwise catch too late.
+
+Scaling down is more delicate than scaling up, because removing a worker that is mid-task wastes the work already done on it. Once load has been low for a while, the pool waits a randomized jitter interval before removing any workers, rather than shrinking every pool in the fleet at exactly the same moment. An unrandomized synchronized shrink across dozens of pools at once can itself cause the next load spike, as traffic that was spread across more workers suddenly funnels through fewer of them at once.
+
+Each worker also reports a heartbeat to the pool controller every few seconds, so the controller can distinguish a worker that is merely busy on a long task from one that has actually crashed and needs to be replaced rather than counted toward capacity. A controller that stops receiving heartbeats from a worker for too long removes it from the active count immediately, independent of any scale-down decision.
+
+Aggressive scale-down carries a fairness risk too: shrinking the pool too eagerly risks starvation of low-priority workers long before high-priority work ever competes for the same slots, though the pool controller here does not implement starvation protection on its own — that responsibility belongs to the scheduler feeding it work, not to the autoscaler itself.

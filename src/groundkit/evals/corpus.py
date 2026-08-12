@@ -156,16 +156,26 @@ def load_judgments(path: Path) -> list[Judgment]:
         Judgments in file order (== ``query_id`` order).
 
     Raises:
-        EvalError: A line is not valid JSON, fails :class:`Judgment`
-            validation, repeats a ``query_id`` already seen, or has a
-            ``query_id`` that does not sort strictly after the previous
-            one. The message names the 1-based line number.
+        EvalError: The file cannot be read or is not valid UTF-8; or a line
+            is not valid JSON, fails :class:`Judgment` validation, repeats a
+            ``query_id`` already seen, or has a ``query_id`` that does not
+            sort strictly after the previous one. Line-level messages name
+            the 1-based line number.
     """
     judgments: list[Judgment] = []
     seen_ids: set[str] = set()
     previous_id: str | None = None
 
-    text = path.read_text(encoding="utf-8")
+    # OSError and UnicodeDecodeError are wrapped for the same reason the
+    # loader and citation resolver wrap them: UnicodeDecodeError is a
+    # ValueError, not an OSError, so catching only OSError would let the raw
+    # builtin escape past every caller that handles GroundkitError.
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise EvalError(f"Cannot read judgments file {str(path)!r}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise EvalError(f"Judgments file {str(path)!r} is not valid UTF-8: {exc}") from exc
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line:

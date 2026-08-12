@@ -123,6 +123,22 @@ shares no vocabulary with anything indexed.
 intersection between every `no_answer` query and the full indexed
 vocabulary is empty.
 
+**Write these as keyword phrases, not as questions.** The tokenizer is a
+bare `\w+` split with no stopword removal, so a query phrased as a sentence
+carries `how`, `a`, `what`, `the`, `you` — words that appear in any English
+prose document and therefore in the corpus. Those alone give BM25 a
+non-zero score, the query returns hits, and abstention is never observed.
+A no-answer query must be content words only:
+
+- Good: `gum arabic granulation cobalt pigment cold-press`
+- Bad: `What causes granulation with cobalt blue pigment on cold-press paper?`
+  — `what`, `with`, `on` all match the corpus.
+
+This makes no-answer queries shaped differently from the other categories,
+which are natural questions. That asymmetry is deliberate and is the cost of
+measuring abstention without inventing a score threshold; it is recorded in
+KNOWN_LIMITATIONS.md.
+
 ## The adversarial rule
 
 An `"adversarial"` judgment's document must contain genuine

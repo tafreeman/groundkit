@@ -1,0 +1,13 @@
+# Delivery Guarantees in Message Queues
+
+Every message queue makes a promise about how many times a consumer will see each message, and that promise shapes everything downstream. The three canonical guarantees are at-most-once, at-least-once, and exactly-once delivery, and the tradeoffs between them are one of the first design decisions a queueing system forces on its users.
+
+At-most-once delivery drops a message rather than risk delivering it twice. Once the broker hands a message to a consumer, it considers the job done, even if the consumer crashes before finishing the work. This favors low latency and simple bookkeeping over completeness, and it suits telemetry pings or cache invalidations where an occasional dropped event is cheap to tolerate.
+
+At-least-once delivery flips that tradeoff. The broker holds a message as unacknowledged until the consumer explicitly confirms it finished, and if that confirmation never arrives — because the worker crashed, the network dropped the ack, or a visibility timeout expired — the broker redelivers the message to another worker. A consumer only removes a message from the queue by sending an explicit acknowledgment after the work completes; a negative acknowledgment, or nack, tells the broker to redeliver immediately rather than waiting out the timeout. Most production queueing systems default to this guarantee, because losing a message silently is almost always worse than processing it twice.
+
+But processing a message twice is exactly the cost at-least-once delivery imposes, and it is why consumer code cannot treat redelivery as a rare edge case. A handler that charges a customer, decrements inventory, or sends a notification must be written so that receiving the same message a second time produces no additional side effect. The industry term for this property is that the consumer is idempotent. Without that property, a redelivered order-confirmation message would double-charge a customer's card, and a redelivered inventory decrement would silently corrupt stock counts across a busy afternoon.
+
+Achieving true exactly-once semantics end to end usually means layering idempotent consumers on top of at-least-once delivery rather than trusting the broker alone, since no broker can guarantee exactly-once behavior across an arbitrary downstream side effect on its own.
+
+Choosing a retry policy compounds this problem: a consumer that retries a failed handler internally, before ever nacking back to the broker, effectively doubles the redelivery surface the idempotency logic has to cover. Delivery guarantees and retry behavior are two separate knobs, and conflating them is a common source of duplicate side effects in production queue consumers.
