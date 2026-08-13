@@ -7,14 +7,58 @@ Async methods are driven with ``asyncio.run()`` inside sync test functions
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 
 import pytest
 
-from groundkit.contracts import Chunk
-from groundkit.errors import ConfigurationError, StorageError
-from groundkit.index.metadata import SQLiteMetadataStore
+from groundkit.config import EmbeddingConfig
+from groundkit.contracts import Chunk, CollectionManifest
+from groundkit.errors import ConfigurationError, IndexIdentityError, StorageError
+from groundkit.index.metadata import APPLICATION_ID, SCHEMA_VERSION, SQLiteMetadataStore
 from groundkit.index.protocols import MetadataStoreProtocol
+from test_protocol_conformance import assert_signature_parity
+
+
+def _write_legacy_schema(tmp_path: Path, collection: str) -> None:
+    """Create a pre-ADR-0004 store file: documents/chunks tables, no manifest stamp.
+
+    Mimics a collection created before the embedding-identity manifest
+    existed — same documents/chunks schema :class:`SQLiteMetadataStore`
+    would create, but with no ``collection_manifest`` table and, crucially,
+    none of ``PRAGMA application_id``/``user_version`` set (both stay at
+    SQLite's default of 0). Built with a raw ``sqlite3`` connection, never
+    through :class:`SQLiteMetadataStore`, so the file exists *before*
+    ``SQLiteMetadataStore.open`` ever sees it — matching how a real
+    pre-existing store is only ever encountered on reopen, not on creation.
+    """
+    db_path = tmp_path / f"{collection}.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE documents (
+                document_id TEXT PRIMARY KEY,
+                source TEXT UNIQUE NOT NULL,
+                content_hash TEXT NOT NULL,
+                ingested_at TEXT NOT NULL
+            );
+            CREATE TABLE chunks (
+                chunk_id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                start_offset INTEGER NOT NULL,
+                end_offset INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                metadata TEXT NOT NULL
+            );
+            CREATE INDEX idx_chunks_document_id ON chunks (document_id);
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _make_chunk(
@@ -459,3 +503,278 @@ def test_open_accepts_valid_collection_names_with_dash_underscore_dot(tmp_path: 
     assert doc_hash == "h1"
     assert len(chunks) == 1
     assert chunks[0].chunk_id == "c1"
+
+
+# ── ADR-0004: collection manifest (embedding identity binding) ─────────────
+
+
+def test_manifest_write_and_read_round_trip(tmp_path: Path) -> None:
+    """A written manifest reads back with the identity it was written with."""
+
+    async def _run() -> CollectionManifest | None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            embedding = EmbeddingConfig(
+                provider="ollama", model_name="nomic-embed-text", dimensions=768
+            )
+            await store.write_manifest(embedding)
+            return await store.get_manifest()
+        finally:
+            await store.close()
+
+    manifest = asyncio.run(_run())
+
+    assert manifest is not None
+    assert manifest.provider == "ollama"
+    assert manifest.model_name == "nomic-embed-text"
+    assert manifest.dimensions == 768
+    assert manifest.created_at  # a real timestamp was recorded, not left blank
+
+
+def test_manifest_rewrite_same_identity_is_noop(tmp_path: Path) -> None:
+    """Re-ingesting into an already-bound collection must keep working.
+
+    A second write with the *same* identity is a no-op, not an error — and
+    genuinely a no-op, not a silent rewrite: the manifest (including its
+    original ``created_at``) is unchanged by the second call.
+    """
+
+    async def _run() -> tuple[CollectionManifest | None, CollectionManifest | None]:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            embedding = EmbeddingConfig(
+                provider="ollama", model_name="nomic-embed-text", dimensions=768
+            )
+            await store.write_manifest(embedding)
+            first = await store.get_manifest()
+            await store.write_manifest(embedding)
+            second = await store.get_manifest()
+            return first, second
+        finally:
+            await store.close()
+
+    first, second = asyncio.run(_run())
+
+    assert first is not None
+    assert second is not None
+    assert first == second
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        pytest.param(
+            EmbeddingConfig(
+                provider="openai_compatible", model_name="nomic-embed-text", dimensions=768
+            ),
+            id="different_provider",
+        ),
+        pytest.param(
+            EmbeddingConfig(provider="ollama", model_name="mxbai-embed-large", dimensions=768),
+            id="different_model_name",
+        ),
+        pytest.param(
+            EmbeddingConfig(provider="ollama", model_name="nomic-embed-text", dimensions=1024),
+            id="different_dimensions",
+        ),
+    ],
+)
+def test_manifest_rewrite_different_identity_raises(
+    tmp_path: Path, second: EmbeddingConfig
+) -> None:
+    """A second write() differing in any single field is refused, not silently applied."""
+    first = EmbeddingConfig(provider="ollama", model_name="nomic-embed-text", dimensions=768)
+
+    async def _run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            await store.write_manifest(first)
+            await store.write_manifest(second)
+        finally:
+            await store.close()
+
+    with pytest.raises(IndexIdentityError):
+        asyncio.run(_run())
+
+
+def test_manifest_rejects_same_dimensions_different_model(tmp_path: Path) -> None:
+    """768-vs-768: two distinct models sharing a vector width must still conflict.
+
+    ``nomic-embed-text`` and ``all-mpnet-base-v2`` are both 768-dimensional
+    — the exact case ADR-0004 exists to close. A width-only identity check
+    would let this swap through silently; identity is the full
+    ``(provider, model_name, dimensions)`` triple, so a match on width alone
+    is not a match.
+    """
+    built_with = EmbeddingConfig(provider="ollama", model_name="nomic-embed-text", dimensions=768)
+    swapped_to = EmbeddingConfig(provider="ollama", model_name="all-mpnet-base-v2", dimensions=768)
+
+    async def _run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            await store.write_manifest(built_with)
+            await store.write_manifest(swapped_to)
+        finally:
+            await store.close()
+
+    with pytest.raises(IndexIdentityError, match="dimensions=768"):
+        asyncio.run(_run())
+
+
+def test_verify_manifest_passes_when_no_manifest_written_yet(tmp_path: Path) -> None:
+    """A collection with no dense write yet has nothing to conflict with.
+
+    ``write_manifest`` establishes the manifest; ``verify_manifest`` never
+    does, so it must not raise merely because no dense write has happened.
+    """
+
+    async def _run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            embedding = EmbeddingConfig(
+                provider="ollama", model_name="nomic-embed-text", dimensions=768
+            )
+            await store.verify_manifest(embedding)
+        finally:
+            await store.close()
+
+    asyncio.run(_run())  # must not raise
+
+
+def test_verify_manifest_passes_for_matching_identity(tmp_path: Path) -> None:
+    """verify_manifest is a no-op when the active config matches the stored manifest."""
+    embedding = EmbeddingConfig(provider="ollama", model_name="nomic-embed-text", dimensions=768)
+
+    async def _run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            await store.write_manifest(embedding)
+            await store.verify_manifest(embedding)
+        finally:
+            await store.close()
+
+    asyncio.run(_run())  # must not raise
+
+
+def test_verify_manifest_raises_on_mismatch(tmp_path: Path) -> None:
+    """verify_manifest refuses a mismatch exactly like write_manifest — never re-embeds."""
+    built_with = EmbeddingConfig(provider="ollama", model_name="nomic-embed-text", dimensions=768)
+    different = EmbeddingConfig(provider="ollama", model_name="all-mpnet-base-v2", dimensions=768)
+
+    async def _run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            await store.write_manifest(built_with)
+            await store.verify_manifest(different)
+        finally:
+            await store.close()
+
+    with pytest.raises(IndexIdentityError):
+        asyncio.run(_run())
+
+
+def test_fresh_store_stamps_application_id_and_user_version(tmp_path: Path) -> None:
+    """A freshly created store is stamped with groundkit's application_id/user_version."""
+
+    async def _open_and_close() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        await store.close()
+
+    asyncio.run(_open_and_close())
+
+    conn = sqlite3.connect(str(tmp_path / "col.sqlite3"))
+    try:
+        app_id = conn.execute("PRAGMA application_id").fetchone()[0]
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert app_id == APPLICATION_ID
+    assert app_id != 0  # sanity: not SQLite's unset default
+    assert version == SCHEMA_VERSION
+    assert version != 0
+
+
+def test_legacy_store_without_manifest_stamp_is_refused_for_dense_work(tmp_path: Path) -> None:
+    """A store predating ADR-0004 refuses manifest writes/verifies but still opens fine.
+
+    BM25-only collections must keep working: a store created before the
+    embedding-identity manifest existed has no PRAGMA application_id/
+    user_version stamp, so opening it and doing ordinary document/chunk work
+    succeeds unchanged. Only the manifest-specific operations — which would
+    otherwise trust an identity this store never recorded — are refused,
+    with a clear IndexIdentityError rather than a guess. Pre-1.0 there is no
+    migration path: the fix is delete-and-reingest.
+    """
+    _write_legacy_schema(tmp_path, "col")
+
+    async def _bm25_only_work() -> tuple[str | None, CollectionManifest | None]:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            await store.upsert_document(source="a.md", document_id="doc-1", content_hash="h1")
+            doc_hash = await store.get_document_hash("a.md")
+            manifest = await store.get_manifest()  # a plain read: never raises
+            return doc_hash, manifest
+        finally:
+            await store.close()
+
+    doc_hash, manifest = asyncio.run(_bm25_only_work())
+    assert doc_hash == "h1"
+    assert manifest is None
+
+    embedding = EmbeddingConfig(provider="ollama", model_name="nomic-embed-text", dimensions=768)
+
+    async def _try_write() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            await store.write_manifest(embedding)
+        finally:
+            await store.close()
+
+    with pytest.raises(IndexIdentityError):
+        asyncio.run(_try_write())
+
+    async def _try_verify() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            await store.verify_manifest(embedding)
+        finally:
+            await store.close()
+
+    with pytest.raises(IndexIdentityError):
+        asyncio.run(_try_verify())
+
+
+def test_bm25_only_round_trip_with_no_manifest_present(tmp_path: Path) -> None:
+    """A collection that never does a dense write behaves exactly as before ADR-0004."""
+
+    async def _run() -> tuple[list[Chunk], CollectionManifest | None]:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            await store.upsert_document(source="a.md", document_id="doc-1", content_hash="h1")
+            chunk = _make_chunk("c1", "doc-1", "hello world")
+            await store.add_chunks([chunk], source="a.md")
+            chunks = await store.get_chunks()
+            manifest = await store.get_manifest()
+            return chunks, manifest
+        finally:
+            await store.close()
+
+    chunks, manifest = asyncio.run(_run())
+
+    assert len(chunks) == 1
+    assert chunks[0].content == "hello world"
+    assert manifest is None
+
+
+def test_sqlite_metadata_store_has_signature_parity_with_protocol() -> None:
+    """SQLiteMetadataStore's manifest methods match MetadataStoreProtocol exactly.
+
+    ``test_sqlite_metadata_store_conforms_to_protocol`` above only confirms
+    (via ``isinstance``) that members of the right name exist — it would not
+    catch a parameter rename or an accidental sync/async mismatch on
+    ``write_manifest``/``verify_manifest``/``get_manifest``.
+    ``assert_signature_parity`` closes that gap by comparing parameter
+    names, kinds, order, defaults, and resolved type hints.
+    """
+    assert_signature_parity(MetadataStoreProtocol, SQLiteMetadataStore)

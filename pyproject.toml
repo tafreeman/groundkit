@@ -69,7 +69,11 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "ARG", "S", "RUF"]
 strict = true
 python_version = "3.11"
 files = ["src/groundkit", "tests"]
-mypy_path = "src"
+# "tests" is on the path so cross-test helper imports (e.g. the shared
+# assert_signature_parity conformance helper) resolve under mypy the same way
+# pytest resolves them at run time. Without it the checked file set silently
+# diverges from the executed one.
+mypy_path = ["src", "tests"]
 explicit_package_bases = true
 
 [tool.pytest.ini_options]

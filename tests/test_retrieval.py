@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from groundkit.config import RetrievalConfig
-from groundkit.contracts import Chunk, Citation, Document
+from groundkit.config import EmbeddingConfig, RetrievalConfig
+from groundkit.contracts import Chunk, Citation, CollectionManifest, Document
 from groundkit.errors import RetrievalError
 from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.index.protocols import MetadataStoreProtocol
@@ -135,6 +135,15 @@ class TestRetriever:
 
             async def delete_document(self, document_id: str) -> int:
                 return 0
+
+            async def write_manifest(self, embedding: EmbeddingConfig) -> None:
+                raise NotImplementedError
+
+            async def verify_manifest(self, embedding: EmbeddingConfig) -> None:
+                raise NotImplementedError
+
+            async def get_manifest(self) -> CollectionManifest | None:
+                return None
 
         store = OrphanStore()
         assert isinstance(store, MetadataStoreProtocol)

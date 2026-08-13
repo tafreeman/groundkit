@@ -11,7 +11,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from groundkit.contracts import Chunk, RetrievalResult
+    from groundkit.config import EmbeddingConfig
+    from groundkit.contracts import Chunk, CollectionManifest, RetrievalResult
 
 
 @runtime_checkable
@@ -58,6 +59,41 @@ class MetadataStoreProtocol(Protocol):
 
     async def delete_document(self, document_id: str) -> int:
         """Delete a document and its chunks. Returns deleted-chunk count."""
+        ...
+
+    async def write_manifest(self, embedding: EmbeddingConfig) -> None:
+        """Write the collection's embedding-identity manifest, once (ADR-0004).
+
+        Called on a collection's first dense write. Immutable thereafter: a
+        later call with the same ``(provider, model_name, dimensions)``
+        triple as the stored manifest is a no-op (re-ingesting into an
+        already-bound collection must keep working); a call with a
+        different triple is refused, never silently overwritten.
+
+        Raises:
+            IndexIdentityError: The store predates the embedding-identity
+                manifest and cannot be used for dense work, or a manifest
+                already exists with a different identity triple.
+        """
+        ...
+
+    async def verify_manifest(self, embedding: EmbeddingConfig) -> None:
+        """Verify ``embedding`` matches the collection's stored identity manifest.
+
+        A collection with no manifest yet (no dense write has ever
+        happened) has nothing to conflict with, so verification passes
+        trivially. Never a re-embed, never a fallback, never a
+        warn-and-continue: a real mismatch always raises.
+
+        Raises:
+            IndexIdentityError: The store predates the embedding-identity
+                manifest and cannot be used for dense work, or the stored
+                manifest's identity triple does not match ``embedding``.
+        """
+        ...
+
+    async def get_manifest(self) -> CollectionManifest | None:
+        """Return the collection's embedding-identity manifest, or None if unset."""
         ...
 
 

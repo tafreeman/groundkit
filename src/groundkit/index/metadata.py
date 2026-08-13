@@ -13,6 +13,13 @@ awaited ``to_thread`` call), guarantees only one thread ever touches the
 connection at a time. This was chosen over per-call connections to avoid
 repeated file-handle churn and "database is locked" contention under WAL for
 groundkit's expected single-process local deployment.
+
+Also implements the ADR-0004 collection manifest: a single-row
+``collection_manifest`` table binding a collection to the embedding
+``(provider, model_name, dimensions)`` triple it was built with, plus the
+``PRAGMA application_id``/``user_version`` stamp that lets :meth:`open`
+recognize a store created before that manifest existed and refuse it for
+dense work rather than trust an identity it never recorded.
 """
 
 from __future__ import annotations
@@ -26,10 +33,11 @@ import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeVar
+from typing import Final, TypeVar
 
-from groundkit.contracts import Chunk
-from groundkit.errors import ConfigurationError, StorageError
+from groundkit.config import EmbeddingConfig
+from groundkit.contracts import Chunk, CollectionManifest
+from groundkit.errors import ConfigurationError, IndexIdentityError, StorageError
 from groundkit.utils.path_safety import ensure_within_base
 
 logger = logging.getLogger(__name__)
@@ -45,6 +53,12 @@ _COLLECTION_NAME_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9._-]+$")
 
 #: Schema for the persisted metadata store. ``IF NOT EXISTS`` makes this safe
 #: to run on every open, whether the file is fresh or already populated.
+#:
+#: ``collection_manifest`` (ADR-0004) is pinned to exactly one row at the
+#: schema level, not by convention: ``id`` is the primary key (unique by
+#: definition) and ``CHECK (id = 1)`` forces the only legal value, so a
+#: second ``INSERT`` collides on the primary key rather than relying on
+#: application code to never issue one.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
     document_id TEXT PRIMARY KEY,
@@ -65,27 +79,78 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks (document_id);
+
+CREATE TABLE IF NOT EXISTS collection_manifest (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    provider TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
+
+#: Fixed identifier stamped into ``PRAGMA application_id`` on every SQLite
+#: file this store creates (ADR-0004 decision 4). SQLite reserves this field
+#: for exactly this purpose and makes no use of it itself
+#: (https://www.sqlite.org/pragma.html#pragma_application_id): it lets a
+#: reopen recognize "this file is groundkit's" without inspecting its
+#: tables. Value is the ASCII bytes of "GRK1" packed big-endian — it only
+#: needs to be a fixed, recognizable 32-bit signed integer, and this stays
+#: comfortably inside that range.
+APPLICATION_ID: Final[int] = 0x47524B31  # "GRK1"
+
+#: Schema version stamped into ``PRAGMA user_version`` alongside
+#: :data:`APPLICATION_ID`, written together as the last statements before
+#: commit when a store is first created (ADR-0004 decisions 4 and 7) so a
+#: failed schema application can never leave a store claiming a version it
+#: does not have. A store lacking either stamp — including every store
+#: created before this ADR landed — predates the collection manifest;
+#: :meth:`SQLiteMetadataStore.open` detects that and
+#: :meth:`SQLiteMetadataStore.write_manifest` /
+#: :meth:`SQLiteMetadataStore.verify_manifest` refuse it for dense work
+#: rather than guessing at an identity it never recorded (ADR-0004 decision
+#: 6: pre-1.0, every index is reproducible from ``grk ingest`` in seconds,
+#: so a migration path here would be code written to preserve data that
+#: costs seconds to regenerate).
+SCHEMA_VERSION: Final[int] = 1
 
 
 class SQLiteMetadataStore:
     """Durable store for documents, chunks, and ingest state, backed by SQLite.
 
     Construct via :meth:`open`, not directly — the constructor takes an
-    already-configured connection.
+    already-configured connection and its precomputed manifest capability.
 
     Attributes:
         db_path: Path to the collection's SQLite file, kept for diagnostics.
     """
 
-    def __init__(self, connection: sqlite3.Connection, db_path: Path) -> None:
+    def __init__(
+        self, connection: sqlite3.Connection, db_path: Path, *, manifest_capable: bool
+    ) -> None:
         self._conn = connection
         self._lock = asyncio.Lock()
         self.db_path = db_path
+        #: True when this store's PRAGMA application_id/user_version carry
+        #: groundkit's ADR-0004 manifest-era stamp (set by :meth:`open`).
+        #: False for a store that predates the manifest (or was never
+        #: created by groundkit); such a store still works for BM25-only
+        #: reads/writes, but :meth:`write_manifest` and :meth:`verify_manifest`
+        #: refuse it via :meth:`_require_manifest_capable`.
+        self._manifest_capable = manifest_capable
 
     @classmethod
     async def open(cls, index_dir: Path, collection: str) -> SQLiteMetadataStore:
         """Open (creating if absent) the SQLite store for a collection.
+
+        Also determines whether this store predates the ADR-0004 collection
+        manifest, by comparing its ``PRAGMA application_id``/``user_version``
+        against :data:`APPLICATION_ID`/:data:`SCHEMA_VERSION`. A freshly
+        created file is stamped with both, inside the same transaction that
+        applies the schema, as the last statements before commit. This
+        never blocks opening the store — BM25-only collections must keep
+        working unchanged — it only gates :meth:`write_manifest` and
+        :meth:`verify_manifest`.
 
         Args:
             index_dir: Directory holding the collection's persisted state.
@@ -113,7 +178,7 @@ class SQLiteMetadataStore:
         _validate_collection(collection)
         db_path = index_dir / f"{collection}.sqlite3"
 
-        def _connect() -> sqlite3.Connection:
+        def _connect() -> tuple[sqlite3.Connection, bool]:
             index_dir.mkdir(parents=True, exist_ok=True)
             _chmod_best_effort(index_dir, 0o700)
             try:
@@ -122,11 +187,27 @@ class SQLiteMetadataStore:
                 raise ConfigurationError(
                     f"collection {collection!r} resolves outside index_dir {index_dir}"
                 ) from exc
+            # Captured before connect() — sqlite3 creates the file on first
+            # connection, so this is the only point at which "did this file
+            # already exist" is still observable.
+            is_new_file = not db_path.exists()
             conn = sqlite3.connect(str(db_path), check_same_thread=False)
             try:
                 conn.execute("PRAGMA foreign_keys = ON")
                 conn.execute("PRAGMA journal_mode = WAL")
                 conn.executescript(_SCHEMA)
+                if is_new_file:
+                    # Stamp groundkit's identity as the last statements
+                    # before commit (ADR-0004 decisions 4 and 7): both
+                    # PRAGMA writes land in the same transaction as the
+                    # schema application above, so a failure anywhere in
+                    # this block (caught below) leaves nothing committed —
+                    # never a store claiming a version it does not have.
+                    # PRAGMA does not accept bound parameters; the
+                    # interpolated values are fixed module constants, never
+                    # externally supplied data.
+                    conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
+                    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 conn.commit()
             except Exception:
                 # Schema application failed (e.g. a corrupted pre-existing
@@ -135,15 +216,22 @@ class SQLiteMetadataStore:
                 conn.close()
                 raise
             _chmod_best_effort(db_path, 0o600)
-            return conn
+            app_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            manifest_capable = app_id == APPLICATION_ID and version == SCHEMA_VERSION
+            return conn, manifest_capable
 
         try:
-            connection = await asyncio.to_thread(_connect)
+            connection, manifest_capable = await asyncio.to_thread(_connect)
         except (OSError, sqlite3.Error) as exc:
             raise StorageError(f"failed to open metadata store at {db_path}") from exc
 
-        logger.debug("opened metadata store (collection=%s)", collection)
-        return cls(connection, db_path)
+        logger.debug(
+            "opened metadata store (collection=%s, manifest_capable=%s)",
+            collection,
+            manifest_capable,
+        )
+        return cls(connection, db_path, manifest_capable=manifest_capable)
 
     async def close(self) -> None:
         """Close the underlying connection."""
@@ -376,6 +464,96 @@ class SQLiteMetadataStore:
 
         return await self._run(_op)
 
+    async def write_manifest(self, embedding: EmbeddingConfig) -> None:
+        """Write the collection's embedding-identity manifest, once (ADR-0004).
+
+        Called on the collection's first dense write. The manifest is
+        immutable for the collection's lifetime thereafter: a later call
+        with the *same* ``(provider, model_name, dimensions)`` triple as the
+        stored manifest is a no-op — re-ingesting into an already-bound
+        collection must keep working — but a call with a *different*
+        triple is refused outright. Never a silent overwrite, never a
+        re-embed.
+
+        Args:
+            embedding: The embedding configuration establishing (or, on a
+                later call, being checked against) this collection's
+                identity.
+
+        Raises:
+            IndexIdentityError: This store predates the embedding-identity
+                manifest (ADR-0004) and cannot be used for dense work, or a
+                manifest already exists with a different identity triple.
+            StorageError: On a backend failure.
+        """
+        self._require_manifest_capable("write")
+        created_at = _now_iso()
+
+        def _op() -> None:
+            existing = self._select_manifest()
+            if existing is None:
+                self._conn.execute(
+                    "INSERT INTO collection_manifest "
+                    "(id, provider, model_name, dimensions, created_at) "
+                    "VALUES (1, ?, ?, ?, ?)",
+                    (embedding.provider, embedding.model_name, embedding.dimensions, created_at),
+                )
+                self._conn.commit()
+                return
+            if _manifest_matches(existing, embedding):
+                return  # same identity: re-ingesting a bound collection is a no-op
+            raise IndexIdentityError(_identity_mismatch_message(existing, embedding))
+
+        await self._run(_op)
+
+    async def verify_manifest(self, embedding: EmbeddingConfig) -> None:
+        """Verify ``embedding`` matches the collection's stored identity manifest.
+
+        A collection with no manifest yet — no dense write has ever
+        happened — has nothing to conflict with, so verification passes
+        trivially; :meth:`write_manifest` is what establishes the manifest,
+        not this method. Never a re-embed, never a fallback, never a
+        warn-and-continue (SPEC.md §2): a real mismatch always raises.
+
+        Args:
+            embedding: The active embedding configuration to check.
+
+        Raises:
+            IndexIdentityError: This store predates the embedding-identity
+                manifest (ADR-0004) and cannot be used for dense work, or
+                the stored manifest's identity triple does not match
+                ``embedding``.
+            StorageError: On a backend failure.
+        """
+        self._require_manifest_capable("verify")
+
+        def _op() -> None:
+            existing = self._select_manifest()
+            if existing is None or _manifest_matches(existing, embedding):
+                return
+            raise IndexIdentityError(_identity_mismatch_message(existing, embedding))
+
+        await self._run(_op)
+
+    async def get_manifest(self) -> CollectionManifest | None:
+        """Return the collection's embedding-identity manifest, or None if unset.
+
+        Unlike :meth:`write_manifest` and :meth:`verify_manifest`, this is a
+        plain read and does not require the store to be manifest-capable: a
+        legacy pre-ADR-0004 store never has a manifest row, so it reports
+        ``None`` here rather than raising — useful for diagnostics (e.g. a
+        future ``index_status`` tool) without needing to catch
+        :class:`~groundkit.errors.IndexIdentityError` just to check.
+
+        Raises:
+            StorageError: On a backend failure.
+        """
+
+        def _op() -> CollectionManifest | None:
+            return self._select_manifest()
+
+        return await self._run(_op)
+
     def _delete_existing_source(self, source: str) -> None:
         """Delete the document (and its chunks) currently registered under ``source``, if any.
 
@@ -420,6 +598,52 @@ class SQLiteMetadataStore:
                     chunk.content_hash,
                     metadata_json,
                 ),
+            )
+
+    def _select_manifest(self) -> CollectionManifest | None:
+        """Read the single manifest row, if present. Must be called from within an ``_op``."""
+        cur = self._conn.execute(
+            "SELECT provider, model_name, dimensions, created_at "
+            "FROM collection_manifest WHERE id = 1"
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        provider, model_name, dimensions, created_at = row
+        return CollectionManifest(
+            provider=provider,
+            model_name=model_name,
+            dimensions=dimensions,
+            created_at=created_at,
+        )
+
+    def _require_manifest_capable(self, action: str) -> None:
+        """Guard dense-identity operations against a store that predates them.
+
+        Checked outside :meth:`_run` (like the empty-``chunks`` guard in
+        :meth:`add_chunks`): ``_manifest_capable`` is a plain attribute fixed
+        at :meth:`open` and never touches the connection, so there is
+        nothing here that needs the lock.
+
+        Args:
+            action: Short verb describing the attempted operation (e.g.
+                ``"write"`` or ``"verify"``), folded into the error message.
+
+        Raises:
+            IndexIdentityError: This store's ``PRAGMA application_id``/
+                ``user_version`` do not carry groundkit's manifest-era stamp
+                — either it predates ADR-0004, or it was never created by
+                groundkit at all. Pre-1.0 there is no migration path: every
+                index is reproducible from ``grk ingest`` in seconds, so the
+                remedy is to delete the collection and re-ingest it, not to
+                write code that preserves data this cheap to regenerate.
+        """
+        if not self._manifest_capable:
+            raise IndexIdentityError(
+                f"cannot {action} the embedding-identity manifest for the store at "
+                f"{self.db_path}: it predates the manifest (ADR-0004) or was not "
+                "created by groundkit. Pre-1.0 there is no migration path for dense "
+                "data — delete this collection and re-ingest it."
             )
 
     async def _run(self, fn: Callable[[], _T]) -> _T:
@@ -470,6 +694,43 @@ def _row_to_chunk(row: tuple[str, str, int, str, int, int, str]) -> Chunk:
         start_offset=start_offset,
         end_offset=end_offset,
         metadata=json.loads(metadata_json),
+    )
+
+
+def _manifest_matches(manifest: CollectionManifest, embedding: EmbeddingConfig) -> bool:
+    """True when ``manifest``'s identity triple matches ``embedding``'s (ADR-0004).
+
+    Identity is the triple ``(provider, model_name, dimensions)``, checked
+    as a triple — never dimensions alone. Vector width by itself is
+    insufficient: ``nomic-embed-text`` and ``all-mpnet-base-v2`` are both
+    768-dimensional, so a width-only check would admit exactly the model
+    swap this whole mechanism exists to reject.
+    """
+    return (
+        manifest.provider == embedding.provider
+        and manifest.model_name == embedding.model_name
+        and manifest.dimensions == embedding.dimensions
+    )
+
+
+def _identity_mismatch_message(manifest: CollectionManifest, embedding: EmbeddingConfig) -> str:
+    """Build the shared ``IndexIdentityError`` message for an identity conflict.
+
+    Names all three fields of both triples explicitly, even when only one
+    differs, because the 768-vs-768 case (two models sharing a width) is
+    exactly what this check exists to catch — a caller should see all three
+    fields compared at once rather than guess which one moved.
+    """
+    return (
+        "embedding identity mismatch: collection was built with "
+        f"(provider={manifest.provider!r}, model_name={manifest.model_name!r}, "
+        f"dimensions={manifest.dimensions}) but the active configuration is "
+        f"(provider={embedding.provider!r}, model_name={embedding.model_name!r}, "
+        f"dimensions={embedding.dimensions}). Vector width alone is not identity — "
+        "distinct models can share a width. Mixing embedding spaces in one "
+        "collection corrupts it silently; the fix is to delete this collection and "
+        "re-ingest it under the new embedding configuration, never to re-embed or "
+        "fall back automatically."
     )
 
 
