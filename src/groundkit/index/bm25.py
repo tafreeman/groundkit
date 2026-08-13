@@ -49,6 +49,7 @@ class BM25Index:
         self._k1 = k1
         self._b = b
         self._chunks: list[Chunk] = []
+        self._tie_keys: list[str] = []
         self._doc_freqs: dict[str, int] = defaultdict(int)
         self._doc_term_freqs: list[dict[str, int]] = []
         self._doc_lengths: list[int] = []
@@ -71,6 +72,7 @@ class BM25Index:
         """
         for chunk in chunks:
             self._chunks.append(chunk)
+            self._tie_keys.append(chunk.content_hash)
             tokens = _tokenize(chunk.content)
             self._doc_lengths.append(len(tokens))
 
@@ -97,7 +99,12 @@ class BM25Index:
         Returns:
             ``(chunk, score)`` pairs ranked by descending BM25 score, each
             score ``>= 0.0``. An empty query or an empty index returns
-            ``[]``, as does a query whose terms match nothing.
+            ``[]``, as does a query whose terms match nothing. Ties are
+            broken by ascending ``content_hash`` so that ranking is stable
+            across re-ingestion of the same corpus (see the sort below).
+            The one case this can't disambiguate: two byte-identical chunks
+            share a ``content_hash`` and fall back to insertion order — no
+            content-derived key can distinguish them.
         """
         query_tokens = _tokenize(query)
         if not query_tokens or not self._chunks:
@@ -109,7 +116,13 @@ class BM25Index:
             if score > 0.0:
                 scored.append((score, doc_idx))
 
-        scored.sort(key=lambda pair: pair[0], reverse=True)
+        # Tie-break on content_hash, not document_id/chunk_id (contracts.py:38,64):
+        # both are uuid4, regenerated on every ingest, so using either as a
+        # secondary key would make tied ordering just as unstable as no
+        # secondary key at all. Negate the score (rather than reverse=True)
+        # so both sort keys are ascending — reverse=True would also flip the
+        # tie-break to descending hash order, which isn't the intent.
+        scored.sort(key=lambda pair: (-pair[0], self._tie_keys[pair[1]]))
         return [(self._chunks[doc_idx], score) for score, doc_idx in scored[:top_k]]
 
     def _score_document(self, query_tokens: list[str], doc_idx: int) -> float:

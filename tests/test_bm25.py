@@ -177,6 +177,42 @@ class TestBM25Index:
         results = index.search("alpha", top_k=5)
         assert [chunk.chunk_id for chunk, _ in results] == ["c1"]
 
+    def test_tied_scores_sort_by_content_hash_not_insertion_order(self) -> None:
+        """Two chunks with identical tf/idf/length inputs score exactly
+        equal for "term"; the tie must resolve by ascending content_hash,
+        not by the order they were appended in."""
+        alpha = _make_chunk("alpha term term", chunk_id="alpha")
+        beta = _make_chunk("beta term term", chunk_id="beta")
+        assert alpha.content_hash < beta.content_hash  # pins the expected tie-break direction
+
+        index = BM25Index()
+        index.index_chunks([beta, alpha])  # insertion order is the opposite of hash order
+
+        results = index.search("term", top_k=2)
+
+        assert len(results) == 2
+        (first_chunk, first_score), (second_chunk, second_score) = results
+        assert first_score == pytest.approx(second_score)  # confirms a genuine tie, not luck
+        assert first_chunk.chunk_id == "alpha"
+        assert second_chunk.chunk_id == "beta"
+
+    def test_tie_break_order_independent_of_insertion_order(self) -> None:
+        """Regression pin: indexing the same tied chunks in either order
+        must yield identical search-result ordering. A position-derived
+        tie-break (e.g. the raw doc_idx) would fail this."""
+        alpha = _make_chunk("alpha term term", chunk_id="alpha")
+        beta = _make_chunk("beta term term", chunk_id="beta")
+
+        forward_index = BM25Index()
+        forward_index.index_chunks([alpha, beta])
+        backward_index = BM25Index()
+        backward_index.index_chunks([beta, alpha])
+
+        forward_ids = [chunk.chunk_id for chunk, _ in forward_index.search("term", top_k=2)]
+        backward_ids = [chunk.chunk_id for chunk, _ in backward_index.search("term", top_k=2)]
+
+        assert forward_ids == backward_ids == ["alpha", "beta"]
+
 
 class TestBM25FromStore:
     """The ADR-0002 persistence-rebuild guarantee: rebuilding from SQLite

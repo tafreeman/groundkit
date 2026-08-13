@@ -37,3 +37,7 @@ class StorageError(GroundkitError):
 
 class RetrievalError(GroundkitError):
     """Error during retrieval or search."""
+
+
+class EvalError(GroundkitError):
+    """Error loading, validating, or resolving the golden eval corpus."""

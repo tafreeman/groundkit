@@ -3,13 +3,13 @@
 Grounded, citation-verifiable hybrid retrieval: a persisted BM25 + dense index,
 a named MCP server, and a retrieval eval harness — fully local by default.
 
-> **Status: Phase 1 landing.** BM25 retrieval, a persisted index, and
-> citation-bearing search work end-to-end locally with no cloud
-> credentials — see the Quickstart below. Hybrid/dense retrieval, rerank,
-> the MCP server, REST API, eval harness, and IaC are not yet built. See
-> [SPEC.md](SPEC.md) for what is being built and in what order, and
-> [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for what is deliberately out
-> of scope.
+> **Status: Phase 2 landing.** BM25 retrieval, a persisted index,
+> citation-bearing search, and a retrieval eval harness with a BM25-only
+> baseline work end-to-end locally with no cloud credentials — see the
+> Quickstart below. Hybrid/dense retrieval, rerank, the MCP server, REST
+> API, and IaC are not yet built. See [SPEC.md](SPEC.md) for what is being
+> built and in what order, and [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)
+> for what is deliberately out of scope.
 
 ## What this will be
 
@@ -39,6 +39,22 @@ index persists under `.groundkit/` and survives restarts, and every result
 carries a citation — source path plus character offsets — that
 `groundkit.retrieval.verify_citation` can check against the source file.
 No cloud credentials are required for any of this.
+
+## Eval harness (Phase 2: BM25 baseline)
+
+```bash
+uv run grk eval
+```
+
+Runs the retrieval-quality harness against the committed golden corpus and
+judgment set — `evals/corpus/` plus `evals/judgments.jsonl`, authored per
+the contract in [evals/README.md](evals/README.md) — and writes a full
+report to `evals/results/latest.json` (gitignored, regenerated per run,
+never committed). Fully offline and credential-free: the harness builds a
+throwaway index over the corpus and scores it with the same deterministic
+BM25 retrieval path `grk search` uses. BM25-only is the baseline every
+later retrieval feature (hybrid, rerank) reports its delta against, in the
+same report.
 
 ## Development
 

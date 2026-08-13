@@ -2,14 +2,15 @@
 
 Honest and current, per repo policy. Updated with each phase.
 
-## Current state (Phase 1)
+## Current state (Phase 2)
 
 BM25-only retrieval works end-to-end locally: `grk ingest` (file or
-directory, incremental by content hash) and `grk search` (citation-bearing
-results with character offsets) against a persisted SQLite index that
-survives restarts. Not yet built, arriving in their phases per SPEC.md §9:
+directory, incremental by content hash), `grk search` (citation-bearing
+results with character offsets), and `grk eval` (retrieval-quality harness
+against the committed golden corpus, BM25-only baseline) — all against a
+persisted SQLite index that survives restarts, all offline with no cloud
+credentials. Not yet built, arriving in their phases per SPEC.md §9:
 
-- Retrieval-quality eval harness and golden corpus (Phase 2).
 - Dense retrieval, hybrid fusion, rerank, and metadata filtering at search
   time (Phase 3) — embedding providers exist and are tested, but nothing
   consumes them yet.
@@ -35,6 +36,40 @@ survives restarts. Not yet built, arriving in their phases per SPEC.md §9:
   and can resolve to silently wrong text.
 - Total ingestion size is unbounded: individual files cap at 10 MiB, but
   nothing caps file count or aggregate bytes for a directory run.
+
+## Phase 2 caveats
+
+- The adversarial category does not test prompt-injection resistance. With
+  no LLM in the retrieval path, "injected text must never surface as
+  instructions" is untestable in Phase 2; that arrives with the Phase 5
+  faithfulness judge. What Phase 2 asserts is fixture correctness — that
+  documents referenced by adversarial judgments genuinely contain
+  injection-styled text, and that retrieval returns it verbatim like any
+  other content. A passing adversarial test is **not** a claim that
+  groundkit resists prompt injection.
+- nDCG's IDCG is inflated by boundary-straddled gold quotes. A single gold
+  quote that spans a chunk boundary resolves to two relevant chunks, so
+  IDCG assumes two ideal positions where a retriever that found the answer
+  via either half alone cannot reach 1.0. Accepted because SPEC.md §6
+  specifies `min(|gold|, 10)` with no span/chunk distinction. recall@k is
+  unaffected — it is hit-rate, not set-recall.
+- No-answer queries are keyword phrases, not questions. The tokenizer is a
+  bare `\w+` split with no stopword removal, so a query phrased as a
+  sentence carries words present in any English prose, scores above zero,
+  and returns hits — abstention would be unobservable. Content-word-only
+  queries make it measurable without inventing a score threshold. This
+  makes no-answer queries shaped differently from the other categories;
+  that asymmetry is deliberate.
+- Baseline deltas are intra-run only. `evals/results/` is gitignored, so no
+  historical artifact reliably exists to diff across runs. Later stages
+  compare against the baseline stage inside the same report.
+- Latency percentiles are computed from a small sample (one measurement per
+  judgment), so p95/p99 are order-of-magnitude indicators, not reliable
+  tail estimates.
+- Two byte-identical chunks still tie non-deterministically in BM25
+  ordering — they are indistinguishable by any content-derived key. (The
+  tie-break fix resolved the far more common case of *distinct* chunks
+  tying.)
 
 ## Deliberately out of scope for v1 (will not be built)
 
