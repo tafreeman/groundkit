@@ -75,14 +75,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: Chunking config pinned for eval runs, deliberately not
-#: ``ChunkingConfig()`` inlined at each call site. Pinning it here means a
-#: future change to the library-wide chunking default becomes a visible,
-#: intentional edit to this constant rather than a silent shift in every
-#: chunk boundary of the golden corpus — which would move straddle behavior
-#: (a gold quote spanning a chunk boundary, SPEC.md §6) and therefore the
-#: BM25-only baseline every later phase reports its delta against.
-EVAL_CHUNKING_CONFIG: ChunkingConfig = ChunkingConfig()
+#: Chunking config pinned for eval runs, with every value stated
+#: explicitly rather than inherited from ``ChunkingConfig()``'s defaults.
+#: The explicitness is the whole point: a bare ``ChunkingConfig()`` would
+#: silently adopt any future change to the library-wide defaults, moving
+#: every chunk boundary in the golden corpus — and therefore straddle
+#: behavior (a gold quote spanning a boundary, SPEC.md §6) and the BM25-only
+#: baseline every later phase reports its delta against — while
+#: ``corpus_hash`` and ``judgments_hash`` stayed identical, so two
+#: incomparable runs would still look comparable. Changing these values is a
+#: deliberate change to the baseline; ``tests/test_runner.py`` pins them so
+#: it cannot happen by accident.
+EVAL_CHUNKING_CONFIG: ChunkingConfig = ChunkingConfig(
+    chunk_size=512,
+    chunk_overlap=64,
+    separators=["\n\n", "\n", ". ", " ", ""],
+)
 
 
 async def run_eval(corpus_dir: Path, judgments_path: Path, *, top_k: int = 10) -> EvalReport:
@@ -135,8 +143,17 @@ async def run_eval(corpus_dir: Path, judgments_path: Path, *, top_k: int = 10) -
         resolved_spans[judgment.query_id] = spans
 
     corpus_root = corpus_dir.resolve()
-    corpus_hash = await asyncio.to_thread(_hash_corpus, corpus_root)
-    judgments_hash = hashlib.sha256(judgments_path.read_bytes()).hexdigest()
+    # Both reads race the filesystem (a file removed or made unreadable
+    # mid-traversal) and both raise bare OSError, which would escape every
+    # caller that handles GroundkitError — the CLI included.
+    try:
+        corpus_hash = await asyncio.to_thread(_hash_corpus, corpus_root)
+    except OSError as exc:
+        raise EvalError(f"Cannot hash corpus at {str(corpus_root)!r}: {exc}") from exc
+    try:
+        judgments_hash = hashlib.sha256(judgments_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise EvalError(f"Cannot read judgments file {str(judgments_path)!r}: {exc}") from exc
     retrieval_config = RetrievalConfig()
 
     with tempfile.TemporaryDirectory() as tmp_dir_name:

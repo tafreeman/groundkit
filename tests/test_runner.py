@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from groundkit.config import ChunkingConfig
 from groundkit.contracts import Chunk, Document
 from groundkit.errors import EvalError
 from groundkit.evals.runner import EVAL_CHUNKING_CONFIG, run_eval, write_report
@@ -309,6 +310,36 @@ class TestCorpusHash:
         assert first.run.corpus_hash == second.run.corpus_hash
 
 
+class TestEvalChunkingConfigPinned:
+    """The eval baseline must not move when a library default changes."""
+
+    def test_chunking_values_are_pinned_explicitly(self) -> None:
+        """Pins the exact baseline chunking values.
+
+        A bare ``ChunkingConfig()`` would adopt any future change to the
+        library defaults, shifting every chunk boundary in the golden corpus
+        — and so the baseline — while ``corpus_hash``/``judgments_hash``
+        stayed identical, making two incomparable runs look comparable.
+        This test failing is the intended signal that someone is changing
+        the baseline; update it deliberately, and expect the metrics to move.
+        """
+        assert EVAL_CHUNKING_CONFIG.chunk_size == 512
+        assert EVAL_CHUNKING_CONFIG.chunk_overlap == 64
+        assert EVAL_CHUNKING_CONFIG.separators == ["\n\n", "\n", ". ", " ", ""]
+
+    def test_pinned_values_do_not_track_library_defaults(self) -> None:
+        """The constant is built explicitly, not from ChunkingConfig()'s defaults.
+
+        Constructing a config whose fields all differ from the pinned ones
+        proves the pin is real: if EVAL_CHUNKING_CONFIG were
+        ``ChunkingConfig()``, it would equal whatever the defaults are, and
+        this assertion could not distinguish the two.
+        """
+        shifted = ChunkingConfig(chunk_size=256, chunk_overlap=32)
+        assert EVAL_CHUNKING_CONFIG.chunk_size != shifted.chunk_size
+        assert EVAL_CHUNKING_CONFIG.chunk_overlap != shifted.chunk_overlap
+
+
 def _minimal_report() -> EvalReport:
     """A schema-valid, all-zeros report — enough to exercise the writer."""
     return EvalReport(
@@ -355,6 +386,38 @@ def _minimal_report() -> EvalReport:
 
 class TestWriteReport:
     """``write_report`` is a plain, parent-creating JSON writer."""
+
+    def test_corpus_hash_failure_raises_eval_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An OSError while hashing the corpus surfaces as EvalError.
+
+        _hash_corpus walks and reads every corpus file, so a file removed or
+        made unreadable mid-traversal raises a bare OSError that would
+        escape main()'s GroundkitError handler as a traceback. The race is
+        simulated rather than provoked: forcing a real mid-walk removal is
+        not portable, and the point under test is the wrapper, not the
+        filesystem.
+        """
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (corpus / "a.md").write_text("alpha content here", encoding="utf-8")
+        judgments = tmp_path / "judgments.jsonl"
+        judgments.write_text(
+            json.dumps(
+                {"query_id": "q-one", "query": "anything", "category": "no_answer", "gold": []}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        def _boom(_root: Path) -> str:
+            raise OSError("simulated: corpus file vanished mid-walk")
+
+        monkeypatch.setattr("groundkit.evals.runner._hash_corpus", _boom)
+
+        with pytest.raises(EvalError, match="Cannot hash corpus"):
+            asyncio.run(run_eval(corpus, judgments))
 
     def test_unwritable_output_raises_eval_error(self, tmp_path: Path) -> None:
         """A filesystem failure surfaces as EvalError, not a raw OSError.
