@@ -12,8 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from groundkit.config import EmbeddingConfig
-from groundkit.contracts import Chunk, CollectionManifest
+from groundkit.contracts import Chunk, CollectionManifest, EmbeddingIdentity
 from groundkit.errors import ConfigurationError, IndexIdentityError, StorageError
 from groundkit.index.metadata import APPLICATION_ID, SCHEMA_VERSION, SQLiteMetadataStore
 from groundkit.index.protocols import MetadataStoreProtocol
@@ -293,6 +292,34 @@ def test_get_document_hash_unseen_source_returns_none(tmp_path: Path) -> None:
     assert asyncio.run(_run()) is None
 
 
+def test_get_document_id_returns_stored_id_and_none_for_unseen(tmp_path: Path) -> None:
+    """get_document_id resolves a source to its stored id, matching get_document_sources.
+
+    The dense write path (Phase 3) needs this to look up a source's current
+    document_id in O(1) rather than scanning the whole get_document_sources()
+    map, so the id it returns must agree with what that map reports for the
+    same source.
+    """
+
+    async def _run() -> tuple[str | None, str | None, dict[str, str]]:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            await store.upsert_document(source="a.md", document_id="doc-1", content_hash="h1")
+            found = await store.get_document_id("a.md")
+            missing = await store.get_document_id("missing.md")
+            sources = await store.get_document_sources()
+            return found, missing, sources
+        finally:
+            await store.close()
+
+    found, missing, sources = asyncio.run(_run())
+
+    assert found == "doc-1"
+    assert missing is None
+    assert found is not None
+    assert sources[found] == "a.md"
+
+
 def test_get_chunk_hit_and_miss(tmp_path: Path) -> None:
     """get_chunk returns the chunk when present and None when absent."""
 
@@ -514,7 +541,7 @@ def test_manifest_write_and_read_round_trip(tmp_path: Path) -> None:
     async def _run() -> CollectionManifest | None:
         store = await SQLiteMetadataStore.open(tmp_path, "col")
         try:
-            embedding = EmbeddingConfig(
+            embedding = EmbeddingIdentity(
                 provider="ollama", model_name="nomic-embed-text", dimensions=768
             )
             await store.write_manifest(embedding)
@@ -542,7 +569,7 @@ def test_manifest_rewrite_same_identity_is_noop(tmp_path: Path) -> None:
     async def _run() -> tuple[CollectionManifest | None, CollectionManifest | None]:
         store = await SQLiteMetadataStore.open(tmp_path, "col")
         try:
-            embedding = EmbeddingConfig(
+            embedding = EmbeddingIdentity(
                 provider="ollama", model_name="nomic-embed-text", dimensions=768
             )
             await store.write_manifest(embedding)
@@ -564,26 +591,26 @@ def test_manifest_rewrite_same_identity_is_noop(tmp_path: Path) -> None:
     "second",
     [
         pytest.param(
-            EmbeddingConfig(
+            EmbeddingIdentity(
                 provider="openai_compatible", model_name="nomic-embed-text", dimensions=768
             ),
             id="different_provider",
         ),
         pytest.param(
-            EmbeddingConfig(provider="ollama", model_name="mxbai-embed-large", dimensions=768),
+            EmbeddingIdentity(provider="ollama", model_name="mxbai-embed-large", dimensions=768),
             id="different_model_name",
         ),
         pytest.param(
-            EmbeddingConfig(provider="ollama", model_name="nomic-embed-text", dimensions=1024),
+            EmbeddingIdentity(provider="ollama", model_name="nomic-embed-text", dimensions=1024),
             id="different_dimensions",
         ),
     ],
 )
 def test_manifest_rewrite_different_identity_raises(
-    tmp_path: Path, second: EmbeddingConfig
+    tmp_path: Path, second: EmbeddingIdentity
 ) -> None:
     """A second write() differing in any single field is refused, not silently applied."""
-    first = EmbeddingConfig(provider="ollama", model_name="nomic-embed-text", dimensions=768)
+    first = EmbeddingIdentity(provider="ollama", model_name="nomic-embed-text", dimensions=768)
 
     async def _run() -> None:
         store = await SQLiteMetadataStore.open(tmp_path, "col")
@@ -606,8 +633,10 @@ def test_manifest_rejects_same_dimensions_different_model(tmp_path: Path) -> Non
     ``(provider, model_name, dimensions)`` triple, so a match on width alone
     is not a match.
     """
-    built_with = EmbeddingConfig(provider="ollama", model_name="nomic-embed-text", dimensions=768)
-    swapped_to = EmbeddingConfig(provider="ollama", model_name="all-mpnet-base-v2", dimensions=768)
+    built_with = EmbeddingIdentity(provider="ollama", model_name="nomic-embed-text", dimensions=768)
+    swapped_to = EmbeddingIdentity(
+        provider="ollama", model_name="all-mpnet-base-v2", dimensions=768
+    )
 
     async def _run() -> None:
         store = await SQLiteMetadataStore.open(tmp_path, "col")
@@ -631,7 +660,7 @@ def test_verify_manifest_passes_when_no_manifest_written_yet(tmp_path: Path) -> 
     async def _run() -> None:
         store = await SQLiteMetadataStore.open(tmp_path, "col")
         try:
-            embedding = EmbeddingConfig(
+            embedding = EmbeddingIdentity(
                 provider="ollama", model_name="nomic-embed-text", dimensions=768
             )
             await store.verify_manifest(embedding)
@@ -643,7 +672,7 @@ def test_verify_manifest_passes_when_no_manifest_written_yet(tmp_path: Path) -> 
 
 def test_verify_manifest_passes_for_matching_identity(tmp_path: Path) -> None:
     """verify_manifest is a no-op when the active config matches the stored manifest."""
-    embedding = EmbeddingConfig(provider="ollama", model_name="nomic-embed-text", dimensions=768)
+    embedding = EmbeddingIdentity(provider="ollama", model_name="nomic-embed-text", dimensions=768)
 
     async def _run() -> None:
         store = await SQLiteMetadataStore.open(tmp_path, "col")
@@ -658,8 +687,8 @@ def test_verify_manifest_passes_for_matching_identity(tmp_path: Path) -> None:
 
 def test_verify_manifest_raises_on_mismatch(tmp_path: Path) -> None:
     """verify_manifest refuses a mismatch exactly like write_manifest — never re-embeds."""
-    built_with = EmbeddingConfig(provider="ollama", model_name="nomic-embed-text", dimensions=768)
-    different = EmbeddingConfig(provider="ollama", model_name="all-mpnet-base-v2", dimensions=768)
+    built_with = EmbeddingIdentity(provider="ollama", model_name="nomic-embed-text", dimensions=768)
+    different = EmbeddingIdentity(provider="ollama", model_name="all-mpnet-base-v2", dimensions=768)
 
     async def _run() -> None:
         store = await SQLiteMetadataStore.open(tmp_path, "col")
@@ -722,7 +751,7 @@ def test_legacy_store_without_manifest_stamp_is_refused_for_dense_work(tmp_path:
     assert doc_hash == "h1"
     assert manifest is None
 
-    embedding = EmbeddingConfig(provider="ollama", model_name="nomic-embed-text", dimensions=768)
+    embedding = EmbeddingIdentity(provider="ollama", model_name="nomic-embed-text", dimensions=768)
 
     async def _try_write() -> None:
         store = await SQLiteMetadataStore.open(tmp_path, "col")

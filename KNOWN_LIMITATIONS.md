@@ -2,7 +2,7 @@
 
 Honest and current, per repo policy. Updated with each phase.
 
-## Current state (Phase 3, Wave A)
+## Current state (Phase 3, Wave B)
 
 BM25-only retrieval works end-to-end locally: `grk ingest` (file or
 directory, incremental by content hash), `grk search` (citation-bearing
@@ -11,17 +11,75 @@ against the committed golden corpus, BM25-only baseline) — all against a
 persisted SQLite index that survives restarts, all offline with no cloud
 credentials. Not yet built, arriving in their phases per SPEC.md §9:
 
-- **Dense retrieval exists but is not reachable.** Wave A landed the vector
-  stores (`InMemoryVectorStore`, `LanceDBVectorStore`) and the ADR-0004
-  collection manifest, but nothing wires them into `Indexer` (Wave B) or
-  `Retriever` (Wave C). `grk ingest` writes no vectors and `grk search` is
-  still BM25-only. Hybrid fusion and rerank are Waves C and D.
-- **The embedding-identity manifest is enforceable but unenforced.** ADR-0004
-  decision 3 requires verification at `Retriever.open()` and at any ingest
-  that writes vectors. The store-side machinery (`write_manifest`,
-  `verify_manifest`) is implemented and tested; no caller invokes it yet, so
-  today nothing actually stops a model swap. That wiring is Wave B, and until
-  it lands the guarantee is theoretical.
+- **Dense retrieval is written but not reachable.** Wave B wired the Wave A
+  vector stores (`InMemoryVectorStore`, `LanceDBVectorStore`) into
+  `Indexer`: `grk ingest` now embeds each chunk and writes it to the
+  configured vector store alongside the SQLite write. `Retriever` is
+  unchanged — it still builds only a BM25 index from the metadata store, so
+  `grk search` stays BM25-only and every vector written so far has no read
+  path. Wiring `Retriever` to the dense store, plus hybrid fusion and
+  rerank, are Waves C and D.
+- **The embedding-identity manifest is enforced on ingest.** ADR-0004
+  decision 3 requires verification at two boundaries: any ingest that
+  writes vectors, and `Retriever.open()`. Wave B closed the first —
+  `Indexer` calls `verify_manifest` before any load/chunk/embed/delete
+  work, and `write_manifest` binds the collection on its first real dense
+  write, so a model swap on an existing collection now raises
+  `IndexIdentityError` instead of silently corrupting it. The second
+  boundary — `Retriever.open()` verification — is a stated Wave C
+  obligation, not a present hole: `Retriever` has no dense read path yet
+  (see above), and a retriever that never reads a vector cannot introduce a
+  second semantic space into a search result. There is nothing yet for
+  `Retriever.open()` to verify until Wave C gives it something to read.
+- **Cross-store writes are not atomic.** SQLite and the vector store share
+  no transaction. Wave B's write order — chunk, embed, write the manifest
+  (once, before the first vector add), delete the previous document's
+  vectors, add the new ones, commit SQLite last — is chosen so SQLite is
+  never ahead of the dense store. A dense store *behind* SQLite is silent:
+  the content-hash skip key means that document is never retried and never
+  appears in dense results. A dense store *ahead* of SQLite is detectable:
+  `Retriever.search` already fails closed on a hit whose document has no
+  stored source. The residue of an interrupted ingest is therefore
+  possibly-orphaned vectors, not a silently missing document — but those
+  orphans carry a document ID SQLite never recorded, so a later re-ingest
+  cannot reclaim them by that ID. Recovering means deleting and rebuilding
+  the collection, which is cheap pre-1.0 and consistent with ADR-0004
+  decision 5.
+- **Delete reconciliation warns, it does not fail.** ADR-0004 decision 6
+  requires the caller to reconcile the vector-delete count against the
+  chunk count SQLite deleted. A mismatch is logged and surfaced in
+  `IndexReport`, not raised, because a collection first ingested BM25-only
+  and later re-ingested with the dense path enabled legitimately deletes
+  chunks and zero vectors — strict equality would fail a completely
+  healthy upgrade.
+- **Turning the dense path on does not backfill an existing collection.**
+  The incremental content-hash gate runs before chunking and therefore
+  before embedding — that is exactly what keeps an unchanged document from
+  being re-embedded on every run. The cost is that enabling an embedder and
+  vector store over a collection already ingested BM25-only leaves every
+  unchanged document without vectors: it is skipped, so it is never
+  embedded. Only documents whose content actually changes afterwards gain
+  vectors. The collection is then permanently half-dense until it is
+  re-ingested from scratch, and nothing reports that state. This is also
+  the case the delete reconciliation above deliberately tolerates. Forcing
+  a backfill means deleting the collection and re-ingesting it.
+- **A BM25-only indexer will orphan a vector-bearing collection.** The
+  inverse of the above: an `Indexer` constructed without an embedder or
+  vector store still happily replaces, prunes, and deletes documents in a
+  collection whose vectors were written by an earlier dense-enabled run.
+  It has no vector store to delete from, so those vectors survive their
+  documents. The orphans are loud rather than silent once Wave C gives
+  them a read path — `Retriever.search` fails closed on a hit whose
+  document has no stored source — but nothing prevents the situation being
+  created, because the store carries no record that dense writes ever
+  happened beyond the manifest itself.
+- **The CLI does not expose the dense path.** Wave B's wiring lives in
+  `Indexer` itself; `grk ingest` still constructs it without an embedder or
+  vector store, so the command-line path writes no vectors today. Turning
+  it on needs a provider flag and a running Ollama, and it only becomes
+  useful once `grk search` can read those vectors too — so it's
+  deliberately deferred to Wave C, where ingest and search can be wired
+  coherently together. This is a stated decision, not an oversight.
 - **Filtered dense search costs O(corpus).** A `metadata_filter` triggers a
   full-table over-fetch, then filters and truncates in Python, because
   metadata is stored as one opaque JSON blob rather than structured columns

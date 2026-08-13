@@ -64,6 +64,21 @@ for the same document in one fused response. The seam now returns
 Protocol with no implementation is a hypothesis, and Wave A was the first thing
 to test it.
 
+Wave B forced two implementation shapes the original plan did not spell out,
+though neither is a new decision: ADR-0004 already settled *what* identity is
+(decision 2) and *that* deletes must be reconciled (decision 6), and these are
+how those decisions were realized in code, not departures from them. The
+manifest seam (`write_manifest`/`verify_manifest`) takes the narrow
+`EmbeddingIdentity` triple — `provider`, `model_name`, `dimensions` — rather
+than a whole `EmbeddingConfig`, which also carries operational settings
+unrelated to semantic-space identity and a `provider` `Literal` no
+third-party embedder could satisfy. And `Indexer`'s dense write order —
+chunk, embed, write the manifest, delete the previous document's vectors, add
+the new ones, commit SQLite last — is itself an invariant, chosen so SQLite
+is never left ahead of the dense store (see `KNOWN_LIMITATIONS.md` for the
+failure mode this avoids). No ADR was skipped for either; both are
+implementation shapes serving decisions ADR-0004 already made.
+
 ### 3.1 ADR-0004 — Embedding identity binding (blocking, do first)
 
 **Problem.** SPEC.md §2 forbids cross-provider embedding fallback because
@@ -124,16 +139,22 @@ changeset that leaves the tree green.
     test with a hostile ID.
   - Dimension/length mismatch on `add` → `StorageError`.
 
-### Wave B — dense write path
+### Wave B — dense write path (**Landed**)
 
-- `Indexer` accepts an optional embedder + vector store. Both absent ⇒ Phase 1
-  BM25-only behaviour, unchanged and still tested.
-- `replace_document` parity: deleting or replacing a document must delete its
-  vectors in the same logical operation. A document row without its vectors is
-  the Phase 1 `replace_document` hazard repeated one store over.
-- Incremental re-index re-embeds only changed documents (content-hash gate
-  already exists — extend, don't duplicate).
-- Manifest verified on open and on ingest; mismatch fails closed.
+- `Indexer` accepts optional keyword-only `embedder` and `vector_store`;
+  both absent leaves Phase 1 BM25-only behaviour unchanged and still
+  tested, and exactly one supplied raises `ConfigurationError` at
+  construction.
+- `replace_document` parity delivered: deleting, replacing, renaming, or
+  emptying a document deletes its vectors in the same logical operation.
+- Incremental re-index re-embeds only changed documents — the existing
+  content-hash gate short-circuits before chunking, extended rather than
+  duplicated.
+- Manifest verified on ingest and fails closed: `verify_manifest` runs
+  before any load/chunk/embed/delete work, and `write_manifest` binds the
+  collection on the first real dense write. `Retriever.open()`
+  verification remains Wave C — see §3 and `KNOWN_LIMITATIONS.md`.
+- `IndexReport` gained `vectors_written` and `vectors_deleted`.
 
 ### Wave C — dense retrieval + RRF fusion
 
@@ -146,6 +167,17 @@ changeset that leaves the tree green.
 - Citation resolution unchanged: dense hits resolve through the same
   `citations.py` path, so a dense result is exactly as verifiable as a lexical
   one.
+- **Inherited from Wave B — `Retriever.open()` manifest verification.**
+  ADR-0004 decision 3 names two boundaries; Wave B closed ingest and left this
+  one, because a retriever with no dense read path cannot introduce a second
+  semantic space and so had nothing to verify. Wave C is what gives it
+  something to read, which is the same commit that must add the check.
+- **Inherited from Wave B — CLI wiring.** `grk ingest` still constructs its
+  `Indexer` without an embedder or vector store, so the command line writes no
+  vectors. It was deferred here deliberately rather than half-wired in Wave B:
+  turning it on needs a provider flag and a running Ollama, and it is only
+  useful once `grk search` can read what it writes, so ingest and search get
+  their flags together.
 
 ### Wave D — optional cross-encoder rerank
 

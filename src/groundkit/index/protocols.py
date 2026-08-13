@@ -11,8 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from groundkit.config import EmbeddingConfig
-    from groundkit.contracts import Chunk, CollectionManifest
+    from groundkit.contracts import Chunk, CollectionManifest, EmbeddingIdentity
 
 
 @runtime_checkable
@@ -25,6 +24,10 @@ class MetadataStoreProtocol(Protocol):
 
     async def get_document_hash(self, source: str) -> str | None:
         """Return the stored content hash for ``source``, or None if unseen."""
+        ...
+
+    async def get_document_id(self, source: str) -> str | None:
+        """Return the stored document ID for ``source``, or None if unseen."""
         ...
 
     async def get_document_sources(self) -> dict[str, str]:
@@ -61,7 +64,7 @@ class MetadataStoreProtocol(Protocol):
         """Delete a document and its chunks. Returns deleted-chunk count."""
         ...
 
-    async def write_manifest(self, embedding: EmbeddingConfig) -> None:
+    async def write_manifest(self, identity: EmbeddingIdentity) -> None:
         """Write the collection's embedding-identity manifest, once (ADR-0004).
 
         Called on a collection's first dense write. Immutable thereafter: a
@@ -77,8 +80,8 @@ class MetadataStoreProtocol(Protocol):
         """
         ...
 
-    async def verify_manifest(self, embedding: EmbeddingConfig) -> None:
-        """Verify ``embedding`` matches the collection's stored identity manifest.
+    async def verify_manifest(self, identity: EmbeddingIdentity) -> None:
+        """Verify ``identity`` matches the collection's stored identity manifest.
 
         A collection with no manifest yet (no dense write has ever
         happened) has nothing to conflict with, so verification passes
@@ -88,7 +91,7 @@ class MetadataStoreProtocol(Protocol):
         Raises:
             IndexIdentityError: The store predates the embedding-identity
                 manifest and cannot be used for dense work, or the stored
-                manifest's identity triple does not match ``embedding``.
+                manifest's identity triple does not match ``identity``.
         """
         ...
 

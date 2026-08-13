@@ -35,8 +35,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, TypeVar
 
-from groundkit.config import EmbeddingConfig
-from groundkit.contracts import Chunk, CollectionManifest
+from groundkit.contracts import Chunk, CollectionManifest, EmbeddingIdentity
 from groundkit.errors import ConfigurationError, IndexIdentityError, StorageError
 from groundkit.utils.path_safety import ensure_within_base
 
@@ -292,6 +291,29 @@ class SQLiteMetadataStore:
 
         return await self._run(_op)
 
+    async def get_document_id(self, source: str) -> str | None:
+        """Return the stored document ID for ``source``, or None if unseen.
+
+        Args:
+            source: File path, URL, or other source identifier.
+
+        Returns:
+            The stored document ID, or ``None`` if ``source`` has never
+            been ingested.
+
+        Raises:
+            StorageError: On a backend failure.
+        """
+
+        def _op() -> str | None:
+            cur = self._conn.execute(
+                "SELECT document_id FROM documents WHERE source = ?", (source,)
+            )
+            row = cur.fetchone()
+            return str(row[0]) if row is not None else None
+
+        return await self._run(_op)
+
     async def get_document_sources(self) -> dict[str, str]:
         """Return a ``document_id -> source`` map for every stored document.
 
@@ -464,7 +486,7 @@ class SQLiteMetadataStore:
 
         return await self._run(_op)
 
-    async def write_manifest(self, embedding: EmbeddingConfig) -> None:
+    async def write_manifest(self, identity: EmbeddingIdentity) -> None:
         """Write the collection's embedding-identity manifest, once (ADR-0004).
 
         Called on the collection's first dense write. The manifest is
@@ -476,7 +498,7 @@ class SQLiteMetadataStore:
         re-embed.
 
         Args:
-            embedding: The embedding configuration establishing (or, on a
+            identity: The embedding identity establishing (or, on a
                 later call, being checked against) this collection's
                 identity.
 
@@ -496,18 +518,18 @@ class SQLiteMetadataStore:
                     "INSERT INTO collection_manifest "
                     "(id, provider, model_name, dimensions, created_at) "
                     "VALUES (1, ?, ?, ?, ?)",
-                    (embedding.provider, embedding.model_name, embedding.dimensions, created_at),
+                    (identity.provider, identity.model_name, identity.dimensions, created_at),
                 )
                 self._conn.commit()
                 return
-            if _manifest_matches(existing, embedding):
+            if _manifest_matches(existing, identity):
                 return  # same identity: re-ingesting a bound collection is a no-op
-            raise IndexIdentityError(_identity_mismatch_message(existing, embedding))
+            raise IndexIdentityError(_identity_mismatch_message(existing, identity))
 
         await self._run(_op)
 
-    async def verify_manifest(self, embedding: EmbeddingConfig) -> None:
-        """Verify ``embedding`` matches the collection's stored identity manifest.
+    async def verify_manifest(self, identity: EmbeddingIdentity) -> None:
+        """Verify ``identity`` matches the collection's stored identity manifest.
 
         A collection with no manifest yet — no dense write has ever
         happened — has nothing to conflict with, so verification passes
@@ -516,22 +538,22 @@ class SQLiteMetadataStore:
         warn-and-continue (SPEC.md §2): a real mismatch always raises.
 
         Args:
-            embedding: The active embedding configuration to check.
+            identity: The active embedding identity to check.
 
         Raises:
             IndexIdentityError: This store predates the embedding-identity
                 manifest (ADR-0004) and cannot be used for dense work, or
                 the stored manifest's identity triple does not match
-                ``embedding``.
+                ``identity``.
             StorageError: On a backend failure.
         """
         self._require_manifest_capable("verify")
 
         def _op() -> None:
             existing = self._select_manifest()
-            if existing is None or _manifest_matches(existing, embedding):
+            if existing is None or _manifest_matches(existing, identity):
                 return
-            raise IndexIdentityError(_identity_mismatch_message(existing, embedding))
+            raise IndexIdentityError(_identity_mismatch_message(existing, identity))
 
         await self._run(_op)
 
@@ -697,8 +719,8 @@ def _row_to_chunk(row: tuple[str, str, int, str, int, int, str]) -> Chunk:
     )
 
 
-def _manifest_matches(manifest: CollectionManifest, embedding: EmbeddingConfig) -> bool:
-    """True when ``manifest``'s identity triple matches ``embedding``'s (ADR-0004).
+def _manifest_matches(manifest: CollectionManifest, identity: EmbeddingIdentity) -> bool:
+    """True when ``manifest``'s identity triple matches ``identity``'s (ADR-0004).
 
     Identity is the triple ``(provider, model_name, dimensions)``, checked
     as a triple — never dimensions alone. Vector width by itself is
@@ -707,13 +729,13 @@ def _manifest_matches(manifest: CollectionManifest, embedding: EmbeddingConfig) 
     swap this whole mechanism exists to reject.
     """
     return (
-        manifest.provider == embedding.provider
-        and manifest.model_name == embedding.model_name
-        and manifest.dimensions == embedding.dimensions
+        manifest.provider == identity.provider
+        and manifest.model_name == identity.model_name
+        and manifest.dimensions == identity.dimensions
     )
 
 
-def _identity_mismatch_message(manifest: CollectionManifest, embedding: EmbeddingConfig) -> str:
+def _identity_mismatch_message(manifest: CollectionManifest, identity: EmbeddingIdentity) -> str:
     """Build the shared ``IndexIdentityError`` message for an identity conflict.
 
     Names all three fields of both triples explicitly, even when only one
@@ -725,8 +747,8 @@ def _identity_mismatch_message(manifest: CollectionManifest, embedding: Embeddin
         "embedding identity mismatch: collection was built with "
         f"(provider={manifest.provider!r}, model_name={manifest.model_name!r}, "
         f"dimensions={manifest.dimensions}) but the active configuration is "
-        f"(provider={embedding.provider!r}, model_name={embedding.model_name!r}, "
-        f"dimensions={embedding.dimensions}). Vector width alone is not identity — "
+        f"(provider={identity.provider!r}, model_name={identity.model_name!r}, "
+        f"dimensions={identity.dimensions}). Vector width alone is not identity — "
         "distinct models can share a width. Mixing embedding spaces in one "
         "collection corrupts it silently; the fix is to delete this collection and "
         "re-ingest it under the new embedding configuration, never to re-embed or "

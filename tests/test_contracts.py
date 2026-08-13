@@ -11,6 +11,7 @@ from groundkit.contracts import (
     Chunk,
     Citation,
     Document,
+    EmbeddingIdentity,
     RetrievalResult,
     SearchResponse,
 )
@@ -113,6 +114,35 @@ class TestRetrievalResult:
         cit = self.make(1.0).citation
         assert isinstance(cit, Citation)
         assert (cit.source, cit.start_offset, cit.end_offset) == ("a.md", 0, 4)
+
+
+class TestEmbeddingIdentity:
+    def make(self, dimensions: int = 768) -> EmbeddingIdentity:
+        return EmbeddingIdentity(
+            provider="ollama", model_name="nomic-embed-text", dimensions=dimensions
+        )
+
+    def test_extra_fields_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            EmbeddingIdentity(
+                provider="ollama",
+                model_name="nomic-embed-text",
+                dimensions=768,
+                surprise=True,  # type: ignore[call-arg]
+            )
+
+    def test_frozen(self) -> None:
+        identity = self.make()
+        with pytest.raises(ValidationError):
+            identity.dimensions = 1024
+
+    def test_zero_dimensions_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            self.make(dimensions=0)
+
+    def test_negative_dimensions_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            self.make(dimensions=-1)
 
 
 class TestSearchResponse:
