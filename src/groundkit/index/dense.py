@@ -71,17 +71,24 @@ reconstruct full :class:`~groundkit.contracts.Chunk` objects internally
 (from stored rows, for LanceDB) specifically so this tie-break key and
 Pydantic's own offset/length re-validation come "for free" at read time.
 
-**No metadata-store join.** Unlike ``BM25Index.search`` (returns ``(Chunk,
-score)`` pairs and leaves the store join to ``retrieval/search.py``,
-because ``Chunk`` carries no ``source`` field), ``VectorStoreProtocol.search``
-must return citation-bearing :class:`~groundkit.contracts.RetrievalResult`
-objects directly — its signature has no store handle to join against. This
-works because ``ingestion/chunking.py`` seeds every chunk's metadata with
-its document's source (``metadata={"source": document.source, **document.metadata}``),
-so :func:`_to_retrieval_result` reads ``source`` straight out of
-``chunk.metadata`` instead. A chunk stored without a ``"source"`` key is an
-index inconsistency and fails closed with :class:`~groundkit.errors.StorageError`,
-mirroring ``Retriever.search``'s own fail-closed behavior for the BM25 path.
+**No citation building here.** ``search`` returns ``(Chunk, score)`` pairs,
+exactly as ``BM25Index.search`` does, and leaves the document-source join to
+``retrieval/search.py``. This is a correctness requirement, not symmetry for
+its own sake.
+
+``ingestion/chunking.py`` does seed every chunk's metadata with its
+document's source (``metadata={"source": document.source, ...}``), so a
+store *could* read ``source`` from ``chunk.metadata``. It must not. That
+value is a snapshot taken at chunk time, while ``documents.source`` in
+SQLite is the durable truth (ADR-0002) that ``Retriever.search`` already
+joins against and fails closed on. Re-ingest a document from a new path and
+the two disagree — a dense hit would cite the stale path while a BM25 hit
+for the same document cites the current one, in a single response. Routing
+both seams through the same join makes that divergence unrepresentable.
+
+It also keeps fusion simple: Wave C's RRF consumes two lists of the same
+shape, and the source join happens once, after fusion, on the surviving
+results.
 """
 
 from __future__ import annotations
@@ -93,7 +100,7 @@ import re
 from pathlib import Path
 from typing import Any, Final
 
-from groundkit.contracts import Chunk, RetrievalResult
+from groundkit.contracts import Chunk
 from groundkit.errors import StorageError
 
 #: Score floor: cosine similarity is clamped to this before it ever reaches
@@ -222,42 +229,6 @@ def _matches_filter(metadata: dict[str, Any], metadata_filter: dict[str, Any] | 
     return all(key in metadata and metadata[key] == value for key, value in metadata_filter.items())
 
 
-def _to_retrieval_result(chunk: Chunk, score: float) -> RetrievalResult:
-    """Build a citation-bearing :class:`RetrievalResult` from a chunk and a clamped score.
-
-    See the module docstring's "No metadata-store join" section for why this
-    reads ``source`` out of ``chunk.metadata`` instead of joining a store.
-
-    Args:
-        chunk: The matched chunk (its metadata must carry a string ``"source"``).
-        score: Already-clamped score (``>= 0.0``).
-
-    Returns:
-        A fully-populated :class:`RetrievalResult`.
-
-    Raises:
-        StorageError: ``chunk.metadata`` has no string ``"source"`` key —
-            an index inconsistency; fail closed rather than construct an
-            unverifiable citation.
-    """
-    source = chunk.metadata.get("source")
-    if not isinstance(source, str):
-        raise StorageError(
-            f"chunk {chunk.chunk_id!r} has no string 'source' in its metadata; cannot "
-            "construct a citation-bearing RetrievalResult"
-        )
-    return RetrievalResult(
-        content=chunk.content,
-        score=score,
-        document_id=chunk.document_id,
-        chunk_id=chunk.chunk_id,
-        source=source,
-        start_offset=chunk.start_offset,
-        end_offset=chunk.end_offset,
-        metadata=chunk.metadata,
-    )
-
-
 def _sort_by_score(scored: list[tuple[Chunk, float]]) -> list[tuple[Chunk, float]]:
     """Sort ``(chunk, score)`` pairs by descending score, ties broken ascending by content hash.
 
@@ -371,7 +342,7 @@ class InMemoryVectorStore:
         query_embedding: list[float],
         top_k: int = 5,
         metadata_filter: dict[str, Any] | None = None,
-    ) -> list[RetrievalResult]:
+    ) -> list[tuple[Chunk, float]]:
         """Return the most similar chunks, most similar first.
 
         Args:
@@ -384,15 +355,14 @@ class InMemoryVectorStore:
                 returns ``top_k`` results whenever that many chunks match.
 
         Returns:
-            Up to ``top_k`` :class:`~groundkit.contracts.RetrievalResult`,
+            Up to ``top_k`` ``(chunk, score)`` pairs,
             ranked by descending score, ties broken by ascending
             ``Chunk.content_hash``. ``top_k <= 0`` or an empty store
             returns ``[]``.
 
         Raises:
             StorageError: ``query_embedding``'s width disagrees with this
-                store's established width, or a matched chunk's metadata
-                has no string ``"source"`` (see :func:`_to_retrieval_result`).
+                store's established width.
         """
         if top_k <= 0 or not self._chunks:
             return []
@@ -408,7 +378,7 @@ class InMemoryVectorStore:
             scored.append((chunk, _clamp_score(_cosine_similarity(query_embedding, vector))))
 
         ranked = _sort_by_score(scored)
-        return [_to_retrieval_result(chunk, score) for chunk, score in ranked[:top_k]]
+        return ranked[:top_k]
 
     async def delete(self, document_id: str) -> int:
         """Delete all vectors for ``document_id``.
@@ -648,7 +618,7 @@ class LanceDBVectorStore:
         query_embedding: list[float],
         top_k: int = 5,
         metadata_filter: dict[str, Any] | None = None,
-    ) -> list[RetrievalResult]:
+    ) -> list[tuple[Chunk, float]]:
         """Return the most similar chunks, most similar first.
 
         Args:
@@ -667,15 +637,14 @@ class LanceDBVectorStore:
                 Python avoids ever constructing one.
 
         Returns:
-            Up to ``top_k`` :class:`~groundkit.contracts.RetrievalResult`,
+            Up to ``top_k`` ``(chunk, score)`` pairs,
             ranked by descending score, ties broken by ascending
             ``Chunk.content_hash``. ``top_k <= 0`` or an empty/absent table
             returns ``[]``.
 
         Raises:
             StorageError: ``query_embedding``'s width disagrees with this
-                store's established width, or a matched chunk's metadata
-                has no string ``"source"`` (see :func:`_to_retrieval_result`).
+                store's established width.
         """
         if top_k <= 0:
             return []
@@ -703,7 +672,7 @@ class LanceDBVectorStore:
             scored.append((chunk, _clamp_score(1.0 - float(row["_distance"]))))
 
         ranked = _sort_by_score(scored)
-        return [_to_retrieval_result(chunk, score) for chunk, score in ranked[:top_k]]
+        return ranked[:top_k]
 
     async def delete(self, document_id: str) -> int:
         """Delete all vectors for ``document_id``.

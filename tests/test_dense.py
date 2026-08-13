@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from groundkit.contracts import Chunk, RetrievalResult
+from groundkit.contracts import Chunk
 from groundkit.errors import StorageError
 from groundkit.index.dense import InMemoryVectorStore, LanceDBVectorStore
 from groundkit.index.protocols import VectorStoreProtocol
@@ -46,7 +46,7 @@ async def _make_store(store_kind: str, tmp_path: Path) -> VectorStoreProtocol:
 
     Typed as ``VectorStoreProtocol`` (structural, not inheritance) rather
     than ``Any`` so every caller gets ``search()``'s real
-    ``list[RetrievalResult]`` return type back instead of ``Any``.
+    ``list[tuple[Chunk, float]]`` return type back instead of ``Any``.
     """
     if store_kind == "memory":
         return InMemoryVectorStore()
@@ -149,7 +149,7 @@ def test_lancedb_open_raises_storage_error_when_lancedb_missing(
 
 @pytest.mark.parametrize("store_kind", _STORE_KINDS)
 def test_add_then_search_orders_by_descending_similarity(store_kind: str, tmp_path: Path) -> None:
-    async def _run() -> list[RetrievalResult]:
+    async def _run() -> list[tuple[Chunk, float]]:
         store = await _make_store(store_kind, tmp_path)
         chunks = [
             _make_chunk("a", "doc-1", "alpha content"),
@@ -165,15 +165,16 @@ def test_add_then_search_orders_by_descending_similarity(store_kind: str, tmp_pa
         return await store.search([1.0, 0.0, 0.0, 0.0], top_k=3)
 
     results = asyncio.run(_run())
-    assert [r.chunk_id for r in results] == ["a", "b", "c"]
-    assert results[0].score == pytest.approx(1.0, abs=1e-4)
-    assert results[1].score == pytest.approx(0.8, abs=1e-4)
-    assert results[2].score == pytest.approx(0.0, abs=1e-4)
-    # Every result is citation-bearing and resolves the source seeded via
-    # chunk.metadata["source"], with no metadata-store join.
-    for result in results:
-        assert result.source == "doc.md"
-        assert result.document_id in ("doc-1", "doc-2")
+    assert [c.chunk_id for c, _ in results] == ["a", "b", "c"]
+    assert results[0][1] == pytest.approx(1.0, abs=1e-4)
+    assert results[1][1] == pytest.approx(0.8, abs=1e-4)
+    assert results[2][1] == pytest.approx(0.0, abs=1e-4)
+    # The store returns chunks, never citations: resolving a chunk to its
+    # document's source is Retriever's job, against the metadata store that
+    # owns that mapping. A store that built citations here would be trusting
+    # chunk.metadata's ingest-time snapshot over the durable truth.
+    for chunk, _ in results:
+        assert chunk.document_id in ("doc-1", "doc-2")
 
 
 # ── Metadata filtering actually filters (hazard 3) ─────────────────────────
@@ -181,7 +182,7 @@ def test_add_then_search_orders_by_descending_similarity(store_kind: str, tmp_pa
 
 @pytest.mark.parametrize("store_kind", _STORE_KINDS)
 def test_metadata_filter_removes_non_matching_chunks(store_kind: str, tmp_path: Path) -> None:
-    async def _run() -> list[RetrievalResult]:
+    async def _run() -> list[tuple[Chunk, float]]:
         store = await _make_store(store_kind, tmp_path)
         chunks = [
             _make_chunk("keep-1", "doc-1", "keep this one", extra_metadata={"category": "keep"}),
@@ -194,14 +195,14 @@ def test_metadata_filter_removes_non_matching_chunks(store_kind: str, tmp_path: 
         )
 
     results = asyncio.run(_run())
-    assert [r.chunk_id for r in results] == ["keep-1"]
+    assert [c.chunk_id for c, _ in results] == ["keep-1"]
 
 
 @pytest.mark.parametrize("store_kind", _STORE_KINDS)
 def test_metadata_filter_requires_all_pairs(store_kind: str, tmp_path: Path) -> None:
     """A filter with two keys only matches a chunk carrying BOTH."""
 
-    async def _run() -> list[RetrievalResult]:
+    async def _run() -> list[tuple[Chunk, float]]:
         store = await _make_store(store_kind, tmp_path)
         chunks = [
             _make_chunk(
@@ -223,7 +224,7 @@ def test_metadata_filter_requires_all_pairs(store_kind: str, tmp_path: Path) -> 
         )
 
     results = asyncio.run(_run())
-    assert [r.chunk_id for r in results] == ["both"]
+    assert [c.chunk_id for c, _ in results] == ["both"]
 
 
 # ── Filtered search still returns top_k when enough matches exist ─────────
@@ -238,7 +239,7 @@ def test_filtered_search_still_returns_top_k_when_enough_matches_exist(
     would return fewer than top_k "keep" results here (or even zero);
     filtering before truncation must not."""
 
-    async def _run() -> list[RetrievalResult]:
+    async def _run() -> list[tuple[Chunk, float]]:
         store = await _make_store(store_kind, tmp_path)
         chunks = [
             _make_chunk("drop-1", "doc-1", "dropped a", extra_metadata={"category": "drop"}),
@@ -275,8 +276,8 @@ def test_filtered_search_still_returns_top_k_when_enough_matches_exist(
 
     results = asyncio.run(_run())
     assert len(results) == 3
-    assert [r.chunk_id for r in results] == ["keep-1", "keep-2", "keep-3"]
-    assert all(r.metadata["category"] == "keep" for r in results)
+    assert [c.chunk_id for c, _ in results] == ["keep-1", "keep-2", "keep-3"]
+    assert all(c.metadata["category"] == "keep" for c, _ in results)
 
 
 # ── delete: correct count, correct scope ────────────────────────────────────
@@ -286,7 +287,7 @@ def test_filtered_search_still_returns_top_k_when_enough_matches_exist(
 def test_delete_returns_count_and_removes_only_target_document(
     store_kind: str, tmp_path: Path
 ) -> None:
-    async def _run() -> tuple[int, list[RetrievalResult]]:
+    async def _run() -> tuple[int, list[tuple[Chunk, float]]]:
         store = await _make_store(store_kind, tmp_path)
         chunks = [
             _make_chunk("d1-a", "doc-1", "a"),
@@ -303,8 +304,8 @@ def test_delete_returns_count_and_removes_only_target_document(
 
     removed, remaining = asyncio.run(_run())
     assert removed == 3
-    assert {r.chunk_id for r in remaining} == {"d2-a", "d2-b"}
-    assert all(r.document_id == "doc-2" for r in remaining)
+    assert {c.chunk_id for c, _ in remaining} == {"d2-a", "d2-b"}
+    assert all(c.document_id == "doc-2" for c, _ in remaining)
 
 
 @pytest.mark.parametrize("store_kind", _STORE_KINDS)
@@ -408,7 +409,7 @@ def test_add_empty_lists_is_a_no_op(store_kind: str, tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("store_kind", _STORE_KINDS)
 def test_scores_are_always_non_negative(store_kind: str, tmp_path: Path) -> None:
-    async def _run() -> list[RetrievalResult]:
+    async def _run() -> list[tuple[Chunk, float]]:
         store = await _make_store(store_kind, tmp_path)
         chunks = [_make_chunk("opposite", "doc-1", "anti-aligned")]
         # Exactly opposite the query vector: cosine similarity == -1.0.
@@ -417,12 +418,12 @@ def test_scores_are_always_non_negative(store_kind: str, tmp_path: Path) -> None
 
     results = asyncio.run(_run())
     assert len(results) == 1
-    assert results[0].score == 0.0
-    # RetrievalResult itself would have raised on construction if a negative
-    # score had reached the contract (Field(ge=0.0)) — this asserts the
-    # producer-side clamp explicitly rather than relying on that as the
-    # only proof.
-    assert all(r.score >= 0.0 for r in results)
+    assert results[0][1] == 0.0
+    # The producer clamps, so a negative similarity never leaves the store.
+    # Retriever builds RetrievalResult (Field(ge=0.0)) downstream from these
+    # scores, and would raise if one slipped through — but that is a backstop,
+    # not the assertion; this pins the clamp at its source.
+    assert all(s >= 0.0 for _, s in results)
 
 
 # ── Determinism: repeated identical searches, tie-break by content hash ────
@@ -443,7 +444,7 @@ def test_repeated_search_returns_identical_ordering(store_kind: str, tmp_path: P
         await store.add(chunks, embeddings)
         first = await store.search([1.0, 0.0, 0.0, 0.0], top_k=3)
         second = await store.search([1.0, 0.0, 0.0, 0.0], top_k=3)
-        return [r.chunk_id for r in first], [r.chunk_id for r in second]
+        return [c.chunk_id for c, _ in first], [c.chunk_id for c, _ in second]
 
     first_order, second_order = asyncio.run(_run())
     assert first_order == second_order
@@ -476,14 +477,14 @@ def test_zero_vector_embedding_scores_zero_in_memory() -> None:
     ``_cosine_similarity``'s guard defines its similarity as 0.0 rather
     than raising ``ZeroDivisionError``."""
 
-    async def _run() -> list[RetrievalResult]:
+    async def _run() -> list[tuple[Chunk, float]]:
         store = InMemoryVectorStore()
         await store.add([_make_chunk("zero", "doc-1", "no direction")], [[0.0, 0.0, 0.0, 0.0]])
         return await store.search([1.0, 0.0, 0.0, 0.0], top_k=5)
 
     results = asyncio.run(_run())
     assert len(results) == 1
-    assert results[0].score == 0.0
+    assert results[0][1] == 0.0
 
 
 def test_zero_vector_embedding_lancedb_excludes_it(tmp_path: Path) -> None:
@@ -496,7 +497,7 @@ def test_zero_vector_embedding_lancedb_excludes_it(tmp_path: Path) -> None:
     documented as a known backend-specific edge case (see dense.py's
     ``_cosine_similarity`` docstring) rather than worked around."""
 
-    async def _run() -> list[RetrievalResult]:
+    async def _run() -> list[tuple[Chunk, float]]:
         store = await LanceDBVectorStore.open(tmp_path / "lancedb")
         await store.add([_make_chunk("zero", "doc-1", "no direction")], [[0.0, 0.0, 0.0, 0.0]])
         return await store.search([1.0, 0.0, 0.0, 0.0], top_k=5)
@@ -506,7 +507,7 @@ def test_zero_vector_embedding_lancedb_excludes_it(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("store_kind", _STORE_KINDS)
 def test_search_top_k_zero_returns_empty(store_kind: str, tmp_path: Path) -> None:
-    async def _run() -> list[RetrievalResult]:
+    async def _run() -> list[tuple[Chunk, float]]:
         store = await _make_store(store_kind, tmp_path)
         await store.add([_make_chunk("a", "doc-1", "x")], [_unit_vector(0)])
         return await store.search(_unit_vector(0), top_k=0)
@@ -522,33 +523,6 @@ def test_search_query_embedding_width_mismatch_raises(store_kind: str, tmp_path:
         await store.search([1.0, 0.0, 0.0], top_k=5)  # width 3, established width 4
 
     with pytest.raises(StorageError):
-        asyncio.run(_run())
-
-
-@pytest.mark.parametrize("store_kind", _STORE_KINDS)
-def test_search_result_with_no_source_metadata_fails_closed(
-    store_kind: str, tmp_path: Path
-) -> None:
-    """A chunk stored without a "source" key in its metadata is an index
-    inconsistency (real ingestion always sets it, per ingestion/chunking.py)
-    -- both stores must fail closed rather than construct an unverifiable
-    citation, mirroring Retriever.search's behavior for the BM25 path."""
-
-    async def _run() -> None:
-        store = await _make_store(store_kind, tmp_path)
-        sourceless = Chunk(
-            chunk_id="no-source",
-            document_id="doc-1",
-            chunk_index=0,
-            content="orphaned chunk",
-            start_offset=0,
-            end_offset=len("orphaned chunk"),
-            metadata={},
-        )
-        await store.add([sourceless], [_unit_vector(0)])
-        await store.search(_unit_vector(0), top_k=5)
-
-    with pytest.raises(StorageError, match="source"):
         asyncio.run(_run())
 
 
@@ -573,7 +547,7 @@ def test_lancedb_search_with_filter_on_emptied_table_returns_empty(tmp_path: Pat
     (everything in it was deleted) with a metadata_filter set must hit the
     fetch_limit <= 0 short-circuit, not call into LanceDB with a 0 limit."""
 
-    async def _run() -> list[RetrievalResult]:
+    async def _run() -> list[tuple[Chunk, float]]:
         store = await LanceDBVectorStore.open(tmp_path / "lancedb")
         await store.add([_make_chunk("a", "doc-1", "x")], [_unit_vector(0)])
         await store.delete("doc-1")
@@ -622,10 +596,10 @@ def test_lancedb_store_persists_and_reopens_across_sessions(tmp_path: Path) -> N
             [_unit_vector(0), _unit_vector(1)],
         )
 
-    async def _reopen_and_search() -> list[RetrievalResult]:
+    async def _reopen_and_search() -> list[tuple[Chunk, float]]:
         store = await LanceDBVectorStore.open(db_path)
         return await store.search(_unit_vector(0), top_k=10)
 
     asyncio.run(_write())
     results = asyncio.run(_reopen_and_search())
-    assert {r.chunk_id for r in results} == {"a", "b"}
+    assert {c.chunk_id for c, _ in results} == {"a", "b"}

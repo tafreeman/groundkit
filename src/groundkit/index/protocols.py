@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from groundkit.config import EmbeddingConfig
-    from groundkit.contracts import Chunk, CollectionManifest, RetrievalResult
+    from groundkit.contracts import Chunk, CollectionManifest
 
 
 @runtime_checkable
@@ -114,10 +114,24 @@ class VectorStoreProtocol(Protocol):
         query_embedding: list[float],
         top_k: int = 5,
         metadata_filter: dict[str, Any] | None = None,
-    ) -> list[RetrievalResult]:
-        """Return the most similar chunks. ``metadata_filter`` keeps only
-        chunks whose metadata contains all specified key/value pairs — it is
-        never accepted-and-ignored."""
+    ) -> list[tuple[Chunk, float]]:
+        """Return the most similar chunks as ``(chunk, score)`` pairs.
+
+        ``metadata_filter`` keeps only chunks whose metadata contains all
+        specified key/value pairs — it is never accepted-and-ignored.
+
+        Returns ``(Chunk, score)`` rather than ``RetrievalResult`` for the
+        same reason ``BM25Index.search`` does: only ``Document`` carries a
+        source path, so a store that holds chunks cannot construct a
+        verifiable citation on its own. Joining chunks to their document
+        source is ``retrieval.Retriever``'s job, against the metadata store
+        that owns that mapping (ADR-0002). A vector store that built
+        ``RetrievalResult`` itself would have to be handed the source
+        alongside each chunk, duplicating document-level truth into every
+        chunk row — a second copy that drifts the moment a document is
+        re-ingested from a new path. Scores are ``>= 0.0``; ordering is
+        descending with a deterministic tie-break.
+        """
         ...
 
     async def delete(self, document_id: str) -> int:

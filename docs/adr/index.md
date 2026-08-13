@@ -11,3 +11,4 @@ that were considered; deviating from SPEC.md requires an ADR proposal first.
 | [ADR-0003](ADR-0003-eval-corpus-and-metrics.md) | Eval corpus and metrics: quote-anchored judgments, hit-rate recall, threshold-free abstention, JSONL | Accepted |
 | [ADR-0004](ADR-0004-embedding-identity-binding.md) | Dense store integrity: embedding identity binding and delete-path safety | Accepted |
 | [ADR-0005](ADR-0005-fusion-and-rerank-scoring.md) | Hybrid scoring: rank-based RRF fusion and sigmoid-normalized rerank | Accepted |
+| [ADR-0006](ADR-0006-dense-seam-returns-chunk-score-pairs.md) | The dense seam returns `(Chunk, score)`, not `RetrievalResult` | Accepted |

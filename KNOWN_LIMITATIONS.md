@@ -2,7 +2,7 @@
 
 Honest and current, per repo policy. Updated with each phase.
 
-## Current state (Phase 2)
+## Current state (Phase 3, Wave A)
 
 BM25-only retrieval works end-to-end locally: `grk ingest` (file or
 directory, incremental by content hash), `grk search` (citation-bearing
@@ -11,9 +11,42 @@ against the committed golden corpus, BM25-only baseline) — all against a
 persisted SQLite index that survives restarts, all offline with no cloud
 credentials. Not yet built, arriving in their phases per SPEC.md §9:
 
-- Dense retrieval, hybrid fusion, rerank, and metadata filtering at search
-  time (Phase 3) — embedding providers exist and are tested, but nothing
-  consumes them yet.
+- **Dense retrieval exists but is not reachable.** Wave A landed the vector
+  stores (`InMemoryVectorStore`, `LanceDBVectorStore`) and the ADR-0004
+  collection manifest, but nothing wires them into `Indexer` (Wave B) or
+  `Retriever` (Wave C). `grk ingest` writes no vectors and `grk search` is
+  still BM25-only. Hybrid fusion and rerank are Waves C and D.
+- **The embedding-identity manifest is enforceable but unenforced.** ADR-0004
+  decision 3 requires verification at `Retriever.open()` and at any ingest
+  that writes vectors. The store-side machinery (`write_manifest`,
+  `verify_manifest`) is implemented and tested; no caller invokes it yet, so
+  today nothing actually stops a model swap. That wiring is Wave B, and until
+  it lands the guarantee is theoretical.
+- **Filtered dense search costs O(corpus).** A `metadata_filter` triggers a
+  full-table over-fetch, then filters and truncates in Python, because
+  metadata is stored as one opaque JSON blob rather than structured columns
+  and pushing caller-controlled values into a LanceDB `WHERE` predicate is
+  the hazard class ADR-0004 decision 6 exists to close. Unfiltered search
+  stays a cheap top-k vector query. The alternative — silently returning
+  fewer than `top_k` — is a defect, not a tradeoff, so the cost is accepted
+  for now. Structured metadata columns would fix it and are not built.
+- **Metadata filtering is equality-only.** A filter matches when every
+  key/value pair is present and equal. No ranges, no negation, no nesting.
+- **`index/dense.py` is not in the coverage `core_subset`.** It sits at 100%
+  today, but the gate that would keep it there covers `retrieval/*`,
+  `ingestion/chunking.py`, and `index/bm25.py` only. Adding it is a Wave F
+  decision (see `docs/specs/phase-3-hybrid-retrieval.md`).
+- **The two vector stores diverge on zero-magnitude vectors.** LanceDB's
+  cosine search omits them from results entirely; `InMemoryVectorStore`
+  returns them at score 0.0. Real embedding models do not emit zero vectors,
+  so this is documented rather than forced into artificial parity — but the
+  two paths are not byte-identical on that degenerate input.
+- **Chunk metadata still carries an ingest-time `source` snapshot.**
+  `ingestion/chunking.py` seeds `metadata["source"]`, duplicating a fact that
+  `documents.source` owns durably. ADR-0006 makes retrieval ignore the copy,
+  so it can no longer produce a wrong citation, but the stale-on-re-ingest
+  copy is still written and still exposed in `RetrievalResult.metadata`.
+  Removing it is a separate change with its own migration cost.
 - PDF/HTML loaders and URL ingestion (with the SSRF guard) — v1 scope, not
   yet scheduled into a phase; the loader currently reads `.md`/`.markdown`/
   `.txt` only.

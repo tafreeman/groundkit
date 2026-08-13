@@ -48,11 +48,21 @@ Two things are *not* seated and must be built before any vector is written:
 
 ## 3. Decisions that need an ADR before code
 
-Both ADRs are now drafted and **Proposed**, awaiting owner acceptance:
 [ADR-0004](../adr/ADR-0004-embedding-identity-binding.md) and
-[ADR-0005](../adr/ADR-0005-fusion-and-rerank-scoring.md). The subsections below
-state the problems they were written to settle; the ADRs hold the decisions,
-alternatives, and citations.
+[ADR-0005](../adr/ADR-0005-fusion-and-rerank-scoring.md) are **Accepted**. The
+subsections below state the problems they were written to settle; the ADRs hold
+the decisions, alternatives, and citations.
+
+A third decision was forced by Wave A rather than anticipated here:
+[ADR-0006](../adr/ADR-0006-dense-seam-returns-chunk-score-pairs.md). Phase 1
+declared `VectorStoreProtocol.search` as returning `RetrievalResult`, which
+turned out to be unsatisfiable without reading `source` from an ingest-time
+`chunk.metadata` snapshot — a copy that disagrees with `documents.source` after
+any re-ingest at a new path, so dense and BM25 hits could cite different paths
+for the same document in one fused response. The seam now returns
+`(Chunk, score)`, matching BM25. This is the useful kind of surprise: a
+Protocol with no implementation is a hypothesis, and Wave A was the first thing
+to test it.
 
 ### 3.1 ADR-0004 — Embedding identity binding (blocking, do first)
 
