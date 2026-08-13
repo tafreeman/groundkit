@@ -1,6 +1,6 @@
 # ADR-0005 — Hybrid scoring: rank-based RRF fusion and sigmoid-normalized rerank
 
-- **Status:** Proposed (awaiting owner acceptance)
+- **Status:** Accepted (owner, 2026-08-13)
 - **Date:** 2026-08-13
 - **Deciders:** Andy Freeman (owner)
 

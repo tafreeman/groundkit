@@ -1,6 +1,6 @@
 # ADR-0004 — Dense store integrity: embedding identity binding and delete-path safety
 
-- **Status:** Proposed (awaiting owner acceptance)
+- **Status:** Accepted (owner, 2026-08-13)
 - **Date:** 2026-08-13
 - **Deciders:** Andy Freeman (owner)
 

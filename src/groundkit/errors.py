@@ -35,6 +35,21 @@ class StorageError(GroundkitError):
     """Error in the persisted index (metadata store, BM25 store, vector store)."""
 
 
+class IndexIdentityError(StorageError):
+    """A collection was opened against an embedding identity it was not built with.
+
+    Raised when the persisted collection manifest's
+    ``(provider, model_name, dimensions)`` triple does not match the active
+    :class:`~groundkit.config.EmbeddingConfig`, or when a store predates the
+    manifest entirely (ADR-0004).
+
+    Never a re-embed and never a fallback: mixing semantic spaces in one
+    index corrupts it silently (SPEC.md §2), and vector width alone cannot
+    detect the swap — distinct models share widths, so identity is the whole
+    triple.
+    """
+
+
 class RetrievalError(GroundkitError):
     """Error during retrieval or search."""
 
