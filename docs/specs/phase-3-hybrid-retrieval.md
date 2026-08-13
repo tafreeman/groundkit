@@ -48,6 +48,12 @@ Two things are *not* seated and must be built before any vector is written:
 
 ## 3. Decisions that need an ADR before code
 
+Both ADRs are now drafted and **Proposed**, awaiting owner acceptance:
+[ADR-0004](../adr/ADR-0004-embedding-identity-binding.md) and
+[ADR-0005](../adr/ADR-0005-fusion-and-rerank-scoring.md). The subsections below
+state the problems they were written to settle; the ADRs hold the decisions,
+alternatives, and citations.
+
 ### 3.1 ADR-0004 — Embedding identity binding (blocking, do first)
 
 **Problem.** SPEC.md §2 forbids cross-provider embedding fallback because
@@ -206,9 +212,13 @@ phase and checking against ADR-0002's stated revisit trigger rather than
 discovering it in Phase 4 when the service opens retrievers per request.
 
 **Q1 — Default retrieval mode after Phase 3.** Does `grk search` default to
-hybrid, or stay BM25-only until a delta justifies the switch? Baseline
-discipline argues for the latter: let the measured delta make the decision,
-and record it.
+hybrid, or stay BM25-only until a delta justifies the switch? **Deliberately
+still open**, and that is the disciplined answer rather than an evasion: SPEC.md
+§6 makes the measured delta the decider, so committing to a default before
+Wave E has produced one would be choosing by assertion. Wave E closes it.
 
-**Q2 — Does the manifest live in SQLite or beside it?** ADR-0004 settles this;
-SQLite is the durable truth per ADR-0002, which argues for in-band.
+**Q2 — Does the manifest live in SQLite or beside it? — Settled.**
+[ADR-0004](../adr/ADR-0004-embedding-identity-binding.md) decision 1 puts it
+in-band, single-row, in SQLite. A sidecar file was rejected as a second source
+of truth that a copy or partial backup can silently decouple from the store it
+describes.
