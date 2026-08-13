@@ -342,6 +342,28 @@ class TestEvalReport:
     def test_schema_version_default(self) -> None:
         assert make_eval_report().schema_version == 1
 
+    @pytest.mark.parametrize("bad_version", [0, 2, 999, -1])
+    def test_unsupported_schema_version_rejected(self, bad_version: int) -> None:
+        """A future artifact version must fail, not be read as this shape.
+
+        An unconstrained int would let a v2 artifact validate against the v1
+        model and be silently misread the first time the format changes.
+        """
+        with pytest.raises(ValidationError):
+            make_eval_report(schema_version=bad_version)
+
+    def test_baseline_stage_must_be_bm25(self) -> None:
+        """stages[0] carrying is_baseline is not enough — it must be BM25.
+
+        SPEC.md §6 fixes BM25-only as the baseline and readers derive every
+        delta against stages[0]; a report whose first stage was 'dense' but
+        flagged as baseline would measure later features against the wrong
+        reference instead of failing.
+        """
+        dense_baseline = make_stage_result(stage="dense", is_baseline=True)
+        with pytest.raises(ValidationError, match="baseline stage must be 'bm25'"):
+            make_eval_report(stages=[dense_baseline])
+
     def test_empty_stages_rejected(self) -> None:
         with pytest.raises(ValidationError, match="stages must not be empty"):
             make_eval_report(stages=[])
@@ -371,9 +393,12 @@ class TestEvalReport:
             make_eval_report(surprise=True)
 
     def test_frozen(self) -> None:
+        # Mutates `stages` rather than `schema_version`: the latter is now
+        # Literal[1], so assigning any other value is a type error before it
+        # is ever a runtime one.
         r = make_eval_report()
         with pytest.raises(ValidationError):
-            r.schema_version = 2
+            r.stages = []
 
     def test_json_round_trip(self) -> None:
         report = make_eval_report()

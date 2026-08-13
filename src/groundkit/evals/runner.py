@@ -227,9 +227,19 @@ def write_report(report: EvalReport, output_path: Path) -> None:
     Args:
         report: The eval report to persist.
         output_path: Destination file (e.g. ``evals/results/latest.json``).
+
+    Raises:
+        EvalError: The parent directory cannot be created or the file cannot
+            be written (unwritable path, a directory where a file is
+            expected, and so on). Wrapped because a bare ``OSError`` escapes
+            every caller that handles :class:`GroundkitError` — the CLI
+            would surface a traceback after an otherwise successful run.
     """
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+    except OSError as exc:
+        raise EvalError(f"Cannot write eval report to {str(output_path)!r}: {exc}") from exc
 
 
 async def _evaluate_judgment(

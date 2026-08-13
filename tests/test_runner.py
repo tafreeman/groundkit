@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from groundkit.contracts import Chunk, Document
+from groundkit.errors import EvalError
 from groundkit.evals.runner import EVAL_CHUNKING_CONFIG, run_eval, write_report
 from groundkit.evals.schema import EvalReport, MetricSet, RunConfig, RunMetadata, StageResult
 from groundkit.ingestion.chunking import RecursiveChunker
@@ -308,51 +309,71 @@ class TestCorpusHash:
         assert first.run.corpus_hash == second.run.corpus_hash
 
 
+def _minimal_report() -> EvalReport:
+    """A schema-valid, all-zeros report — enough to exercise the writer."""
+    return EvalReport(
+        run=RunMetadata(
+            started_at="2026-01-01T00:00:00+00:00",
+            groundkit_version="0.0.0",
+            corpus_hash="a" * 64,
+            judgments_hash="b" * 64,
+            document_count=0,
+            chunk_count=0,
+            judgment_count=0,
+            config=RunConfig(
+                chunk_size=512,
+                chunk_overlap=64,
+                top_k=10,
+                bm25_k1=1.5,
+                bm25_b=0.75,
+                score_threshold=None,
+            ),
+        ),
+        stages=[
+            StageResult(
+                stage="bm25",
+                is_baseline=True,
+                aggregate=MetricSet(
+                    query_count=0,
+                    recall_at_1=0.0,
+                    recall_at_5=0.0,
+                    recall_at_10=0.0,
+                    mrr=0.0,
+                    ndcg_at_10=0.0,
+                ),
+                by_category={},
+                no_answer_query_count=0,
+                no_answer_abstained_count=0,
+                latency_p50_ms=0.0,
+                latency_p95_ms=0.0,
+                latency_p99_ms=0.0,
+                queries=[],
+            )
+        ],
+    )
+
+
 class TestWriteReport:
     """``write_report`` is a plain, parent-creating JSON writer."""
 
+    def test_unwritable_output_raises_eval_error(self, tmp_path: Path) -> None:
+        """A filesystem failure surfaces as EvalError, not a raw OSError.
+
+        ``main()`` catches only GroundkitError, so a bare OSError here would
+        print a traceback after an otherwise successful — and potentially
+        expensive — eval run. Pointing --output at an existing directory is
+        the portable way to force the failure on both POSIX and Windows.
+        """
+        report = _minimal_report()
+        target = tmp_path / "a-directory"
+        target.mkdir()
+
+        with pytest.raises(EvalError, match="Cannot write eval report"):
+            write_report(report, target)
+
     def test_write_report_creates_parent_directories(self, tmp_path: Path) -> None:
         """Writing to a nested, not-yet-existing path creates every parent dir."""
-        report = EvalReport(
-            run=RunMetadata(
-                started_at="2026-01-01T00:00:00+00:00",
-                groundkit_version="0.0.0",
-                corpus_hash="a" * 64,
-                judgments_hash="b" * 64,
-                document_count=0,
-                chunk_count=0,
-                judgment_count=0,
-                config=RunConfig(
-                    chunk_size=512,
-                    chunk_overlap=64,
-                    top_k=10,
-                    bm25_k1=1.5,
-                    bm25_b=0.75,
-                    score_threshold=None,
-                ),
-            ),
-            stages=[
-                StageResult(
-                    stage="bm25",
-                    is_baseline=True,
-                    aggregate=MetricSet(
-                        query_count=0,
-                        recall_at_1=0.0,
-                        recall_at_5=0.0,
-                        recall_at_10=0.0,
-                        mrr=0.0,
-                        ndcg_at_10=0.0,
-                    ),
-                    by_category={},
-                    no_answer_query_count=0,
-                    no_answer_abstained_count=0,
-                    latency_p50_ms=0.0,
-                    latency_p95_ms=0.0,
-                    latency_p99_ms=0.0,
-                    queries=[],
-                )
-            ],
-        )
+        report = _minimal_report()
 
         output_path = tmp_path / "nested" / "dir" / "latest.json"
         write_report(report, output_path)

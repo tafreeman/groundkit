@@ -304,15 +304,19 @@ class EvalReport(BaseModel):
     gap for a future phase to "fix" by adding cross-run diffing.
 
     Attributes:
-        schema_version: Version of this artifact schema.
+        schema_version: Version of this artifact schema. Pinned to the one
+            version this module can actually parse: an artifact labelled
+            with any other version is rejected rather than silently read as
+            though it had this shape, which is what an unconstrained ``int``
+            would do the first time the format changes.
         run: Provenance and settings for this run.
         stages: Per-stage results; non-empty, with exactly one baseline
-            stage, at index 0.
+            stage, at index 0, and that stage is BM25.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: int = 1
+    schema_version: Literal[1] = 1
     run: RunMetadata
     stages: list[StageResult]
 
@@ -327,4 +331,13 @@ class EvalReport(BaseModel):
             )
         if not self.stages[0].is_baseline:
             raise ValueError("the baseline stage must be stages[0]")
+        # SPEC.md §6 fixes BM25-only as *the* baseline, and readers derive
+        # every delta against stages[0]. Checking only the flag and the
+        # position would accept a report whose stages[0] was, say, dense —
+        # and silently measure every later feature against the wrong
+        # reference instead of failing.
+        if self.stages[0].stage != "bm25":
+            raise ValueError(
+                f"the baseline stage must be 'bm25' (SPEC.md §6), got {self.stages[0].stage!r}"
+            )
         return self
