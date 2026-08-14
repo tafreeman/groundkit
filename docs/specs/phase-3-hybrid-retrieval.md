@@ -266,10 +266,40 @@ rather than one being built under it.
 
 - SPEC.md §9 Phase 3 → done with date; `KNOWN_LIMITATIONS.md` updated.
 - ADR-0004/0005 accepted and listed in `docs/adr/index.md`.
-- Decide whether `src/groundkit/index/dense.py` joins
-  `[tool.groundkit.coverage].core_subset`. It is core retrieval, and the
-  current subset list would otherwise exclude it while covering `bm25.py` —
-  an asymmetry worth closing deliberately rather than by omission.
+- **Add `src/groundkit/index/dense.py` to
+  `[tool.groundkit.coverage].core_subset` — decided, do it here.** It is
+  scoring (`_cosine_similarity`, `_clamp_score`, `_matches_filter`,
+  `_sort_by_score`), the vector peer of the already-gated `bm25.py`; it holds
+  both live ADR-0001 hazards (3 and 5), and hazard 3 has now demonstrated
+  that an ungated guard decays quietly; and `retrieval/fusion.py` is already
+  gated by the `retrieval/*` glob, so leaving `dense.py` out gates the
+  combiner but not one of its two inputs. It sits at 100% today, so the gate
+  costs nothing to add now and would cost a fight later.
+
+  **Two caveats that must be written into the same commit, not left to
+  omission — the exact failure this bullet was created to avoid:**
+
+  1. **Why `index/metadata.py` still stays out.** "It is core, so gate it"
+     proves too much: `metadata.py` is the durable truth (ADR-0002) and is
+     equally core by that argument. The `index/` entries are enumerated
+     file-by-file precisely because the reasoning is per-file, unlike the
+     `retrieval/*` glob. Say so explicitly, or the next reader reopens it.
+  2. **`dense.py` is a mixed file** — roughly two-thirds shared helpers plus
+     `InMemoryVectorStore`, one-third `LanceDBVectorStore` behind the
+     optional `dense` extra. Gating it wholesale admits, inside a single
+     file, the offsetting the subset exists to prevent: well-covered LanceDB
+     rows can mask a thin in-memory path, or the reverse, and the gate cannot
+     see the difference. Accepted because `lancedb` is pinned in the dev
+     group (`pyproject.toml`) so CI genuinely covers both halves — a
+     convention, not an invariant, and worth recording as the thing that
+     makes this safe.
+
+  The cleaner long-term fix is splitting `LanceDBVectorStore` into its own
+  module so the core half can be gated without caveat 2. That is a real
+  refactor and must **not** ride along inside Wave F; if it happens, it is
+  its own change with its own ADR.
+- Accept ADR-0007 (or amend it) — it lands from Wave E as **Proposed**, and a
+  phase must not close with an open proposal deciding its default behaviour.
 - No hardcoded metric numbers in any doc (SPEC.md §2).
 
 ## 5. Hazard obligations carried into this phase
