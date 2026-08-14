@@ -160,8 +160,8 @@ per SPEC.md §9:
   writes ever happened beyond the manifest itself.
 - **The CLI exposes the dense path, entirely opt-in.** `grk ingest --dense`
   embeds and writes vectors alongside the SQLite write; `grk search --mode
-  {bm25,dense,hybrid}` reads them back (default `bm25`, unchanged by this
-  wave — Q1 stays open). Both share `--embed-provider`/`--embed-model`/
+  {bm25,dense,hybrid}` reads them back (default `bm25`, and it stays there —
+  Q1 is decided in ADR-0007). Both share `--embed-provider`/`--embed-model`/
   `--embed-dimensions`/`--embed-base-url`, which resolve to their defaults
   (`ollama`/`nomic-embed-text`/768/the local Ollama endpoint) only once a
   dense path is actually active — supplying any of them without `--dense`

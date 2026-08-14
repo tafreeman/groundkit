@@ -396,9 +396,12 @@ as corpus size grows, leaving the BM25 rebuild as the only O(corpus) term in
 measurements. Per repo policy, no number from a run of that script is quoted
 here or anywhere else — regenerate them by running the script.
 
-**Q1 — Default retrieval mode after Phase 3.** Does `grk search` default to
-hybrid, or stay BM25-only until a delta justifies the switch? **The quality
-half is now measured; the decision is not yet made, and needs an ADR.**
+**Q1 — Default retrieval mode after Phase 3. — Decided.** Does `grk search`
+default to hybrid, or stay BM25-only? **`grk search` stays on `bm25`**,
+recorded in [ADR-0007](../adr/ADR-0007-default-retrieval-mode.md), which is
+**Proposed** and whose acceptance is a Wave F item. The reasoning is below;
+the decision itself is not open, and the only thing outstanding is owner
+sign-off on the record of it.
 
 A gated run against the committed golden corpus (`nomic-embed-text` via local
 Ollama) produced the first real delta. Qualitatively — the values live in the

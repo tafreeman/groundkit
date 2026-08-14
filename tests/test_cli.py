@@ -190,11 +190,13 @@ def test_search_mode_hybrid_over_dense_ingested_collection_reports_fusion_stage(
 def test_search_default_mode_stays_bm25_over_dense_ingested_collection(
     corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Q1 (docs/specs/phase-3-hybrid-retrieval.md) is deliberately open: the
-    # default mode must stay "bm25" even over a collection that also has a
-    # dense index, until Wave E's measured delta decides otherwise. If this
-    # test ever fails because the default changed, that change must come
-    # from Wave E's data, not from this CLI wiring.
+    # Q1 is decided (ADR-0007): the default mode stays "bm25" even over a
+    # collection that also carries a dense index. Wave E measured the delta
+    # and hybrid won it on quality — the default did not move, because
+    # hybrid cannot abstain and would require an embedding provider the
+    # default install does not ship. If this test ever fails because the
+    # default changed, that change needs an accepted ADR superseding
+    # ADR-0007, not a larger delta and not a CLI-wiring tweak.
     idx = str(tmp_path / "idx")
     main(["ingest", str(corpus), "--index-dir", idx, "--dense", "--embed-provider", "inmemory"])
     capsys.readouterr()
