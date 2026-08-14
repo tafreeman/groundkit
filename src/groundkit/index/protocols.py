@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from groundkit.contracts import Chunk, RetrievalResult
+    from groundkit.contracts import Chunk, CollectionManifest, EmbeddingIdentity
 
 
 @runtime_checkable
@@ -24,6 +24,10 @@ class MetadataStoreProtocol(Protocol):
 
     async def get_document_hash(self, source: str) -> str | None:
         """Return the stored content hash for ``source``, or None if unseen."""
+        ...
+
+    async def get_document_id(self, source: str) -> str | None:
+        """Return the stored document ID for ``source``, or None if unseen."""
         ...
 
     async def get_document_sources(self) -> dict[str, str]:
@@ -60,6 +64,41 @@ class MetadataStoreProtocol(Protocol):
         """Delete a document and its chunks. Returns deleted-chunk count."""
         ...
 
+    async def write_manifest(self, identity: EmbeddingIdentity) -> None:
+        """Write the collection's embedding-identity manifest, once (ADR-0004).
+
+        Called on a collection's first dense write. Immutable thereafter: a
+        later call with the same ``(provider, model_name, dimensions)``
+        triple as the stored manifest is a no-op (re-ingesting into an
+        already-bound collection must keep working); a call with a
+        different triple is refused, never silently overwritten.
+
+        Raises:
+            IndexIdentityError: The store predates the embedding-identity
+                manifest and cannot be used for dense work, or a manifest
+                already exists with a different identity triple.
+        """
+        ...
+
+    async def verify_manifest(self, identity: EmbeddingIdentity) -> None:
+        """Verify ``identity`` matches the collection's stored identity manifest.
+
+        A collection with no manifest yet (no dense write has ever
+        happened) has nothing to conflict with, so verification passes
+        trivially. Never a re-embed, never a fallback, never a
+        warn-and-continue: a real mismatch always raises.
+
+        Raises:
+            IndexIdentityError: The store predates the embedding-identity
+                manifest and cannot be used for dense work, or the stored
+                manifest's identity triple does not match ``identity``.
+        """
+        ...
+
+    async def get_manifest(self) -> CollectionManifest | None:
+        """Return the collection's embedding-identity manifest, or None if unset."""
+        ...
+
 
 @runtime_checkable
 class VectorStoreProtocol(Protocol):
@@ -78,10 +117,24 @@ class VectorStoreProtocol(Protocol):
         query_embedding: list[float],
         top_k: int = 5,
         metadata_filter: dict[str, Any] | None = None,
-    ) -> list[RetrievalResult]:
-        """Return the most similar chunks. ``metadata_filter`` keeps only
-        chunks whose metadata contains all specified key/value pairs — it is
-        never accepted-and-ignored."""
+    ) -> list[tuple[Chunk, float]]:
+        """Return the most similar chunks as ``(chunk, score)`` pairs.
+
+        ``metadata_filter`` keeps only chunks whose metadata contains all
+        specified key/value pairs — it is never accepted-and-ignored.
+
+        Returns ``(Chunk, score)`` rather than ``RetrievalResult`` for the
+        same reason ``BM25Index.search`` does: only ``Document`` carries a
+        source path, so a store that holds chunks cannot construct a
+        verifiable citation on its own. Joining chunks to their document
+        source is ``retrieval.Retriever``'s job, against the metadata store
+        that owns that mapping (ADR-0002). A vector store that built
+        ``RetrievalResult`` itself would have to be handed the source
+        alongside each chunk, duplicating document-level truth into every
+        chunk row — a second copy that drifts the moment a document is
+        re-ingested from a new path. Scores are ``>= 0.0``; ordering is
+        descending with a deterministic tie-break.
+        """
         ...
 
     async def delete(self, document_id: str) -> int:

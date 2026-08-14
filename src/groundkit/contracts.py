@@ -1,4 +1,5 @@
-"""Core data model: Document, Chunk, RetrievalResult, Citation, SearchResponse.
+"""Core data model: Document, Chunk, RetrievalResult, Citation, SearchResponse,
+EmbeddingIdentity, CollectionManifest.
 
 Ported from ARP's ``agentic_v2/rag/contracts.py`` per ADR-0001, with two
 deliberate changes: chunks carry **character offsets** into their source
@@ -156,6 +157,62 @@ class RetrievalResult(BaseModel):
             start_offset=self.start_offset,
             end_offset=self.end_offset,
         )
+
+
+class EmbeddingIdentity(BaseModel):
+    """The embedding identity triple a collection is bound to (ADR-0004 decision 2).
+
+    The *input* to a manifest write or verify, and the exact set of fields
+    ADR-0004 defines identity as — no more. Distinct from
+    :class:`CollectionManifest`, which is what comes back *out* of the store
+    and additionally carries the ``created_at`` stamp the store assigns.
+
+    Deliberately not an ``EmbeddingConfig``: that model also carries
+    operational settings (``base_url``, ``batch_size``, ``timeout_seconds``)
+    that have nothing to do with which semantic space a collection lives in,
+    and its ``provider`` is a closed ``Literal`` over the providers this repo
+    ships, which a third-party
+    :class:`~groundkit.providers.protocols.EmbeddingProtocol` implementation
+    could not satisfy. Taking the narrow triple lets the identity be read
+    straight off the embedder that actually produces the vectors.
+
+    Attributes:
+        provider: Embedding provider identity (e.g. ``"ollama"``).
+        model_name: Model identifier used to embed.
+        dimensions: Embedding vector width.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider: str
+    model_name: str
+    dimensions: int = Field(gt=0)
+
+
+class CollectionManifest(BaseModel):
+    """The persisted embedding identity a collection was built with (ADR-0004).
+
+    Identity is the triple ``(provider, model_name, dimensions)``, checked
+    as a triple — never dimensions alone. Distinct embedding models can
+    share a vector width (``nomic-embed-text`` and ``all-mpnet-base-v2`` are
+    both 768-dimensional), so a width-only check would admit exactly the
+    model swap this manifest exists to reject. Written once, by
+    ``SQLiteMetadataStore.write_manifest`` on a collection's first dense
+    write, and immutable for the collection's lifetime thereafter.
+
+    Attributes:
+        provider: Embedding provider the collection was built with.
+        model_name: Model identifier the collection was built with.
+        dimensions: Embedding vector width the collection was built with.
+        created_at: ISO-8601 UTC timestamp of the manifest's creation.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider: str
+    model_name: str
+    dimensions: int = Field(gt=0)
+    created_at: str
 
 
 class SearchResponse(BaseModel):

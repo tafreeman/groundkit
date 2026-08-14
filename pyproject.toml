@@ -26,6 +26,15 @@ dependencies = [
   "httpx>=0.27,<1",
 ]
 
+[project.optional-dependencies]
+# Dense retrieval backend (Phase 3, ADR-0004). Optional so a BM25-only install
+# stays light — but pinned in the dev group below as well, because CI must
+# actually exercise the backend rather than skip it: no job that is the sole
+# proof of a backend may be continue-on-error (SPEC.md §3).
+dense = [
+  "lancedb>=0.13,<1",
+]
+
 [project.scripts]
 grk = "groundkit.cli:main"
 
@@ -37,6 +46,7 @@ dev = [
   "pytest-cov>=5,<8",
   "pip-audit>=2.7,<3",
   "pre-commit>=4,<6",
+  "lancedb>=0.13,<1",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -59,7 +69,11 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "ARG", "S", "RUF"]
 strict = true
 python_version = "3.11"
 files = ["src/groundkit", "tests"]
-mypy_path = "src"
+# "tests" is on the path so cross-test helper imports (e.g. the shared
+# assert_signature_parity conformance helper) resolve under mypy the same way
+# pytest resolves them at run time. Without it the checked file set silently
+# diverges from the executed one.
+mypy_path = ["src", "tests"]
 explicit_package_bases = true
 
 [tool.pytest.ini_options]

@@ -79,6 +79,232 @@ def test_no_command_prints_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert "usage: grk" in capsys.readouterr().out
 
 
+def test_ingest_dense_writes_vectors_and_lance_store(
+    corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    idx = str(tmp_path / "idx")
+    assert (
+        main(
+            [
+                "ingest",
+                str(corpus),
+                "--index-dir",
+                idx,
+                "--dense",
+                "--embed-provider",
+                "inmemory",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert out == (
+        "ingested: 2 files seen, 2 indexed, 0 unchanged, 2 chunks written, "
+        "2 vectors written, 0 vectors deleted\n"
+    )
+    assert (Path(idx) / "default.lance").is_dir()
+
+
+def test_ingest_without_dense_output_format_unchanged(
+    corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    idx = str(tmp_path / "idx")
+    assert main(["ingest", str(corpus), "--index-dir", idx]) == 0
+    out = capsys.readouterr().out
+    assert out == "ingested: 2 files seen, 2 indexed, 0 unchanged, 2 chunks written\n"
+
+
+def test_search_mode_dense_over_dense_ingested_collection(
+    corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    idx = str(tmp_path / "idx")
+    main(["ingest", str(corpus), "--index-dir", idx, "--dense", "--embed-provider", "inmemory"])
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "search",
+                "reciprocal rank fusion",
+                "--index-dir",
+                idx,
+                "--mode",
+                "dense",
+                "--embed-provider",
+                "inmemory",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "no results" not in out
+    assert "1. [" in out
+
+    assert (
+        main(
+            [
+                "search",
+                "reciprocal rank fusion",
+                "--index-dir",
+                idx,
+                "--mode",
+                "dense",
+                "--embed-provider",
+                "inmemory",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["metadata"]["stage"] == "dense"
+
+
+def test_search_mode_hybrid_over_dense_ingested_collection_reports_fusion_stage(
+    corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    idx = str(tmp_path / "idx")
+    main(["ingest", str(corpus), "--index-dir", idx, "--dense", "--embed-provider", "inmemory"])
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "search",
+                "reciprocal rank fusion",
+                "--index-dir",
+                idx,
+                "--mode",
+                "hybrid",
+                "--embed-provider",
+                "inmemory",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["metadata"]["stage"] == "fusion"
+
+
+def test_search_default_mode_stays_bm25_over_dense_ingested_collection(
+    corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Q1 (docs/specs/phase-3-hybrid-retrieval.md) is deliberately open: the
+    # default mode must stay "bm25" even over a collection that also has a
+    # dense index, until Wave E's measured delta decides otherwise. If this
+    # test ever fails because the default changed, that change must come
+    # from Wave E's data, not from this CLI wiring.
+    idx = str(tmp_path / "idx")
+    main(["ingest", str(corpus), "--index-dir", idx, "--dense", "--embed-provider", "inmemory"])
+    capsys.readouterr()
+
+    assert main(["search", "reciprocal rank fusion", "--index-dir", idx, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["metadata"]["stage"] == "bm25"
+
+
+def test_ingest_embed_flag_without_dense_fails_closed(
+    corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    idx = str(tmp_path / "idx")
+    assert main(["ingest", str(corpus), "--index-dir", idx, "--embed-model", "some-model"]) == 1
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "--dense" in err
+
+
+def test_search_embed_flag_without_dense_mode_fails_closed(
+    corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    idx = str(tmp_path / "idx")
+    main(["ingest", str(corpus), "--index-dir", idx])
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "search",
+                "reciprocal rank fusion",
+                "--index-dir",
+                idx,
+                "--embed-model",
+                "some-model",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "--mode" in err
+
+
+def test_search_dense_identity_mismatch_fails_closed(
+    corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    idx = str(tmp_path / "idx")
+    main(
+        [
+            "ingest",
+            str(corpus),
+            "--index-dir",
+            idx,
+            "--dense",
+            "--embed-provider",
+            "inmemory",
+            "--embed-dimensions",
+            "384",
+        ]
+    )
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "search",
+                "reciprocal rank fusion",
+                "--index-dir",
+                idx,
+                "--mode",
+                "dense",
+                "--embed-provider",
+                "inmemory",
+                "--embed-dimensions",
+                "512",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "identity" in err
+
+
+def test_search_dense_over_never_dense_ingested_collection_returns_no_results(
+    corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    idx = str(tmp_path / "idx")
+    main(["ingest", str(corpus), "--index-dir", idx])  # BM25-only: no --dense
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "search",
+                "reciprocal rank fusion",
+                "--index-dir",
+                idx,
+                "--mode",
+                "dense",
+                "--embed-provider",
+                "inmemory",
+            ]
+        )
+        == 0
+    )
+    assert "no results" in capsys.readouterr().out
+
+
 @pytest.fixture
 def eval_corpus(tmp_path: Path) -> Path:
     """A tiny two-document golden corpus for ``grk eval``."""

@@ -19,6 +19,21 @@ class EmbeddingProtocol(Protocol):
         """Model identity used to embed."""
         ...
 
+    @property
+    def dimensions(self) -> int:
+        """Vector width this embedder produces.
+
+        Part of the seam (rather than read off an ``EmbeddingConfig``
+        alongside it) because ADR-0004's collection manifest binds a
+        collection to the ``(provider, model_name, dimensions)`` triple of
+        whatever actually produced its vectors. Sourcing all three from the
+        embedder itself makes "the manifest describes a different model than
+        the one that embedded" unrepresentable, instead of a divergence a
+        caller has to be trusted not to introduce by passing a config that
+        disagrees with the embedder built from a different one.
+        """
+        ...
+
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """Embed ``texts``, preserving input order.
 

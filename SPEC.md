@@ -184,6 +184,17 @@ providers excluded, README states the subset honestly). `mypy --strict`
 clean. A failing gate blocks the phase. Conventional commits, small
 changesets; each phase ends with CI green and docs updated in the same change.
 
+**A regression test is not accepted on the strength of passing.** Every test
+written to close a named defect — an ADR-0001 hazard, a review finding, a bug
+fix — must be run against the unfixed code and observed to *fail*, then run
+against the fix and observed to pass. Both directions get reported. A test
+that passes before the fix is testing something other than the defect, and a
+green suite is evidence of nothing until that has been ruled out. This matters
+most for exactly the defects this repo keeps finding: crash windows,
+cancellation paths, and cross-run reproducibility are unreachable on a
+non-failing path, so they are invisible to coverage and to a passing suite
+alike. Revert the source (not the test), run, restore, run.
+
 ## 9. Phase plan & status
 
 | Phase | Deliverable | "Done" means | Status |
