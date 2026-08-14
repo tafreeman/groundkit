@@ -432,11 +432,18 @@ The honest reading is that the measurement licenses hybrid as the
 *recommended* mode where a provider is configured, not as the unconditional
 default. **Recorded as
 [ADR-0007](../adr/ADR-0007-default-retrieval-mode.md) (Proposed).** BM25 stays
-the default, no behaviour changes, and the reopening condition is abstention
-becoming reachable on the dense path — a design gap, not a data gap. Note
-what that means in practice: growing the corpus or re-running the gate until
-the delta is larger does **not** reopen it, which is deliberate, since R2
-warns against exactly that reflex.
+the default and no behaviour changes.
+
+The reopening condition is **hybrid** becoming able to abstain — not dense.
+The distinction is the whole point and is easy to lose: dense *already*
+abstains when `score_threshold` is set, so calibrating a dense threshold
+would feel like progress toward reopening while leaving the actual blocker
+untouched. Hybrid is the mode proposed as the default, and ADR-0005 decision
+6 keeps thresholding away from rank-derived fused scores deliberately, so
+hybrid needs a genuinely different abstention rule rather than the dense one
+extended. That is a design gap. Note also what does *not* reopen it: growing
+the corpus, or re-running the gate until the delta is larger, moves no part
+of this — deliberate, since R2 warns against exactly that reflex.
 
 **Q2 — Does the manifest live in SQLite or beside it? — Settled.**
 [ADR-0004](../adr/ADR-0004-embedding-identity-binding.md) decision 1 puts it

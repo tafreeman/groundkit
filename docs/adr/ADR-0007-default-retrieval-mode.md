@@ -16,8 +16,16 @@ The measurement now exists. A gated run (`EVAL_GATED=1`, `nomic-embed-text`
 via local Ollama) over the committed golden corpus found **dense and fusion
 both improving on the BM25 baseline with no metric regressing**; fusion
 additionally improved recall@10, where dense tied. Values are not restated
-here — they live in the generated artifact (SPEC.md §2). Reproduce with
-`.github/workflows/eval-gated.yml` or the local command in `CLAUDE.md`.
+here — they live in the generated artifact (SPEC.md §2). Reproduce it:
+
+```bash
+uv run grk eval --dense --embed-model nomic-embed-text
+```
+
+which writes the full report to `evals/results/latest.json` (gitignored,
+regenerated per run). The gated test suite covers the same path via
+`EVAL_GATED=1 uv run pytest tests/test_eval_gated.py`, and
+`.github/workflows/eval-gated.yml` runs both on demand.
 
 Two facts constrain what may be concluded from that.
 
