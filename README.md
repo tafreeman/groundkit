@@ -75,6 +75,43 @@ full report:
 uv run grk eval --dense --embed-model nomic-embed-text
 ```
 
+### Building a dense index — start a fresh collection
+
+**`--mode hybrid` only works against a collection that was ingested with
+`--dense`.** Adding it to an existing BM25-only collection does not work, and
+does not tell you it did not work:
+
+```bash
+# WRONG — this silently gives you BM25 rankings labelled as hybrid.
+uv run grk ingest ./docs                    # BM25-only collection
+uv run grk search "your query" --mode hybrid   # fuses BM25 with an empty dense side
+uv run grk ingest ./docs --dense            # "0 vectors written" — every doc hash-skipped
+```
+
+Ingestion is incremental by content hash, and that check runs *before*
+embedding — which is what stops unchanged documents being re-embedded on
+every run, and is also why turning `--dense` on later backfills nothing.
+Only documents whose content changes afterwards ever gain vectors, so the
+collection stays permanently vector-less and no command reports that. The
+dense side then contributes nothing to fusion, and you get BM25 results
+believing you are looking at hybrid ones.
+
+Do this instead — a dense collection from the first ingest:
+
+```bash
+ollama pull nomic-embed-text                       # once; any embedding model works
+uv run grk ingest ./docs --collection dense --dense
+uv run grk search "your query" --collection dense --mode hybrid
+```
+
+To convert a collection you already have, delete it and re-ingest: remove
+`.groundkit/<collection>.sqlite3` and `.groundkit/<collection>.lance`, then
+run the `--dense` ingest above. There is no in-place upgrade — see
+[KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for why, and for the inverse
+hazard (a BM25-only ingest over a dense collection orphans its vectors).
+
+### The tradeoff
+
 **Hybrid is recommended wherever you have an embedding provider configured
 and can accept two costs**, both of which sit outside those quality metrics:
 
