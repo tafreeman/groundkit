@@ -696,8 +696,30 @@ class SQLiteMetadataStore:
             except sqlite3.Error as exc:
                 await asyncio.to_thread(self._conn.rollback)
                 raise StorageError(str(exc)) from exc
-            except Exception:
-                await asyncio.to_thread(self._conn.rollback)
+            except BaseException:
+                # BaseException, not Exception: CancelledError is not an
+                # Exception, so an `except Exception` here skipped the
+                # rollback on exactly the path that needs it most — a
+                # cancelled task (gather abandoning siblings, a timeout)
+                # leaving the implicit transaction's already-executed
+                # statements uncommitted but not undone, ready to leak out
+                # on the next unrelated commit.
+                #
+                # Rolled back synchronously rather than through to_thread:
+                # awaiting anything inside an already-cancelling task can
+                # re-raise CancelledError before the rollback ever runs. The
+                # lock is still held, so no other operation can be mid-
+                # statement on this connection, and a rollback is short
+                # enough to run on the loop thread.
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    # Already closed (a cancelled operation racing store
+                    # teardown) or otherwise unusable. There is no open
+                    # transaction left to undo in that state, and raising
+                    # here would replace the exception we are propagating
+                    # with a less informative one.
+                    logger.debug("Rollback skipped: connection unusable", exc_info=True)
                 raise
 
 

@@ -304,7 +304,29 @@ class Indexer:
             async with semaphore:
                 return await self._process(str(path))
 
-        outcomes = await asyncio.gather(*(_one(path) for path in files))
+        # return_exceptions=True: a bare gather propagates the first failure
+        # immediately and cancels every in-flight sibling, which can land a
+        # CancelledError between a sibling's dense write and its SQLite
+        # commit — the one window the ordering invariant above cannot make
+        # self-healing, since the interrupted document never gets to record
+        # that it is mid-write. Letting every _process finish or fail on its
+        # own costs nothing (the failure still propagates, below) and leaves
+        # no torn write behind.
+        settled = await asyncio.gather(*(_one(path) for path in files), return_exceptions=True)
+
+        outcomes: list[_SourceOutcome] = []
+        first_error: BaseException | None = None
+        for result in settled:
+            if isinstance(result, BaseException):
+                # files is path-sorted and gather resolves in argument order,
+                # so "first" is deterministic across runs.
+                if first_error is None:
+                    first_error = result
+            else:
+                outcomes.append(result)
+        if first_error is not None:
+            raise first_error
+
         totals = _aggregate(outcomes)
 
         # Runs after every _process call has completed, so it can never see
@@ -398,9 +420,18 @@ class Indexer:
 
         Within the dense half the order is also load-bearing:
 
-        - The previous version's vectors are deleted *before*
-          ``replace_document`` runs, because ``replace_document`` destroys
-          the row ``get_document_id`` reads the old id from.
+        - The old document id is read *before* ``replace_document`` runs,
+          because ``replace_document`` destroys the row
+          ``get_document_id`` reads it from.
+        - The new vectors are added *before* the old ones are deleted.
+          Deleting first opens a window in which the document has no
+          vectors at all: a crash there, followed by a content reversion
+          (``git checkout``), leaves SQLite's ``content_hash`` matching
+          the restored bytes, so every later run hash-skips the document
+          and it stays silently absent from dense results forever. The
+          add-first residue is the benign one — both versions' vectors
+          present, the un-advanced hash guaranteeing the next run redoes
+          the document and deletes the stale set.
         - The manifest is bound after embedding succeeds and before the
           first ``add`` (see :meth:`_ensure_manifest`).
 
@@ -424,9 +455,20 @@ class Indexer:
             embeddings = await embedder.embed([chunk.content for chunk in chunks])
             await self._ensure_manifest(embedder)
             old_id = await self._store.get_document_id(doc.source)
-            if old_id is not None:
+            if old_id is not None and old_id == doc.document_id:
+                # Ids collide, so rows added under the new id are
+                # indistinguishable from the old ones and the delete cannot
+                # come second — it would take the new vectors with it. Not
+                # reachable while Document.document_id defaults to a fresh
+                # uuid4 per load (contracts.py), but a content-derived id
+                # would make it the normal path, and the failure it guards
+                # against is silent data loss rather than an error.
                 vectors_deleted = await vector_store.delete(old_id)
-            await vector_store.add(chunks, embeddings)
+                await vector_store.add(chunks, embeddings)
+            else:
+                await vector_store.add(chunks, embeddings)
+                if old_id is not None:
+                    vectors_deleted = await vector_store.delete(old_id)
             vectors_written = len(embeddings)
         await self._store.replace_document(
             source=doc.source,

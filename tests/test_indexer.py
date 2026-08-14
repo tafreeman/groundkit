@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Final
 
@@ -146,6 +147,70 @@ class _CountingEmbedder:
         self.embed_calls += 1
         self.texts_embedded += len(texts)
         return await self._inner.embed(texts)
+
+
+class _RecordingVectorStore:
+    """Wraps :class:`InMemoryVectorStore`, recording call order; ``delete`` can fail once.
+
+    The G1 regression seam. The replace path's ``add``/``delete`` order is
+    not observable from final state — both orders converge on the same
+    stored rows when nothing fails — so the order itself has to be recorded
+    to be asserted. ``fail_delete_once`` then stops the run in the window
+    between them, which *is* state-observable.
+
+    Satisfies :class:`~groundkit.index.protocols.VectorStoreProtocol`
+    structurally.
+    """
+
+    def __init__(self, *, fail_delete_once: bool = False) -> None:
+        self._inner: InMemoryVectorStore = InMemoryVectorStore()
+        self.calls: list[str] = []
+        self._armed: bool = fail_delete_once
+
+    async def add(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
+        self.calls.append("add")
+        await self._inner.add(chunks, embeddings)
+
+    async def search(
+        self,
+        query_embedding: list[float],
+        top_k: int = 5,
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> list[tuple[Chunk, float]]:
+        return await self._inner.search(query_embedding, top_k, metadata_filter)
+
+    async def delete(self, document_id: str) -> int:
+        self.calls.append("delete")
+        if self._armed:
+            self._armed = False
+            raise StorageError("simulated dense-store outage on delete()")
+        return await self._inner.delete(document_id)
+
+
+class _SlowFailingChunker:
+    """Raises for one target source; sleeps on every other, recording completions.
+
+    The G2 regression seam. "One file's failure must not abandon its
+    siblings" is only observable while the siblings are still in flight, so
+    the target has to fail *fast* and the siblings have to be *slow*: the
+    target is the first entry in path-sorted order, and every other source
+    blocks long enough to still be mid-``_process`` when it does. Chunking
+    runs through ``asyncio.to_thread``, so a blocking sleep here suspends
+    that source without blocking the loop.
+    """
+
+    def __init__(self, target_name: str) -> None:
+        self._inner: RecursiveChunker = RecursiveChunker()
+        self._target_name: str = target_name
+        self.completed: list[str] = []
+
+    def chunk(self, document: Document, **kwargs: Any) -> list[Chunk]:
+        if Path(document.source).name == self._target_name:
+            raise RuntimeError(f"simulated chunker failure for {self._target_name}")
+        time.sleep(0.25)
+        chunks = self._inner.chunk(document, **kwargs)
+        self.completed.append(Path(document.source).name)
+        return chunks
 
 
 class _FailOnceVectorStore:
@@ -1205,6 +1270,141 @@ def test_legacy_unstamped_store_is_refused_for_dense_indexing(corpus: Path, tmp_
             bm25_only = Indexer(store, FileLoader(allowed_base_dir=corpus))
             report = await bm25_only.index_directory(str(corpus))
             assert report.documents_indexed == 3
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_dense_replace_adds_new_vectors_before_deleting_old(corpus: Path, tmp_path: Path) -> None:
+    """The replace path must add the new vectors before deleting the old ones.
+
+    G1. Deleting first opens a window in which the document has no vectors
+    at all, and that window is not self-healing: a crash inside it leaves
+    SQLite's ``content_hash`` still matching the *previous* content, so
+    reverting the file (``git checkout``) makes every later run hash-skip
+    the document — permanently, silently absent from dense results, which
+    is exactly what SPEC.md §2's fail-closed rule forbids. Ordering is
+    invisible in final state (both orders converge when nothing fails), so
+    it is pinned by call order here and by consequence in
+    ``test_crash_between_dense_add_and_delete_preserves_old_vectors``.
+    """
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            recorder = _RecordingVectorStore()
+            indexer = Indexer(
+                store,
+                FileLoader(allowed_base_dir=corpus),
+                embedder=_CountingEmbedder(),
+                vector_store=recorder,
+            )
+            alpha = corpus / "alpha.md"
+
+            await indexer.index_source(str(alpha))
+            # First ingest: nothing stored for this source, so no delete.
+            assert recorder.calls == ["add"]
+
+            alpha.write_text("Entirely different content for the replace.", encoding="utf-8")
+            report = await indexer.index_source(str(alpha))
+            assert report.documents_indexed == 1
+
+            # The replace: add strictly precedes delete.
+            assert recorder.calls == ["add", "add", "delete"]
+            await _assert_dense_matches_sqlite(store, recorder)
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_crash_between_dense_add_and_delete_preserves_old_vectors(
+    corpus: Path, tmp_path: Path
+) -> None:
+    """A crash mid-replace must leave the previous content still dense-searchable.
+
+    G1's defect, reproduced end to end: fail between the two dense writes,
+    then revert the file. Under delete-first the old vectors were already
+    gone and the un-advanced ``content_hash`` now matches the reverted
+    bytes, so the document is skipped forever with no error — a silent
+    permanent hole. Under add-first the old vectors are still there, so the
+    reverted content resolves correctly.
+
+    What this does *not* claim: the interrupted run's vectors remain in the
+    store under a ``document_id`` SQLite never committed, and no prune sweep
+    can reach them (sweeps iterate SQLite). That residue is loud rather than
+    silent — ``Retriever.search`` fails closed on it — and is recorded in
+    ``KNOWN_LIMITATIONS.md``.
+    """
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            recorder = _RecordingVectorStore(fail_delete_once=True)
+            indexer = Indexer(
+                store,
+                FileLoader(allowed_base_dir=corpus),
+                embedder=_CountingEmbedder(),
+                vector_store=recorder,
+            )
+            alpha = corpus / "alpha.md"
+            original = alpha.read_text(encoding="utf-8")
+
+            await indexer.index_source(str(alpha))
+
+            alpha.write_text("Replacement content that will fail to land.", encoding="utf-8")
+            with pytest.raises(StorageError):
+                await indexer.index_source(str(alpha))
+
+            # The add landed, the delete did not, and SQLite never advanced.
+            assert recorder.calls == ["add", "add", "delete"]
+            stored = await store.get_chunks()
+            assert any(original[:20] in chunk.content for chunk in stored)
+
+            # Revert: the hash now matches what SQLite still holds, so the
+            # document is skipped -- and must still be dense-searchable.
+            alpha.write_text(original, encoding="utf-8")
+            report = await indexer.index_source(str(alpha))
+            assert report.documents_skipped == 1
+            assert report.documents_indexed == 0
+
+            rows = await _dense_rows(recorder)
+            assert any("Restarts do not lose data" in chunk.content for chunk, _ in rows)
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_one_failing_file_does_not_abandon_its_siblings(corpus: Path, tmp_path: Path) -> None:
+    """A single file's failure must not cancel siblings mid-write.
+
+    G2. ``asyncio.gather`` without ``return_exceptions=True`` propagates the
+    first failure immediately and cancels every in-flight sibling, landing a
+    ``CancelledError`` inside whatever store call each was awaiting -- for a
+    dense-enabled indexer, potentially between the vector write and the
+    SQLite commit, the one torn state the ordering invariant cannot make
+    self-healing. Every sibling must therefore run to completion before the
+    failure propagates.
+
+    ``alpha.md`` sorts first and fails instantly; the rest sleep, so under a
+    bare gather they are still in flight when it does.
+    """
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            chunker = _SlowFailingChunker("alpha.md")
+            indexer = Indexer(store, FileLoader(allowed_base_dir=corpus), chunker)
+
+            with pytest.raises(IngestionError):
+                await indexer.index_directory(str(corpus))
+
+            # Both siblings finished rather than being cancelled mid-flight.
+            assert sorted(chunker.completed) == ["beta.txt", "gamma.md"]
+            sources = await store.get_document_sources()
+            assert sorted(Path(s).name for s in sources.values()) == ["beta.txt", "gamma.md"]
         finally:
             await store.close()
 

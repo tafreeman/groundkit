@@ -807,3 +807,49 @@ def test_sqlite_metadata_store_has_signature_parity_with_protocol() -> None:
     names, kinds, order, defaults, and resolved type hints.
     """
     assert_signature_parity(MetadataStoreProtocol, SQLiteMetadataStore)
+
+
+def test_cancelled_operation_rolls_back_its_partial_writes(tmp_path: Path) -> None:
+    """A cancelled operation must roll back, not leave writes pending.
+
+    G2's second half. The connection runs in sqlite3's legacy transaction
+    mode: an implicit transaction opens at the first DML statement and stays
+    open, its writes visible to later reads on this same connection and
+    durable the moment any *other* commit runs on it. ``_run`` rolls back on
+    the way out for exactly that reason -- but under ``except Exception`` it
+    skipped the path that needs it most, since ``CancelledError`` derives
+    from ``BaseException``, not ``Exception``. A sibling cancelled by
+    ``asyncio.gather`` therefore left its half-written statements armed to
+    leak out on the next unrelated commit.
+
+    Driven through ``_run`` directly: the invariant is about how ``_run``
+    unwinds, and every public method commits atomically, so there is no
+    public seam that can be interrupted mid-transaction on purpose.
+    """
+
+    async def run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path / "idx", "default")
+        try:
+
+            def _op() -> None:
+                store._conn.execute(
+                    "INSERT INTO documents (document_id, source, content_hash, ingested_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    ("doc-cancelled", "/corpus/cancelled.md", "hash", "2026-01-01T00:00:00Z"),
+                )
+                raise asyncio.CancelledError()
+
+            with pytest.raises(asyncio.CancelledError):
+                await store._run(_op)
+
+            # The implicit transaction was undone, not left pending.
+            assert store._conn.in_transaction is False
+
+            # And the write is genuinely gone -- not merely uncommitted and
+            # waiting for some later commit to make it durable.
+            await store.upsert_document("/corpus/other.md", "doc-other", "hash-other")
+            assert await store.get_document_sources() == {"doc-other": "/corpus/other.md"}
+        finally:
+            await store.close()
+
+    asyncio.run(run())

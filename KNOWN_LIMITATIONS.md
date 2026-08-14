@@ -51,19 +51,33 @@ phases per SPEC.md §9:
   with no manifest (never dense-ingested) verifies trivially — there is
   nothing yet for a mismatch to exist against.
 - **Cross-store writes are not atomic.** SQLite and the vector store share
-  no transaction. Wave B's write order — chunk, embed, write the manifest
-  (once, before the first vector add), delete the previous document's
-  vectors, add the new ones, commit SQLite last — is chosen so SQLite is
-  never ahead of the dense store. A dense store *behind* SQLite is silent:
-  the content-hash skip key means that document is never retried and never
-  appears in dense results. A dense store *ahead* of SQLite is detectable:
-  `Retriever.search` already fails closed on a hit whose document has no
-  stored source. The residue of an interrupted ingest is therefore
-  possibly-orphaned vectors, not a silently missing document — but those
-  orphans carry a document ID SQLite never recorded, so a later re-ingest
-  cannot reclaim them by that ID. Recovering means deleting and rebuilding
-  the collection, which is cheap pre-1.0 and consistent with ADR-0004
-  decision 5.
+  no transaction. The write order — chunk, embed, write the manifest (once,
+  before the first vector add), add the new vectors, delete the previous
+  document's, commit SQLite last — is chosen so SQLite is never ahead of the
+  dense store, and so the document is never left with *no* vectors at any
+  point. A dense store *behind* SQLite is silent: the content-hash skip key
+  means that document is never retried and never appears in dense results. A
+  dense store *ahead* of SQLite is detectable: `Retriever.search` already
+  fails closed on a hit whose document has no stored source. The residue of
+  an interrupted ingest is therefore possibly-orphaned vectors, not a
+  silently missing document — but those orphans carry a document ID SQLite
+  never recorded, so a later re-ingest cannot reclaim them by that ID.
+  Recovering means deleting and rebuilding the collection, which is cheap
+  pre-1.0 and consistent with ADR-0004 decision 5.
+- **Adding before deleting trades a silent failure for a loud one; it does
+  not eliminate the residue.** Deleting first was worse — it opened a window
+  with no vectors at all, and a crash there followed by a content reversion
+  (`git checkout`) left SQLite's `content_hash` matching the restored bytes,
+  so the document was hash-skipped forever and silently absent from dense
+  results. Adding first closes that: the previous vectors survive, so the
+  reverted content still resolves. What it costs is that the interrupted
+  run's vectors stay behind under an uncommitted document ID, and a single
+  such orphan makes `Retriever.search` fail closed for *any* query that
+  ranks it — not just for that document. Prune sweeps iterate SQLite, so
+  they cannot reach it. Fully closing this needs the document row committed
+  before the dense write with its content hash withheld until after
+  (a two-phase commit `MetadataStoreProtocol` does not currently expose);
+  until then the recovery is a collection rebuild, as above.
 - **Delete reconciliation warns, it does not fail.** ADR-0004 decision 6
   requires the caller to reconcile the vector-delete count against the
   chunk count SQLite deleted. A mismatch is logged and surfaced in
