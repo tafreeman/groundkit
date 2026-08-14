@@ -156,7 +156,7 @@ changeset that leaves the tree green.
   verification remains Wave C — see §3 and `KNOWN_LIMITATIONS.md`.
 - `IndexReport` gained `vectors_written` and `vectors_deleted`.
 
-### Wave C — dense retrieval + RRF fusion
+### Wave C — dense retrieval + RRF fusion (**Landed**)
 
 - `retrieval/fusion.py`: pure RRF, no I/O, deterministic tie-break.
 - `Retriever` gains a dense path and a hybrid mode; `SearchResponse.metadata`
@@ -167,17 +167,25 @@ changeset that leaves the tree green.
 - Citation resolution unchanged: dense hits resolve through the same
   `citations.py` path, so a dense result is exactly as verifiable as a lexical
   one.
-- **Inherited from Wave B — `Retriever.open()` manifest verification.**
-  ADR-0004 decision 3 names two boundaries; Wave B closed ingest and left this
-  one, because a retriever with no dense read path cannot introduce a second
-  semantic space and so had nothing to verify. Wave C is what gives it
-  something to read, which is the same commit that must add the check.
-- **Inherited from Wave B — CLI wiring.** `grk ingest` still constructs its
-  `Indexer` without an embedder or vector store, so the command line writes no
-  vectors. It was deferred here deliberately rather than half-wired in Wave B:
-  turning it on needs a provider flag and a running Ollama, and it is only
-  useful once `grk search` can read what it writes, so ingest and search get
-  their flags together.
+- **Inherited from Wave B — `Retriever.open()` manifest verification
+  (closed).** ADR-0004 decision 3 names two boundaries; Wave B closed ingest
+  and left this one, because a retriever with no dense read path cannot
+  introduce a second semantic space and so had nothing to verify. Wave C gave
+  it something to read and, in the same commit, added the check:
+  `Retriever.open()` now verifies the collection's manifest against the
+  supplied embedder's identity before the O(corpus) BM25 rebuild runs,
+  whenever a dense pair is passed. A mismatch is `IndexIdentityError`. Both
+  ADR-0004 decision-3 boundaries are now closed.
+- **Inherited from Wave B — CLI wiring (closed, default off).** `grk ingest`
+  previously constructed its `Indexer` without an embedder or vector store, so
+  the command line wrote no vectors. It was deferred here deliberately rather
+  than half-wired in Wave B: turning it on needed a provider flag and a
+  running Ollama, and was only useful once `grk search` could read what it
+  writes, so ingest and search got their flags together. Wave C adds
+  `grk ingest --dense` and `grk search --mode {bm25,dense,hybrid}`, sharing
+  `--embed-provider`/`--embed-model`/`--embed-dimensions`/`--embed-base-url`.
+  Both remain opt-in: the default install, default commands, and CI need no
+  Ollama, and `grk search` still defaults to `bm25` (Q1, below).
 
 ### Wave D — optional cross-encoder rerank
 
@@ -252,6 +260,20 @@ open, O(corpus), accepted in ADR-0002 with a revisit trigger. Adding a LanceDB
 open and a manifest check makes `open()` heavier. Worth measuring in this
 phase and checking against ADR-0002's stated revisit trigger rather than
 discovering it in Phase 4 when the service opens retrievers per request.
+
+**Measured this wave.** `scripts/measure_retriever_open.py` is the method:
+for a range of synthetic corpus sizes, it ingests once BM25-only and once
+dense-enabled (the in-memory hash embedder — only vector-plumbing cost is
+timed, not embedding quality), then times repeated fresh `Retriever.open()`
+calls per configuration, composing the full store-open + LanceDB-connect +
+manifest-verify + snapshot-query + BM25-rebuild path exactly as Phase 4's
+per-request service would pay it. Qualitative conclusion: the dense
+additions — manifest verification, the LanceDB connection, and the
+open()-time document snapshot query — add overhead that stays near-constant
+as corpus size grows, leaving the BM25 rebuild as the only O(corpus) term in
+`open()`. ADR-0002's revisit trigger is therefore not met by this wave's
+measurements. Per repo policy, no number from a run of that script is quoted
+here or anywhere else — regenerate them by running the script.
 
 **Q1 — Default retrieval mode after Phase 3.** Does `grk search` default to
 hybrid, or stay BM25-only until a delta justifies the switch? **Deliberately

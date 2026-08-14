@@ -3,7 +3,15 @@
 Phase 1 shipped ``ingest`` and ``search`` end-to-end against the persisted
 local index with zero cloud credentials. Phase 2 adds ``eval``, running the
 BM25-baseline retrieval harness (``groundkit.evals.runner``) against a
-golden corpus and judgment set. ``serve`` and ``serve-mcp`` land in their
+golden corpus and judgment set. Phase 3 Wave C wires the dense write and
+read paths into both commands: ``grk ingest --dense`` embeds and writes
+vectors alongside the existing SQLite write, and ``grk search --mode
+{bm25,dense,hybrid}`` can read them back. Both are opt-in and default off.
+``search --mode`` in particular defaults to, and stays, ``"bm25"`` —
+Q1 in ``docs/specs/phase-3-hybrid-retrieval.md`` is deliberately left open
+until Wave E's measured eval delta decides whether dense or hybrid should
+become the default; changing the default here would be choosing by
+assertion instead of by data. ``serve`` and ``serve-mcp`` land in their
 phases per SPEC.md §9.
 """
 
@@ -14,16 +22,23 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from groundkit import __version__
-from groundkit.config import RetrievalConfig
-from groundkit.errors import EvalError, GroundkitError
+from groundkit.config import EmbeddingConfig, RetrievalConfig
+from groundkit.errors import ConfigurationError, EvalError, GroundkitError
 from groundkit.evals.runner import run_eval, write_report
 from groundkit.evals.schema import EvalReport
+from groundkit.index.dense import LanceDBVectorStore
 from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.indexer import Indexer
 from groundkit.ingestion.loaders import FileLoader
+from groundkit.providers.embeddings import build_embedder
 from groundkit.retrieval.search import MAX_TOP_K, Retriever
+
+if TYPE_CHECKING:
+    from groundkit.index.protocols import VectorStoreProtocol
+    from groundkit.providers.protocols import EmbeddingProtocol
 
 #: Characters of chunk content shown per result in text output.
 _SNIPPET_CHARS: int = 160
@@ -31,6 +46,15 @@ _SNIPPET_CHARS: int = 160
 #: Floor on ``grk eval --top-k``: recall@10 cannot be computed from fewer
 #: than 10 retrieved results per query.
 _MIN_EVAL_TOP_K: int = 10
+
+#: ``--embed-*`` flags shared by ``ingest --dense`` and ``search --mode
+#: {dense,hybrid}``, and the ``argparse.Namespace`` attribute each maps to.
+_EMBED_FLAG_ATTRS: tuple[str, ...] = (
+    "embed_provider",
+    "embed_model",
+    "embed_dimensions",
+    "embed_base_url",
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -65,6 +89,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Containment root for loads (default: the ingested directory, or the file's parent).",
     )
+    ingest.add_argument(
+        "--dense",
+        action="store_true",
+        help="Also embed and write vectors to the collection's LanceDB store (opt-in).",
+    )
+    _add_embedding_args(ingest)
     ingest.set_defaults(func=_cmd_ingest)
 
     search = sub.add_parser("search", help="Search the local index.")
@@ -75,6 +105,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--top-k", type=int, default=None, help=f"Results to return (1-{MAX_TOP_K})."
     )
     search.add_argument("--json", action="store_true", help="Emit the full response as JSON.")
+    search.add_argument(
+        "--mode",
+        choices=["bm25", "dense", "hybrid"],
+        default="bm25",
+        help=(
+            "Retrieval mode. Defaults to 'bm25' and stays there: dense and hybrid are "
+            "opt-in pending Wave E's measured eval delta (Q1, "
+            "docs/specs/phase-3-hybrid-retrieval.md), never a default changed by assertion."
+        ),
+    )
+    _add_embedding_args(search)
     search.set_defaults(func=_cmd_search)
 
     eval_parser = sub.add_parser(
@@ -103,7 +144,111 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_embedding_args(parser: argparse.ArgumentParser) -> None:
+    """Add the ``--embed-*`` flags shared by ``ingest --dense`` and ``search --mode``.
+
+    All four default to ``None`` and are only resolved into an
+    :class:`~groundkit.config.EmbeddingConfig` (falling back to its own
+    defaults — ``ollama`` / ``nomic-embed-text`` / 768 dimensions /
+    :data:`~groundkit.config.DEFAULT_OLLAMA_BASE_URL`) once the dense path
+    is actually active. Supplying any of them while the dense path is
+    inactive is a :class:`~groundkit.errors.ConfigurationError` (see
+    :func:`_embed_flags_supplied`) rather than a silently ignored flag.
+    """
+    parser.add_argument(
+        "--embed-provider",
+        choices=["ollama", "openai_compatible", "inmemory"],
+        default=None,
+        help=(
+            "Embedding provider for the dense path (default: ollama). 'inmemory' is an "
+            "offline test double with no semantic signal — never use it to measure "
+            "retrieval quality."
+        ),
+    )
+    parser.add_argument(
+        "--embed-model", default=None, help="Embedding model name (default: nomic-embed-text)."
+    )
+    parser.add_argument(
+        "--embed-dimensions",
+        type=int,
+        default=None,
+        help="Expected embedding vector width (default: 768).",
+    )
+    parser.add_argument(
+        "--embed-base-url",
+        default=None,
+        help="Embedding provider endpoint (default: the local Ollama endpoint).",
+    )
+
+
+def _embed_flags_supplied(args: argparse.Namespace) -> bool:
+    """True if any ``--embed-*`` flag was explicitly supplied."""
+    return any(getattr(args, attr) is not None for attr in _EMBED_FLAG_ATTRS)
+
+
+def _resolve_embedding_config(args: argparse.Namespace) -> EmbeddingConfig:
+    """Build an :class:`EmbeddingConfig` from ``--embed-*`` flags, unsupplied ones defaulted.
+
+    Built via explicit keyword construction rather than a ``dict[str, ...]``
+    splat: a heterogeneous override dict (``provider`` is a ``Literal``,
+    ``dimensions`` an ``int``, the rest ``str``) cannot type-check cleanly
+    against ``EmbeddingConfig``'s typed fields under ``mypy --strict``.
+    ``argparse.Namespace`` attributes are typed ``Any``, so passing them
+    straight through here type-checks without a cast, and pydantic still
+    validates the ``provider`` literal at construction (argparse's ``choices``
+    already constrains it, so this is defense in depth, not the only check).
+    Defaults come from a fresh :class:`EmbeddingConfig` — one source of truth,
+    not a second copy of its field defaults.
+    """
+    defaults = EmbeddingConfig()
+    return EmbeddingConfig(
+        provider=args.embed_provider if args.embed_provider is not None else defaults.provider,
+        model_name=args.embed_model if args.embed_model is not None else defaults.model_name,
+        dimensions=(
+            args.embed_dimensions if args.embed_dimensions is not None else defaults.dimensions
+        ),
+        base_url=args.embed_base_url if args.embed_base_url is not None else defaults.base_url,
+    )
+
+
+async def _open_dense_deps(
+    args: argparse.Namespace,
+) -> tuple[EmbeddingProtocol, VectorStoreProtocol]:
+    """Build the embedder + LanceDB store pair shared by ``ingest --dense`` and dense/hybrid search.
+
+    Layout is pinned: the LanceDB data for a collection lives at
+    ``<index-dir>/<collection>.lance`` (a directory, sibling of
+    ``<collection>.sqlite3``), opened with the default table name.
+    """
+    embedder = build_embedder(_resolve_embedding_config(args))
+    vector_store = await LanceDBVectorStore.open(Path(args.index_dir) / f"{args.collection}.lance")
+    return embedder, vector_store
+
+
+async def _maybe_aclose(embedder: EmbeddingProtocol | None) -> None:
+    """Close ``embedder``'s underlying resources if it exposes ``aclose``.
+
+    ``aclose`` is not part of :class:`EmbeddingProtocol` — ``InMemoryEmbedder``
+    has nothing to release and does not define it, while the HTTP-backed
+    providers do (``providers/embeddings.py``'s ``_HttpEmbedder.aclose``).
+    Duck-typed rather than an isinstance check against a concrete class, so a
+    future embedder with its own ``aclose`` is closed too without this
+    function needing to know about it.
+    """
+    if embedder is None:
+        return
+    aclose = getattr(embedder, "aclose", None)
+    if callable(aclose):
+        await aclose()
+
+
 async def _cmd_ingest(args: argparse.Namespace) -> int:
+    if not args.dense and _embed_flags_supplied(args):
+        raise ConfigurationError(
+            "--embed-provider/--embed-model/--embed-dimensions/--embed-base-url require "
+            "--dense; without --dense there is no dense path for them to configure"
+        )
+
     path = Path(args.path)
     if args.base_dir is not None:
         base_dir = Path(args.base_dir)
@@ -112,32 +257,64 @@ async def _cmd_ingest(args: argparse.Namespace) -> int:
     else:
         base_dir = path.parent
 
+    # SQLiteMetadataStore.open validates the collection name before any
+    # path (including the LanceDB directory below) is built from it.
     store = await SQLiteMetadataStore.open(Path(args.index_dir), args.collection)
+    embedder: EmbeddingProtocol | None = None
     try:
-        indexer = Indexer(store, FileLoader(allowed_base_dir=base_dir))
+        vector_store: VectorStoreProtocol | None = None
+        if args.dense:
+            embedder, vector_store = await _open_dense_deps(args)
+        indexer = Indexer(
+            store,
+            FileLoader(allowed_base_dir=base_dir),
+            embedder=embedder,
+            vector_store=vector_store,
+        )
         if path.is_dir():
             report = await indexer.index_directory(str(path))
         else:
             report = await indexer.index_source(str(path))
     finally:
         await store.close()
+        await _maybe_aclose(embedder)
 
-    print(
+    line = (
         f"ingested: {report.files_seen} files seen, "
         f"{report.documents_indexed} indexed, "
         f"{report.documents_skipped} unchanged, "
         f"{report.chunks_written} chunks written"
     )
+    if args.dense:
+        line += (
+            f", {report.vectors_written} vectors written, {report.vectors_deleted} vectors deleted"
+        )
+    print(line)
     return 0
 
 
 async def _cmd_search(args: argparse.Namespace) -> int:
+    if args.mode == "bm25" and _embed_flags_supplied(args):
+        raise ConfigurationError(
+            "--embed-provider/--embed-model/--embed-dimensions/--embed-base-url require "
+            "--mode dense or --mode hybrid; bm25 mode never touches the dense path"
+        )
+
+    # SQLiteMetadataStore.open validates the collection name before any
+    # path (including the LanceDB directory below) is built from it.
     store = await SQLiteMetadataStore.open(Path(args.index_dir), args.collection)
+    embedder: EmbeddingProtocol | None = None
     try:
-        retriever = await Retriever.open(store, RetrievalConfig())
-        response = await retriever.search(args.query, top_k=args.top_k)
+        vector_store: VectorStoreProtocol | None = None
+        if args.mode != "bm25":
+            embedder, vector_store = await _open_dense_deps(args)
+        retriever = await Retriever.open(
+            store, RetrievalConfig(), embedder=embedder, vector_store=vector_store
+        )
+        response = await retriever.search(args.query, top_k=args.top_k, mode=args.mode)
     finally:
         await store.close()
+        await _maybe_aclose(embedder)
 
     if args.json:
         print(json.dumps(response.model_dump(), indent=2))

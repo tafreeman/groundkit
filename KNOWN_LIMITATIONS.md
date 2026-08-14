@@ -2,35 +2,54 @@
 
 Honest and current, per repo policy. Updated with each phase.
 
-## Current state (Phase 3, Wave B)
+## Current state (Phase 3, Wave C)
 
-BM25-only retrieval works end-to-end locally: `grk ingest` (file or
-directory, incremental by content hash), `grk search` (citation-bearing
-results with character offsets), and `grk eval` (retrieval-quality harness
-against the committed golden corpus, BM25-only baseline) — all against a
-persisted SQLite index that survives restarts, all offline with no cloud
-credentials. Not yet built, arriving in their phases per SPEC.md §9:
+Hybrid retrieval now works end-to-end locally, behind opt-in flags: `grk
+ingest --dense` embeds each chunk into a LanceDB vector store alongside the
+existing SQLite write, and `grk search --mode {bm25,dense,hybrid}` reads
+lexical, vector, or RRF-fused (ADR-0005) results back — every mode still
+resolving to a citation-bearing result with character offsets. `grk eval`
+still runs the BM25-only baseline harness against the committed golden
+corpus (dense and fusion eval stages are Wave E). Everything remains offline
+with no cloud credentials by default: neither flag is required, and `grk
+search` defaults to, and stays on, BM25 pending Wave E's measured eval delta
+(Q1, `docs/specs/phase-3-hybrid-retrieval.md`) — dense and hybrid are
+reachable to opt into, not yet the default. Not yet built, arriving in their
+phases per SPEC.md §9:
 
-- **Dense retrieval is written but not reachable.** Wave B wired the Wave A
-  vector stores (`InMemoryVectorStore`, `LanceDBVectorStore`) into
-  `Indexer`: `grk ingest` now embeds each chunk and writes it to the
-  configured vector store alongside the SQLite write. `Retriever` is
-  unchanged — it still builds only a BM25 index from the metadata store, so
-  `grk search` stays BM25-only and every vector written so far has no read
-  path. Wiring `Retriever` to the dense store, plus hybrid fusion and
-  rerank, are Waves C and D.
-- **The embedding-identity manifest is enforced on ingest.** ADR-0004
-  decision 3 requires verification at two boundaries: any ingest that
-  writes vectors, and `Retriever.open()`. Wave B closed the first —
-  `Indexer` calls `verify_manifest` before any load/chunk/embed/delete
-  work, and `write_manifest` binds the collection on its first real dense
-  write, so a model swap on an existing collection now raises
-  `IndexIdentityError` instead of silently corrupting it. The second
-  boundary — `Retriever.open()` verification — is a stated Wave C
-  obligation, not a present hole: `Retriever` has no dense read path yet
-  (see above), and a retriever that never reads a vector cannot introduce a
-  second semantic space into a search result. There is nothing yet for
-  `Retriever.open()` to verify until Wave C gives it something to read.
+- **Dense and hybrid retrieval are reachable, opt-in, and unmeasured for
+  quality.** Wave C wired `Retriever` to the dense store and to RRF fusion
+  (`retrieval/fusion.py`, ADR-0005): `grk search --mode dense` and `--mode
+  hybrid` read the vectors `grk ingest --dense` writes, resolving to
+  citations through the same document-source join BM25 uses. Neither mode
+  is a quality claim yet — the retrieval-quality delta against the BM25
+  baseline is Wave E's job, gated behind `EVAL_GATED=1` because the
+  CI-default `InMemoryEmbedder` produces hash-derived vectors with no
+  semantic signal (noise presented as a number if used to measure quality;
+  see the Phase 2 caveats below and SPEC.md §2). `grk search --mode bm25`
+  remains the default (Q1, `docs/specs/phase-3-hybrid-retrieval.md`).
+- **A dense/hybrid result list can be shorter than `top_k` during the
+  staleness window between an `open()` and the retriever's next reopen.**
+  The vector store's search already truncates to `top_k` before the
+  `open()`-time document snapshot filter runs (`Retriever`'s class
+  docstring, `retrieval/search.py`): a hit for a document ingested after
+  `open()` is dropped *after* that truncation, not backfilled from a lower
+  rank. If any of the store's already-truncated top-`k` hits belong to
+  documents ingested since `open()`, the returned dense or hybrid list
+  shrinks below `top_k` rather than being topped back up. Reopening the
+  retriever clears the window. BM25 has no equivalent gap — the stale
+  in-memory index simply has no representation of the new content at all.
+- **The embedding-identity manifest is verified at both ADR-0004 decision-3
+  boundaries.** Wave B closed the ingest boundary — `Indexer` calls
+  `verify_manifest` before any load/chunk/embed/delete work, and
+  `write_manifest` binds the collection on its first real dense write. Wave
+  C closes the second: whenever a dense pair is supplied,
+  `Retriever.open()` verifies the collection's manifest against the
+  embedder's `(provider, model_name, dimensions)` triple *before* the
+  O(corpus) BM25 rebuild does any work. A mismatch raises
+  `IndexIdentityError`, never a re-embed and never a fallback. A collection
+  with no manifest (never dense-ingested) verifies trivially — there is
+  nothing yet for a mismatch to exist against.
 - **Cross-store writes are not atomic.** SQLite and the vector store share
   no transaction. Wave B's write order — chunk, embed, write the manifest
   (once, before the first vector add), delete the previous document's
@@ -68,18 +87,38 @@ credentials. Not yet built, arriving in their phases per SPEC.md §9:
   vector store still happily replaces, prunes, and deletes documents in a
   collection whose vectors were written by an earlier dense-enabled run.
   It has no vector store to delete from, so those vectors survive their
-  documents. The orphans are loud rather than silent once Wave C gives
-  them a read path — `Retriever.search` fails closed on a hit whose
-  document has no stored source — but nothing prevents the situation being
-  created, because the store carries no record that dense writes ever
-  happened beyond the manifest itself.
-- **The CLI does not expose the dense path.** Wave B's wiring lives in
-  `Indexer` itself; `grk ingest` still constructs it without an embedder or
-  vector store, so the command-line path writes no vectors today. Turning
-  it on needs a provider flag and a running Ollama, and it only becomes
-  useful once `grk search` can read those vectors too — so it's
-  deliberately deferred to Wave C, where ingest and search can be wired
-  coherently together. This is a stated decision, not an oversight.
+  documents. The orphans are loud, not silent: Wave C's dense read path
+  fails closed on them — `Retriever.search` (dense and hybrid modes)
+  raises `RetrievalError` on a hit whose document has no stored source,
+  with regression tests for both the deleted-after-open and
+  deleted-before-open cases. Nothing prevents the situation being created
+  in the first place, because the store carries no record that dense
+  writes ever happened beyond the manifest itself.
+- **The CLI exposes the dense path, entirely opt-in.** `grk ingest --dense`
+  embeds and writes vectors alongside the SQLite write; `grk search --mode
+  {bm25,dense,hybrid}` reads them back (default `bm25`, unchanged by this
+  wave — Q1 stays open). Both share `--embed-provider`/`--embed-model`/
+  `--embed-dimensions`/`--embed-base-url`, which resolve to their defaults
+  (`ollama`/`nomic-embed-text`/768/the local Ollama endpoint) only once a
+  dense path is actually active — supplying any of them without `--dense`
+  (ingest) or without a dense `--mode` (search) fails closed with
+  `ConfigurationError` rather than being silently ignored.
+  `--embed-provider inmemory` is the same offline test double described
+  above: correct for exercising the CLI's dense wiring, never a quality
+  measurement. LanceDB data for a collection lives at
+  `<index-dir>/<collection>.lance`, beside `<collection>.sqlite3`. The
+  default install, default commands, and CI need no Ollama and are
+  unchanged by any of this.
+- **`score_threshold` does not apply to hybrid results.** ADR-0005
+  decision 6: an RRF-fused score is a function of result-set size and
+  retriever count, not a probability, and thresholding it would silently
+  mean something different from thresholding BM25 or dense scores directly.
+  `RetrievalConfig.score_threshold` therefore applies to `bm25` and `dense`
+  mode results only, never to fused scores, and never to the pre-fusion
+  candidate lists either (thresholding those would reintroduce the same
+  threshold by a side door). Phase 3 ships hybrid search with no confidence
+  cutoff at all. This is a deliberate deferral, not an oversight (ADR-0005
+  Consequences).
 - **Filtered dense search costs O(corpus).** A `metadata_filter` triggers a
   full-table over-fetch, then filters and truncates in Python, because
   metadata is stored as one opaque JSON blob rather than structured columns
