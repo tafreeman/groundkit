@@ -434,8 +434,8 @@ metrics and both cut against making hybrid the default:
 The honest reading is that the measurement licenses hybrid as the
 *recommended* mode where a provider is configured, not as the unconditional
 default. **Recorded as
-[ADR-0007](../adr/ADR-0007-default-retrieval-mode.md) (Proposed).** BM25 stays
-the default and no behaviour changes.
+[ADR-0007](../adr/ADR-0007-default-retrieval-mode.md), Accepted 2026-08-14.**
+BM25 stays the default and no behaviour changes.
 
 The reopening condition is **hybrid** becoming able to abstain — not dense.
 The distinction is the whole point and is easy to lose: dense *already*
