@@ -1409,3 +1409,90 @@ def test_one_failing_file_does_not_abandon_its_siblings(corpus: Path, tmp_path: 
             await store.close()
 
     asyncio.run(run())
+
+
+def test_lost_dense_side_is_refused_rather_than_silently_reindexed(
+    corpus: Path, tmp_path: Path
+) -> None:
+    """A manifest-bound collection whose vectors vanished must fail closed.
+
+    G10. SQLite's ``content_hash`` records whether the *content* changed,
+    never whether the vectors derived from it still exist -- so a collection
+    that kept its SQLite file while losing its dense store reports every
+    document unchanged, re-embeds nothing, and answers every dense query
+    from an empty index, permanently and silently.
+
+    Reproduced the way a library caller reaches it: an ephemeral
+    ``InMemoryVectorStore`` paired with a persisted store, then a fresh
+    vector store standing in for the restart. The likelier operational
+    route -- a deleted ``.lance`` directory -- lands in the identical state,
+    which is why the check keys on the ADR-0004 manifest (proof that vectors
+    once existed) rather than on the store's type.
+    """
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            embedder = _CountingEmbedder()
+            first = Indexer(
+                store,
+                FileLoader(allowed_base_dir=corpus),
+                embedder=embedder,
+                vector_store=InMemoryVectorStore(),
+            )
+            report = await first.index_directory(str(corpus))
+            assert report.vectors_written > 0
+
+            # The restart: SQLite survived, the vectors did not.
+            restarted = InMemoryVectorStore()
+            after = Indexer(
+                store,
+                FileLoader(allowed_base_dir=corpus),
+                embedder=_CountingEmbedder(),
+                vector_store=restarted,
+            )
+            with pytest.raises(StorageError, match="Dense side is empty"):
+                await after.index_directory(str(corpus))
+
+            # The read path refuses it too, rather than answering from empty.
+            with pytest.raises(StorageError, match="Dense side is empty"):
+                await Retriever.open(store, embedder=_CountingEmbedder(), vector_store=restarted)
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_bm25_only_collection_is_not_mistaken_for_a_lost_dense_side(
+    corpus: Path, tmp_path: Path
+) -> None:
+    """No manifest means dense was never used -- not that vectors were lost.
+
+    The counterpart to the check above, and the case that decides it is
+    keyed on the manifest rather than on emptiness alone. Enabling the dense
+    path over a collection previously ingested BM25-only leaves every
+    unchanged document without vectors by design (the documented
+    no-backfill limitation), and that legitimate upgrade must not be
+    refused as corruption.
+    """
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            bm25_only = Indexer(store, FileLoader(allowed_base_dir=corpus))
+            assert (await bm25_only.index_directory(str(corpus))).documents_indexed == 3
+
+            # Dense enabled afterwards: no manifest was ever bound, so the
+            # empty vector store is expected, not evidence of loss.
+            upgraded = Indexer(
+                store,
+                FileLoader(allowed_base_dir=corpus),
+                embedder=_CountingEmbedder(),
+                vector_store=InMemoryVectorStore(),
+            )
+            report = await upgraded.index_directory(str(corpus))
+            assert report.documents_skipped == 3
+        finally:
+            await store.close()
+
+    asyncio.run(run())

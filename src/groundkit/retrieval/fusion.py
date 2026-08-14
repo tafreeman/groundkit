@@ -24,12 +24,16 @@ Every decision below is ADR-0005's, cited here rather than re-derived:
   default — is recorded in ADR-0005, not here. :func:`reciprocal_rank_fusion`
   takes ``rrf_k`` as a required keyword argument and never substitutes a
   value of its own, so "60" has exactly one source of truth in the repo.
-- **Tie-break is ascending ``chunk_id`` (decision 3).** Equal fused scores
-  sort by ascending :attr:`~groundkit.contracts.Chunk.chunk_id` — a total,
-  content-derived order that never depends on dict or set iteration order.
-  This is deliberately distinct from the stores' own ``content_hash``
-  tie-break (``index/bm25.py``, ``index/dense.py``); ADR-0005 names
-  ``chunk_id`` specifically for fusion.
+- **Tie-break is ascending ``(content_hash, chunk_index)`` (decision 3).**
+  Equal fused scores sort by that pair — content-derived, so it survives a
+  re-ingest, and never dependent on dict or set iteration order. It is the
+  same tie-break the stores themselves use (``index/bm25.py``,
+  ``index/dense.py``), extended by ``chunk_index`` because ``content_hash``
+  alone is not total: duplicate content shares a hash. ``chunk_id`` is
+  deliberately *not* used despite being unique — it is ``uuid4`` per ingest
+  (``contracts.py``), so tied results would reorder every time the same
+  corpus was re-indexed, breaking the across-runs determinism ADR-0005
+  decision 3 requires.
 - **No clamping (decision 5).** With ``rrf_k > 0`` (enforced below) and
   ranks starting at 1, every summed term ``1 / (rrf_k + rank)`` is strictly
   positive by construction, so fused scores satisfy
@@ -79,10 +83,12 @@ def reciprocal_rank_fusion(
 
     Returns:
         ``(Chunk, score)`` pairs sorted by descending fused score, ties
-        broken by ascending ``chunk_id`` (ADR-0005 decision 3). When a
-        chunk_id appears in more than one ranking, the emitted ``Chunk``
-        object is the one from the first (lowest-index) ranking containing
-        it. Empty ``rankings``, or rankings that are all empty, yield ``[]``.
+        broken by ascending ``(content_hash, chunk_index)`` (ADR-0005
+        decision 3) — content-derived, so the ordering is identical across
+        re-ingests of the same corpus. When a chunk_id appears in more than
+        one ranking, the emitted ``Chunk`` object is the one from the first
+        (lowest-index) ranking containing it. Empty ``rankings``, or
+        rankings that are all empty, yield ``[]``.
 
     Raises:
         ValueError: ``rrf_k <= 0``; ``top_k`` is not ``None`` and
@@ -111,7 +117,11 @@ def reciprocal_rank_fusion(
                 first_chunk[chunk_id] = chunk
 
     fused = [(first_chunk[chunk_id], score) for chunk_id, score in fused_scores.items()]
-    fused.sort(key=lambda pair: (-pair[1], pair[0].chunk_id))
+    # Sort on content, not identity: chunk_id groups a chunk across rankings
+    # (it is unique within one search) but is uuid4 per ingest, so using it
+    # here would reorder tied results on every re-index. See ADR-0005
+    # decision 3 and the module docstring.
+    fused.sort(key=lambda pair: (-pair[1], pair[0].content_hash, pair[0].chunk_index))
 
     if top_k is not None:
         fused = fused[:top_k]

@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from groundkit.contracts import EmbeddingIdentity
 from groundkit.errors import ConfigurationError, IngestionError
+from groundkit.index.dense import verify_dense_side_present
 from groundkit.ingestion.chunking import RecursiveChunker
 from groundkit.ingestion.pipeline import DEFAULT_MAX_CONCURRENT, discover_files
 from groundkit.utils.path_safety import is_within_base
@@ -369,13 +370,28 @@ class Indexer:
         already destroyed part of a healthy collection's dense side on the
         way to its error.
 
+        The same reasoning covers the dense-side integrity check that
+        follows it: a collection that kept its SQLite file but lost its
+        vectors must be refused *before* this run hash-skips every document
+        and writes nothing, not after. Identity is checked first — a
+        mismatched embedder is a misconfiguration, and reporting a missing
+        dense side to a process that was never entitled to touch this
+        collection would name the wrong problem.
+
         Raises:
             IndexIdentityError: The collection is bound to a different
                 embedding identity (never a re-embed, never a fallback).
+            StorageError: The collection is manifest-bound and holds
+                documents, but its vector store is empty — see
+                :func:`~groundkit.index.dense.verify_dense_side_present`.
         """
         if self._embedder is None:
             return
         await self._store.verify_manifest(_identity_of(self._embedder))
+        if self._vector_store is not None:
+            await verify_dense_side_present(
+                self._store, self._vector_store, self._embedder.dimensions
+            )
 
     async def _ensure_manifest(self, embedder: EmbeddingProtocol) -> None:
         """Bind the collection to this embedder's identity on the first real write.

@@ -16,6 +16,7 @@ from groundkit.config import RetrievalConfig
 from groundkit.contracts import EmbeddingIdentity, RetrievalResult, SearchResponse
 from groundkit.errors import ConfigurationError, RetrievalError
 from groundkit.index.bm25 import BM25Index
+from groundkit.index.dense import verify_dense_side_present
 from groundkit.retrieval.fusion import reciprocal_rank_fusion
 
 if TYPE_CHECKING:
@@ -129,11 +130,18 @@ class Retriever:
                 ``vector_store`` was supplied.
             IndexIdentityError: The collection is bound to a different
                 embedding identity (ADR-0004).
+            StorageError: The collection is manifest-bound and holds
+                documents, but its vector store is empty — a lost dense
+                side, refused here rather than silently answering every
+                dense and hybrid query from an empty index. See
+                :func:`~groundkit.index.dense.verify_dense_side_present`.
         """
         cfg = config or RetrievalConfig()
         _validate_dense_pair(embedder, vector_store)
         if embedder is not None:
             await store.verify_manifest(_identity_of(embedder))
+        if embedder is not None and vector_store is not None:
+            await verify_dense_side_present(store, vector_store, embedder.dimensions)
         bm25 = await BM25Index.from_store(store, k1=cfg.bm25_k1, b=cfg.bm25_b)
         documents_at_open: frozenset[str] | None = None
         if embedder is not None:

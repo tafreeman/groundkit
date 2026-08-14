@@ -108,19 +108,58 @@ class TestDeterminism:
 
 
 class TestTieBreak:
-    def test_equal_fused_scores_sort_by_ascending_chunk_id(self) -> None:
-        """Two chunks that each rank first in exactly one ranking produce an
-        exact score tie (both compute 1/(rrf_k + 1)); the tie must resolve
-        by ascending chunk_id, not insertion order."""
-        zeta = _make_chunk("zeta content", chunk_id="zeta")
-        alpha = _make_chunk("alpha content", chunk_id="alpha")
-        ranking_a = [(zeta, 1.0)]  # zeta inserted first
-        ranking_b = [(alpha, 1.0)]
+    """ADR-0005 decision 3: ties break on ``(content_hash, chunk_index)``.
+
+    Content-derived, so the ordering survives a re-ingest. The decision
+    originally named ``chunk_id`` while calling itself "content-derived";
+    ``chunk_id`` is ``uuid4`` per ingest, so tied results reordered every
+    time the same corpus was re-indexed.
+    """
+
+    def test_equal_fused_scores_sort_by_ascending_content_hash(self) -> None:
+        """Two chunks each ranked first in exactly one ranking tie exactly
+        (both compute 1/(rrf_k + 1)); the tie resolves on content_hash, not
+        on insertion order."""
+        first_inserted = _make_chunk("zeta content", chunk_id="c-zeta")
+        second_inserted = _make_chunk("alpha content", chunk_id="c-alpha")
+        ranking_a = [(first_inserted, 1.0)]
+        ranking_b = [(second_inserted, 1.0)]
 
         results = reciprocal_rank_fusion([ranking_a, ranking_b], rrf_k=60)
 
-        assert [chunk.chunk_id for chunk, _ in results] == ["alpha", "zeta"]
+        expected = sorted([first_inserted, second_inserted], key=lambda chunk: chunk.content_hash)
+        assert [chunk.content for chunk, _ in results] == [c.content for c in expected]
         assert results[0][1] == pytest.approx(results[1][1])
+
+    def test_identical_content_breaks_the_remaining_tie_on_chunk_index(self) -> None:
+        """content_hash alone is not a total order — duplicate content shares
+        a hash — so chunk_index resolves what is left."""
+        later = _make_chunk("duplicated passage", chunk_id="c-later", chunk_index=7)
+        earlier = _make_chunk("duplicated passage", chunk_id="c-earlier", chunk_index=2)
+        assert later.content_hash == earlier.content_hash
+
+        results = reciprocal_rank_fusion([[(later, 1.0)], [(earlier, 1.0)]], rrf_k=60)
+
+        assert [chunk.chunk_index for chunk, _ in results] == [2, 7]
+
+    def test_tied_ordering_is_unchanged_when_chunk_ids_are_regenerated(self) -> None:
+        """The re-ingest property, and the regression that pins it.
+
+        Re-ingesting a corpus regenerates every ``chunk_id`` (``uuid4``,
+        ``contracts.py``) while the content is byte-identical. Fusing the
+        same content under a *reversed* chunk_id ordering must therefore
+        produce the same result order. Under the previous ``chunk_id`` sort
+        key this returned the two chunks in opposite orders.
+        """
+
+        def _fuse(id_alpha: str, id_zeta: str) -> list[str]:
+            alpha = _make_chunk("alpha content", chunk_id=id_alpha)
+            zeta = _make_chunk("zeta content", chunk_id=id_zeta)
+            fused = reciprocal_rank_fusion([[(alpha, 1.0)], [(zeta, 1.0)]], rrf_k=60)
+            return [chunk.content for chunk, _ in fused]
+
+        # Ingest 1: alpha's id sorts first. Ingest 2: zeta's does.
+        assert _fuse("aaa-0001", "zzz-9999") == _fuse("zzz-9999", "aaa-0001")
 
 
 class TestInputScoresIgnored:

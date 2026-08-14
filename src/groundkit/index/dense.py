@@ -102,6 +102,7 @@ from typing import Any, Final
 
 from groundkit.contracts import Chunk
 from groundkit.errors import StorageError
+from groundkit.index.protocols import MetadataStoreProtocol, VectorStoreProtocol
 
 #: Score floor: cosine similarity is clamped to this before it ever reaches
 #: RetrievalResult, which requires score >= 0.0 (contracts.py).
@@ -700,3 +701,71 @@ class LanceDBVectorStore:
             await asyncio.to_thread(self._table.delete, predicate)
             after = await asyncio.to_thread(self._table.count_rows)
         return int(before) - int(after)
+
+
+async def verify_dense_side_present(
+    store: MetadataStoreProtocol, vector_store: VectorStoreProtocol, dimensions: int
+) -> None:
+    """Fail closed when a dense-bound collection has lost its vectors.
+
+    The dense analogue of the content-hash skip key's blind spot. SQLite is
+    the durable truth for documents and chunks (ADR-0002) and its
+    ``content_hash`` decides what gets re-indexed — but that hash records
+    only whether the *content* changed, never whether the vectors derived
+    from it still exist. A collection whose SQLite file persisted while its
+    vectors did not therefore reports every document as unchanged, re-embeds
+    nothing, and returns nothing from the dense side, permanently and with
+    no error: exactly the silent-absence class SPEC.md §2 fails closed
+    against.
+
+    Two ways to reach that state. The library one is pairing an
+    :class:`InMemoryVectorStore` with a file-backed
+    :class:`~groundkit.index.metadata.SQLiteMetadataStore`, where the dense
+    side empties on every restart by construction (the ``grk`` CLI cannot:
+    it wires :class:`LanceDBVectorStore` unconditionally). The operational
+    one, and the likelier one, is the collection's ``.lance`` directory
+    being deleted, moved, or restored from a backup that omitted it.
+
+    ADR-0004's manifest is what makes the check unambiguous: it is written
+    on the collection's *first dense write*, so a bound manifest proves
+    vectors once existed. Manifest bound + documents in SQLite + an empty
+    vector store is a lost dense side, and is distinguishable from the
+    legitimate cases — an unbound manifest means the collection was only
+    ever BM25-only (whose upgrade path is the documented no-backfill
+    limitation, not a defect), and no documents means an empty collection.
+
+    Emptiness is probed with ``search(top_k=1)`` rather than a count: a
+    dense search never drops zero-scored results, so an empty result means
+    an empty store, and this needs no addition to
+    :class:`~groundkit.index.protocols.VectorStoreProtocol`.
+
+    Args:
+        store: The collection's metadata store.
+        vector_store: The dense store paired with it.
+        dimensions: Embedding width, used to shape the probe vector.
+
+    Raises:
+        StorageError: The collection is manifest-bound and holds documents,
+            but its vector store is empty.
+    """
+    if await store.get_manifest() is None:
+        return
+    sources = await store.get_document_sources()
+    if not sources:
+        return
+
+    # A unit vector rather than zeros: cosine similarity is undefined
+    # against a zero-magnitude query.
+    probe = [1.0] + [0.0] * (dimensions - 1)
+    if await vector_store.search(probe, top_k=1):
+        return
+
+    raise StorageError(
+        f"Dense side is empty for a collection bound to an embedding identity with "
+        f"{len(sources)} document(s) still in SQLite. The vectors were lost while the "
+        "metadata store survived (an ephemeral vector store paired with a persisted "
+        "SQLite store, or a deleted/moved LanceDB directory). Refusing to continue: "
+        "the content-hash gate would report every document unchanged, re-embed "
+        "nothing, and return nothing from the dense side, silently. Rebuild the "
+        "collection, or restore the vector store alongside its SQLite file."
+    )

@@ -55,10 +55,29 @@ test.
    under SPEC.md §6 discipline and must be reported as such.
 
 3. **Tie-breaking is total, explicit, and content-derived.** Equal RRF scores
-   break by ascending `chunk_id`. The comparator must never depend on dict or
-   set iteration order, and fusion over the same inputs must produce a
-   byte-identical ordering across runs and across Python versions — asserted by
-   test, in the same spirit as Phase 2's BM25 determinism pinning.
+   break by ascending `(content_hash, chunk_index)`. The comparator must never
+   depend on dict or set iteration order, and fusion over the same inputs must
+   produce a byte-identical ordering across runs and across Python versions —
+   asserted by test, in the same spirit as Phase 2's BM25 determinism pinning.
+
+   This decision originally named `chunk_id`, which contradicted the word
+   "content-derived" in its own first sentence: `chunk_id` is
+   `uuid.uuid4().hex` (`contracts.py`), regenerated on every ingest. Because
+   it is persisted, ordering was stable within a given index and across
+   process restarts — but the same corpus re-ingested produced a different
+   fusion ranking wherever scores tied, which is exactly the "byte-identical
+   across runs" property this decision exists to guarantee. RRF ties are not
+   rare: scores are rank-derived, so two chunks reached at the same rank in
+   one list each collide exactly.
+
+   `content_hash` alone is not a total order — duplicate content shares a
+   hash, which is why `index/bm25.py` documents falling back to insertion
+   order. `chunk_index` breaks that remaining tie, leaving only genuinely
+   identical content at the same position in different documents unordered,
+   where the choice is unobservable in the results. Both components are
+   content-derived and survive re-ingest, which `chunk_id` does not, and the
+   pair now agrees with the tie-break `index/bm25.py` and `index/dense.py`
+   already use rather than deliberately diverging from it.
 
 4. **Cross-encoder logits are normalized with a sigmoid, never min-max.**
    `sigmoid: ℝ → (0, 1)` is total, so no logit — however negative — can violate
