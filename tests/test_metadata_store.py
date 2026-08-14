@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -847,6 +848,66 @@ def test_cancelled_operation_rolls_back_its_partial_writes(tmp_path: Path) -> No
 
             # And the write is genuinely gone -- not merely uncommitted and
             # waiting for some later commit to make it durable.
+            await store.upsert_document("/corpus/other.md", "doc-other", "hash-other")
+            assert await store.get_document_sources() == {"doc-other": "/corpus/other.md"}
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_cancellation_waits_for_the_worker_before_releasing_the_lock(tmp_path: Path) -> None:
+    """Cancelling an operation must not free the connection while it is in use.
+
+    Cancelling ``await asyncio.to_thread(fn)`` does not stop ``fn`` -- the
+    worker thread runs to completion regardless. So neither the rollback nor
+    the lock release can be driven off the awaiting coroutine unwinding: a
+    rollback issued from the event loop would race statements the worker is
+    still executing, and releasing the lock on unwind would let the next
+    operation interleave with an abandoned one, breaking exactly the
+    one-commit atomicity ``replace_document`` promises.
+
+    Pinned directly on ``_run``: the invariant is about how ``_run`` unwinds,
+    and no public method can be interrupted mid-transaction on purpose.
+    """
+
+    async def run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path / "idx", "default")
+        try:
+            entered = threading.Event()
+            may_finish = threading.Event()
+
+            def _op() -> None:
+                store._conn.execute(
+                    "INSERT INTO documents (document_id, source, content_hash, ingested_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    ("doc-slow", "/corpus/slow.md", "hash", "2026-01-01T00:00:00Z"),
+                )
+                entered.set()
+                may_finish.wait(timeout=10)
+                raise sqlite3.OperationalError("worker failed after cancellation")
+
+            task = asyncio.create_task(store._run(_op))
+            await asyncio.to_thread(entered.wait, 10)
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            # The worker is still inside _op. The lock must still be held.
+            assert store._lock.locked()
+
+            may_finish.set()
+            for _ in range(200):
+                if not store._lock.locked():
+                    break
+                await asyncio.sleep(0.05)
+
+            # Released only once the worker finished, and it rolled back its
+            # own partial write on its own thread.
+            assert not store._lock.locked()
+            assert store._conn.in_transaction is False
+
             await store.upsert_document("/corpus/other.md", "doc-other", "hash-other")
             assert await store.get_document_sources() == {"doc-other": "/corpus/other.md"}
         finally:

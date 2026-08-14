@@ -603,3 +603,108 @@ def test_lancedb_store_persists_and_reopens_across_sessions(tmp_path: Path) -> N
     asyncio.run(_write())
     results = asyncio.run(_reopen_and_search())
     assert {c.chunk_id for c, _ in results} == {"a", "b"}
+
+
+@pytest.mark.parametrize("store_kind", _STORE_KINDS)
+def test_add_rejects_a_document_id_that_could_never_be_deleted(
+    store_kind: str, tmp_path: Path
+) -> None:
+    """A document ID accepted by ``add`` must be one ``delete`` can act on.
+
+    ``delete`` validates ``document_id`` against ``_DOCUMENT_ID_PATTERN``
+    (ADR-0001 hazard 5, keeping it out of LanceDB's SQL-like delete
+    predicate), but ``Chunk.document_id`` is a plain ``str``. A custom loader
+    supplying ``tenant/doc`` therefore used to ingest cleanly and only fail
+    later, on the first replace or prune that tried to delete it — leaving a
+    collection whose vectors could be written but never maintained or
+    removed through the protocol.
+
+    Validating on the way in makes the accepted set identical at both ends,
+    and identical across both store implementations, which share
+    ``_validate_add_shapes``.
+    """
+
+    async def run() -> None:
+        store = await _make_store(store_kind, tmp_path)
+        undeletable = _make_chunk("c1", "tenant/doc", "content that will be refused")
+
+        with pytest.raises(StorageError, match="document_id"):
+            await store.add([undeletable], [[1.0, 0.0, 0.0, 0.0]])
+
+        # Nothing was written on the way to the error.
+        assert await store.search([1.0, 0.0, 0.0, 0.0], top_k=_PROBE_TOP_K) == []
+
+        # And the ID that *is* deletable still works, so the guard is not
+        # simply rejecting everything.
+        fine = _make_chunk("c2", "tenant.doc-1_v2", "content that is accepted")
+        await store.add([fine], [[1.0, 0.0, 0.0, 0.0]])
+        assert len(await store.search([1.0, 0.0, 0.0, 0.0], top_k=_PROBE_TOP_K)) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_kind", _STORE_KINDS)
+def test_duplicate_content_ties_break_deterministically_on_chunk_index(
+    store_kind: str, tmp_path: Path
+) -> None:
+    """Duplicate content must not rank backend-dependently.
+
+    ``content_hash`` alone is not a total order. ``index/bm25.py`` can fall
+    back to insertion order because its postings are rebuilt from SQLite in a
+    fixed order, but this sort is fed by LanceDB row order, which carries no
+    such guarantee. ``chunk_index`` completes the order, matching ADR-0005
+    decision 3 and ``retrieval/fusion.py``.
+    """
+
+    async def run() -> None:
+        store = await _make_store(store_kind, tmp_path)
+        vector = [1.0, 0.0, 0.0, 0.0]
+
+        # Identical content, so identical content_hash and identical score.
+        seeded = [
+            _make_chunk("c-late", "doc-b", "duplicated passage", chunk_index=9),
+            _make_chunk("c-early", "doc-a", "duplicated passage", chunk_index=1),
+        ]
+        await store.add(seeded, [vector, vector])
+
+        ranked = await store.search(vector, top_k=_PROBE_TOP_K)
+
+        assert [chunk.content_hash for chunk, _ in ranked].count(ranked[0][0].content_hash) == 2
+        assert [chunk.chunk_index for chunk, _ in ranked] == [1, 9]
+
+    asyncio.run(run())
+
+
+def test_empty_metadata_filter_does_not_trigger_the_over_fetch_path(tmp_path: Path) -> None:
+    """``{}`` is a documented no-op filter, so it must not pay the O(N) fetch.
+
+    ``_matches_filter`` treats an empty dict as matching everything. The
+    LanceDB path keyed its over-fetch on ``metadata_filter is None``, so
+    ``{}`` counted the whole table to apply a filter that cannot remove a
+    single row. The two must agree on what counts as a filter.
+    """
+
+    async def run() -> None:
+        store = await LanceDBVectorStore.open(tmp_path / "lancedb")
+        chunks = [
+            _make_chunk(f"c{i}", "doc-a", f"passage number {i}", chunk_index=i) for i in range(5)
+        ]
+        await store.add(chunks, [[1.0, 0.0, 0.0, 0.0] for _ in chunks])
+
+        counted: list[int] = []
+        original = store._table.count_rows
+
+        def _counting() -> int:
+            counted.append(1)
+            return int(original())
+
+        store._table.count_rows = _counting
+
+        assert len(await store.search([1.0, 0.0, 0.0, 0.0], top_k=2, metadata_filter={})) == 2
+        assert counted == []
+
+        # A real filter still takes the over-fetch path.
+        await store.search([1.0, 0.0, 0.0, 0.0], top_k=2, metadata_filter={"source": "doc.md"})
+        assert counted == [1]
+
+    asyncio.run(run())

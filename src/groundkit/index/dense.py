@@ -133,6 +133,18 @@ _DOCUMENT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9._-]+$")
 def _validate_add_shapes(chunks: list[Chunk], embeddings: list[list[float]]) -> int | None:
     """Validate one ``add()`` call's shape; shared by both store implementations.
 
+    Every chunk's ``document_id`` is validated here too, at the write
+    boundary, because :meth:`delete` validates it as well
+    (:func:`_validate_document_id`, ADR-0001 hazard 5) and the two must agree
+    on what is storable. ``Chunk.document_id`` is a plain ``str``, so a
+    custom loader supplying something outside ``_DOCUMENT_ID_PATTERN``
+    (``tenant/doc``, say) used to ingest cleanly and only fail later, on the
+    first replace or prune that tried to delete it — leaving a collection
+    whose vectors could never be maintained or removed through the protocol.
+    Rejecting it on the way in fails closed at the boundary that can still
+    do something about it, and keeps the accepted-id set identical on both
+    store implementations, which share this function.
+
     Args:
         chunks: Chunks passed to ``add()``.
         embeddings: Embeddings passed to ``add()``, expected one per chunk.
@@ -142,13 +154,16 @@ def _validate_add_shapes(chunks: list[Chunk], embeddings: list[list[float]]) -> 
         are empty (a legal no-op ``add()``).
 
     Raises:
-        StorageError: ``chunks`` and ``embeddings`` differ in length, or the
-            embeddings in this call are not all the same width.
+        StorageError: ``chunks`` and ``embeddings`` differ in length, the
+            embeddings in this call are not all the same width, or a chunk
+            carries a ``document_id`` that could never be deleted.
     """
     if len(chunks) != len(embeddings):
         raise StorageError(
             f"chunks ({len(chunks)}) and embeddings ({len(embeddings)}) must have the same length"
         )
+    for chunk in chunks:
+        _validate_document_id(chunk.document_id)
     if not embeddings:
         return None
     width = len(embeddings[0])
@@ -231,13 +246,20 @@ def _matches_filter(metadata: dict[str, Any], metadata_filter: dict[str, Any] | 
 
 
 def _sort_by_score(scored: list[tuple[Chunk, float]]) -> list[tuple[Chunk, float]]:
-    """Sort ``(chunk, score)`` pairs by descending score, ties broken ascending by content hash.
+    """Sort ``(chunk, score)`` pairs by descending score, ties broken content-first.
 
-    Mirrors ``index/bm25.py``'s tie-break convention exactly, so repeated
-    searches against unchanged state return byte-identical ordering across
-    runs and processes, not merely identical scores.
+    Ties break on ``(content_hash, chunk_index)``, matching ADR-0005
+    decision 3 and ``retrieval/fusion.py``. ``content_hash`` alone is not a
+    total order — duplicate content shares a hash — and unlike
+    ``index/bm25.py``, whose remaining ties fall back to a deterministic
+    insertion order (its postings are rebuilt from SQLite in a fixed order),
+    this sort is fed by LanceDB row order, which carries no such guarantee.
+    Duplicate content could therefore rank backend-dependently here.
+    ``chunk_index`` removes that, leaving unordered only genuinely identical
+    content at the same position in different documents, where the choice is
+    unobservable in the results.
     """
-    return sorted(scored, key=lambda pair: (-pair[1], pair[0].content_hash))
+    return sorted(scored, key=lambda pair: (-pair[1], pair[0].content_hash, pair[0].chunk_index))
 
 
 def _validate_document_id(document_id: str) -> None:
@@ -657,7 +679,12 @@ class LanceDBVectorStore:
                 raise _dimension_mismatch_error(
                     "query embedding", len(query_embedding), self._dimensions
                 )
-            if metadata_filter is None:
+            # `not metadata_filter`, not `is None`: _matches_filter treats an
+            # empty dict as a no-op that matches everything, so treating {}
+            # as "filtering enabled" here would pay the O(N) count_rows
+            # over-fetch to apply a filter that cannot remove anything. The
+            # two must agree on what counts as a filter.
+            if not metadata_filter:
                 fetch_limit = top_k
             else:
                 fetch_limit = await asyncio.to_thread(self._table.count_rows)

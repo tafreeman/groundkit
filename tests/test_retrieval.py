@@ -1013,3 +1013,115 @@ class TestValidationAppliesToEveryMode:
                 await store.close()
 
         asyncio.run(run())
+
+
+class _ScriptedVectorStore:
+    """Returns a fixed ranking truncated to ``top_k``, recording each ``top_k`` asked for.
+
+    The snapshot filter's behaviour depends on *what order* the live store
+    returns hits in, which a hash-vector embedder cannot be made to control.
+    Scripting the ranking is the only way to put post-open content above
+    eligible content deterministically. ``requested`` exposes the widening.
+
+    Satisfies :class:`~groundkit.index.protocols.VectorStoreProtocol`
+    structurally.
+    """
+
+    def __init__(self) -> None:
+        self.ranked: list[tuple[Chunk, float]] = []
+        self.requested: list[int] = []
+
+    async def add(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
+        return None
+
+    async def search(
+        self,
+        query_embedding: list[float],
+        top_k: int = 5,
+        metadata_filter: dict[str, object] | None = None,
+    ) -> list[tuple[Chunk, float]]:
+        self.requested.append(top_k)
+        return self.ranked[:top_k]
+
+    async def delete(self, document_id: str) -> int:
+        return 0
+
+
+def test_post_open_documents_do_not_displace_eligible_dense_results(tmp_path: Path) -> None:
+    """Content ingested after open() must be invisible, not obstructive.
+
+    The dense path reads a *live* vector-store handle, so post-open chunks
+    occupy ranking slots that the stale in-memory BM25 index does not even
+    contain. Fetching exactly top_k and only then dropping them let new
+    content push eligible results off the end: the search returns fewer than
+    top_k -- here, nothing at all -- while perfectly good pre-open chunks sat
+    immediately below the cut. That contradicts the open()-time snapshot
+    semantics the dense path claims, since a search over the old corpus
+    would have returned them, and it breaks the filter-then-truncate rule
+    ``index/dense.py`` already applies to metadata filters.
+    """
+
+    async def run() -> None:
+        store = await _populated_store(tmp_path)
+        pre_open_chunks = await store.get_chunks()
+        assert len(pre_open_chunks) == 2
+
+        scripted = _ScriptedVectorStore()
+        retriever = await Retriever.open(
+            store, embedder=InMemoryEmbedder(dimensions=8), vector_store=scripted
+        )
+
+        # Ingested after open(): present in sources, absent from the snapshot.
+        post_open_chunks: list[Chunk] = []
+        for name in ("gamma.md", "delta.md"):
+            doc = Document(source=str(tmp_path / name), content=f"{name} added after open")
+            await store.upsert_document(
+                source=doc.source, document_id=doc.document_id, content_hash="h-post"
+            )
+            chunks = _chunks_for(doc)
+            await store.add_chunks(chunks, source=doc.source)
+            post_open_chunks.extend(chunks)
+
+        # Both post-open chunks outrank everything eligible.
+        scripted.ranked = [(chunk, 9.9) for chunk in post_open_chunks] + [
+            (chunk, 1.0) for chunk in pre_open_chunks
+        ]
+
+        response = await retriever.search("anything", top_k=2, mode="dense")
+
+        # Both eligible chunks come back; neither post-open document appears.
+        assert len(response.results) == 2
+        returned = {result.chunk_id for result in response.results}
+        assert returned == {chunk.chunk_id for chunk in pre_open_chunks}
+
+        # It got there by widening the fetch, not by asking for top_k once.
+        assert scripted.requested[0] == 2
+        assert max(scripted.requested) > 2
+
+    asyncio.run(run())
+
+
+def test_unknown_search_mode_raises_instead_of_silently_fusing(tmp_path: Path) -> None:
+    """An unrecognised mode is a caller bug, not a request for hybrid.
+
+    ``SearchMode`` is a type hint, not a runtime guard. Dispatching the
+    default branch to fusion meant a typo'd mode returned fused results
+    stamped ``metadata["stage"] = "fusion"`` -- a wrong answer presented as a
+    valid one, which SPEC.md §2's fail-closed rule forbids.
+    """
+
+    async def run() -> None:
+        store = await _populated_store(tmp_path)
+        retriever = await Retriever.open(
+            store,
+            embedder=InMemoryEmbedder(dimensions=8),
+            vector_store=InMemoryVectorStore(),
+        )
+
+        with pytest.raises(RetrievalError, match="Unknown search mode"):
+            await retriever.search("anything", mode="sparse")  # type: ignore[arg-type]
+
+        # The three real modes still dispatch.
+        assert (await retriever.search("ranking", mode="bm25")).metadata["stage"] == "bm25"
+
+    asyncio.run(run())

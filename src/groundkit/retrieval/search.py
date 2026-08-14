@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 from groundkit.config import RetrievalConfig
 from groundkit.contracts import EmbeddingIdentity, RetrievalResult, SearchResponse
@@ -31,6 +31,12 @@ MAX_TOP_K: int = 50
 
 #: Search modes accepted by :meth:`Retriever.search`.
 SearchMode = Literal["bm25", "dense", "hybrid"]
+
+#: How many times the dense snapshot filter may double its fetch before
+#: giving up and returning fewer than top_k. Each attempt doubles from k, so
+#: the last attempt asks for k * 2**(n-1); the loop also stops early the
+#: moment the store returns fewer rows than asked, which means exhausted.
+_MAX_SNAPSHOT_FETCH_ATTEMPTS: Final[int] = 5
 
 _NS_PER_MS = 1_000_000
 
@@ -220,7 +226,7 @@ class Retriever:
             pairs = await self._dense_candidates(query, k, sources, embedder, vector_store)
             results = self._resolve(pairs, sources, apply_threshold=True)
             metadata = {"stage": "dense", "top_k": k}
-        else:
+        elif mode == "hybrid":
             embedder, vector_store = self._require_dense(mode)
             bm25_pairs = self._bm25.search(query, top_k=k)
             dense_pairs = await self._dense_candidates(query, k, sources, embedder, vector_store)
@@ -229,6 +235,15 @@ class Retriever:
             )
             results = self._resolve(fused, sources, apply_threshold=False)
             metadata = {"stage": "fusion", "top_k": k, "rrf_k": self._config.rrf_k}
+        else:
+            # SearchMode is a type hint, not a runtime guard. Falling through
+            # to hybrid would answer a typo'd mode with fused results and
+            # stamp metadata["stage"] = "fusion" on them — a wrong answer
+            # reported as a valid one, which SPEC.md §2's fail-closed rule
+            # forbids. An unknown mode is a caller bug; name it.
+            raise RetrievalError(
+                f"Unknown search mode {mode!r}; expected one of 'bm25', 'dense', 'hybrid'"
+            )
 
         latency_ms = (time.perf_counter_ns() - started) / _NS_PER_MS
         logger.info("Search returned %d results in %.2f ms", len(results), latency_ms)
@@ -272,6 +287,23 @@ class Retriever:
           stale in-memory BM25 index.
         - in neither → orphaned vectors; fail closed loudly.
 
+        **Filter-then-truncate, by over-fetching.** Asking the store for
+        exactly ``k`` and then dropping post-open hits would let content
+        ingested after ``open()`` *displace* eligible results: enough new
+        chunks ranking above them and a dense or hybrid search returns fewer
+        than ``k``, or nothing at all, while perfectly good pre-open chunks
+        sat just below the cut. That is not the snapshot semantics claimed
+        above — a search over the old corpus would have returned them — and
+        it is the same principle ``index/dense.py`` already applies to
+        metadata filters. So the fetch widens (doubling, bounded) until
+        either ``k`` results survive the filter or the store is exhausted,
+        and only then truncates.
+
+        Widening also widens the orphan check's window, which can surface an
+        orphan that a ``k``-sized fetch would not have reached. That is the
+        intended direction: an orphan is real corruption, and finding it is
+        the fail-closed outcome, not a regression.
+
         Raises:
             RetrievalError: A hit references a document with no stored
                 source — orphaned vectors (a document deleted from SQLite
@@ -279,7 +311,38 @@ class Retriever:
                 or interrupted-ingest residue; ``KNOWN_LIMITATIONS.md``).
         """
         embedding = (await embedder.embed([query]))[0]
-        pairs = await vector_store.search(embedding, top_k=k)
+        kept: list[tuple[Chunk, float]] = []
+        fetch = k
+        for attempt in range(_MAX_SNAPSHOT_FETCH_ATTEMPTS):
+            pairs = await vector_store.search(embedding, top_k=fetch)
+            kept = self._apply_snapshot_filter(pairs, sources)
+            if len(kept) >= k or len(pairs) < fetch:
+                # Enough survivors, or the store returned less than asked and
+                # therefore holds nothing more to widen into.
+                break
+            if attempt == _MAX_SNAPSHOT_FETCH_ATTEMPTS - 1:
+                # Never silently: a caller seeing < k results is entitled to
+                # know the cap truncated the search rather than the corpus.
+                logger.warning(
+                    "Dense snapshot filter still short of top_k after %d widening "
+                    "attempts (fetched %d, kept %d, wanted %d); returning what survived",
+                    _MAX_SNAPSHOT_FETCH_ATTEMPTS,
+                    fetch,
+                    len(kept),
+                    k,
+                )
+                break
+            fetch *= 2
+        return kept[:k]
+
+    def _apply_snapshot_filter(
+        self, pairs: list[tuple[Chunk, float]], sources: dict[str, str]
+    ) -> list[tuple[Chunk, float]]:
+        """Keep only hits whose document existed at ``open()``; fail closed on orphans.
+
+        Split out of :meth:`_dense_candidates` because the over-fetch loop
+        applies it once per widening attempt.
+        """
         kept: list[tuple[Chunk, float]] = []
         for chunk, score in pairs:
             if chunk.document_id in self._documents_at_open:

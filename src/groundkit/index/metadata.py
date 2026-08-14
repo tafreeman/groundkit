@@ -33,7 +33,7 @@ import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final, TypeVar
+from typing import Any, Final, TypeVar
 
 from groundkit.contracts import Chunk, CollectionManifest, EmbeddingIdentity
 from groundkit.errors import ConfigurationError, IndexIdentityError, StorageError
@@ -684,43 +684,71 @@ class SQLiteMetadataStore:
         ``_op``s roll back too; that is harmless (nothing pending) rather
         than pointless to special-case away.
 
+        Cancellation is the case that dictates the shape of this method.
+        Cancelling ``await asyncio.to_thread(fn)`` does not stop ``fn`` — the
+        worker thread runs to completion regardless — so neither the rollback
+        nor the lock release can be driven off this coroutine unwinding:
+
+        - **The rollback runs on the worker thread**, inside ``_guarded``,
+          strictly after ``fn``'s last statement. Rolling back from the event
+          loop thread instead would race a worker still executing statements
+          on this same connection, potentially undoing part of an operation
+          while the rest went on to commit.
+        - **The lock is released when the worker finishes**, not when this
+          coroutine returns. Releasing on unwind would let the next operation
+          start while an abandoned worker was still mid-statement, and
+          ``replace_document``'s one-commit atomicity is exactly what that
+          would break.
+        - ``asyncio.shield`` keeps the worker alive through an outer
+          cancellation, so the connection is always left consistent by the
+          thread that was using it. The cancellation itself still propagates.
+
         Raises:
             StorageError: Wraps any ``sqlite3.Error`` raised by ``fn``.
                 Errors of other types (e.g. a deliberate ``StorageError``
                 raised by ``fn`` itself) propagate unchanged — both trigger
                 the same rollback first.
         """
-        async with self._lock:
+
+        def _guarded() -> _T:
             try:
-                return await asyncio.to_thread(fn)
-            except sqlite3.Error as exc:
-                await asyncio.to_thread(self._conn.rollback)
-                raise StorageError(str(exc)) from exc
+                return fn()
             except BaseException:
-                # BaseException, not Exception: CancelledError is not an
-                # Exception, so an `except Exception` here skipped the
-                # rollback on exactly the path that needs it most — a
-                # cancelled task (gather abandoning siblings, a timeout)
-                # leaving the implicit transaction's already-executed
-                # statements uncommitted but not undone, ready to leak out
-                # on the next unrelated commit.
-                #
-                # Rolled back synchronously rather than through to_thread:
-                # awaiting anything inside an already-cancelling task can
-                # re-raise CancelledError before the rollback ever runs. The
-                # lock is still held, so no other operation can be mid-
-                # statement on this connection, and a rollback is short
-                # enough to run on the loop thread.
                 try:
                     self._conn.rollback()
                 except sqlite3.Error:
-                    # Already closed (a cancelled operation racing store
-                    # teardown) or otherwise unusable. There is no open
-                    # transaction left to undo in that state, and raising
-                    # here would replace the exception we are propagating
-                    # with a less informative one.
+                    # Already closed (an operation racing store teardown) or
+                    # otherwise unusable. Nothing is left to undo in that
+                    # state, and raising here would replace the exception
+                    # being propagated with a less informative one.
                     logger.debug("Rollback skipped: connection unusable", exc_info=True)
                 raise
+
+        await self._lock.acquire()
+        try:
+            worker: asyncio.Task[_T] = asyncio.ensure_future(asyncio.to_thread(_guarded))
+        except BaseException:
+            self._lock.release()
+            raise
+        worker.add_done_callback(self._release_after_worker)
+
+        try:
+            return await asyncio.shield(worker)
+        except sqlite3.Error as exc:
+            raise StorageError(str(exc)) from exc
+
+    def _release_after_worker(self, worker: asyncio.Future[Any]) -> None:
+        """Release the operation lock once the worker thread is done with the connection.
+
+        Wired as :meth:`_run`'s done-callback rather than a ``finally``: on
+        cancellation the awaiting coroutine unwinds while the thread is still
+        running, and the lock must outlive it. Also retrieves the worker's
+        exception so an abandoned failure does not surface as an
+        "exception was never retrieved" warning.
+        """
+        self._lock.release()
+        if not worker.cancelled():
+            worker.exception()
 
 
 def _row_to_chunk(row: tuple[str, str, int, str, int, int, str]) -> Chunk:
