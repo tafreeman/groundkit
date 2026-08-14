@@ -197,14 +197,49 @@ changeset that leaves the tree green.
 - Heavy deps (torch/sentence-transformers) must stay out of the base install;
   CI's default job must not pull them.
 
-### Wave E — eval deltas (the phase gate)
+### Wave E — eval deltas (the phase gate) (**Landed**)
 
-- Runner emits multiple stages into one report; deltas derived vs `stages[0]`.
-- Per-stage latency percentiles (SPEC.md §6 names BM25/dense/fusion/rerank
-  explicitly — the schema already has the fields).
-- The honest-loss path is tested: a stage that underperforms baseline is
-  reported as such, not suppressed.
-- `EVAL_GATED=1` workflow for real-model runs; skips cleanly when unconfigured.
+Taken before Wave D deliberately. R1 names the eval delta as the phase's
+largest scheduling risk, and Wave E depends on nothing rerank provides, so
+building it first means Wave D reports into a harness that already works
+rather than one being built under it.
+
+- `run_eval` accepts an optional keyword-only `embedder`/`vector_store` pair
+  (both or neither, `ConfigurationError` otherwise — matching `Indexer` and
+  `Retriever`) and emits `bm25` → `dense` → `fusion` into one report. One
+  index and **one retriever** serve every stage, so the stages differ by
+  retrieval strategy alone; ground truth is resolved once per judgment and
+  shared, so no two stages can disagree about what counted as relevant.
+- Deltas are derived at read time by `evals/delta.py` and never stored.
+  `StageDelta` is a return type, never a field of `EvalReport`.
+- Per-stage latency percentiles come from each stage's own per-query
+  timings — the existing `StageResult` fields, now populated per stage.
+- **The honest-loss path is tested, in both directions.** A losing stage is
+  reported with its real numbers, flagged `is_regression`, and printed with
+  a `REGRESSION vs baseline` verdict. Verified per SPEC.md §8 by mutating the
+  source twice — `is_regression` forced to `False`, and a filter that drops
+  stages losing to baseline — and observing 6 and 10 test failures
+  respectively, then restoring.
+- **No noise threshold.** `is_regression` is a strict sign test. A tolerance
+  band would be an invented number, and R2 says a real effect on this corpus
+  can be smaller than any epsilon anyone would pick. `is_improvement` is
+  tracked separately rather than as the negation, so a stage that gains one
+  metric and loses another reports as `MIXED` instead of hiding half the
+  result.
+- `EVAL_GATED=1` gates a real-model run (`tests/test_eval_gated.py`,
+  `.github/workflows/eval-gated.yml`: schedule + `workflow_dispatch` + an
+  `eval-gated` PR label). Skipping cleanly is the *default* outcome; the gated
+  tests assert the run reports honestly and deliberately **do not** assert
+  that dense or fusion beats BM25, since a test that reddens on a loss would
+  pressure the next person to grow the corpus until it passes.
+- `RunConfig` gained two optional, defaulted fields — `embedding` (the
+  ADR-0004 identity triple) and `rrf_k`, both `None`-meaning-absent. Without
+  the first, two runs over identical golden data with *different* embedders
+  agree on `corpus_hash` and `judgments_hash` while measuring two different
+  semantic spaces: ADR-0004's silent-mixing failure one layer above the
+  index. Additive-with-default rather than a `schema_version` bump; the
+  reasoning, and the condition that would force a bump instead, are in
+  `schema.py`'s module docstring.
 
 ### Wave F — docs and gates
 
@@ -241,6 +276,18 @@ while normal CI runs only the deterministic structural assertions. The
 the phase that has to actually build it. **This is the single largest
 scheduling risk in the phase.**
 
+**Mechanism built in Wave E; measurement still outstanding.** `EVAL_GATED=1`
+now exists as a pytest gate (`tests/test_eval_gated.py`, skipped by default
+and by design) and a workflow (`.github/workflows/eval-gated.yml`). Normal
+CI remains offline and runs only structural assertions on the dense path;
+no test anywhere asserts a dense or fusion quality *value*. Recording the
+embedder identity in `RunConfig.embedding` makes the distinction
+machine-checkable rather than a convention a reader has to remember: a
+report whose `embedding.provider` is `inmemory` is self-labelling as
+structural, and the CLI stamps an explicit warning on it. The risk is
+therefore contained but **not retired** — it retires when a gated run has
+actually produced a delta (see Q1).
+
 **R2 — The corpus may be too small for a meaningful delta.** The Phase 2
 baseline runs over 10 documents / 84 chunks / 44 judgments. On a corpus that
 size, dense-vs-BM25 differences may be within noise, and a "win" may not
@@ -276,10 +323,21 @@ measurements. Per repo policy, no number from a run of that script is quoted
 here or anywhere else — regenerate them by running the script.
 
 **Q1 — Default retrieval mode after Phase 3.** Does `grk search` default to
-hybrid, or stay BM25-only until a delta justifies the switch? **Deliberately
-still open**, and that is the disciplined answer rather than an evasion: SPEC.md
-§6 makes the measured delta the decider, so committing to a default before
-Wave E has produced one would be choosing by assertion. Wave E closes it.
+hybrid, or stay BM25-only until a delta justifies the switch? **Still open
+after Wave E, and deliberately so.** Wave E was scoped to close it, and it
+built everything needed to: the harness now emits all three stages, derives
+each one's signed delta, and reports a loss as a loss. What it did not do is
+*produce the measurement*, because the only honest one comes from a real
+embedding model through the `EVAL_GATED=1` path, and that has not been run.
+
+The distinction matters and is not a technicality. A delta computed with
+`InMemoryEmbedder` exists — the harness will print one — and it is noise, so
+closing Q1 on it would be choosing by assertion while appearing to choose by
+data, which is worse than leaving the question open. Q1 closes on the first
+gated run against the committed golden corpus: schedule the workflow, or run
+it manually, then read `evals/results/latest.json`. Note R2 in advance — a
+wash or a loss is a legitimate outcome and would close Q1 as "BM25 stays the
+default", which is a real answer, not a failure to answer.
 
 **Q2 — Does the manifest live in SQLite or beside it? — Settled.**
 [ADR-0004](../adr/ADR-0004-embedding-identity-binding.md) decision 1 puts it

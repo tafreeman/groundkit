@@ -7,6 +7,22 @@ against: Phase 3 appends ``dense``/``fusion``/``rerank`` stages to the same
 ``EvalReport``'s docstring for why that makes intra-run comparison the only
 kind this schema supports.
 
+Wave E kept that promise for stages and extended :class:`RunConfig` by two
+optional, defaulted fields (``embedding``, ``rrf_k``) rather than by a
+``schema_version`` bump. Additive-with-default is not a breaking change in
+the direction that exists: a current reader parses a pre-Wave-E artifact
+unchanged, both fields defaulting to ``None``. The reverse direction — an
+older reader meeting a newer artifact — would fail on ``extra="forbid"``,
+and is accepted precisely because no such artifact is kept: ``evals/results/``
+is gitignored, so every artifact in existence is produced by the code
+reading it. Should that ever stop being true, the next field is a version
+bump, not another default.
+
+Deltas are **not** here. They are derived at read time by
+:mod:`groundkit.evals.delta`, which returns a ``StageDelta`` that is never a
+field of :class:`EvalReport` — see that module and :class:`EvalReport` for
+why a stored delta is the one thing this schema refuses to carry.
+
 All models are frozen and reject unknown fields, matching ``contracts.py``
 and ``config.py``.
 """
@@ -18,6 +34,15 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from groundkit.contracts import EmbeddingIdentity
+
+#: The retrieval stages a report may contain, in the order Phase 3 produces
+#: them. Defined once here and referenced by :class:`StageResult`, the
+#: runner, and :mod:`groundkit.evals.delta`: three copies of the same
+#: ``Literal`` would let a stage added to one drift out of the others, and
+#: the artifact schema is the right single owner of what a stage may be.
+StageName = Literal["bm25", "dense", "fusion", "rerank"]
+
 
 class RunConfig(BaseModel):
     """The settings that produced a run — what makes two runs comparable.
@@ -26,6 +51,16 @@ class RunConfig(BaseModel):
     comparability key: SPEC.md keys comparability on ``corpus_hash`` +
     ``judgments_hash`` (see :class:`RunMetadata`). A config diff between two
     otherwise-comparable runs explains *why* their numbers might disagree.
+
+    ``embedding`` and ``rrf_k`` arrived with Phase 3 Wave E's dense and
+    fusion stages, both optional and both ``None``-meaning-absent rather
+    than ``None``-meaning-defaulted: a BM25-only run has no embedding
+    identity and no fusion constant, and inventing one would put a number in
+    the artifact that nothing produced. ``embedding`` in particular is what
+    stops the corpus/judgment hashes from overstating comparability — two
+    runs over identical golden data with *different* embedders agree on
+    every existing field here while measuring two different semantic spaces,
+    which is ADR-0004's silent-mixing failure one layer above the index.
 
     Attributes:
         chunk_size: Target chunk size in characters
@@ -36,6 +71,15 @@ class RunConfig(BaseModel):
         bm25_b: BM25 length-normalization parameter.
         score_threshold: Minimum score filter in effect, or ``None`` if
             disabled.
+        embedding: The ADR-0004 identity triple of the embedder that
+            produced this run's dense vectors, or ``None`` for a BM25-only
+            run that embedded nothing. A ``provider`` of ``"inmemory"``
+            marks every dense-derived number in the report as structurally
+            valid and semantically meaningless (SPEC.md §2) — recorded in
+            the artifact so that judgment is machine-checkable rather than
+            a footnote a reader has to remember.
+        rrf_k: The RRF constant used by the fusion stage (ADR-0005), or
+            ``None`` if this run produced no fusion stage.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -46,6 +90,8 @@ class RunConfig(BaseModel):
     bm25_k1: float
     bm25_b: float
     score_threshold: float | None
+    embedding: EmbeddingIdentity | None = None
+    rrf_k: int | None = Field(default=None, gt=0)
 
 
 class RunMetadata(BaseModel):
@@ -264,7 +310,7 @@ class StageResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    stage: Literal["bm25", "dense", "fusion", "rerank"]
+    stage: StageName
     is_baseline: bool
     aggregate: MetricSet
     by_category: dict[str, MetricSet]

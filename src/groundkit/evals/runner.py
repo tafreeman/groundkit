@@ -1,4 +1,4 @@
-"""BM25-baseline retrieval eval runner (Phase 2, SPEC.md §6, §8).
+"""Multi-stage retrieval eval runner (Phase 2 baseline; Phase 3 Wave E stages).
 
 Ties the pieces already built independently — :mod:`groundkit.evals.corpus`
 (judgment loading and gold-span resolution), :mod:`groundkit.evals.metrics`
@@ -6,6 +6,21 @@ Ties the pieces already built independently — :mod:`groundkit.evals.corpus`
 shape) — into one entry point, :func:`run_eval`, that builds a throwaway
 index over a corpus, retrieves against it, and reports an
 :class:`~groundkit.evals.schema.EvalReport`.
+
+Phase 2 shipped this as a single-stage BM25 baseline. Wave E made it
+multi-stage: given a dense pair, one run indexes once, opens **one**
+retriever, and replays the same judgment set through every stage
+(``bm25`` → ``dense`` → ``fusion``), emitting them into one report so the
+delta each stage owes SPEC.md §6 is derivable within that artifact
+(:mod:`groundkit.evals.delta`). Stages share the index and the retriever
+deliberately: a per-stage rebuild would let corpus or chunking differences
+leak into what is supposed to be a comparison of retrieval strategies alone.
+
+**A losing stage is reported, not dropped.** There is no filtering anywhere
+in this module — every configured stage lands in ``report.stages`` with
+whatever numbers it earned. SPEC.md §6's baseline discipline makes that a
+requirement, and it is the reason the dense and fusion stages are appended
+unconditionally once a dense pair is supplied rather than "if they help".
 
 Two conventions this module exists to enforce, both easy to get wrong:
 
@@ -32,11 +47,12 @@ import tempfile
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from groundkit import __version__
 from groundkit.config import ChunkingConfig, RetrievalConfig
-from groundkit.errors import EvalError
+from groundkit.contracts import EmbeddingIdentity
+from groundkit.errors import ConfigurationError, EvalError
 from groundkit.evals.corpus import (
     chunk_overlaps_span,
     load_judgments,
@@ -60,11 +76,13 @@ from groundkit.evals.schema import (
     RetrievedHit,
     RunConfig,
     RunMetadata,
+    StageName,
     StageResult,
 )
 from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.indexer import Indexer
 from groundkit.ingestion.loaders import FileLoader
+from groundkit.providers.embeddings import INMEMORY_PROVIDER
 from groundkit.retrieval.search import Retriever
 
 if TYPE_CHECKING:
@@ -72,8 +90,27 @@ if TYPE_CHECKING:
 
     from groundkit.contracts import Chunk
     from groundkit.evals.corpus import GoldSpan, Judgment
+    from groundkit.index.protocols import VectorStoreProtocol
+    from groundkit.providers.protocols import EmbeddingProtocol
+    from groundkit.retrieval.search import SearchMode
 
 logger = logging.getLogger(__name__)
+
+#: Eval stage -> the :meth:`Retriever.search` mode that produces it, in the
+#: order stages are appended to a report. ``stages[0]`` must be ``"bm25"``
+#: (``EvalReport`` validates it), so the baseline's position is pinned here
+#: rather than assembled by callers.
+#:
+#: Note ``fusion`` maps to mode ``"hybrid"``: the *stage* is named for what
+#: produced the ranking (RRF fusion) and the *mode* for what the caller asks
+#: for, and ``SearchResponse.metadata["stage"]`` already reports ``"fusion"``
+#: for a hybrid search. Mapping them here keeps that single rename in one
+#: place instead of scattered across the runner.
+_DENSE_STAGE_MODES: tuple[tuple[StageName, SearchMode], ...] = (
+    ("dense", "dense"),
+    ("fusion", "hybrid"),
+)
+
 
 #: Chunking config pinned for eval runs, with every value stated
 #: explicitly rather than inherited from ``ChunkingConfig()``'s defaults.
@@ -93,8 +130,15 @@ EVAL_CHUNKING_CONFIG: ChunkingConfig = ChunkingConfig(
 )
 
 
-async def run_eval(corpus_dir: Path, judgments_path: Path, *, top_k: int = 10) -> EvalReport:
-    """Run the BM25-baseline retrieval eval over a corpus and judgment set.
+async def run_eval(
+    corpus_dir: Path,
+    judgments_path: Path,
+    *,
+    top_k: int = 10,
+    embedder: EmbeddingProtocol | None = None,
+    vector_store: VectorStoreProtocol | None = None,
+) -> EvalReport:
+    """Run the retrieval eval over a corpus and judgment set, one stage per strategy.
 
     Resolves every gold span against the corpus text first (failing closed
     on a missing or ambiguous quote before any indexing happens), then
@@ -103,7 +147,22 @@ async def run_eval(corpus_dir: Path, judgments_path: Path, *, top_k: int = 10) -
     :data:`EVAL_CHUNKING_CONFIG`, opens a
     :class:`~groundkit.retrieval.search.Retriever` snapshot over the
     freshly-ingested store (ADR-0002: the retriever is opened *after*
-    ingestion and never refreshed), and scores every judgment against it.
+    ingestion and never refreshed), and scores every judgment against it
+    once per stage.
+
+    Without a dense pair this is exactly the Phase 2 baseline run: a single
+    ``bm25`` stage. With one, the same index and the same retriever also
+    produce ``dense`` and ``fusion`` stages, so the three differ only in
+    retrieval strategy and their deltas
+    (:func:`~groundkit.evals.delta.derive_stage_deltas`) measure that alone.
+
+    Passing :class:`~groundkit.providers.embeddings.InMemoryEmbedder` is
+    supported and *logged as a warning*: it exercises the dense and fusion
+    code paths deterministically and offline, but its hash-derived vectors
+    carry no semantic signal, so the quality numbers of those stages are
+    noise (SPEC.md §2). The embedder's identity is recorded in
+    ``report.run.config.embedding`` so a reader can tell which case they are
+    looking at without being told.
 
     Args:
         corpus_dir: Root directory of the corpus documents (e.g.
@@ -111,13 +170,21 @@ async def run_eval(corpus_dir: Path, judgments_path: Path, *, top_k: int = 10) -
         judgments_path: Path to a JSONL judgments file, as read by
             :func:`~groundkit.evals.corpus.load_judgments`.
         top_k: Results requested per query. Retrieval runs exactly once per
-            query at this cutoff; recall@1/5/10 are all sliced from that
-            single ranked list rather than re-querying per ``k``.
+            query per stage at this cutoff; recall@1/5/10 are all sliced
+            from that single ranked list rather than re-querying per ``k``.
+        embedder: Optional embedding provider enabling the ``dense`` and
+            ``fusion`` stages (keyword-only; both or neither with
+            ``vector_store``, mirroring ``Indexer`` and ``Retriever``).
+        vector_store: Optional dense vector store (keyword-only).
 
     Returns:
-        A single-stage (``bm25``, baseline) :class:`EvalReport`.
+        An :class:`EvalReport` whose ``stages[0]`` is always the ``bm25``
+        baseline, followed by ``dense`` and ``fusion`` when a dense pair was
+        supplied.
 
     Raises:
+        ConfigurationError: Exactly one of ``embedder`` / ``vector_store``
+            was supplied.
         EvalError: A judgment or gold span fails to load or resolve against
             the corpus, or a gold span's document (or a retrieved hit's
             document) has no corresponding entry among the corpus's
@@ -127,6 +194,20 @@ async def run_eval(corpus_dir: Path, judgments_path: Path, *, top_k: int = 10) -
         RetrievalError: A search call fails (e.g. an index inconsistency,
             or an out-of-range ``top_k``).
     """
+    _validate_dense_pair(embedder, vector_store)
+    if embedder is not None and embedder.provider == INMEMORY_PROVIDER:
+        logger.warning(
+            # Plain ASCII deliberately: this string is emitted to a live
+            # console, and the repo's primary dev platform defaults to a
+            # cp1252 code page that mangles a section sign into a
+            # replacement character mid-warning.
+            "Eval running with the %r embedder: dense and fusion stages will exercise "
+            "the code paths but their quality metrics are hash-derived noise, not a "
+            "retrieval-quality measurement (SPEC.md section 2). Use a real embedding "
+            "provider for any number that is meant to mean something.",
+            INMEMORY_PROVIDER,
+        )
+
     started_at = datetime.now(UTC).isoformat()
     judgments = load_judgments(judgments_path)
 
@@ -163,12 +244,19 @@ async def run_eval(corpus_dir: Path, judgments_path: Path, *, top_k: int = 10) -
                 store,
                 FileLoader(allowed_base_dir=corpus_dir),
                 chunking_config=EVAL_CHUNKING_CONFIG,
+                embedder=embedder,
+                vector_store=vector_store,
             )
             await indexer.index_directory(str(corpus_dir))
 
             # Opened AFTER ingestion completes: a Retriever snapshots the
-            # store at open() and never refreshes it (ADR-0002).
-            retriever = await Retriever.open(store, retrieval_config)
+            # store at open() and never refreshes it (ADR-0002). One
+            # retriever serves every stage — nothing writes between stages,
+            # so the snapshot stays valid, and sharing it keeps the stages
+            # comparing retrieval strategy rather than index state.
+            retriever = await Retriever.open(
+                store, retrieval_config, embedder=embedder, vector_store=vector_store
+            )
 
             all_chunks = await store.get_chunks()
             sources = await store.get_document_sources()
@@ -192,17 +280,40 @@ async def run_eval(corpus_dir: Path, judgments_path: Path, *, top_k: int = 10) -
             for chunk in all_chunks:
                 chunks_by_document[chunk.document_id].append(chunk)
 
-            query_results: list[QueryResult] = []
-            for judgment in judgments:
-                query_results.append(
-                    await _evaluate_judgment(
-                        judgment,
-                        resolved_spans[judgment.query_id],
-                        retriever=retriever,
-                        top_k=top_k,
-                        chunks_by_document=chunks_by_document,
-                        relpath_to_document_id=relpath_to_document_id,
-                        document_id_to_relpath=document_id_to_relpath,
+            # Ground truth is a property of the corpus and the judgments,
+            # not of any retrieval strategy, so it is resolved once here and
+            # reused by every stage. Recomputing it per stage would be
+            # wasted work and, worse, a place for two stages to disagree
+            # about what "relevant" meant.
+            gold_by_query: dict[str, _JudgmentGold] = {
+                judgment.query_id: _build_gold(
+                    judgment,
+                    resolved_spans[judgment.query_id],
+                    chunks_by_document=chunks_by_document,
+                    relpath_to_document_id=relpath_to_document_id,
+                )
+                for judgment in judgments
+            }
+
+            stages: list[StageResult] = []
+            for stage_name, mode in _planned_stages(embedder, vector_store):
+                query_results: list[QueryResult] = []
+                for judgment in judgments:
+                    query_results.append(
+                        await _evaluate_judgment(
+                            judgment,
+                            gold_by_query[judgment.query_id],
+                            retriever=retriever,
+                            top_k=top_k,
+                            mode=mode,
+                            document_id_to_relpath=document_id_to_relpath,
+                        )
+                    )
+                stages.append(
+                    _build_stage_result(
+                        query_results,
+                        stage=stage_name,
+                        is_baseline=not stages,
                     )
                 )
         finally:
@@ -211,7 +322,6 @@ async def run_eval(corpus_dir: Path, judgments_path: Path, *, top_k: int = 10) -
             # is still open.
             await store.close()
 
-    stage = _build_stage_result(query_results)
     run_metadata = RunMetadata(
         started_at=started_at,
         groundkit_version=__version__,
@@ -227,15 +337,85 @@ async def run_eval(corpus_dir: Path, judgments_path: Path, *, top_k: int = 10) -
             bm25_k1=retrieval_config.bm25_k1,
             bm25_b=retrieval_config.bm25_b,
             score_threshold=retrieval_config.score_threshold,
+            embedding=_identity_of(embedder) if embedder is not None else None,
+            # Recorded only when a fusion stage actually ran: on a BM25-only
+            # run the constant was never applied to anything, and stamping
+            # the configured value into the artifact anyway would describe a
+            # computation that did not happen.
+            rrf_k=retrieval_config.rrf_k if embedder is not None else None,
         ),
     )
     logger.info(
-        "Eval run complete: %d judgments, %d documents, %d chunks",
+        "Eval run complete: %d stages, %d judgments, %d documents, %d chunks",
+        len(stages),
         len(judgments),
         document_count,
         chunk_count,
     )
-    return EvalReport(run=run_metadata, stages=[stage])
+    return EvalReport(run=run_metadata, stages=stages)
+
+
+def _planned_stages(
+    embedder: EmbeddingProtocol | None, vector_store: VectorStoreProtocol | None
+) -> tuple[tuple[StageName, SearchMode], ...]:
+    """The stages this run will emit, baseline first.
+
+    Args:
+        embedder: The run's embedder, or ``None``.
+        vector_store: The run's vector store, or ``None``. Pairing is
+            already validated by the caller; both are read here so the
+            dense stages cannot be planned off half a pair.
+
+    Returns:
+        ``(stage_name, search_mode)`` pairs. Always starts with the
+        ``bm25`` baseline; appends :data:`_DENSE_STAGE_MODES` when a dense
+        pair is present.
+    """
+    baseline: tuple[tuple[StageName, SearchMode], ...] = (("bm25", "bm25"),)
+    if embedder is None or vector_store is None:
+        return baseline
+    return baseline + _DENSE_STAGE_MODES
+
+
+def _validate_dense_pair(
+    embedder: EmbeddingProtocol | None, vector_store: VectorStoreProtocol | None
+) -> None:
+    """Reject half a dense pair before any corpus work starts.
+
+    Mirrors the identical checks on ``Indexer`` and ``Retriever``. Done here
+    too, rather than left to whichever of them raises first, so the eval
+    fails on the caller's mistake before spending a full ingest on it.
+
+    Raises:
+        ConfigurationError: Exactly one of ``embedder`` / ``vector_store``
+            was supplied.
+    """
+    if embedder is not None and vector_store is None:
+        raise ConfigurationError(
+            "run_eval was given an embedder but no vector_store. The pair is "
+            "inseparable: there would be no dense index to search. Pass both or neither."
+        )
+    if vector_store is not None and embedder is None:
+        raise ConfigurationError(
+            "run_eval was given a vector_store but no embedder. The pair is "
+            "inseparable: queries could never be embedded. Pass both or neither."
+        )
+
+
+def _identity_of(embedder: EmbeddingProtocol) -> EmbeddingIdentity:
+    """Read the ADR-0004 identity triple off the embedder itself.
+
+    Mirrors the helpers of the same name in ``indexer.py`` and
+    ``retrieval/search.py``, and for the same reason: sourcing all three
+    fields from the object that actually embeds makes an artifact that
+    names a different model than the one that produced its vectors
+    unrepresentable.
+    """
+    return EmbeddingIdentity(
+        provider=embedder.provider,
+        model_name=embedder.model_name,
+        dimensions=embedder.dimensions,
+    )
 
 
 def write_report(report: EvalReport, output_path: Path) -> None:
@@ -259,55 +439,60 @@ def write_report(report: EvalReport, output_path: Path) -> None:
         raise EvalError(f"Cannot write eval report to {str(output_path)!r}: {exc}") from exc
 
 
-async def _evaluate_judgment(
+class _JudgmentGold(NamedTuple):
+    """One judgment's ground truth, resolved once and reused by every stage.
+
+    Attributes:
+        chunk_ids: Every persisted chunk whose offsets overlap a gold span.
+        spans: The resolved gold spans, for the artifact.
+    """
+
+    chunk_ids: set[str]
+    spans: list[GoldSpanResult]
+
+
+def _build_gold(
     judgment: Judgment,
     resolved_gold_spans: list[tuple[GoldSpan, int, int]],
     *,
-    retriever: Retriever,
-    top_k: int,
     chunks_by_document: dict[str, list[Chunk]],
     relpath_to_document_id: dict[str, str],
-    document_id_to_relpath: dict[str, str],
-) -> QueryResult:
-    """Score one judgment against a live retriever.
+) -> _JudgmentGold:
+    """Resolve one judgment's ground truth against the persisted chunk set.
 
-    Ground truth (``gold_ids``) is built from every persisted chunk whose
-    document matches a gold span's document and whose offsets overlap that
-    span — deliberately over *all* chunks in ``chunks_by_document``, not
-    just the chunks this call's ``retriever.search`` happens to return, so
-    nDCG's IDCG reflects the true count of relevant chunks rather than being
-    capped by ``top_k``.
+    Ground truth is built from every persisted chunk whose document matches
+    a gold span's document and whose offsets overlap that span —
+    deliberately over *all* chunks in ``chunks_by_document``, not just the
+    chunks some retrieval call happens to return, so nDCG's IDCG reflects
+    the true count of relevant chunks rather than being capped by ``top_k``.
+
+    Computed once per judgment and shared across stages: it depends only on
+    the corpus and the judgments, so a per-stage recomputation would be both
+    wasted work and an opportunity for two stages to disagree about what
+    counted as relevant.
 
     Args:
-        judgment: The judgment to score.
+        judgment: The judgment to resolve.
         resolved_gold_spans: ``(gold_span, start, end)`` triples, one per
             ``judgment.gold`` entry, already resolved against the corpus
             text before ingestion.
-        retriever: An open retriever snapshotting the freshly-ingested
-            corpus.
-        top_k: Results requested for this query.
         chunks_by_document: Every persisted chunk, grouped by
             ``document_id``.
         relpath_to_document_id: Corpus-relative posix path ->
             ``document_id``, for looking up a gold span's document.
-        document_id_to_relpath: The inverse map, for labeling retrieved
-            hits with a corpus-relative path.
 
     Returns:
-        This judgment's fully-scored :class:`~groundkit.evals.schema.QueryResult`.
+        The judgment's :class:`_JudgmentGold`.
 
     Raises:
-        EvalError: A gold span's document, or a retrieved hit's document,
-            has no corresponding entry among the indexed corpus documents —
-            it was never actually persisted, so ground truth (or the result
-            label) cannot be computed.
+        EvalError: A gold span's document has no corresponding entry among
+            the indexed corpus documents — it was never actually persisted,
+            so ground truth cannot be computed.
     """
-    is_no_answer = judgment.category == "no_answer"
-
-    gold_ids: set[str] = set()
-    gold_results: list[GoldSpanResult] = []
+    chunk_ids: set[str] = set()
+    spans: list[GoldSpanResult] = []
     for gold_span, start, end in resolved_gold_spans:
-        gold_results.append(
+        spans.append(
             GoldSpanResult(
                 document=gold_span.doc,
                 start_offset=start,
@@ -323,9 +508,44 @@ async def _evaluate_judgment(
             )
         for chunk in chunks_by_document.get(document_id, []):
             if chunk_overlaps_span(chunk.start_offset, chunk.end_offset, (start, end)):
-                gold_ids.add(chunk.chunk_id)
+                chunk_ids.add(chunk.chunk_id)
+    return _JudgmentGold(chunk_ids=chunk_ids, spans=spans)
 
-    response = await retriever.search(judgment.query, top_k=top_k)
+
+async def _evaluate_judgment(
+    judgment: Judgment,
+    gold: _JudgmentGold,
+    *,
+    retriever: Retriever,
+    top_k: int,
+    mode: SearchMode,
+    document_id_to_relpath: dict[str, str],
+) -> QueryResult:
+    """Score one judgment against a live retriever in one retrieval mode.
+
+    Args:
+        judgment: The judgment to score.
+        gold: The judgment's pre-resolved ground truth (:func:`_build_gold`).
+        retriever: An open retriever snapshotting the freshly-ingested
+            corpus.
+        top_k: Results requested for this query.
+        mode: The retrieval mode this stage measures.
+        document_id_to_relpath: ``document_id`` -> corpus-relative path, for
+            labeling retrieved hits.
+
+    Returns:
+        This judgment's fully-scored :class:`~groundkit.evals.schema.QueryResult`.
+
+    Raises:
+        EvalError: A retrieved hit's document has no corresponding entry
+            among the indexed corpus documents, so the result cannot be
+            labeled.
+    """
+    is_no_answer = judgment.category == "no_answer"
+    gold_ids = gold.chunk_ids
+    gold_results = gold.spans
+
+    response = await retriever.search(judgment.query, top_k=top_k, mode=mode)
     ranked_ids = [result.chunk_id for result in response.results]
 
     retrieved: list[RetrievedHit] = []
@@ -420,22 +640,37 @@ def _aggregate_by_category(query_results: Sequence[QueryResult]) -> dict[str, Me
     return {category: _aggregate_metric_set(results) for category, results in grouped.items()}
 
 
-def _build_stage_result(query_results: list[QueryResult]) -> StageResult:
-    """Assemble the single ``bm25`` baseline stage from per-query results.
+def _build_stage_result(
+    query_results: list[QueryResult], *, stage: StageName, is_baseline: bool
+) -> StageResult:
+    """Assemble one stage's result from its per-query results.
+
+    Latency percentiles are computed from *this* stage's own per-query
+    latencies, which is what makes SPEC.md §6's "latency percentiles per
+    stage (BM25 / dense / fusion / rerank)" a real per-stage measurement:
+    every stage times its own retrieval calls independently over the same
+    judgment set.
 
     Args:
-        query_results: Every judgment's scored result, in judgment order.
+        query_results: Every judgment's scored result for this stage, in
+            judgment order.
+        stage: The stage name, typed as the schema's own
+            :data:`~groundkit.evals.schema.StageName` so an unrecognized
+            stage is a type error rather than a runtime surprise.
+        is_baseline: Whether this is the run's baseline stage. The caller
+            sets it for ``stages[0]`` only; ``EvalReport``'s validators
+            enforce that there is exactly one and that it is BM25.
 
     Returns:
-        The stage result, with ``is_baseline=True``.
+        The assembled stage result.
     """
     no_answer_results = [qr for qr in query_results if qr.is_no_answer]
     no_answer_abstained = sum(1 for qr in no_answer_results if not qr.retrieved)
     latencies = sorted(qr.latency_ms for qr in query_results)
 
     return StageResult(
-        stage="bm25",
-        is_baseline=True,
+        stage=stage,
+        is_baseline=is_baseline,
         aggregate=_aggregate_metric_set(query_results),
         by_category=_aggregate_by_category(query_results),
         no_answer_query_count=len(no_answer_results),

@@ -502,3 +502,163 @@ def test_eval_human_summary_reports_metrics_and_output_path(
     assert "p50=" in out
     assert "p95=" in out
     assert str(output) in out
+
+
+def _run_dense_eval(
+    eval_corpus: Path, eval_judgments: Path, output: Path, *, extra: list[str] | None = None
+) -> int:
+    """Run ``grk eval --dense`` with the offline embedder against a temp corpus."""
+    return main(
+        [
+            "eval",
+            "--corpus-dir",
+            str(eval_corpus),
+            "--judgments",
+            str(eval_judgments),
+            "--output",
+            str(output),
+            "--dense",
+            "--embed-provider",
+            "inmemory",
+            "--embed-dimensions",
+            "32",
+            *(extra or []),
+        ]
+    )
+
+
+def test_eval_dense_writes_all_three_stages(
+    eval_corpus: Path, eval_judgments: Path, tmp_path: Path
+) -> None:
+    output = tmp_path / "results" / "latest.json"
+    assert _run_dense_eval(eval_corpus, eval_judgments, output) == 0
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert [stage["stage"] for stage in payload["stages"]] == ["bm25", "dense", "fusion"]
+    assert payload["run"]["config"]["embedding"]["provider"] == "inmemory"
+    assert payload["run"]["config"]["rrf_k"] is not None
+
+
+def test_eval_dense_summary_prints_a_signed_delta_per_stage(
+    eval_corpus: Path,
+    eval_judgments: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output = tmp_path / "results" / "latest.json"
+    assert _run_dense_eval(eval_corpus, eval_judgments, output) == 0
+
+    out = capsys.readouterr().out
+    assert "delta[dense vs bm25]:" in out
+    assert "delta[fusion vs bm25]:" in out
+    # Signs are always explicit, so a reader never has to infer direction.
+    assert "recall_at_1=+" in out or "recall_at_1=-" in out
+
+
+def test_eval_dense_summary_warns_that_inmemory_numbers_are_not_a_measurement(
+    eval_corpus: Path,
+    eval_judgments: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """SPEC.md §2: hash-derived vectors must never be presented as a quality number."""
+    output = tmp_path / "results" / "latest.json"
+    assert _run_dense_eval(eval_corpus, eval_judgments, output) == 0
+
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "NOT a retrieval-quality measurement" in out
+    assert "provider=inmemory" in out
+
+
+def test_eval_baseline_only_prints_no_delta_and_no_embedding_line(
+    eval_corpus: Path,
+    eval_judgments: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A BM25-only run has nothing to diff and no semantic space to name."""
+    output = tmp_path / "results" / "latest.json"
+    assert (
+        main(
+            [
+                "eval",
+                "--corpus-dir",
+                str(eval_corpus),
+                "--judgments",
+                str(eval_judgments),
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    out = capsys.readouterr().out
+    assert "delta[" not in out
+    assert "embedding:" not in out
+
+
+def test_eval_embed_flags_without_dense_fail_cleanly(
+    eval_corpus: Path,
+    eval_judgments: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A flag that would be silently ignored is an error, matching ingest/search."""
+    output = tmp_path / "results" / "latest.json"
+    assert (
+        main(
+            [
+                "eval",
+                "--corpus-dir",
+                str(eval_corpus),
+                "--judgments",
+                str(eval_judgments),
+                "--output",
+                str(output),
+                "--embed-provider",
+                "inmemory",
+            ]
+        )
+        == 1
+    )
+    assert "require --dense" in capsys.readouterr().err
+
+
+def test_eval_dense_verdict_matches_the_artifact_it_describes(
+    eval_corpus: Path,
+    eval_judgments: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """SPEC.md §6 at the CLI boundary: the printed verdict must reach the operator.
+
+    The expected verdict is *derived from the artifact* rather than assumed.
+    Asserting "REGRESSION" outright would bake in which way this embedder's
+    hashes happen to fall — deterministic, but an arbitrary fact about the
+    fixture rather than a property of the code. Reading the stage's own
+    numbers back and requiring the printed line to agree with them tests the
+    thing that actually matters: the summary cannot describe a loss as
+    anything else.
+    """
+    output = tmp_path / "results" / "latest.json"
+    assert _run_dense_eval(eval_corpus, eval_judgments, output) == 0
+
+    out = capsys.readouterr().out
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    stages = {stage["stage"]: stage["aggregate"] for stage in payload["stages"]}
+    assert "dense" in stages, "the losing stage must stay in the artifact, not be dropped"
+
+    metric_names = ("recall_at_1", "recall_at_5", "recall_at_10", "mrr", "ndcg_at_10")
+    regressed = any(stages["dense"][name] < stages["bm25"][name] for name in metric_names)
+    improved = any(stages["dense"][name] > stages["bm25"][name] for name in metric_names)
+
+    if regressed and improved:
+        assert "MIXED vs baseline" in out
+    elif regressed:
+        assert "REGRESSION vs baseline" in out
+    elif improved:
+        assert "improvement vs baseline" in out
+    else:
+        assert "no change vs baseline" in out

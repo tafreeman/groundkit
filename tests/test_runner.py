@@ -16,12 +16,16 @@ from typing import Any
 
 import pytest
 
-from groundkit.config import ChunkingConfig
+from groundkit.config import ChunkingConfig, RetrievalConfig
 from groundkit.contracts import Chunk, Document
-from groundkit.errors import EvalError
-from groundkit.evals.runner import EVAL_CHUNKING_CONFIG, run_eval, write_report
+from groundkit.errors import ConfigurationError, EvalError
+from groundkit.evals.delta import derive_stage_deltas
+from groundkit.evals.runner import EVAL_CHUNKING_CONFIG, _percentile, run_eval, write_report
 from groundkit.evals.schema import EvalReport, MetricSet, RunConfig, RunMetadata, StageResult
+from groundkit.index.dense import InMemoryVectorStore
+from groundkit.index.protocols import VectorStoreProtocol
 from groundkit.ingestion.chunking import RecursiveChunker
+from groundkit.providers.embeddings import InMemoryEmbedder
 
 
 @pytest.fixture
@@ -485,3 +489,254 @@ class TestEndToEndScoring:
         assert query_result.metrics.recall_at_1 == 1.0
         assert query_result.metrics.reciprocal_rank == 1.0
         assert report.stages[0].aggregate.mrr == 1.0
+
+
+class _GoldLastVectorStore:
+    """A vector store that deterministically ranks the gold chunk last.
+
+    Ranking by a content marker rather than by inverting a real similarity
+    order, because inverting is not reliably adversarial: ``InMemoryEmbedder``
+    is hash-derived, so its "natural" order is arbitrary, and reversing it
+    can just as easily promote the gold chunk as bury it. Ranking on the
+    marker makes the loss a property of the fixture instead of an accident
+    of which way the hashes fell — which is exactly what a test of the
+    honest-loss path needs, since a fixture that only *sometimes* loses
+    cannot prove a loss is reported.
+
+    Satisfies :class:`~groundkit.index.protocols.VectorStoreProtocol`.
+    """
+
+    def __init__(self, needle: str) -> None:
+        self._needle = needle
+        self._chunks: list[Chunk] = []
+
+    async def add(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
+        """Store chunks; embeddings are irrelevant to this store's ranking."""
+        self._chunks.extend(chunks)
+
+    async def search(
+        self,
+        query_embedding: list[float],
+        top_k: int = 5,
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> list[tuple[Chunk, float]]:
+        """Return every chunk, marker-bearing ones last, scores descending."""
+        ordered = [chunk for chunk in self._chunks if self._needle not in chunk.content]
+        ordered += [chunk for chunk in self._chunks if self._needle in chunk.content]
+        scored = [(chunk, max(0.0, 1.0 - index / 100.0)) for index, chunk in enumerate(ordered)]
+        return scored[:top_k]
+
+    async def delete(self, document_id: str) -> int:
+        """Drop every stored chunk belonging to ``document_id``."""
+        before = len(self._chunks)
+        self._chunks = [chunk for chunk in self._chunks if chunk.document_id != document_id]
+        return before - len(self._chunks)
+
+
+def _dense_pair() -> tuple[InMemoryEmbedder, InMemoryVectorStore]:
+    """A working offline dense pair, for structural assertions only.
+
+    Never for a quality assertion: ``InMemoryEmbedder``'s vectors are
+    hash-derived and carry no semantic signal (SPEC.md §2), so the tests
+    below assert stage *structure*, provenance, and delta *direction* — never
+    that dense or fusion achieves any particular metric value.
+    """
+    return InMemoryEmbedder(dimensions=32), InMemoryVectorStore()
+
+
+def _run_multi_stage(
+    corpus: Path,
+    tmp_path: Path,
+    *,
+    vector_store: VectorStoreProtocol | None = None,
+) -> EvalReport:
+    """Run a one-judgment multi-stage eval and return the report.
+
+    Args:
+        corpus: The two-document fixture corpus.
+        tmp_path: Where the judgments file is written.
+        vector_store: Override for the dense store; defaults to a plain
+            in-memory one. Pass :class:`_WorstFirstVectorStore` to force a
+            losing dense stage.
+    """
+
+    async def run() -> EvalReport:
+        judgments_path = tmp_path / "judgments.jsonl"
+        _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+        embedder, default_store = _dense_pair()
+        return await run_eval(
+            corpus,
+            judgments_path,
+            embedder=embedder,
+            vector_store=default_store if vector_store is None else vector_store,
+        )
+
+    return asyncio.run(run())
+
+
+class TestMultiStageReport:
+    """A dense pair turns one run into bm25 + dense + fusion, in that order."""
+
+    def test_dense_pair_produces_three_stages_in_report_order(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """Pins the stage sequence Wave E appends."""
+        report = _run_multi_stage(corpus, tmp_path)
+
+        assert [stage.stage for stage in report.stages] == ["bm25", "dense", "fusion"]
+
+    def test_only_the_bm25_stage_is_flagged_baseline(self, corpus: Path, tmp_path: Path) -> None:
+        """Every later stage must diff against exactly one reference."""
+        report = _run_multi_stage(corpus, tmp_path)
+
+        assert [stage.is_baseline for stage in report.stages] == [True, False, False]
+
+    def test_every_stage_scores_the_same_judgment_set(self, corpus: Path, tmp_path: Path) -> None:
+        """Stages must differ by strategy alone, not by which queries they answered."""
+        report = _run_multi_stage(corpus, tmp_path)
+
+        query_ids = [[qr.query_id for qr in stage.queries] for stage in report.stages]
+        assert query_ids[0] == query_ids[1] == query_ids[2]
+
+    def test_gold_spans_are_identical_across_stages(self, corpus: Path, tmp_path: Path) -> None:
+        """Ground truth is corpus-derived, so no stage may disagree about it."""
+        report = _run_multi_stage(corpus, tmp_path)
+
+        gold_per_stage = [stage.queries[0].gold for stage in report.stages]
+        assert gold_per_stage[0] == gold_per_stage[1] == gold_per_stage[2]
+        totals = [stage.queries[0].total_relevant_chunks for stage in report.stages]
+        assert totals[0] == totals[1] == totals[2]
+
+    def test_bm25_only_run_still_produces_exactly_one_stage(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """Phase 2 behaviour is unchanged when no dense pair is supplied."""
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(corpus, judgments_path)
+
+        report = asyncio.run(run())
+
+        assert [stage.stage for stage in report.stages] == ["bm25"]
+        assert derive_stage_deltas(report) == []
+
+
+class TestPerStageLatency:
+    """SPEC.md §6: latency percentiles are reported per stage."""
+
+    def test_each_stage_computes_percentiles_from_its_own_queries(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """Not a pool shared across stages, which would blur all three together."""
+        report = _run_multi_stage(corpus, tmp_path)
+
+        for stage in report.stages:
+            latencies = sorted(qr.latency_ms for qr in stage.queries)
+            assert stage.latency_p50_ms == _percentile(latencies, 50)
+            assert stage.latency_p95_ms == _percentile(latencies, 95)
+            assert stage.latency_p99_ms == _percentile(latencies, 99)
+
+    def test_each_stage_times_its_own_retrieval_calls(self, corpus: Path, tmp_path: Path) -> None:
+        """Every stage's per-query latency is a real, independently recorded number."""
+        report = _run_multi_stage(corpus, tmp_path)
+
+        for stage in report.stages:
+            assert all(qr.latency_ms > 0.0 for qr in stage.queries)
+
+
+class TestHonestLossReporting:
+    """SPEC.md §6: a stage that loses to baseline is reported, never suppressed."""
+
+    def test_a_losing_dense_stage_is_present_in_the_report(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """The stage appears even though its ranking is the worst available."""
+        report = _run_multi_stage(corpus, tmp_path, vector_store=_GoldLastVectorStore("quokka"))
+
+        assert [stage.stage for stage in report.stages] == ["bm25", "dense", "fusion"]
+
+    def test_a_losing_dense_stage_reports_its_real_worse_numbers(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """The artifact carries the loss itself — not a floored or omitted metric."""
+        report = _run_multi_stage(corpus, tmp_path, vector_store=_GoldLastVectorStore("quokka"))
+        bm25, dense = report.stages[0], report.stages[1]
+
+        assert bm25.aggregate.recall_at_1 == 1.0
+        assert dense.aggregate.recall_at_1 == 0.0
+        assert dense.aggregate.mrr < bm25.aggregate.mrr
+
+    def test_the_derived_delta_flags_the_loss_as_a_regression(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """End-to-end: a real losing run derives a signed, negative, flagged delta."""
+        report = _run_multi_stage(corpus, tmp_path, vector_store=_GoldLastVectorStore("quokka"))
+        dense_delta = next(d for d in derive_stage_deltas(report) if d.stage == "dense")
+
+        assert dense_delta.is_regression is True
+        assert dense_delta.quality["recall_at_1"] == -1.0
+        assert dense_delta.quality["mrr"] < 0.0
+
+
+class TestRunProvenance:
+    """The artifact records which semantic space produced its dense numbers."""
+
+    def test_embedding_identity_is_recorded_for_a_dense_run(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """Without it, two runs over identical golden data look comparable."""
+        report = _run_multi_stage(corpus, tmp_path)
+        embedding = report.run.config.embedding
+
+        assert embedding is not None
+        assert embedding.provider == "inmemory"
+        assert embedding.dimensions == 32
+
+    def test_bm25_only_run_records_no_embedding_and_no_rrf_k(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """``None`` means absent here, never a defaulted number nothing produced."""
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(corpus, judgments_path)
+
+        report = asyncio.run(run())
+
+        assert report.run.config.embedding is None
+        assert report.run.config.rrf_k is None
+
+    def test_rrf_k_is_recorded_when_a_fusion_stage_ran(self, corpus: Path, tmp_path: Path) -> None:
+        """The fusion constant belongs in the artifact that holds fusion numbers."""
+        report = _run_multi_stage(corpus, tmp_path)
+
+        assert report.run.config.rrf_k == RetrievalConfig().rrf_k
+
+
+class TestDensePairValidation:
+    """Half a dense pair is refused before any corpus work happens."""
+
+    def test_embedder_without_vector_store_raises(self, corpus: Path, tmp_path: Path) -> None:
+        """Fails on the caller's mistake, not after paying for a full ingest."""
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(corpus, judgments_path, embedder=InMemoryEmbedder(dimensions=32))
+
+        with pytest.raises(ConfigurationError, match="no vector_store"):
+            asyncio.run(run())
+
+    def test_vector_store_without_embedder_raises(self, corpus: Path, tmp_path: Path) -> None:
+        """The other half of the same guard."""
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(corpus, judgments_path, vector_store=InMemoryVectorStore())
+
+        with pytest.raises(ConfigurationError, match="no embedder"):
+            asyncio.run(run())

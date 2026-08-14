@@ -2,43 +2,58 @@
 
 Honest and current, per repo policy. Updated with each phase.
 
-## Current state (Phase 3, Wave C)
+## Current state (Phase 3, Wave E)
 
-Hybrid retrieval now works end-to-end locally, behind opt-in flags: `grk
+Hybrid retrieval works end-to-end locally, behind opt-in flags: `grk
 ingest --dense` embeds each chunk into a LanceDB vector store alongside the
 existing SQLite write, and `grk search --mode {bm25,dense,hybrid}` reads
 lexical, vector, or RRF-fused (ADR-0005) results back — every mode still
-resolving to a citation-bearing result with character offsets. `grk eval`
-still runs the BM25-only baseline harness against the committed golden
-corpus (dense and fusion eval stages are Wave E). Everything remains offline
-with no cloud credentials by default: neither flag is required, and `grk
-search` defaults to, and stays on, BM25 pending Wave E's measured eval delta
-(Q1, `docs/specs/phase-3-hybrid-retrieval.md`) — dense and hybrid are
-reachable to opt into, not yet the default. Not yet built, arriving in their
-phases per SPEC.md §9:
+resolving to a citation-bearing result with character offsets. `grk eval
+--dense` now runs the same three strategies over the golden corpus and
+reports each stage's signed delta against the BM25 baseline. Everything
+remains offline with no cloud credentials by default: no flag is required,
+and `grk search` defaults to, and stays on, BM25 (Q1,
+`docs/specs/phase-3-hybrid-retrieval.md`) — dense and hybrid are reachable
+to opt into, not yet the default. Not yet built, arriving in their phases
+per SPEC.md §9:
 
-- **Dense and hybrid retrieval are reachable, opt-in, and unmeasured for
-  quality.** Wave C wired `Retriever` to the dense store and to RRF fusion
-  (`retrieval/fusion.py`, ADR-0005): `grk search --mode dense` and `--mode
-  hybrid` read the vectors `grk ingest --dense` writes, resolving to
-  citations through the same document-source join BM25 uses. Neither mode
-  is a quality claim yet — the retrieval-quality delta against the BM25
-  baseline is Wave E's job, gated behind `EVAL_GATED=1` because the
-  CI-default `InMemoryEmbedder` produces hash-derived vectors with no
-  semantic signal (noise presented as a number if used to measure quality;
-  see the Phase 2 caveats below and SPEC.md §2). `grk search --mode bm25`
-  remains the default (Q1, `docs/specs/phase-3-hybrid-retrieval.md`).
-- **A dense/hybrid result list can be shorter than `top_k` during the
+- **The dense and fusion quality delta is measurable but not yet measured.**
+  Wave E built the harness: `grk eval --dense` emits `bm25` → `dense` →
+  `fusion` into one report, deltas are derived at read time
+  (`evals/delta.py`), and a stage that loses to baseline is reported as a
+  loss rather than suppressed. What has not happened is a run that produces
+  a *meaningful* number. The CI-default `InMemoryEmbedder` produces
+  hash-derived vectors with no semantic signal, so the delta it yields is
+  noise presented as a number (SPEC.md §2) — the CLI stamps an explicit
+  warning on any such report, and `RunConfig.embedding` records the provider
+  so the artifact self-labels. A real delta needs `EVAL_GATED=1` against a
+  live embedding model (`.github/workflows/eval-gated.yml`). Until that has
+  run, no claim about dense or hybrid retrieval quality is supported, and Q1
+  stays open.
+- **A dense or fusion stage cannot abstain on a no-answer query.** BM25
+  returns nothing when no indexed chunk shares a term with the query, which
+  is what makes the corpus's `no_answer` judgments measure abstention at
+  all. A vector search has no equivalent floor: it returns its `top_k`
+  nearest neighbours regardless of how far away they are, and
+  `score_threshold` defaults to `None` (and is excluded from fused scores
+  entirely, ADR-0005 decision 6). So `no_answer_abstained_count` is
+  structurally 0 for the dense and fusion stages while the baseline can
+  abstain on every one. This is a real property of the retrieval strategies,
+  not an artifact of the test embedder, and it means abstention is not
+  comparable across stages — read it per stage, never as a delta.
+- **A dense/hybrid result list can still be shorter than `top_k` during the
   staleness window between an `open()` and the retriever's next reopen.**
-  The vector store's search already truncates to `top_k` before the
-  `open()`-time document snapshot filter runs (`Retriever`'s class
-  docstring, `retrieval/search.py`): a hit for a document ingested after
-  `open()` is dropped *after* that truncation, not backfilled from a lower
-  rank. If any of the store's already-truncated top-`k` hits belong to
-  documents ingested since `open()`, the returned dense or hybrid list
-  shrinks below `top_k` rather than being topped back up. Reopening the
-  retriever clears the window. BM25 has no equivalent gap — the stale
-  in-memory index simply has no representation of the new content at all.
+  The dense path over-fetches to avoid this where it can: `_dense_candidates`
+  (`retrieval/search.py`) widens its fetch, doubling from `top_k`, until
+  either `top_k` hits survive the `open()`-time snapshot filter or the store
+  is exhausted — so a hit dropped for belonging to a document ingested after
+  `open()` *is* backfilled from a lower rank. The residual gap is the cap on
+  that widening (`_MAX_SNAPSHOT_FETCH_ATTEMPTS`): if enough post-`open()`
+  content outranks the eligible chunks to survive every widening attempt,
+  the list is returned short, and a warning is logged rather than the
+  truncation passing silently. Reopening the retriever clears the window.
+  BM25 has no equivalent gap — the stale in-memory index simply has no
+  representation of the new content at all.
 - **The embedding-identity manifest is verified at both ADR-0004 decision-3
   boundaries.** Wave B closed the ingest boundary — `Indexer` calls
   `verify_manifest` before any load/chunk/embed/delete work, and
