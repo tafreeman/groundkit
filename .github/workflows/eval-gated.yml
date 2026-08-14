@@ -12,14 +12,28 @@
 # sole proof of a backend, and this is the sole proof of the Ollama path.
 name: eval-gated
 
+# TRIGGERS — deliberately manual-only for now.
+#
+# SPEC.md §6 describes this workflow as running "on schedule/label". It does
+# neither yet, on purpose: every run pulls an embedding model, and during
+# active development the eval is run locally far more often than a weekly
+# cron would add value. A schedule that fires against a moving branch also
+# produces a stream of results nobody reads, which is how a gate quietly
+# becomes noise.
+#
+# REVISIT AT END OF DEVELOPMENT (Phase 7, alongside the release checklist):
+# turn the weekly `schedule` back on and re-add the `eval-gated` PR label
+# trigger, so the real-model path is proven on a cadence once `main` is
+# stable enough for the result to mean something. The label-gating condition
+# on the job below is left in place and inert precisely so that re-enabling
+# is a two-line change to this block, not a rewrite.
+#
+#   schedule:
+#     - cron: "0 6 * * 1"          # weekly, Mondays 06:00 UTC
+#   pull_request:
+#     types: [opened, synchronize, reopened, labeled]
 on:
-  schedule:
-    # Weekly, Mondays 06:00 UTC. Frequent enough to catch a broken real-model
-    # path within a week; rare enough not to pull a model image daily.
-    - cron: "0 6 * * 1"
   workflow_dispatch:
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
@@ -27,9 +41,12 @@ permissions:
 jobs:
   gated-eval:
     runs-on: ubuntu-latest
-    # On a PR this runs only when the label is present. Scheduled and manual
-    # runs always proceed. Without this guard the job would pull a model on
-    # every PR, which is exactly the cost the gate exists to avoid.
+    # Inert while `on:` is dispatch-only — `workflow_dispatch` never matches
+    # the pull_request branch, so this always passes today. Kept rather than
+    # deleted so re-enabling the PR trigger (see the note above `on:`) does
+    # not also require remembering to re-add label gating, which is the half
+    # of the change that would be easy to miss and expensive to get wrong:
+    # without it, every PR pulls a model.
     if: >-
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'eval-gated')

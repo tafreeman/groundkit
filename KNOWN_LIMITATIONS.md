@@ -27,9 +27,12 @@ per SPEC.md §9:
   artifact, never restated in docs (SPEC.md §2). Two caveats stand: that is a
   single run over a 10-document corpus, which R2
   (`docs/specs/phase-3-hybrid-retrieval.md`) warns is small enough that a
-  result may not survive corpus growth; and
-  `.github/workflows/eval-gated.yml` has not yet run on schedule, so nothing
-  re-measures this automatically. The CI-default `InMemoryEmbedder` produces
+  result may not survive corpus growth; and `.github/workflows/eval-gated.yml`
+  is `workflow_dispatch`-only during active development, so **nothing
+  re-measures this automatically** — the result above is a point-in-time
+  local measurement, and it will not be contradicted by CI if it stops being
+  true. Re-enabling the schedule is noted in the workflow file and slated for
+  Phase 7. The CI-default `InMemoryEmbedder` produces
   hash-derived vectors with no semantic signal and, on this same corpus,
   reports both stages as regressions instead — so a delta from it is noise
   with a sign, not a weak measurement. The CLI stamps an explicit warning on

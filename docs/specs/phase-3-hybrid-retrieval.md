@@ -240,8 +240,16 @@ rather than one being built under it.
   metric and loses another reports as `MIXED` instead of hiding half the
   result.
 - `EVAL_GATED=1` gates a real-model run (`tests/test_eval_gated.py`,
-  `.github/workflows/eval-gated.yml`: schedule + `workflow_dispatch` + an
-  `eval-gated` PR label). Skipping cleanly is the *default* outcome; the gated
+  `.github/workflows/eval-gated.yml`). The workflow is **`workflow_dispatch`
+  only** during active development: every run pulls an embedding model, the
+  eval is run locally far more often than a weekly cron would add value, and
+  a schedule firing against a moving branch produces results nobody reads,
+  which is how a gate becomes noise. SPEC.md §6's "on schedule/label" wording
+  is therefore not yet satisfied by this workflow, deliberately and with the
+  reinstatement noted in the file itself — the schedule and the label trigger
+  are commented in place, and the job's label-gating condition is left inert
+  rather than deleted, so re-enabling in Phase 7 is a two-line change.
+  Skipping cleanly is the *default* outcome; the gated
   tests assert the run reports honestly and deliberately **do not** assert
   that dense or fusion beats BM25, since a test that reddens on a loss would
   pressure the next person to grow the corpus until it passes.
@@ -388,10 +396,13 @@ metrics and both cut against making hybrid the default:
 
 The honest reading is that the measurement licenses hybrid as the
 *recommended* mode where a provider is configured, not as the unconditional
-default. Committing to that is a user-visible behaviour change with a stated
-tradeoff, which by repo convention is an ADR, not a spec edit — so Q1 stays
-open pending one, now with data rather than for lack of it. Re-run the gate
-before deciding: one run on a corpus this size is evidence, not proof.
+default. **Recorded as
+[ADR-0007](../adr/ADR-0007-default-retrieval-mode.md) (Proposed).** BM25 stays
+the default, no behaviour changes, and the reopening condition is abstention
+becoming reachable on the dense path — a design gap, not a data gap. Note
+what that means in practice: growing the corpus or re-running the gate until
+the delta is larger does **not** reopen it, which is deliberate, since R2
+warns against exactly that reflex.
 
 **Q2 — Does the manifest live in SQLite or beside it? — Settled.**
 [ADR-0004](../adr/ADR-0004-embedding-identity-binding.md) decision 1 puts it
