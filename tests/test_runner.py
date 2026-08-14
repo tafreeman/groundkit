@@ -26,6 +26,7 @@ from groundkit.index.dense import InMemoryVectorStore
 from groundkit.index.protocols import VectorStoreProtocol
 from groundkit.ingestion.chunking import RecursiveChunker
 from groundkit.providers.embeddings import InMemoryEmbedder
+from groundkit.retrieval.search import MAX_TOP_K
 
 
 @pytest.fixture
@@ -742,6 +743,92 @@ class TestDensePairValidation:
             asyncio.run(run())
 
 
+class TestTopKBoundIsCheckedBeforeAnyWork:
+    """An out-of-range cutoff must not cost a full embed pass first.
+
+    ``Retriever.search`` enforces ``1..MAX_TOP_K``, but only inside the stage
+    loop — by which point a dense run has embedded the entire corpus. Against
+    a hosted provider that is billable work for an invocation that could
+    never have produced a report, so ``run_eval`` rejects the cutoff up front.
+    """
+
+    def test_top_k_above_the_cap_is_rejected(self, corpus: Path, tmp_path: Path) -> None:
+        """Pins the upper bound at the harness boundary."""
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(corpus, judgments_path, top_k=MAX_TOP_K + 1)
+
+        with pytest.raises(EvalError, match=f"between 1 and {MAX_TOP_K}"):
+            asyncio.run(run())
+
+    def test_top_k_below_one_is_rejected(self, corpus: Path, tmp_path: Path) -> None:
+        """The other end of the same bound."""
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(corpus, judgments_path, top_k=0)
+
+        with pytest.raises(EvalError, match=f"between 1 and {MAX_TOP_K}"):
+            asyncio.run(run())
+
+    def test_the_cap_is_rejected_before_the_embedder_is_ever_called(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """The point of the check: no embedding happens for a doomed run.
+
+        Asserted against an embedder that fails loudly if touched, so this
+        cannot pass merely because the run happened to be cheap.
+        """
+
+        class _ExplodingEmbedder:
+            """Satisfies EmbeddingProtocol; raises if anything is embedded."""
+
+            @property
+            def provider(self) -> str:
+                return "exploding"
+
+            @property
+            def model_name(self) -> str:
+                return "never-called"
+
+            @property
+            def dimensions(self) -> int:
+                return 32
+
+            async def embed(self, texts: list[str]) -> list[list[float]]:
+                raise AssertionError(
+                    "embed() was called for an out-of-range top_k; the bound must be "
+                    "checked before any corpus work"
+                )
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(
+                corpus,
+                judgments_path,
+                top_k=MAX_TOP_K + 1,
+                embedder=_ExplodingEmbedder(),
+                vector_store=InMemoryVectorStore(),
+            )
+
+        with pytest.raises(EvalError, match=f"between 1 and {MAX_TOP_K}"):
+            asyncio.run(run())
+
+    def test_the_cap_itself_is_accepted(self, corpus: Path, tmp_path: Path) -> None:
+        """A boundary check that is off by one would be worse than none."""
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(corpus, judgments_path, top_k=MAX_TOP_K)
+
+        assert asyncio.run(run()).run.config.top_k == MAX_TOP_K
+
+
 class TestCallerVectorStoreIsNotContaminated:
     """An eval must not strand vectors in a store it does not own.
 
@@ -855,25 +942,39 @@ class TestCallerVectorStoreIsNotContaminated:
         """The purge lives in a ``finally``, so a mid-run failure still cleans up.
 
         The failure has to land *after* vectors are written, or the test
-        proves nothing. ``top_k=999`` exceeds ``MAX_TOP_K``, and that check
-        lives in ``Retriever.search`` — which runs in the stage loop, after
-        ingest has already embedded the corpus into the store. So by the time
-        this raises, the store genuinely holds this run's vectors, and only
-        the ``finally`` can get them back out. (The CLI's own ``--top-k``
-        floor is a separate, earlier check; ``run_eval`` has no such guard,
-        which is what makes this reachable.)
+        proves nothing. A judgment set containing only ``no_answer`` queries
+        does that: those carry no metrics by construction, so
+        ``_aggregate_metric_set`` refuses to aggregate over zero answerable
+        queries — and it is called from ``_build_stage_result``, at the end
+        of the stage loop, long after ingest has embedded the corpus into the
+        store. So by the time this raises, the store genuinely holds this
+        run's vectors and only the ``finally`` can get them back out.
+
+        (An out-of-range ``top_k`` used to serve this purpose. It no longer
+        can, and deliberately so: ``run_eval`` now rejects that up front
+        precisely to avoid embedding a corpus for a doomed invocation, which
+        is the same class of waste this test guards the other end of.)
         """
         store = InMemoryVectorStore()
 
         async def run() -> None:
             judgments_path = tmp_path / "judgments.jsonl"
-            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            _write_judgments(
+                judgments_path,
+                [
+                    {
+                        "query_id": "unanswerable-only",
+                        "query": "kolokolo bandicoot tessellation",
+                        "category": "no_answer",
+                        "gold": [],
+                    }
+                ],
+            )
             await run_eval(
                 corpus,
                 judgments_path,
                 embedder=InMemoryEmbedder(dimensions=32),
                 vector_store=store,
-                top_k=999,
             )
 
         with pytest.raises(GroundkitError):

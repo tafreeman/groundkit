@@ -144,7 +144,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--top-k",
         type=int,
         default=10,
-        help=f"Results retrieved per query (minimum {_MIN_EVAL_TOP_K}).",
+        help=f"Results retrieved per query ({_MIN_EVAL_TOP_K}-{MAX_TOP_K}).",
     )
     eval_parser.add_argument("--json", action="store_true", help="Emit the full report as JSON.")
     eval_parser.add_argument(
@@ -353,10 +353,20 @@ async def _cmd_search(args: argparse.Namespace) -> int:
 
 
 async def _cmd_eval(args: argparse.Namespace) -> int:
+    # Both bounds are checked before anything is constructed or ingested. The
+    # upper one matters most on the dense path: without it, an out-of-range
+    # --top-k embeds the whole corpus and only then gets rejected inside the
+    # stage loop, spending real provider work — billable, against a hosted
+    # endpoint — on an invocation that could never have produced a report.
     if args.top_k < _MIN_EVAL_TOP_K:
         raise EvalError(
             f"--top-k must be at least {_MIN_EVAL_TOP_K} (recall@10 cannot be computed "
             f"from fewer than {_MIN_EVAL_TOP_K} retrieved results), got {args.top_k}"
+        )
+    if args.top_k > MAX_TOP_K:
+        raise EvalError(
+            f"--top-k must be at most {MAX_TOP_K} (the retrieval cap enforced by "
+            f"Retriever.search), got {args.top_k}"
         )
     if not args.dense and _embed_flags_supplied(args):
         raise ConfigurationError(

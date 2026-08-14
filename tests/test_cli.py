@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from groundkit.cli import main
+from groundkit.retrieval.search import MAX_TOP_K
 
 
 @pytest.fixture
@@ -421,6 +422,46 @@ def test_eval_top_k_below_ten_fails_cleanly(
     err = capsys.readouterr().err
     assert "error:" in err
     assert "--top-k" in err
+
+
+def test_eval_top_k_above_the_cap_fails_before_writing_a_report(
+    eval_corpus: Path, eval_judgments: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An out-of-range cutoff is rejected up front, not after a full embed pass.
+
+    Without the upper bound, ``Retriever.search`` rejects it instead — but
+    only inside the stage loop, after a dense run has embedded the whole
+    corpus. Against a hosted provider that is billable work for an
+    invocation that could never have produced a report. Asserting the report
+    file was never created pins "failed before doing the work", not merely
+    "failed".
+    """
+    output = tmp_path / "results" / "latest.json"
+    assert (
+        main(
+            [
+                "eval",
+                "--corpus-dir",
+                str(eval_corpus),
+                "--judgments",
+                str(eval_judgments),
+                "--output",
+                str(output),
+                "--top-k",
+                str(MAX_TOP_K + 1),
+                "--dense",
+                "--embed-provider",
+                "inmemory",
+                "--embed-dimensions",
+                "32",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "--top-k" in err
+    assert not output.exists()
     assert not output.exists()
 
 

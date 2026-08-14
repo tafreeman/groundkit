@@ -83,7 +83,7 @@ from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.indexer import Indexer
 from groundkit.ingestion.loaders import FileLoader
 from groundkit.providers.embeddings import INMEMORY_PROVIDER
-from groundkit.retrieval.search import Retriever
+from groundkit.retrieval.search import MAX_TOP_K, Retriever
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -199,6 +199,14 @@ async def run_eval(
         RetrievalError: A search call fails (e.g. an index inconsistency,
             or an out-of-range ``top_k``).
     """
+    if not 1 <= top_k <= MAX_TOP_K:
+        raise EvalError(
+            f"top_k must be between 1 and {MAX_TOP_K}, got {top_k}. Checked here rather "
+            "than left to Retriever.search, which enforces the same bound but only "
+            "inside the stage loop — by then a dense run has embedded the entire "
+            "corpus, doing real and possibly billable provider work for an invocation "
+            "that was always going to be rejected."
+        )
     _validate_dense_pair(embedder, vector_store)
     if embedder is not None and vector_store is not None:
         await _require_empty_vector_store(vector_store, embedder.dimensions)
