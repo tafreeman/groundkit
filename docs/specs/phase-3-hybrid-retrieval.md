@@ -284,9 +284,19 @@ no test anywhere asserts a dense or fusion quality *value*. Recording the
 embedder identity in `RunConfig.embedding` makes the distinction
 machine-checkable rather than a convention a reader has to remember: a
 report whose `embedding.provider` is `inmemory` is self-labelling as
-structural, and the CLI stamps an explicit warning on it. The risk is
-therefore contained but **not retired** — it retires when a gated run has
-actually produced a delta (see Q1).
+structural, and the CLI stamps an explicit warning on it.
+
+**Retired.** A gated run against the committed golden corpus, using
+`nomic-embed-text` through local Ollama, has produced a real delta — see Q1
+for what it says and what it does and does not settle. The risk R1 named was
+that the phase would reach its gate with no way to measure quality; that is
+now false in both senses, mechanism and measurement. Worth noting for
+calibration: the same harness run with `InMemoryEmbedder` reported dense and
+fusion as clear *regressions*, and the real model reported them as clear
+improvements. The two disagree in direction, on the same corpus, through the
+same code — which is precisely why SPEC.md §2 refuses to let the hash
+embedder produce a quality number, and is the sharpest available evidence
+that the refusal is load-bearing rather than ceremonial.
 
 **R2 — The corpus may be too small for a meaningful delta.** The Phase 2
 baseline runs over 10 documents / 84 chunks / 44 judgments. On a corpus that
@@ -323,21 +333,39 @@ measurements. Per repo policy, no number from a run of that script is quoted
 here or anywhere else — regenerate them by running the script.
 
 **Q1 — Default retrieval mode after Phase 3.** Does `grk search` default to
-hybrid, or stay BM25-only until a delta justifies the switch? **Still open
-after Wave E, and deliberately so.** Wave E was scoped to close it, and it
-built everything needed to: the harness now emits all three stages, derives
-each one's signed delta, and reports a loss as a loss. What it did not do is
-*produce the measurement*, because the only honest one comes from a real
-embedding model through the `EVAL_GATED=1` path, and that has not been run.
+hybrid, or stay BM25-only until a delta justifies the switch? **The quality
+half is now measured; the decision is not yet made, and needs an ADR.**
 
-The distinction matters and is not a technicality. A delta computed with
-`InMemoryEmbedder` exists — the harness will print one — and it is noise, so
-closing Q1 on it would be choosing by assertion while appearing to choose by
-data, which is worse than leaving the question open. Q1 closes on the first
-gated run against the committed golden corpus: schedule the workflow, or run
-it manually, then read `evals/results/latest.json`. Note R2 in advance — a
-wash or a loss is a legitimate outcome and would close Q1 as "BM25 stays the
-default", which is a real answer, not a failure to answer.
+A gated run against the committed golden corpus (`nomic-embed-text` via local
+Ollama) produced the first real delta. Qualitatively — the values live in the
+generated artifact, not here (SPEC.md §2): **both dense and fusion improved on
+the baseline across recall@1, recall@5, MRR and nDCG@10, with no metric
+regressing on either stage.** Fusion additionally improved recall@10, where
+dense tied. So the retrieval-quality argument for hybrid is real, and this is
+the outcome R2 warned might *not* appear.
+
+That does not settle Q1 on its own, because two costs sit outside the quality
+metrics and both cut against making hybrid the default:
+
+- **Abstention is lost entirely.** BM25 abstained on every no-answer query;
+  dense and fusion abstained on none. A vector search returns its `top_k`
+  nearest neighbours regardless of distance, so abstention is structurally
+  unreachable on those paths (see `KNOWN_LIMITATIONS.md`). Defaulting to
+  hybrid would mean the default mode of a tool whose entire premise is
+  grounded, citation-verifiable retrieval never says "I have nothing".
+- **The default path would require a provider the default install lacks.**
+  SPEC.md §10 makes "`grk` works end-to-end locally with zero cloud
+  credentials" part of the v1 definition of done. Hybrid needs a running
+  embedding model and costs roughly two orders of magnitude more latency per
+  query than the lexical path. A default that fails without Ollama is a
+  different product than the one §10 describes.
+
+The honest reading is that the measurement licenses hybrid as the
+*recommended* mode where a provider is configured, not as the unconditional
+default. Committing to that is a user-visible behaviour change with a stated
+tradeoff, which by repo convention is an ADR, not a spec edit — so Q1 stays
+open pending one, now with data rather than for lack of it. Re-run the gate
+before deciding: one run on a corpus this size is evidence, not proof.
 
 **Q2 — Does the manifest live in SQLite or beside it? — Settled.**
 [ADR-0004](../adr/ADR-0004-embedding-identity-binding.md) decision 1 puts it

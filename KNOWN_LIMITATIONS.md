@@ -17,19 +17,24 @@ and `grk search` defaults to, and stays on, BM25 (Q1,
 to opt into, not yet the default. Not yet built, arriving in their phases
 per SPEC.md §9:
 
-- **The dense and fusion quality delta is measurable but not yet measured.**
-  Wave E built the harness: `grk eval --dense` emits `bm25` → `dense` →
-  `fusion` into one report, deltas are derived at read time
+- **The dense and fusion quality delta has been measured once, locally, and
+  is not yet a standing CI result.** `grk eval --dense` emits `bm25` →
+  `dense` → `fusion` into one report, deltas are derived at read time
   (`evals/delta.py`), and a stage that loses to baseline is reported as a
-  loss rather than suppressed. What has not happened is a run that produces
-  a *meaningful* number. The CI-default `InMemoryEmbedder` produces
-  hash-derived vectors with no semantic signal, so the delta it yields is
-  noise presented as a number (SPEC.md §2) — the CLI stamps an explicit
-  warning on any such report, and `RunConfig.embedding` records the provider
-  so the artifact self-labels. A real delta needs `EVAL_GATED=1` against a
-  live embedding model (`.github/workflows/eval-gated.yml`). Until that has
-  run, no claim about dense or hybrid retrieval quality is supported, and Q1
-  stays open.
+  loss rather than suppressed. A gated run (`EVAL_GATED=1`,
+  `nomic-embed-text` via local Ollama) found both dense and fusion improving
+  on the baseline with no metric regressing — the values are in the generated
+  artifact, never restated in docs (SPEC.md §2). Two caveats stand: that is a
+  single run over a 10-document corpus, which R2
+  (`docs/specs/phase-3-hybrid-retrieval.md`) warns is small enough that a
+  result may not survive corpus growth; and
+  `.github/workflows/eval-gated.yml` has not yet run on schedule, so nothing
+  re-measures this automatically. The CI-default `InMemoryEmbedder` produces
+  hash-derived vectors with no semantic signal and, on this same corpus,
+  reports both stages as regressions instead — so a delta from it is noise
+  with a sign, not a weak measurement. The CLI stamps an explicit warning on
+  any such report and `RunConfig.embedding` records the provider, so an
+  artifact self-labels which of the two it is.
 - **A dense or fusion stage cannot abstain on a no-answer query.** BM25
   returns nothing when no indexed chunk shares a term with the query, which
   is what makes the corpus's `no_answer` judgments measure abstention at
