@@ -28,13 +28,30 @@ growth. A single measurement is evidence, not proof.
 **Second — and decisive — the quality metrics do not measure everything the
 default is responsible for.** Two costs sit entirely outside them:
 
-1. **Abstention is lost.** BM25 abstained on every no-answer judgment; the
-   dense and fusion stages abstained on none. This is structural, not a
-   corpus artifact or a property of the test embedder: a vector search returns
-   its `top_k` nearest neighbours regardless of distance, `score_threshold`
-   defaults to `None`, and ADR-0005 decision 6 excludes fused scores from
-   thresholding entirely. There is no configuration of the current code in
-   which a dense or fusion query says "I have nothing."
+1. **Hybrid cannot abstain at all; dense does not abstain as configured.**
+   BM25 abstained on every no-answer judgment; the dense and fusion stages
+   abstained on none. The two reach that outcome by different routes, and
+   collapsing them would overstate the case:
+
+   - **Hybrid is structural.** ADR-0005 decision 6 excludes rank-derived
+     fused scores from `score_threshold` entirely, so *no* configuration of
+     the current code makes a hybrid query return nothing on relevance
+     grounds. `Retriever.search` calls `_resolve(..., apply_threshold=False)`
+     on that branch, and
+     `test_impossible_score_threshold_zeroes_bm25_and_dense_but_not_hybrid`
+     pins it with a threshold no producer score could clear.
+   - **Dense is configurational, not structural.** The dense branch *does*
+     apply `score_threshold` (`apply_threshold=True`), and the same test
+     proves a high enough threshold zeroes a dense result set. What is
+     missing is a *principled value*: the default is `None`, the eval runs
+     unthresholded, and nothing in the harness measures abstention quality,
+     so any number picked today would be invented — which is why
+     `StageResult` refuses a score threshold in the first place.
+
+   The mode under consideration as the default is hybrid, so the structural
+   half is the one that binds. The dense half is a gap in configuration and
+   evidence rather than in capability, and is recorded separately so a future
+   reader does not "fix" a limitation the code does not have.
 2. **The default path would require a provider the default install lacks.**
    SPEC.md §10 makes "`grk` works end-to-end locally with zero cloud
    credentials" a v1 definition-of-done criterion. Hybrid needs a running
@@ -65,12 +82,15 @@ Specifically:
    knowingly. A recommendation a user opts into is honest; a default they
    inherit is not, when the cost is the tool's ability to say it found
    nothing.
-3. **Abstention is the reopening condition, not corpus size.** This decision
-   is revisited when a dense or fusion query can abstain — i.e. when there is
-   a principled score floor for the dense path, or a fusion-level abstention
-   rule that is not an invented threshold. That is the blocker, and it is a
-   design problem, not a measurement problem. A larger corpus or a bigger
-   delta does not resolve it, and neither should be mistaken for doing so.
+3. **Abstention is the reopening condition, not corpus size.** Concretely,
+   this decision is revisited when **hybrid** can abstain — a fusion-level
+   rule that is not an invented threshold, since ADR-0005 decision 6 rules
+   out applying an absolute cutoff to fused scores. A defensible
+   `score_threshold` value for the dense path is a related but separate
+   prerequisite: the dense mechanism already exists, so what that needs is
+   evidence, not code. Both are design and measurement problems about
+   abstention specifically. A larger corpus or a bigger quality delta
+   resolves neither, and must not be mistaken for doing so.
 4. **A second reopening condition, independent of the first:** if a future
    phase makes an embedding provider a base dependency rather than an extra,
    objection 2 lapses and only objection 1 remains. Recorded so the two are
@@ -93,10 +113,15 @@ Specifically:
   why. That is the "silently different behaviour from ambient config" shape
   SPEC.md §2 rules out elsewhere, and it is worse here than a wrong default,
   because it is not reproducible.
-- **Add a `score_threshold` for the dense path so hybrid can abstain, then
-  default to hybrid.** Rejected *for now*, and it is the right long-term
-  direction (see decision 4 above). Rejected here because the threshold value
-  would be invented: nothing in the current eval measures abstention quality,
+- **Give hybrid an abstention rule, then default to it.** Rejected *for now*,
+  and it is the right long-term direction (see decision 3). Note what is and
+  is not missing: the dense path already applies `score_threshold`, so the
+  mechanism exists there and only a defensible value is absent. Hybrid is the
+  harder case — ADR-0005 decision 6 withholds thresholding from fused scores
+  deliberately, because an absolute cutoff against a rank-derived quantity
+  measures nothing, so hybrid needs a genuinely different rule rather than
+  the dense one extended. Rejected here because either would have to be
+  invented today: nothing in the current eval measures abstention quality,
   and `StageResult` already refuses a score threshold for exactly this reason
   — "any fixed cutoff would report noise from an arbitrary number rather than
   a real measurement". Picking one to justify a default reverses the order

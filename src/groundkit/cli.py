@@ -7,12 +7,16 @@ golden corpus and judgment set. Phase 3 Wave C wires the dense write and
 read paths into both commands: ``grk ingest --dense`` embeds and writes
 vectors alongside the existing SQLite write, and ``grk search --mode
 {bm25,dense,hybrid}`` can read them back. Both are opt-in and default off.
-``search --mode`` in particular defaults to, and stays, ``"bm25"`` —
-Q1 in ``docs/specs/phase-3-hybrid-retrieval.md`` is deliberately left open
-until Wave E's measured eval delta decides whether dense or hybrid should
-become the default; changing the default here would be choosing by
-assertion instead of by data. ``serve`` and ``serve-mcp`` land in their
-phases per SPEC.md §9.
+``search --mode`` in particular defaults to, and stays, ``"bm25"``. Wave E
+measured the delta Q1 was waiting on and hybrid won it on every quality
+metric — and ADR-0007 still keeps BM25 as the default, because hybrid cannot
+abstain (ADR-0005 decision 6 keeps ``score_threshold`` away from fused
+scores, so no configuration lets it return nothing for an unanswerable
+question) and because a hybrid default would require an embedding provider
+the default install does not ship, against SPEC.md §10. Hybrid is documented
+as *recommended where a provider is configured*, which is a tradeoff a caller
+opts into rather than one they inherit. ``serve`` and ``serve-mcp`` land in
+their phases per SPEC.md §9.
 """
 
 from __future__ import annotations
@@ -111,9 +115,12 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["bm25", "dense", "hybrid"],
         default="bm25",
         help=(
-            "Retrieval mode. Defaults to 'bm25' and stays there: dense and hybrid are "
-            "opt-in pending Wave E's measured eval delta (Q1, "
-            "docs/specs/phase-3-hybrid-retrieval.md), never a default changed by assertion."
+            "Retrieval mode. Defaults to 'bm25'. On the golden corpus, 'hybrid' measured "
+            "better than the BM25 baseline on every retrieval-quality metric -- but it "
+            "cannot abstain: unlike bm25, it returns its top-k for a question the corpus "
+            "cannot answer, and no score threshold applies to fused scores. It also needs "
+            "a running embedding provider. Recommended where you have one and can accept "
+            "that tradeoff; see ADR-0007."
         ),
     )
     _add_embedding_args(search)

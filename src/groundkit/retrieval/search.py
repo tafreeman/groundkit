@@ -171,11 +171,14 @@ class Retriever:
     ) -> SearchResponse:
         """Search the collection.
 
-        The default mode is ``"bm25"`` deliberately: whether dense or hybrid
-        should become the default is Q1 in
-        ``docs/specs/phase-3-hybrid-retrieval.md``, left open until Wave E
-        produces a measured eval delta — SPEC.md §6 makes the measurement
-        the decider, so the default here changes with data, not assertion.
+        The default mode is ``"bm25"`` deliberately, and stays so under
+        ADR-0007 even though Wave E's measured eval delta favoured hybrid on
+        every retrieval-quality metric. The reason is abstention: ``"hybrid"``
+        applies no ``score_threshold`` (ADR-0005 decision 6 — see below), so
+        no configuration makes it return nothing for a question the corpus
+        cannot answer, and a default that always answers is the wrong default
+        for citation-verifiable retrieval. ``"dense"`` *does* honour
+        ``score_threshold``; what it lacks is a measured, defensible value.
 
         ``score_threshold`` applies to the producer-scored modes (``bm25``,
         ``dense``) and never to hybrid: fused scores are rank-derived

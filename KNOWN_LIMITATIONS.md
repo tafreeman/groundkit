@@ -38,17 +38,29 @@ per SPEC.md §9:
   with a sign, not a weak measurement. The CLI stamps an explicit warning on
   any such report and `RunConfig.embedding` records the provider, so an
   artifact self-labels which of the two it is.
-- **A dense or fusion stage cannot abstain on a no-answer query.** BM25
-  returns nothing when no indexed chunk shares a term with the query, which
-  is what makes the corpus's `no_answer` judgments measure abstention at
-  all. A vector search has no equivalent floor: it returns its `top_k`
-  nearest neighbours regardless of how far away they are, and
-  `score_threshold` defaults to `None` (and is excluded from fused scores
-  entirely, ADR-0005 decision 6). So `no_answer_abstained_count` is
-  structurally 0 for the dense and fusion stages while the baseline can
-  abstain on every one. This is a real property of the retrieval strategies,
-  not an artifact of the test embedder, and it means abstention is not
-  comparable across stages — read it per stage, never as a delta.
+- **Hybrid cannot abstain on a no-answer query; dense does not abstain as
+  configured.** BM25 returns nothing when no indexed chunk shares a term with
+  the query, which is what makes the corpus's `no_answer` judgments measure
+  abstention at all. A vector search has no equivalent intrinsic floor — it
+  returns its `top_k` nearest neighbours regardless of distance — but the two
+  dense-side modes differ, and the difference is worth stating precisely:
+  - **Hybrid/fusion: structural.** ADR-0005 decision 6 excludes rank-derived
+    fused scores from `score_threshold` altogether
+    (`_resolve(..., apply_threshold=False)`), so no configuration makes a
+    hybrid query abstain on relevance grounds.
+  - **Dense: configurational.** The dense branch *does* apply
+    `score_threshold`, and
+    `test_impossible_score_threshold_zeroes_bm25_and_dense_but_not_hybrid`
+    proves a high enough one returns zero dense hits. The default is `None`
+    and the eval runs unthresholded, so the measured stage abstained on
+    nothing — but the capability exists, and this is a missing defensible
+    value rather than a missing mechanism.
+
+  Either way `no_answer_abstained_count` is 0 for both stages as run, while
+  the baseline abstains on every one, so abstention is not comparable across
+  stages — read it per stage, never as a delta. See
+  [ADR-0007](docs/adr/ADR-0007-default-retrieval-mode.md), where this is the
+  reason the default stays BM25.
 - **A dense/hybrid result list can still be shorter than `top_k` during the
   staleness window between an `open()` and the retriever's next reopen.**
   The dense path over-fetches to avoid this where it can: `_dense_candidates`

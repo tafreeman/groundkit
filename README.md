@@ -3,13 +3,16 @@
 Grounded, citation-verifiable hybrid retrieval: a persisted BM25 + dense index,
 a named MCP server, and a retrieval eval harness — fully local by default.
 
-> **Status: Phase 2 landing.** BM25 retrieval, a persisted index,
-> citation-bearing search, and a retrieval eval harness with a BM25-only
-> baseline work end-to-end locally with no cloud credentials — see the
-> Quickstart below. Hybrid/dense retrieval, rerank, the MCP server, REST
-> API, and IaC are not yet built. See [SPEC.md](SPEC.md) for what is being
-> built and in what order, and [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)
-> for what is deliberately out of scope.
+> **Status: Phase 3 in progress.** BM25 retrieval, a persisted index,
+> citation-bearing search, and a retrieval eval harness work end-to-end
+> locally with no cloud credentials — see the Quickstart below. Dense and
+> hybrid (RRF) retrieval now work too, opt-in behind `--dense` / `--mode`
+> and requiring a local embedding provider; the eval harness reports their
+> delta against the BM25 baseline. Cross-encoder rerank, the MCP server,
+> REST API, and IaC are not yet built. See [SPEC.md](SPEC.md) for what is
+> being built and in what order, and
+> [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for what is deliberately out
+> of scope or presently broken.
 
 ## What this will be
 
@@ -55,6 +58,40 @@ throwaway index over the corpus and scores it with the same deterministic
 BM25 retrieval path `grk search` uses. BM25-only is the baseline every
 later retrieval feature (hybrid, rerank) reports its delta against, in the
 same report.
+
+## Which retrieval mode should I use?
+
+`grk search` defaults to `--mode bm25`, and that is a deliberate decision
+rather than an unfinished one — see
+[ADR-0007](docs/adr/ADR-0007-default-retrieval-mode.md).
+
+Measured against the golden corpus with a real embedding model, **`--mode
+hybrid` beat the BM25 baseline on every retrieval-quality metric**, with no
+metric regressing. Reproduce it yourself rather than taking that on trust —
+no metric value is written into this README by policy, and the run writes a
+full report:
+
+```bash
+uv run grk eval --dense --embed-model nomic-embed-text
+```
+
+**Hybrid is recommended wherever you have an embedding provider configured
+and can accept two costs**, both of which sit outside those quality metrics:
+
+- **It cannot abstain.** BM25 returns nothing when no indexed chunk shares a
+  term with your query. Hybrid always returns its top-k, however irrelevant,
+  because fused scores are rank-derived and no score threshold applies to
+  them (ADR-0005 decision 6). For a question your corpus cannot answer, BM25
+  says nothing and hybrid answers confidently. `--mode dense` *does* honour
+  `score_threshold`, but no defensible default value has been measured yet.
+- **It needs a running embedding provider** (Ollama by default) and costs
+  substantially more latency per query. BM25 needs neither, which is why it
+  remains the default: `grk` works end-to-end with zero cloud credentials
+  and no model server, and the default path is not permitted to break that.
+
+If you are indexing content you will ask open-ended questions of and can
+tolerate a confident answer to an unanswerable one, use hybrid. If you need
+"I found nothing" to be a possible answer, stay on BM25.
 
 ## Development
 

@@ -411,12 +411,16 @@ the outcome R2 warned might *not* appear.
 That does not settle Q1 on its own, because two costs sit outside the quality
 metrics and both cut against making hybrid the default:
 
-- **Abstention is lost entirely.** BM25 abstained on every no-answer query;
-  dense and fusion abstained on none. A vector search returns its `top_k`
-  nearest neighbours regardless of distance, so abstention is structurally
-  unreachable on those paths (see `KNOWN_LIMITATIONS.md`). Defaulting to
-  hybrid would mean the default mode of a tool whose entire premise is
-  grounded, citation-verifiable retrieval never says "I have nothing".
+- **Abstention is lost.** BM25 abstained on every no-answer query; dense and
+  fusion abstained on none. For **hybrid** that is structural — ADR-0005
+  decision 6 keeps `score_threshold` away from rank-derived fused scores, so
+  no configuration makes it abstain. For **dense** it is configurational: the
+  dense branch does apply `score_threshold`, but the default is `None`, the
+  eval runs unthresholded, and no defensible value has been measured (see
+  `KNOWN_LIMITATIONS.md`). Since hybrid is the mode proposed as the default,
+  the structural half binds: defaulting to it would mean the default mode of
+  a tool whose entire premise is grounded, citation-verifiable retrieval
+  never says "I have nothing".
 - **The default path would require a provider the default install lacks.**
   SPEC.md §10 makes "`grk` works end-to-end locally with zero cloud
   credentials" part of the v1 definition of done. Hybrid needs a running
