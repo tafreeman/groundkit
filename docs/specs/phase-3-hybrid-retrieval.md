@@ -133,7 +133,20 @@ changeset that leaves the tree green.
 - Hazard regression tests:
   - **Hazard 3 (silent filter drop):** assert filtering actually removes
     non-matching chunks, *and* that no call spelling silently no-ops — a
-    misspelled filter key must raise, not be absorbed.
+    misspelled filter **argument** must raise, not be absorbed.
+
+    > **Corrected during Wave E.** This bullet and the §5 table below
+    > previously read "a misspelled filter *key* must raise". That
+    > over-extended ADR-0001 hazard 3, whose defect is an argument
+    > (`**kwargs` swallowing `metadata_filter=` so the search silently ran
+    > *unfiltered*), into a rule about dict keys that the code does not and
+    > should not implement. Chunk metadata is open-ended, so a store cannot
+    > tell a typo'd key from one legitimately absent from everything indexed
+    > so far — filtering on a tenant before any tenant-tagged document exists
+    > is valid and must not be an error. The implemented behaviour is the
+    > fail-closed one: an unknown key matches nothing and the search returns
+    > empty, which is the *opposite* of the hazard rather than an instance of
+    > it. Wave E closed the genuinely untested half instead — see §5.
   - **Hazard 5 (unescaped delete predicate):** a document ID containing quote
     characters must not alter the delete expression. Parameterize or escape;
     test with a hostile ID.
@@ -197,23 +210,96 @@ changeset that leaves the tree green.
 - Heavy deps (torch/sentence-transformers) must stay out of the base install;
   CI's default job must not pull them.
 
-### Wave E — eval deltas (the phase gate)
+### Wave E — eval deltas (the phase gate) (**Landed**)
 
-- Runner emits multiple stages into one report; deltas derived vs `stages[0]`.
-- Per-stage latency percentiles (SPEC.md §6 names BM25/dense/fusion/rerank
-  explicitly — the schema already has the fields).
-- The honest-loss path is tested: a stage that underperforms baseline is
-  reported as such, not suppressed.
-- `EVAL_GATED=1` workflow for real-model runs; skips cleanly when unconfigured.
+Taken before Wave D deliberately. R1 names the eval delta as the phase's
+largest scheduling risk, and Wave E depends on nothing rerank provides, so
+building it first means Wave D reports into a harness that already works
+rather than one being built under it.
+
+- `run_eval` accepts an optional keyword-only `embedder`/`vector_store` pair
+  (both or neither, `ConfigurationError` otherwise — matching `Indexer` and
+  `Retriever`) and emits `bm25` → `dense` → `fusion` into one report. One
+  index and **one retriever** serve every stage, so the stages differ by
+  retrieval strategy alone; ground truth is resolved once per judgment and
+  shared, so no two stages can disagree about what counted as relevant.
+- Deltas are derived at read time by `evals/delta.py` and never stored.
+  `StageDelta` is a return type, never a field of `EvalReport`.
+- Per-stage latency percentiles come from each stage's own per-query
+  timings — the existing `StageResult` fields, now populated per stage.
+- **The honest-loss path is tested, in both directions.** A losing stage is
+  reported with its real numbers, flagged `is_regression`, and printed with
+  a `REGRESSION vs baseline` verdict. Verified per SPEC.md §8 by mutating the
+  source twice — `is_regression` forced to `False`, and a filter that drops
+  stages losing to baseline — and observing 6 and 10 test failures
+  respectively, then restoring.
+- **No noise threshold.** `is_regression` is a strict sign test. A tolerance
+  band would be an invented number, and R2 says a real effect on this corpus
+  can be smaller than any epsilon anyone would pick. `is_improvement` is
+  tracked separately rather than as the negation, so a stage that gains one
+  metric and loses another reports as `MIXED` instead of hiding half the
+  result.
+- `EVAL_GATED=1` gates a real-model run (`tests/test_eval_gated.py`,
+  `.github/workflows/eval-gated.yml`). The workflow is **`workflow_dispatch`
+  only** during active development: every run pulls an embedding model, the
+  eval is run locally far more often than a weekly cron would add value, and
+  a schedule firing against a moving branch produces results nobody reads,
+  which is how a gate becomes noise. SPEC.md §6's "on schedule/label" wording
+  is therefore not yet satisfied by this workflow, deliberately and with the
+  reinstatement noted in the file itself — the schedule and the label trigger
+  are commented in place, and the job's label-gating condition is left inert
+  rather than deleted, so re-enabling in Phase 7 is a two-line change.
+  Skipping cleanly is the *default* outcome; the gated
+  tests assert the run reports honestly and deliberately **do not** assert
+  that dense or fusion beats BM25, since a test that reddens on a loss would
+  pressure the next person to grow the corpus until it passes.
+- `RunConfig` gained two optional, defaulted fields — `embedding` (the
+  ADR-0004 identity triple) and `rrf_k`, both `None`-meaning-absent. Without
+  the first, two runs over identical golden data with *different* embedders
+  agree on `corpus_hash` and `judgments_hash` while measuring two different
+  semantic spaces: ADR-0004's silent-mixing failure one layer above the
+  index. Additive-with-default rather than a `schema_version` bump; the
+  reasoning, and the condition that would force a bump instead, are in
+  `schema.py`'s module docstring.
 
 ### Wave F — docs and gates
 
 - SPEC.md §9 Phase 3 → done with date; `KNOWN_LIMITATIONS.md` updated.
 - ADR-0004/0005 accepted and listed in `docs/adr/index.md`.
-- Decide whether `src/groundkit/index/dense.py` joins
-  `[tool.groundkit.coverage].core_subset`. It is core retrieval, and the
-  current subset list would otherwise exclude it while covering `bm25.py` —
-  an asymmetry worth closing deliberately rather than by omission.
+- **Add `src/groundkit/index/dense.py` to
+  `[tool.groundkit.coverage].core_subset` — decided, do it here.** It is
+  scoring (`_cosine_similarity`, `_clamp_score`, `_matches_filter`,
+  `_sort_by_score`), the vector peer of the already-gated `bm25.py`; it holds
+  both live ADR-0001 hazards (3 and 5), and hazard 3 has now demonstrated
+  that an ungated guard decays quietly; and `retrieval/fusion.py` is already
+  gated by the `retrieval/*` glob, so leaving `dense.py` out gates the
+  combiner but not one of its two inputs. It sits at 100% today, so the gate
+  costs nothing to add now and would cost a fight later.
+
+  **Two caveats that must be written into the same commit, not left to
+  omission — the exact failure this bullet was created to avoid:**
+
+  1. **Why `index/metadata.py` still stays out.** "It is core, so gate it"
+     proves too much: `metadata.py` is the durable truth (ADR-0002) and is
+     equally core by that argument. The `index/` entries are enumerated
+     file-by-file precisely because the reasoning is per-file, unlike the
+     `retrieval/*` glob. Say so explicitly, or the next reader reopens it.
+  2. **`dense.py` is a mixed file** — roughly two-thirds shared helpers plus
+     `InMemoryVectorStore`, one-third `LanceDBVectorStore` behind the
+     optional `dense` extra. Gating it wholesale admits, inside a single
+     file, the offsetting the subset exists to prevent: well-covered LanceDB
+     rows can mask a thin in-memory path, or the reverse, and the gate cannot
+     see the difference. Accepted because `lancedb` is pinned in the dev
+     group (`pyproject.toml`) so CI genuinely covers both halves — a
+     convention, not an invariant, and worth recording as the thing that
+     makes this safe.
+
+  The cleaner long-term fix is splitting `LanceDBVectorStore` into its own
+  module so the core half can be gated without caveat 2. That is a real
+  refactor and must **not** ride along inside Wave F; if it happens, it is
+  its own change with its own ADR.
+- ~~Accept ADR-0007~~ — **done**, accepted 2026-08-14 during Wave E. Listed
+  as Accepted in `docs/adr/index.md`.
 - No hardcoded metric numbers in any doc (SPEC.md §2).
 
 ## 5. Hazard obligations carried into this phase
@@ -225,8 +311,21 @@ have been waiting:
 | # | Defect | Where it lands | Test shape |
 |---|---|---|---|
 | 2 | Cross-encoder feeds raw negative logits into a `ge=0.0` contract | Wave D | negative logits → no crash, order preserved |
-| 3 | `**kwargs` absorbs any metadata filter without error | Wave A | filter works; wrong key raises; no spelling no-ops |
+| 3 | `**kwargs` absorbs any metadata filter without error | Wave A (completed Wave E) | filter works; absent key excludes; misspelled *argument* raises; unknown key returns empty, never everything |
 | 5 | Document IDs interpolated into LanceDB's SQL-like delete expression | Wave A | hostile ID with quotes deletes exactly one document |
+
+**Hazard 3's untested half, closed in Wave E.** Wave A's filter tests seeded
+every chunk with the filter's key and varied only its *value*, so
+`key in metadata` was true throughout and the membership guard in
+`_matches_filter` was never exercised. Replacing it with one that treats an
+absent key as a match left both tests passing — a guard that survives its own
+mutation is not tested, and this is the purest form of the hazard: a chunk the
+filter knows nothing about being returned as if it matched. Three tests now
+cover it on **both** store paths: a chunk missing the key entirely is
+excluded, a misspelled filter *argument* raises `TypeError` (the ARP defect
+verbatim), and an unknown filter key returns empty rather than everything.
+Verified per SPEC.md §8 — the mutation above fails the three new tests on both
+stores and, tellingly, neither of the two original ones.
 
 ## 6. Risks and open questions
 
@@ -240,6 +339,28 @@ while normal CI runs only the deterministic structural assertions. The
 `EVAL_GATED=1` mechanism in SPEC.md §6 already anticipates this — Phase 3 is
 the phase that has to actually build it. **This is the single largest
 scheduling risk in the phase.**
+
+**Mechanism built in Wave E; measurement still outstanding.** `EVAL_GATED=1`
+now exists as a pytest gate (`tests/test_eval_gated.py`, skipped by default
+and by design) and a workflow (`.github/workflows/eval-gated.yml`). Normal
+CI remains offline and runs only structural assertions on the dense path;
+no test anywhere asserts a dense or fusion quality *value*. Recording the
+embedder identity in `RunConfig.embedding` makes the distinction
+machine-checkable rather than a convention a reader has to remember: a
+report whose `embedding.provider` is `inmemory` is self-labelling as
+structural, and the CLI stamps an explicit warning on it.
+
+**Retired.** A gated run against the committed golden corpus, using
+`nomic-embed-text` through local Ollama, has produced a real delta — see Q1
+for what it says and what it does and does not settle. The risk R1 named was
+that the phase would reach its gate with no way to measure quality; that is
+now false in both senses, mechanism and measurement. Worth noting for
+calibration: the same harness run with `InMemoryEmbedder` reported dense and
+fusion as clear *regressions*, and the real model reported them as clear
+improvements. The two disagree in direction, on the same corpus, through the
+same code — which is precisely why SPEC.md §2 refuses to let the hash
+embedder produce a quality number, and is the sharpest available evidence
+that the refusal is load-bearing rather than ceremonial.
 
 **R2 — The corpus may be too small for a meaningful delta.** The Phase 2
 baseline runs over 10 documents / 84 chunks / 44 judgments. On a corpus that
@@ -275,11 +396,57 @@ as corpus size grows, leaving the BM25 rebuild as the only O(corpus) term in
 measurements. Per repo policy, no number from a run of that script is quoted
 here or anywhere else — regenerate them by running the script.
 
-**Q1 — Default retrieval mode after Phase 3.** Does `grk search` default to
-hybrid, or stay BM25-only until a delta justifies the switch? **Deliberately
-still open**, and that is the disciplined answer rather than an evasion: SPEC.md
-§6 makes the measured delta the decider, so committing to a default before
-Wave E has produced one would be choosing by assertion. Wave E closes it.
+**Q1 — Default retrieval mode after Phase 3. — Closed.** Does `grk search`
+default to hybrid, or stay BM25-only? **`grk search` stays on `bm25`**,
+recorded in [ADR-0007](../adr/ADR-0007-default-retrieval-mode.md), **Accepted
+2026-08-14**. The reasoning is below; reopening it requires a superseding ADR
+and, per ADR-0007 decision 3, hybrid becoming able to abstain — not a larger
+quality delta.
+
+A gated run against the committed golden corpus (`nomic-embed-text` via local
+Ollama) produced the first real delta. Qualitatively — the values live in the
+generated artifact, not here (SPEC.md §2): **both dense and fusion improved on
+the baseline across recall@1, recall@5, MRR and nDCG@10, with no metric
+regressing on either stage.** Fusion additionally improved recall@10, where
+dense tied. So the retrieval-quality argument for hybrid is real, and this is
+the outcome R2 warned might *not* appear.
+
+That does not settle Q1 on its own, because two costs sit outside the quality
+metrics and both cut against making hybrid the default:
+
+- **Abstention is lost.** BM25 abstained on every no-answer query; dense and
+  fusion abstained on none. For **hybrid** that is structural — ADR-0005
+  decision 6 keeps `score_threshold` away from rank-derived fused scores, so
+  no configuration makes it abstain. For **dense** it is configurational: the
+  dense branch does apply `score_threshold`, but the default is `None`, the
+  eval runs unthresholded, and no defensible value has been measured (see
+  `KNOWN_LIMITATIONS.md`). Since hybrid is the mode proposed as the default,
+  the structural half binds: defaulting to it would mean the default mode of
+  a tool whose entire premise is grounded, citation-verifiable retrieval
+  never says "I have nothing".
+- **The default path would require a provider the default install lacks.**
+  SPEC.md §10 makes "`grk` works end-to-end locally with zero cloud
+  credentials" part of the v1 definition of done. Hybrid needs a running
+  embedding model and costs roughly two orders of magnitude more latency per
+  query than the lexical path. A default that fails without Ollama is a
+  different product than the one §10 describes.
+
+The honest reading is that the measurement licenses hybrid as the
+*recommended* mode where a provider is configured, not as the unconditional
+default. **Recorded as
+[ADR-0007](../adr/ADR-0007-default-retrieval-mode.md), Accepted 2026-08-14.**
+BM25 stays the default and no behaviour changes.
+
+The reopening condition is **hybrid** becoming able to abstain — not dense.
+The distinction is the whole point and is easy to lose: dense *already*
+abstains when `score_threshold` is set, so calibrating a dense threshold
+would feel like progress toward reopening while leaving the actual blocker
+untouched. Hybrid is the mode proposed as the default, and ADR-0005 decision
+6 keeps thresholding away from rank-derived fused scores deliberately, so
+hybrid needs a genuinely different abstention rule rather than the dense one
+extended. That is a design gap. Note also what does *not* reopen it: growing
+the corpus, or re-running the gate until the delta is larger, moves no part
+of this — deliberate, since R2 warns against exactly that reflex.
 
 **Q2 — Does the manifest live in SQLite or beside it? — Settled.**
 [ADR-0004](../adr/ADR-0004-embedding-identity-binding.md) decision 1 puts it

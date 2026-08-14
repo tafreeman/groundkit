@@ -557,15 +557,25 @@ class TestManifestVerificationAtOpen:
 
 
 class TestNoBackfillDenseRead:
-    """KNOWN_LIMITATIONS.md's "turning the dense path on does not backfill":
-    opening a dense pair over a collection that was only ever ingested
-    BM25-only must succeed (an unset manifest verifies trivially), and the
-    dense side must then behave as an honestly empty index, never an
-    error."""
+    """ADR-0008: a dense or hybrid search refuses a never-dense collection.
 
-    def test_dense_pair_over_never_dense_ingested_collection_opens_and_dense_mode_is_empty(
-        self, tmp_path: Path
-    ) -> None:
+    **This class asserted the opposite through Wave C, deliberately
+    reversed by ADR-0008.** Wave C held that opening a dense pair over a
+    BM25-only collection should succeed and the dense side should then
+    "behave as an honestly empty index, never an error". Opening still
+    succeeds — that half was right, and a caller may open with a pair and
+    search ``"bm25"`` only. What was wrong is what the caller got back from
+    the other modes: ``hybrid`` fused one non-empty ranking with an empty
+    one and returned *BM25's ordering* stamped ``metadata["stage"] =
+    "fusion"``, and ``dense`` returned zero results, which reads as "nothing
+    matched" when the truth is "there is no dense index". Both are the
+    silent-absence class SPEC.md §2 fails closed against, and the first is
+    the same defect shape already closed for an unrecognised ``mode``.
+    """
+
+    def test_dense_mode_over_never_dense_ingested_collection_raises(self, tmp_path: Path) -> None:
+        """Zero results would read as "nothing matched", not "no dense index"."""
+
         async def run() -> None:
             store = await _populated_store(tmp_path)
             try:
@@ -574,43 +584,79 @@ class TestNoBackfillDenseRead:
                     embedder=InMemoryEmbedder(dimensions=_DENSE_DIMS),
                     vector_store=InMemoryVectorStore(),
                 )
-                response = await retriever.search("pasta", mode="dense")
-                assert response.total_results == 0
-                assert response.results == []
-                assert response.metadata["stage"] == "dense"
+                with pytest.raises(ConfigurationError, match="no embedding-identity manifest"):
+                    await retriever.search("pasta", mode="dense")
             finally:
                 await store.close()
 
         asyncio.run(run())
 
-    def test_hybrid_mode_over_never_dense_ingested_collection_matches_bm25_ordering(
-        self, tmp_path: Path
-    ) -> None:
-        """With no vectors to contribute, RRF fuses one non-empty ranking
-        (bm25) with an empty one (dense) — the result must carry exactly
-        bm25's chunk ordering (WAVE_C_INTERFACES.md §2)."""
+    def test_hybrid_mode_over_never_dense_ingested_collection_raises(self, tmp_path: Path) -> None:
+        """The sharper half: this used to return BM25 results labelled "fusion"."""
 
         async def run() -> None:
             store = await _populated_store(tmp_path)
             try:
-                bm25_only = await Retriever.open(store)
-                dense_paired = await Retriever.open(
+                retriever = await Retriever.open(
                     store,
                     embedder=InMemoryEmbedder(dimensions=_DENSE_DIMS),
                     vector_store=InMemoryVectorStore(),
                 )
-                bm25_response = await bm25_only.search("BM25 lexical ranking", top_k=5)
-                hybrid_response = await dense_paired.search(
-                    "BM25 lexical ranking", top_k=5, mode="hybrid"
-                )
-                assert [r.chunk_id for r in hybrid_response.results] == [
-                    r.chunk_id for r in bm25_response.results
-                ]
-                assert hybrid_response.total_results == bm25_response.total_results
-                assert hybrid_response.total_results > 0
-                assert hybrid_response.metadata["stage"] == "fusion"
+                with pytest.raises(ConfigurationError, match="no embedding-identity manifest"):
+                    await retriever.search("BM25 lexical ranking", top_k=5, mode="hybrid")
             finally:
                 await store.close()
+
+        asyncio.run(run())
+
+    def test_the_error_points_at_the_remedy_that_actually_works(self, tmp_path: Path) -> None:
+        """A bare "no manifest" would send the caller to a silent no-op.
+
+        Enabling ``--dense`` over an existing collection backfills nothing —
+        the content-hash gate runs before embedding — so the message has to
+        name re-ingestion, or it routes the reader to the exact command that
+        appears to fix this and does not.
+        """
+
+        async def run() -> None:
+            store = await _populated_store(tmp_path)
+            try:
+                retriever = await Retriever.open(
+                    store,
+                    embedder=InMemoryEmbedder(dimensions=_DENSE_DIMS),
+                    vector_store=InMemoryVectorStore(),
+                )
+                with pytest.raises(ConfigurationError) as excinfo:
+                    await retriever.search("pasta", mode="dense")
+            finally:
+                await store.close()
+            message = str(excinfo.value)
+            assert "does not backfill" in message
+            assert "grk ingest --dense" in message
+
+        asyncio.run(run())
+
+    def test_bm25_mode_still_works_on_a_dense_paired_retriever(self, tmp_path: Path) -> None:
+        """ADR-0008 decision 1: the refusal is per-mode, never at ``open()``.
+
+        Opening with a dense pair and searching only ``"bm25"`` is valid and
+        must keep working — failing at ``open()`` would have been simpler and
+        would have broken this for a mode the caller never used.
+        """
+
+        async def run() -> None:
+            store = await _populated_store(tmp_path)
+            try:
+                retriever = await Retriever.open(
+                    store,
+                    embedder=InMemoryEmbedder(dimensions=_DENSE_DIMS),
+                    vector_store=InMemoryVectorStore(),
+                )
+                response = await retriever.search("BM25 lexical ranking", top_k=5)
+            finally:
+                await store.close()
+            assert response.total_results > 0
+            assert response.metadata["stage"] == "bm25"
 
         asyncio.run(run())
 
@@ -1067,9 +1113,23 @@ def test_post_open_documents_do_not_displace_eligible_dense_results(tmp_path: Pa
         assert len(pre_open_chunks) == 2
 
         scripted = _ScriptedVectorStore()
-        retriever = await Retriever.open(
-            store, embedder=InMemoryEmbedder(dimensions=8), vector_store=scripted
+        embedder = InMemoryEmbedder(dimensions=8)
+        # Two open()-time guards have to be satisfied before this test can
+        # reach the behaviour it is actually about (over-fetch ranking).
+        # Bind the manifest, or ADR-0008 refuses dense search on a collection
+        # that never had vectors; and seed a ranking, or
+        # verify_dense_side_present sees a bound manifest over an empty store
+        # and calls it a lost dense side. Both are real guards doing their
+        # job — the seed is replaced below with the adversarial ordering.
+        await store.write_manifest(
+            EmbeddingIdentity(
+                provider=embedder.provider,
+                model_name=embedder.model_name,
+                dimensions=embedder.dimensions,
+            )
         )
+        scripted.ranked = [(chunk, 1.0) for chunk in pre_open_chunks]
+        retriever = await Retriever.open(store, embedder=embedder, vector_store=scripted)
 
         # Ingested after open(): present in sources, absent from the snapshot.
         post_open_chunks: list[Chunk] = []
@@ -1086,6 +1146,11 @@ def test_post_open_documents_do_not_displace_eligible_dense_results(tmp_path: Pa
         scripted.ranked = [(chunk, 9.9) for chunk in post_open_chunks] + [
             (chunk, 1.0) for chunk in pre_open_chunks
         ]
+        # Drop the open()-time probe verify_dense_side_present made
+        # (search(top_k=1)); `requested` below is about the search's own
+        # widening, and counting the probe as its first fetch would make the
+        # assertion measure the wrong thing.
+        scripted.requested.clear()
 
         response = await retriever.search("anything", top_k=2, mode="dense")
 

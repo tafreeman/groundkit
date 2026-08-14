@@ -82,6 +82,7 @@ class Retriever:
         embedder: EmbeddingProtocol | None = None,
         vector_store: VectorStoreProtocol | None = None,
         documents_at_open: frozenset[str] | None = None,
+        collection_is_dense_bound: bool = False,
     ) -> None:
         _validate_dense_pair(embedder, vector_store)
         if embedder is not None and documents_at_open is None:
@@ -98,6 +99,7 @@ class Retriever:
         self._documents_at_open: frozenset[str] = (
             documents_at_open if documents_at_open is not None else frozenset()
         )
+        self._collection_is_dense_bound = collection_is_dense_bound
 
     @classmethod
     async def open(
@@ -116,8 +118,10 @@ class Retriever:
         boundaries (``Indexer`` closed the ingest boundary in Wave B). A
         mismatch is :class:`~groundkit.errors.IndexIdentityError`, never a
         re-embed and never a fallback. A collection with no manifest (never
-        dense-ingested) verifies trivially and simply has nothing for the
-        dense path to read.
+        dense-ingested) verifies trivially here — opening is legitimate, and
+        a caller may then search ``"bm25"`` — but a ``dense`` or ``hybrid``
+        search against it is refused in :meth:`search` (ADR-0008), because
+        there are no vectors for either mode to read.
 
         Args:
             store: The collection's metadata store.
@@ -150,8 +154,15 @@ class Retriever:
             await verify_dense_side_present(store, vector_store, embedder.dimensions)
         bm25 = await BM25Index.from_store(store, k1=cfg.bm25_k1, b=cfg.bm25_b)
         documents_at_open: frozenset[str] | None = None
+        dense_bound = False
         if embedder is not None:
             documents_at_open = frozenset(await store.get_document_sources())
+            # Recorded, not enforced, here. A collection with no manifest was
+            # never dense-ingested, which is a legitimate state to open with
+            # a dense pair — the caller may only ever search "bm25". It is
+            # searching *dense* or *hybrid* against it that cannot be
+            # answered, so the refusal lives in search(), per mode.
+            dense_bound = await store.get_manifest() is not None
         logger.info("Retriever opened over %d chunks", bm25.size)
         return cls(
             store,
@@ -160,6 +171,7 @@ class Retriever:
             embedder=embedder,
             vector_store=vector_store,
             documents_at_open=documents_at_open,
+            collection_is_dense_bound=dense_bound,
         )
 
     async def search(
@@ -171,11 +183,14 @@ class Retriever:
     ) -> SearchResponse:
         """Search the collection.
 
-        The default mode is ``"bm25"`` deliberately: whether dense or hybrid
-        should become the default is Q1 in
-        ``docs/specs/phase-3-hybrid-retrieval.md``, left open until Wave E
-        produces a measured eval delta — SPEC.md §6 makes the measurement
-        the decider, so the default here changes with data, not assertion.
+        The default mode is ``"bm25"`` deliberately, and stays so under
+        ADR-0007 even though Wave E's measured eval delta favoured hybrid on
+        every retrieval-quality metric. The reason is abstention: ``"hybrid"``
+        applies no ``score_threshold`` (ADR-0005 decision 6 — see below), so
+        no configuration makes it return nothing for a question the corpus
+        cannot answer, and a default that always answers is the wrong default
+        for citation-verifiable retrieval. ``"dense"`` *does* honour
+        ``score_threshold``; what it lacks is a measured, defensible value.
 
         ``score_threshold`` applies to the producer-scored modes (``bm25``,
         ``dense``) and never to hybrid: fused scores are rank-derived
@@ -205,7 +220,12 @@ class Retriever:
                 stored source — including orphaned dense vectors — fail
                 closed rather than emit an unverifiable citation).
             ConfigurationError: ``mode`` is ``"dense"`` or ``"hybrid"`` but
-                this retriever was opened without a dense pair.
+                this retriever was opened without a dense pair, or the
+                collection has no embedding-identity manifest and therefore
+                no vectors either mode could read (ADR-0008). The second
+                case is refused rather than answered from an empty dense
+                side, which would return lexical results labelled as dense
+                or fused.
         """
         if not query.strip():
             raise RetrievalError("Query must not be empty")
@@ -255,12 +275,47 @@ class Retriever:
         )
 
     def _require_dense(self, mode: str) -> tuple[EmbeddingProtocol, VectorStoreProtocol]:
-        """Return the dense pair, or fail closed if this retriever has none."""
+        """Return the dense pair, or fail closed if this mode cannot be served.
+
+        Two separate ways a dense or hybrid search can be unanswerable, and
+        both are caller errors rather than corruption:
+
+        1. **This retriever has no dense pair.** Nothing to embed with.
+        2. **This collection was never dense-ingested** — no ADR-0004
+           manifest, so no vectors exist for any query to match. Answering
+           anyway is the trap this check closes: the dense side contributes
+           nothing, RRF over one non-empty list returns the BM25 ordering
+           unchanged, and ``metadata["stage"]`` stamps it ``"fusion"``. The
+           caller gets lexical results labelled hybrid, with no error — a
+           wrong answer presented as a valid one, which SPEC.md §2 forbids
+           and which this repo already ruled on once (the unknown-``mode``
+           fallthrough closed in review on PR #3).
+
+        Deliberately *not* checked in :meth:`open`: an unbound manifest is a
+        legitimate collection state (a BM25-only collection, whose upgrade
+        path is the documented no-backfill limitation, not a defect), and a
+        caller may open with a dense pair and only ever search ``"bm25"``.
+        The mode is what makes it unanswerable, so the mode is where it
+        fails.
+        """
         if self._embedder is None or self._vector_store is None:
             raise ConfigurationError(
                 f"search mode {mode!r} requires a dense path, but this Retriever was "
                 "opened without one. Reopen it via Retriever.open(store, config, "
                 "embedder=..., vector_store=...) to search dense or hybrid."
+            )
+        if not self._collection_is_dense_bound:
+            # ASCII only: this reaches a live console, and the repo's primary
+            # dev platform defaults to a cp1252 code page that mangles
+            # non-ASCII punctuation mid-message.
+            raise ConfigurationError(
+                f"search mode {mode!r} requires a collection that was ingested with a "
+                "dense path, but this one has no embedding-identity manifest - no "
+                "vectors have ever been written to it. Refusing rather than returning "
+                "lexical results labelled as dense or fused. Note that enabling the "
+                "dense path over an existing collection does not backfill it (the "
+                "content-hash gate runs before embedding): re-ingest the corpus into a "
+                "fresh collection with `grk ingest --dense`."
             )
         return self._embedder, self._vector_store
 

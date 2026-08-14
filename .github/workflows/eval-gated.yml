@@ -1,0 +1,119 @@
+# Real-model retrieval eval (SPEC.md §6's `EVAL_GATED=1` workflow).
+#
+# Separate from `ci.yml` on purpose. The default suite must stay offline and
+# credential-free, and `InMemoryEmbedder`'s hash-derived vectors cannot
+# produce a retrieval-quality number without violating SPEC.md §2 — so the
+# only honest dense/fusion delta comes from a real embedding model, which
+# means a running Ollama, which cannot be a precondition of every PR.
+#
+# This workflow is therefore opt-in and never blocks a PR: it runs on a
+# schedule, on demand, and on a PR only when explicitly labelled. Nothing
+# here is `continue-on-error` — SPEC.md §3 forbids that for a job that is the
+# sole proof of a backend, and this is the sole proof of the Ollama path.
+name: eval-gated
+
+# TRIGGERS — deliberately manual-only for now.
+#
+# SPEC.md §6 describes this workflow as running "on schedule/label". It does
+# neither yet, on purpose: every run pulls an embedding model, and during
+# active development the eval is run locally far more often than a weekly
+# cron would add value. A schedule that fires against a moving branch also
+# produces a stream of results nobody reads, which is how a gate quietly
+# becomes noise.
+#
+# REVISIT AT END OF DEVELOPMENT (Phase 7, alongside the release checklist):
+# turn the weekly `schedule` back on and re-add the `eval-gated` PR label
+# trigger, so the real-model path is proven on a cadence once `main` is
+# stable enough for the result to mean something. The label-gating condition
+# on the job below is left in place and inert precisely so that re-enabling
+# is a two-line change to this block, not a rewrite.
+#
+#   schedule:
+#     - cron: "0 6 * * 1"          # weekly, Mondays 06:00 UTC
+#   pull_request:
+#     types: [opened, synchronize, reopened, labeled]
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gated-eval:
+    runs-on: ubuntu-latest
+    # Inert while `on:` is dispatch-only — `workflow_dispatch` never matches
+    # the pull_request branch, so this always passes today. Kept rather than
+    # deleted so re-enabling the PR trigger (see the note above `on:`) does
+    # not also require remembering to re-add label gating, which is the half
+    # of the change that would be easy to miss and expensive to get wrong:
+    # without it, every PR pulls a model.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'eval-gated')
+    timeout-minutes: 30
+
+    services:
+      ollama:
+        image: ollama/ollama:latest
+        ports:
+          - 11434:11434
+
+    env:
+      GROUNDKIT_EVAL_EMBED_MODEL: nomic-embed-text
+      GROUNDKIT_EVAL_EMBED_DIMENSIONS: "768"
+      GROUNDKIT_EVAL_EMBED_BASE_URL: http://localhost:11434
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+      - run: uv sync --locked --group dev
+
+      - name: Wait for Ollama to accept connections
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl -sf "$GROUNDKIT_EVAL_EMBED_BASE_URL/api/tags" >/dev/null; then
+              echo "Ollama is up after ${attempt} attempt(s)."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Ollama did not become ready within 60s." >&2
+          exit 1
+
+      - name: Pull the embedding model
+        run: |
+          curl -sf -X POST "$GROUNDKIT_EVAL_EMBED_BASE_URL/api/pull" \
+            -H 'Content-Type: application/json' \
+            -d "{\"name\": \"$GROUNDKIT_EVAL_EMBED_MODEL\"}" \
+            -o /dev/null
+          # Prove the model is actually resident rather than trusting the
+          # pull's exit code: /api/pull streams progress and can report
+          # success for a partially-completed transfer.
+          curl -sf "$GROUNDKIT_EVAL_EMBED_BASE_URL/api/tags" \
+            | grep -q "$GROUNDKIT_EVAL_EMBED_MODEL"
+
+      - name: Run the gated eval tests
+        env:
+          EVAL_GATED: "1"
+        run: uv run pytest tests/test_eval_gated.py -v
+
+      # Produces the artifact a human reads for the actual delta. The tests
+      # above assert the run is honest; this step is what makes the numbers
+      # available, since no metric value may be committed to a doc
+      # (SPEC.md §2) and `evals/results/` is gitignored.
+      - name: Generate the real-model eval report
+        run: |
+          uv run grk eval --dense \
+            --embed-provider ollama \
+            --embed-model "$GROUNDKIT_EVAL_EMBED_MODEL" \
+            --embed-dimensions "$GROUNDKIT_EVAL_EMBED_DIMENSIONS" \
+            --embed-base-url "$GROUNDKIT_EVAL_EMBED_BASE_URL"
+
+      - name: Upload the eval report
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-real-model
+          path: evals/results/latest.json
+          if-no-files-found: error

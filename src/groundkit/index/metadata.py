@@ -100,7 +100,7 @@ APPLICATION_ID: Final[int] = 0x47524B31  # "GRK1"
 
 #: Schema version stamped into ``PRAGMA user_version`` alongside
 #: :data:`APPLICATION_ID`, written together as the last statements before
-#: commit when a store is first created (ADR-0004 decisions 4 and 7) so a
+#: commit when a store is first created (ADR-0004 decision 4) so a
 #: failed schema application can never leave a store claiming a version it
 #: does not have. A store lacking either stamp — including every store
 #: created before this ADR landed — predates the collection manifest;
@@ -108,7 +108,7 @@ APPLICATION_ID: Final[int] = 0x47524B31  # "GRK1"
 #: :meth:`SQLiteMetadataStore.write_manifest` /
 #: :meth:`SQLiteMetadataStore.verify_manifest` refuse it for dense work
 #: rather than guessing at an identity it never recorded (ADR-0004 decision
-#: 6: pre-1.0, every index is reproducible from ``grk ingest`` in seconds,
+#: 5: pre-1.0, every index is reproducible from ``grk ingest`` in seconds,
 #: so a migration path here would be code written to preserve data that
 #: costs seconds to regenerate).
 SCHEMA_VERSION: Final[int] = 1
@@ -197,7 +197,7 @@ class SQLiteMetadataStore:
                 conn.executescript(_SCHEMA)
                 if is_new_file:
                     # Stamp groundkit's identity as the last statements
-                    # before commit (ADR-0004 decisions 4 and 7): both
+                    # before commit (ADR-0004 decision 4): both
                     # PRAGMA writes land in the same transaction as the
                     # schema application above, so a failure anywhere in
                     # this block (caught below) leaves nothing committed —

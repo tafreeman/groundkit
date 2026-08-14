@@ -35,6 +35,15 @@ from groundkit.providers.protocols import EmbeddingProtocol
 
 logger = logging.getLogger(__name__)
 
+#: Provider identity of the labeled offline test double below. Public and
+#: referenced by name wherever code has to *recognize* it rather than merely
+#: build it — the eval runner warns on it, and the CLI stamps a caveat on
+#: any report produced with it (SPEC.md §2: a quality number from
+#: hash-derived vectors is noise presented as a number). A bare ``"inmemory"``
+#: string literal repeated at each of those call sites is a check that
+#: silently stops matching the day the identity changes.
+INMEMORY_PROVIDER: Final[str] = "inmemory"
+
 #: Bytes of a hash digest consumed per generated float (one big-endian uint32).
 _VECTOR_BYTE_STRIDE: Final[int] = 4
 
@@ -78,7 +87,7 @@ class InMemoryEmbedder:
     @property
     def provider(self) -> str:
         """Provider identity for the deterministic in-memory embedder."""
-        return "inmemory"
+        return INMEMORY_PROVIDER
 
     @property
     def model_name(self) -> str:
