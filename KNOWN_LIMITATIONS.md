@@ -38,6 +38,21 @@ per SPEC.md §9:
   with a sign, not a weak measurement. The CLI stamps an explicit warning on
   any such report and `RunConfig.embedding` records the provider, so an
   artifact self-labels which of the two it is.
+- **`run_eval` requires a disposable vector store, and its cleanup has one
+  gap.** An eval builds a throwaway index whose SQLite half lives in an OS
+  temp directory deleted when the run ends. A caller-supplied
+  `vector_store` is therefore treated as disposable too: it must be empty
+  (`ConfigurationError` otherwise) and every vector the run writes is deleted
+  on the way out, including when the run fails. The guard exists because
+  vectors stranded in a live collection are not inert — `Retriever`'s orphan
+  check fails that collection's dense searches closed the moment one ranks
+  into the candidate window, with no visible connection to having run an
+  eval. The residual gap: `Indexer` commits SQLite *last*, so a crash
+  part-way through ingest can leave the in-flight document's vectors in a
+  store SQLite never recorded, and the purge — which enumerates documents via
+  SQLite — cannot see them. The emptiness guard bounds this to a store the
+  caller already declared disposable, and the purge logs loudly on failure,
+  but it is not a guarantee.
 - **Hybrid cannot abstain on a no-answer query; dense does not abstain as
   configured.** BM25 returns nothing when no indexed chunk shares a term with
   the query, which is what makes the corpus's `no_answer` judgments measure

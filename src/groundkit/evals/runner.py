@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, NamedTuple
 from groundkit import __version__
 from groundkit.config import ChunkingConfig, RetrievalConfig
 from groundkit.contracts import EmbeddingIdentity
-from groundkit.errors import ConfigurationError, EvalError
+from groundkit.errors import ConfigurationError, EvalError, GroundkitError
 from groundkit.evals.corpus import (
     chunk_overlaps_span,
     load_judgments,
@@ -90,7 +90,7 @@ if TYPE_CHECKING:
 
     from groundkit.contracts import Chunk
     from groundkit.evals.corpus import GoldSpan, Judgment
-    from groundkit.index.protocols import VectorStoreProtocol
+    from groundkit.index.protocols import MetadataStoreProtocol, VectorStoreProtocol
     from groundkit.providers.protocols import EmbeddingProtocol
     from groundkit.retrieval.search import SearchMode
 
@@ -175,7 +175,12 @@ async def run_eval(
         embedder: Optional embedding provider enabling the ``dense`` and
             ``fusion`` stages (keyword-only; both or neither with
             ``vector_store``, mirroring ``Indexer`` and ``Retriever``).
-        vector_store: Optional dense vector store (keyword-only).
+        vector_store: Optional dense vector store (keyword-only). **Must be
+            empty**, and is treated as disposable: this run writes the
+            corpus's vectors into it and deletes them again on the way out.
+            Pass a fresh store, never a live collection's — see
+            :func:`_require_empty_vector_store` for what goes wrong
+            otherwise.
 
     Returns:
         An :class:`EvalReport` whose ``stages[0]`` is always the ``bm25``
@@ -184,7 +189,7 @@ async def run_eval(
 
     Raises:
         ConfigurationError: Exactly one of ``embedder`` / ``vector_store``
-            was supplied.
+            was supplied, or ``vector_store`` already holds vectors.
         EvalError: A judgment or gold span fails to load or resolve against
             the corpus, or a gold span's document (or a retrieved hit's
             document) has no corresponding entry among the corpus's
@@ -195,6 +200,8 @@ async def run_eval(
             or an out-of-range ``top_k``).
     """
     _validate_dense_pair(embedder, vector_store)
+    if embedder is not None and vector_store is not None:
+        await _require_empty_vector_store(vector_store, embedder.dimensions)
     if embedder is not None and embedder.provider == INMEMORY_PROVIDER:
         logger.warning(
             # Plain ASCII deliberately: this string is emitted to a live
@@ -317,6 +324,10 @@ async def run_eval(
                     )
                 )
         finally:
+            # Purge BEFORE closing: the document set lives in the store, and
+            # the store is about to go away with the temp directory.
+            if vector_store is not None:
+                await _purge_eval_vectors(vector_store, store)
             # Must close before the TemporaryDirectory context exits: on
             # Windows the sqlite file cannot be deleted while a handle to it
             # is still open.
@@ -375,6 +386,106 @@ def _planned_stages(
     if embedder is None or vector_store is None:
         return baseline
     return baseline + _DENSE_STAGE_MODES
+
+
+async def _require_empty_vector_store(vector_store: VectorStoreProtocol, dimensions: int) -> None:
+    """Refuse a vector store that already holds vectors.
+
+    An eval run builds a **throwaway** index: its SQLite half lives in an OS
+    temp directory that is deleted when the run ends. The vector half is
+    supplied by the caller, and nothing about the protocol makes it
+    throwaway too — so writing eval vectors into a store that already holds
+    a real collection would leave them behind after the SQLite side they
+    reference has been deleted. Those orphans are not inert: a later dense
+    search through that store fails closed with ``RetrievalError`` the
+    moment one ranks into the candidate window (``retrieval/search.py``'s
+    orphan check), which breaks the caller's collection permanently and for
+    a reason with no visible connection to having run an eval.
+
+    Requiring the store to be empty makes contaminating a populated
+    collection unrepresentable rather than merely discouraged, and
+    :func:`_purge_eval_vectors` then leaves an accepted store as it was
+    found.
+
+    Emptiness is probed with ``search(top_k=1)``, the same idiom
+    :func:`~groundkit.index.dense.verify_dense_side_present` uses: a dense
+    search never drops zero-scored results, so an empty result means an
+    empty store, and this needs no addition to
+    :class:`~groundkit.index.protocols.VectorStoreProtocol`.
+
+    Args:
+        vector_store: The caller-supplied dense store.
+        dimensions: Embedding width, used to shape the probe vector.
+
+    Raises:
+        ConfigurationError: The store already holds at least one vector.
+    """
+    # A unit vector rather than zeros: cosine similarity is undefined
+    # against a zero-magnitude query.
+    probe = [1.0] + [0.0] * (dimensions - 1)
+    if await vector_store.search(probe, top_k=1):
+        raise ConfigurationError(
+            "run_eval was given a vector_store that already holds vectors. An eval "
+            "builds a throwaway index whose SQLite half is deleted when the run ends, "
+            "so writing into a populated store would strand those vectors with no "
+            "metadata behind them and fail that collection's later dense searches "
+            "closed. Pass a fresh, empty store (the CLI builds an InMemoryVectorStore "
+            "per run); evaluate an existing collection by re-ingesting its corpus here "
+            "instead of handing over its live store."
+        )
+
+
+async def _purge_eval_vectors(
+    vector_store: VectorStoreProtocol, store: MetadataStoreProtocol
+) -> None:
+    """Delete every vector this run wrote, leaving the store as it was found.
+
+    The store was verified empty at entry
+    (:func:`_require_empty_vector_store`), so everything in it now was
+    written by this run and every document SQLite knows about is one to
+    remove.
+
+    Best-effort by construction, and deliberately not fatal: this runs in a
+    ``finally``, so raising here would replace whatever real failure brought
+    us into it with a cleanup error. Failures are logged loudly instead.
+
+    One residual gap, worth knowing rather than discovering: ``Indexer``
+    commits SQLite *last* (vectors are written before the metadata that
+    references them, so SQLite is never ahead of the dense store). A crash
+    part-way through ingest can therefore leave the in-flight document's
+    vectors in a store SQLite never recorded, and this purge cannot see
+    them. The emptiness guard bounds the damage — that can only ever happen
+    to a store the caller declared disposable — and it is recorded in
+    ``KNOWN_LIMITATIONS.md``.
+
+    Args:
+        vector_store: The caller-supplied dense store to clean.
+        store: The run's temporary metadata store, still open.
+    """
+    try:
+        document_ids = list(await store.get_document_sources())
+    except GroundkitError as exc:
+        logger.warning(
+            "Could not read the document set to purge eval vectors from the supplied "
+            "vector store; it may still hold this run's vectors: %s",
+            exc,
+        )
+        return
+
+    failed: list[str] = []
+    for document_id in document_ids:
+        try:
+            await vector_store.delete(document_id)
+        except GroundkitError:
+            failed.append(document_id)
+    if failed:
+        logger.warning(
+            "Failed to purge eval vectors for %d of %d documents from the supplied "
+            "vector store; it still holds vectors for: %s",
+            len(failed),
+            len(document_ids),
+            ", ".join(failed),
+        )
 
 
 def _validate_dense_pair(

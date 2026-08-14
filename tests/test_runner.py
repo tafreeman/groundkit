@@ -18,7 +18,7 @@ import pytest
 
 from groundkit.config import ChunkingConfig, RetrievalConfig
 from groundkit.contracts import Chunk, Document
-from groundkit.errors import ConfigurationError, EvalError
+from groundkit.errors import ConfigurationError, EvalError, GroundkitError
 from groundkit.evals.delta import derive_stage_deltas
 from groundkit.evals.runner import EVAL_CHUNKING_CONFIG, _percentile, run_eval, write_report
 from groundkit.evals.schema import EvalReport, MetricSet, RunConfig, RunMetadata, StageResult
@@ -740,3 +740,144 @@ class TestDensePairValidation:
 
         with pytest.raises(ConfigurationError, match="no embedder"):
             asyncio.run(run())
+
+
+class TestCallerVectorStoreIsNotContaminated:
+    """An eval must not strand vectors in a store it does not own.
+
+    ``run_eval`` builds a throwaway index whose SQLite half lives in a temp
+    directory that is deleted when the run ends. Vectors written into a
+    caller-supplied store would outlive the metadata they reference, and
+    ``Retriever``'s orphan check fails a dense search closed the moment one
+    ranks into the candidate window — so a caller who ran an eval against a
+    live collection would find that collection permanently broken, for a
+    reason with no visible connection to the eval.
+    """
+
+    def test_a_populated_vector_store_is_refused_before_any_work(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """Contaminating a live collection is refused, not merely discouraged."""
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            populated = InMemoryVectorStore()
+            await populated.add(
+                [
+                    Chunk(
+                        chunk_id="pre-existing",
+                        document_id="callers-doc",
+                        chunk_index=0,
+                        content="a document the caller already indexed",
+                        start_offset=0,
+                        end_offset=37,
+                        metadata={"source": "callers.md"},
+                    )
+                ],
+                [[1.0] + [0.0] * 31],
+            )
+            return await run_eval(
+                corpus,
+                judgments_path,
+                embedder=InMemoryEmbedder(dimensions=32),
+                vector_store=populated,
+            )
+
+        with pytest.raises(ConfigurationError, match="already holds vectors"):
+            asyncio.run(run())
+
+    def test_the_caller_s_pre_existing_vectors_are_left_untouched(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """The refusal must happen before ingest, not part-way through it."""
+        populated = InMemoryVectorStore()
+
+        async def run() -> None:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            await populated.add(
+                [
+                    Chunk(
+                        chunk_id="pre-existing",
+                        document_id="callers-doc",
+                        chunk_index=0,
+                        content="a document the caller already indexed",
+                        start_offset=0,
+                        end_offset=37,
+                        metadata={"source": "callers.md"},
+                    )
+                ],
+                [[1.0] + [0.0] * 31],
+            )
+            with pytest.raises(ConfigurationError):
+                await run_eval(
+                    corpus,
+                    judgments_path,
+                    embedder=InMemoryEmbedder(dimensions=32),
+                    vector_store=populated,
+                )
+            survivors = await populated.search([1.0] + [0.0] * 31, top_k=100)
+            assert [chunk.chunk_id for chunk, _ in survivors] == ["pre-existing"]
+
+        asyncio.run(run())
+
+    def test_an_accepted_store_is_left_empty_after_a_successful_run(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """Every vector the run wrote is purged, so the store ends as it began.
+
+        Without the purge these vectors outlive the temp SQLite store that
+        gave them meaning, which is the orphaning the class docstring
+        describes.
+        """
+        store = InMemoryVectorStore()
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(
+                corpus,
+                judgments_path,
+                embedder=InMemoryEmbedder(dimensions=32),
+                vector_store=store,
+            )
+
+        report = asyncio.run(run())
+        assert [stage.stage for stage in report.stages] == ["bm25", "dense", "fusion"]
+
+        leftovers = asyncio.run(store.search([1.0] + [0.0] * 31, top_k=100))
+        assert leftovers == [], "the run must not leave vectors in a store it does not own"
+
+    def test_the_store_is_purged_even_when_the_run_fails(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """The purge lives in a ``finally``, so a mid-run failure still cleans up.
+
+        The failure has to land *after* vectors are written, or the test
+        proves nothing. ``top_k=999`` exceeds ``MAX_TOP_K``, and that check
+        lives in ``Retriever.search`` — which runs in the stage loop, after
+        ingest has already embedded the corpus into the store. So by the time
+        this raises, the store genuinely holds this run's vectors, and only
+        the ``finally`` can get them back out. (The CLI's own ``--top-k``
+        floor is a separate, earlier check; ``run_eval`` has no such guard,
+        which is what makes this reachable.)
+        """
+        store = InMemoryVectorStore()
+
+        async def run() -> None:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            await run_eval(
+                corpus,
+                judgments_path,
+                embedder=InMemoryEmbedder(dimensions=32),
+                vector_store=store,
+                top_k=999,
+            )
+
+        with pytest.raises(GroundkitError):
+            asyncio.run(run())
+
+        leftovers = asyncio.run(store.search([1.0] + [0.0] * 31, top_k=100))
+        assert leftovers == [], "a failed run must not leave vectors behind either"
