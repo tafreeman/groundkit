@@ -133,7 +133,20 @@ changeset that leaves the tree green.
 - Hazard regression tests:
   - **Hazard 3 (silent filter drop):** assert filtering actually removes
     non-matching chunks, *and* that no call spelling silently no-ops — a
-    misspelled filter key must raise, not be absorbed.
+    misspelled filter **argument** must raise, not be absorbed.
+
+    > **Corrected during Wave E.** This bullet and the §5 table below
+    > previously read "a misspelled filter *key* must raise". That
+    > over-extended ADR-0001 hazard 3, whose defect is an argument
+    > (`**kwargs` swallowing `metadata_filter=` so the search silently ran
+    > *unfiltered*), into a rule about dict keys that the code does not and
+    > should not implement. Chunk metadata is open-ended, so a store cannot
+    > tell a typo'd key from one legitimately absent from everything indexed
+    > so far — filtering on a tenant before any tenant-tagged document exists
+    > is valid and must not be an error. The implemented behaviour is the
+    > fail-closed one: an unknown key matches nothing and the search returns
+    > empty, which is the *opposite* of the hazard rather than an instance of
+    > it. Wave E closed the genuinely untested half instead — see §5.
   - **Hazard 5 (unescaped delete predicate):** a document ID containing quote
     characters must not alter the delete expression. Parameterize or escape;
     test with a hostile ID.
@@ -260,8 +273,21 @@ have been waiting:
 | # | Defect | Where it lands | Test shape |
 |---|---|---|---|
 | 2 | Cross-encoder feeds raw negative logits into a `ge=0.0` contract | Wave D | negative logits → no crash, order preserved |
-| 3 | `**kwargs` absorbs any metadata filter without error | Wave A | filter works; wrong key raises; no spelling no-ops |
+| 3 | `**kwargs` absorbs any metadata filter without error | Wave A (completed Wave E) | filter works; absent key excludes; misspelled *argument* raises; unknown key returns empty, never everything |
 | 5 | Document IDs interpolated into LanceDB's SQL-like delete expression | Wave A | hostile ID with quotes deletes exactly one document |
+
+**Hazard 3's untested half, closed in Wave E.** Wave A's filter tests seeded
+every chunk with the filter's key and varied only its *value*, so
+`key in metadata` was true throughout and the membership guard in
+`_matches_filter` was never exercised. Replacing it with one that treats an
+absent key as a match left both tests passing — a guard that survives its own
+mutation is not tested, and this is the purest form of the hazard: a chunk the
+filter knows nothing about being returned as if it matched. Three tests now
+cover it on **both** store paths: a chunk missing the key entirely is
+excluded, a misspelled filter *argument* raises `TypeError` (the ARP defect
+verbatim), and an unknown filter key returns empty rather than everything.
+Verified per SPEC.md §8 — the mutation above fails the three new tests on both
+stores and, tellingly, neither of the two original ones.
 
 ## 6. Risks and open questions
 

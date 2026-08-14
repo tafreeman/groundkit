@@ -227,6 +227,100 @@ def test_metadata_filter_requires_all_pairs(store_kind: str, tmp_path: Path) -> 
     assert [c.chunk_id for c, _ in results] == ["both"]
 
 
+@pytest.mark.parametrize("store_kind", _STORE_KINDS)
+def test_metadata_filter_excludes_a_chunk_missing_the_key_entirely(
+    store_kind: str, tmp_path: Path
+) -> None:
+    """A chunk with no such metadata key at all must not match (hazard 3).
+
+    The purest form of the silent-filter-drop hazard, and the branch the
+    other two filter tests never reach: they seed every chunk with the
+    filter's key and vary only its *value*, so ``key in metadata`` is True
+    throughout and a guard that treated an absent key as a match would pass
+    them both. Here the second chunk carries no ``category`` at all, so
+    returning it would mean the filter admitted a chunk it knows nothing
+    about — plausible-looking unfiltered results, which is exactly what
+    ADR-0001 hazard 3 records.
+    """
+
+    async def _run() -> list[tuple[Chunk, float]]:
+        store = await _make_store(store_kind, tmp_path)
+        chunks = [
+            _make_chunk("has-key", "doc-1", "carries the key", extra_metadata={"category": "keep"}),
+            _make_chunk("no-key", "doc-1", "carries no category"),
+        ]
+        embeddings = [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]
+        await store.add(chunks, embeddings)
+        return await store.search(
+            [1.0, 0.0, 0.0, 0.0], top_k=10, metadata_filter={"category": "keep"}
+        )
+
+    results = asyncio.run(_run())
+    assert [c.chunk_id for c, _ in results] == ["has-key"]
+
+
+@pytest.mark.parametrize("store_kind", _STORE_KINDS)
+def test_a_misspelled_filter_argument_raises_instead_of_being_absorbed(
+    store_kind: str, tmp_path: Path
+) -> None:
+    """ADR-0001 hazard 3, verbatim: no call spelling may silently no-op.
+
+    ARP's ``search`` took ``**kwargs``, so ``metadata_filters=`` (or any
+    other misspelling) was swallowed and the search ran *unfiltered* while
+    looking like it had filtered. ``VectorStoreProtocol`` drops the catch-all
+    precisely so this is a ``TypeError`` at the call site. Asserted on both
+    implementations, since the protocol only constrains the signature the
+    conformance test checks — nothing stops a concrete store from
+    reintroducing ``**kwargs`` on its own.
+    """
+
+    async def _run() -> None:
+        store = await _make_store(store_kind, tmp_path)
+        await store.add(
+            [_make_chunk("only", "doc-1", "some text", extra_metadata={"category": "keep"})],
+            [[1.0, 0.0, 0.0, 0.0]],
+        )
+        # The misspelling below IS the test, so the call is suppressed for
+        # mypy rather than fixed. That mypy flags it at all is the same
+        # guarantee holding one layer earlier, at type-check time.
+        await store.search(  # type: ignore[call-arg]
+            [1.0, 0.0, 0.0, 0.0], top_k=10, metadata_filters={"category": "keep"}
+        )
+
+    with pytest.raises(TypeError, match="metadata_filters"):
+        asyncio.run(_run())
+
+
+@pytest.mark.parametrize("store_kind", _STORE_KINDS)
+def test_an_unknown_filter_key_returns_nothing_rather_than_everything(
+    store_kind: str, tmp_path: Path
+) -> None:
+    """A filter key no chunk carries yields an empty result, never an unfiltered one.
+
+    Pins the deliberate reading of hazard 3's "no silent no-op": the failure
+    mode the hazard names is a filter that quietly stops filtering, and the
+    opposite of that is returning *nothing*, not raising. Raising is not
+    available as a policy here — chunk metadata is open-ended, so a store
+    cannot distinguish a typo'd key from one that is simply absent from
+    every chunk indexed so far (filtering on a tenant before any tenant-
+    tagged document exists is legitimate and must not be an error). Empty is
+    the fail-closed answer; this test exists so a future change to
+    "unknown key matches everything" cannot pass.
+    """
+
+    async def _run() -> list[tuple[Chunk, float]]:
+        store = await _make_store(store_kind, tmp_path)
+        await store.add(
+            [_make_chunk("only", "doc-1", "some text", extra_metadata={"category": "keep"})],
+            [[1.0, 0.0, 0.0, 0.0]],
+        )
+        return await store.search(
+            [1.0, 0.0, 0.0, 0.0], top_k=10, metadata_filter={"catgeory": "keep"}
+        )
+
+    assert asyncio.run(_run()) == []
+
+
 # ── Filtered search still returns top_k when enough matches exist ─────────
 
 
