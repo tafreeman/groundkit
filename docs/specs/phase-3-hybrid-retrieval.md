@@ -298,8 +298,8 @@ rather than one being built under it.
   module so the core half can be gated without caveat 2. That is a real
   refactor and must **not** ride along inside Wave F; if it happens, it is
   its own change with its own ADR.
-- Accept ADR-0007 (or amend it) — it lands from Wave E as **Proposed**, and a
-  phase must not close with an open proposal deciding its default behaviour.
+- ~~Accept ADR-0007~~ — **done**, accepted 2026-08-14 during Wave E. Listed
+  as Accepted in `docs/adr/index.md`.
 - No hardcoded metric numbers in any doc (SPEC.md §2).
 
 ## 5. Hazard obligations carried into this phase
@@ -396,12 +396,12 @@ as corpus size grows, leaving the BM25 rebuild as the only O(corpus) term in
 measurements. Per repo policy, no number from a run of that script is quoted
 here or anywhere else — regenerate them by running the script.
 
-**Q1 — Default retrieval mode after Phase 3. — Decided.** Does `grk search`
+**Q1 — Default retrieval mode after Phase 3. — Closed.** Does `grk search`
 default to hybrid, or stay BM25-only? **`grk search` stays on `bm25`**,
-recorded in [ADR-0007](../adr/ADR-0007-default-retrieval-mode.md), which is
-**Proposed** and whose acceptance is a Wave F item. The reasoning is below;
-the decision itself is not open, and the only thing outstanding is owner
-sign-off on the record of it.
+recorded in [ADR-0007](../adr/ADR-0007-default-retrieval-mode.md), **Accepted
+2026-08-14**. The reasoning is below; reopening it requires a superseding ADR
+and, per ADR-0007 decision 3, hybrid becoming able to abstain — not a larger
+quality delta.
 
 A gated run against the committed golden corpus (`nomic-embed-text` via local
 Ollama) produced the first real delta. Qualitatively — the values live in the

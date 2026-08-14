@@ -283,9 +283,17 @@ def test_search_dense_identity_mismatch_fails_closed(
     assert "identity" in err
 
 
-def test_search_dense_over_never_dense_ingested_collection_returns_no_results(
-    corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("mode", ["dense", "hybrid"])
+def test_search_dense_or_hybrid_over_never_dense_collection_fails_cleanly(
+    mode: str, corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """ADR-0008 at the CLI: the operator gets an error, not plausible results.
+
+    Previously this exited 0 — ``dense`` printed "no results" and ``hybrid``
+    printed BM25's ranking labelled as fusion. Both are the trap the README
+    documents; the CLI now refuses rather than relying on the operator having
+    read it.
+    """
     idx = str(tmp_path / "idx")
     main(["ingest", str(corpus), "--index-dir", idx])  # BM25-only: no --dense
     capsys.readouterr()
@@ -298,14 +306,19 @@ def test_search_dense_over_never_dense_ingested_collection_returns_no_results(
                 "--index-dir",
                 idx,
                 "--mode",
-                "dense",
+                mode,
                 "--embed-provider",
                 "inmemory",
             ]
         )
-        == 0
+        == 1
     )
-    assert "no results" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "error:" in captured.err
+    assert "no embedding-identity manifest" in captured.err
+    # The remedy that actually works, not the one that silently no-ops.
+    assert "grk ingest --dense" in captured.err
+    assert "no results" not in captured.out
 
 
 @pytest.fixture

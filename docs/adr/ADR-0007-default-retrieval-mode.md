@@ -1,6 +1,6 @@
 # ADR-0007 — Hybrid is recommended where configured; BM25 stays the default
 
-- **Status:** Proposed (owner review pending)
+- **Status:** Accepted (owner, 2026-08-14)
 - **Date:** 2026-08-14
 - **Deciders:** Andy Freeman (owner)
 

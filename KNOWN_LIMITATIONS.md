@@ -143,9 +143,16 @@ per SPEC.md §9:
   unchanged document without vectors: it is skipped, so it is never
   embedded. Only documents whose content actually changes afterwards gain
   vectors. The collection is then permanently half-dense until it is
-  re-ingested from scratch, and nothing reports that state. This is also
-  the case the delete reconciliation above deliberately tolerates. Forcing
-  a backfill means deleting the collection and re-ingesting it.
+  re-ingested from scratch. This is also the case the delete reconciliation
+  above deliberately tolerates. Forcing a backfill means deleting the
+  collection and re-ingesting it. **Reading it densely is no longer silent
+  (ADR-0008):** a `dense` or `hybrid` search against a collection with no
+  embedding-identity manifest raises `ConfigurationError` naming the
+  re-ingest remedy, instead of returning zero results (`dense`) or BM25's
+  ranking stamped `"stage": "fusion"` (`hybrid`). A collection that *is*
+  manifest-bound but only partially embedded — documents that changed after
+  the dense path was enabled — is still not detected, and remains the
+  genuine half-dense case this entry describes.
 - **A BM25-only indexer will orphan a vector-bearing collection.** The
   inverse of the above: an `Indexer` constructed without an embedder or
   vector store still happily replaces, prunes, and deletes documents in a

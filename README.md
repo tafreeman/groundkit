@@ -78,23 +78,28 @@ uv run grk eval --dense --embed-model nomic-embed-text
 ### Building a dense index — start a fresh collection
 
 **`--mode hybrid` only works against a collection that was ingested with
-`--dense`.** Adding it to an existing BM25-only collection does not work, and
-does not tell you it did not work:
+`--dense`.** You cannot add the dense path to an existing BM25-only
+collection:
 
 ```bash
-# WRONG — this silently gives you BM25 rankings labelled as hybrid.
-uv run grk ingest ./docs                    # BM25-only collection
-uv run grk search "your query" --mode hybrid   # fuses BM25 with an empty dense side
-uv run grk ingest ./docs --dense            # "0 vectors written" — every doc hash-skipped
+uv run grk ingest ./docs                       # BM25-only collection
+uv run grk search "your query" --mode hybrid   # error: no embedding-identity manifest
+uv run grk ingest ./docs --dense               # "0 vectors written" — all hash-skipped
 ```
 
 Ingestion is incremental by content hash, and that check runs *before*
 embedding — which is what stops unchanged documents being re-embedded on
 every run, and is also why turning `--dense` on later backfills nothing.
 Only documents whose content changes afterwards ever gain vectors, so the
-collection stays permanently vector-less and no command reports that. The
-dense side then contributes nothing to fusion, and you get BM25 results
-believing you are looking at hybrid ones.
+collection stays permanently vector-less and the second command above
+reports `0 vectors written` rather than fixing anything.
+
+The search **fails loudly** rather than answering ([ADR-0008](docs/adr/ADR-0008-dense-search-requires-a-dense-collection.md)).
+Before that, it returned BM25's ranking stamped `"stage": "fusion"` — lexical
+results labelled as hybrid, with no error — which is the failure mode this
+whole section exists to prevent. `--mode bm25` is unaffected, and a
+dense-paired retriever may still search `bm25`; only the modes that need
+vectors are refused.
 
 Do this instead — a dense collection from the first ingest:
 
