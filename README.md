@@ -2,18 +2,26 @@
 
 <!-- Badges are live endpoints only, never hand-written values (SPEC.md §2:
      "Real data only ... numbers come from generated eval artifacts or dynamic
-     badges, or are omitted"). A badge showing a stale number is the failure
-     this policy exists to prevent, so nothing here is a literal.
+     badges, or are omitted"). A badge showing a stale value is the failure the
+     policy exists to prevent, so nothing here is a literal.
 
-     The PyPI badges resolve once the first release is published — publishing
-     is triggered by a published GitHub release, see .github/workflows/publish.yml.
-     Until then they render as "not found", which is the accurate state. -->
+     Only badges that resolve to real state TODAY are present. Three that a
+     released project would carry are deliberately absent until they have
+     something true to report, rather than shipped rendering "not found":
+
+       PyPI version / Python versions   — need the first published release
+                                          (.github/workflows/publish.yml).
+       License                          — shields' github/license endpoint
+                                          needs a public repo; a hand-written
+                                          MIT badge would be exactly the
+                                          literal this policy excludes. The
+                                          LICENSE file and the docs site's
+                                          license page carry it meanwhile.
+
+     Add each one when the thing it reports becomes true. -->
 
 [![ci](https://github.com/tafreeman/groundkit/actions/workflows/ci.yml/badge.svg)](https://github.com/tafreeman/groundkit/actions/workflows/ci.yml)
 [![docs](https://github.com/tafreeman/groundkit/actions/workflows/docs.yml/badge.svg)](https://tafreeman.github.io/groundkit/)
-[![PyPI](https://img.shields.io/pypi/v/groundkit)](https://pypi.org/p/groundkit)
-[![Python](https://img.shields.io/pypi/pyversions/groundkit)](https://pypi.org/p/groundkit)
-[![License: MIT](https://img.shields.io/badge/license-MIT-informational)](LICENSE)
 
 Grounded, citation-verifiable hybrid retrieval: a persisted BM25 + dense index,
 a named MCP server, and a retrieval eval harness — fully local by default.
