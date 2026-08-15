@@ -279,10 +279,7 @@ def _coerce_vector(values: list[object], *, provider_label: str) -> list[float]:
     """
     vector: list[float] = []
     for position, value in enumerate(values):
-        # bool first: it is a subclass of int and would pass the isinstance
-        # check below.
-        if isinstance(value, bool) or not isinstance(value, int | float):
-            raise EmbeddingError(
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
                 f"{provider_label} embedding response contained a non-numeric vector "
                 f"value at position {position} (got {type(value).__name__}); refusing "
                 "to coerce it into an index"
