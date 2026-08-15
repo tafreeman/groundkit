@@ -20,15 +20,23 @@ from typing import Any
 
 import pytest
 
-from groundkit.contracts import RetrievalResult
+from groundkit.config import RetrievalConfig
+from groundkit.contracts import Chunk, RetrievalResult
 from groundkit.errors import EvalError
 from groundkit.evals.delta import derive_stage_deltas
-from groundkit.evals.runner import MIN_EVAL_TOP_K, run_eval
+from groundkit.evals.runner import (
+    MIN_EVAL_TOP_K,
+    _rerank_input_stage,
+    _StagePlan,
+    run_eval,
+)
 from groundkit.evals.schema import EvalReport
+from groundkit.index.bm25 import BM25Index
 from groundkit.index.dense import InMemoryVectorStore
 from groundkit.index.protocols import VectorStoreProtocol
 from groundkit.providers.embeddings import InMemoryEmbedder
 from groundkit.providers.protocols import EmbeddingProtocol
+from groundkit.retrieval.fusion import reciprocal_rank_fusion
 from groundkit.retrieval.protocols import RerankerProtocol
 from groundkit.retrieval.search import MAX_TOP_K
 
@@ -585,3 +593,129 @@ class TestStageIndependenceWithRerank:
 
         gold_per_stage = [stage.queries[0].gold for stage in report.stages]
         assert gold_per_stage[0] == gold_per_stage[1] == gold_per_stage[2] == gold_per_stage[3]
+
+
+def _chunk(document_id: str, content: str, *, chunk_index: int = 0) -> Chunk:
+    """A minimal valid Chunk; only ``document_id`` and ``content`` vary per call."""
+    return Chunk(
+        document_id=document_id,
+        chunk_index=chunk_index,
+        content=content,
+        start_offset=0,
+        end_offset=len(content),
+    )
+
+
+class TestRerankInputStageWraparound:
+    """Fix 3: a rerank plan at index 0 must raise, never silently read ``plans[-1]``.
+
+    ``_rerank_input_stage`` looks up the stage before a rerank plan via
+    ``plans[position - 1]``. At ``position == 0`` that expression is
+    ``plans[-1]`` — Python silently wraps negative indices rather than
+    raising ``IndexError``, so an unguarded lookup would return the LAST
+    plan's name instead of failing. That is worse than a crash: it stamps a
+    confident, wrong ``rerank_input`` into the artifact rather than refusing
+    to report one.
+    """
+
+    def test_rerank_plan_at_index_zero_raises_instead_of_wrapping_to_the_last_plan(
+        self,
+    ) -> None:
+        """Two plans, not one, so a silent ``plans[-1]`` wraparound would return
+        a real (and wrong) stage name — ``"fusion"`` — rather than trivially
+        returning the rerank plan's own name back to itself. That distinction
+        is what makes this a meaningful regression test rather than one that
+        would pass by accident against either version of the source.
+        """
+        plans = (
+            _StagePlan("rerank", "bm25", reranks=True),
+            _StagePlan("fusion", "hybrid"),
+        )
+
+        with pytest.raises(EvalError, match="cannot be first"):
+            _rerank_input_stage(plans)
+
+
+class TestBM25IsDepthInvariant:
+    """Fix 4 (property, not a defect fix): BM25 scores every chunk independently
+    of ``top_k`` (``index/bm25.py``) — ``top_k`` only truncates an
+    already-fully-sorted list, so a wider fetch is a strict prefix of a
+    narrower one. This is what lets ``derive_rerank_attribution``
+    (``evals/delta.py``) call a BM25-input rerank delta a clean isolation of
+    the cross-encoder's own contribution: the reranker sees a superset of
+    exactly what the baseline stage scored, and nothing about widening the
+    fetch could have rescored or reordered any of it.
+    """
+
+    def test_top_10_of_top_50_equals_a_direct_top_10_search(self) -> None:
+        """``search(top_k=50)[:10] == search(top_k=10)``, chunk-for-chunk and
+        score-for-score — the exact prefix property the module docstring in
+        ``evals/delta.py`` relies on."""
+        index = BM25Index()
+        chunks = [
+            _chunk(
+                f"doc-{i:03d}",
+                f"quokka burrow telemetry entry {i:03d} across the reserve",
+            )
+            for i in range(20)
+        ]
+        index.index_chunks(chunks)
+
+        deep = index.search("quokka burrow telemetry reserve", top_k=50)
+        shallow = index.search("quokka burrow telemetry reserve", top_k=10)
+
+        assert len(shallow) == 10
+        assert deep[:10] == shallow
+
+
+class TestRRFIsNotDepthInvariant:
+    """Fix 4 (property, not a defect fix): RRF's score for a chunk sums
+    ``1 / (rrf_k + rank)`` over every input ranking it is *visible in at the
+    fetched depth* (``retrieval/fusion.py``). Widening the fetch therefore
+    adds contributions that did not exist at the narrower one —
+    ``fusion@50`` is a genuinely different ranking function, not a deeper
+    slice of ``fusion@10``. Unlike BM25 (``TestBM25IsDepthInvariant``), this
+    is exactly why ``derive_rerank_attribution`` can only call a
+    fusion-input rerank delta a real production comparison, never the
+    cross-encoder's isolated contribution: part of the delta may belong to
+    the wider candidate pool the reranker was handed, not to the reranker.
+
+    The "hidden" chunk below sits at rank 11 in BOTH input rankings —
+    deliberately not rank 1 of either. A chunk visible at rank 1 of any
+    ranking is visible at every depth >= 1, so nothing about widening the
+    fetch could ever change whether it appears in the fused output; the two
+    depth-10 and depth-50 top-10s would then be identical and this test
+    would pass without demonstrating anything.
+    """
+
+    def test_depth_50_top_10_differs_from_depth_10_top_10(self) -> None:
+        rrf_k = RetrievalConfig().rrf_k  # 60 by default (ADR-0005 decision 2)
+
+        # Ranks 1..9 in BOTH rankings: always in every depth-10 window.
+        shared = [_chunk(f"shared-{i}", f"shared chunk number {i}") for i in range(1, 10)]
+        # Rank 10, each in ONE ranking only: fills out both depth-10 windows.
+        unique_to_a = _chunk("unique-a", "unique to ranking a")
+        unique_to_b = _chunk("unique-b", "unique to ranking b")
+        # Rank 11 in BOTH rankings: outside every depth-10 window, inside
+        # both once the fetch widens past it.
+        hidden = _chunk("hidden", "hidden chunk outside both depth-10 windows")
+
+        ranking_a = [(chunk, 1.0) for chunk in [*shared, unique_to_a, hidden]]
+        ranking_b = [(chunk, 1.0) for chunk in [*shared, unique_to_b, hidden]]
+
+        depth_10_fused = reciprocal_rank_fusion(
+            [ranking_a[:10], ranking_b[:10]], rrf_k=rrf_k, top_k=10
+        )
+        depth_50_fused = reciprocal_rank_fusion(
+            [ranking_a[:50], ranking_b[:50]], rrf_k=rrf_k, top_k=10
+        )
+
+        depth_10_ids = {chunk.chunk_id for chunk, _ in depth_10_fused}
+        depth_50_ids = {chunk.chunk_id for chunk, _ in depth_50_fused}
+
+        # Fixture sanity: if this fails, the fixture itself is wrong, not the
+        # property under test.
+        assert hidden.chunk_id not in depth_10_ids
+        assert hidden.chunk_id in depth_50_ids
+
+        assert depth_10_ids != depth_50_ids

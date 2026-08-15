@@ -652,6 +652,77 @@ class TestCrossEncoderRerankerFailsClosed:
 
         asyncio.run(run())
 
+    def test_overflow_error_from_float_conversion_is_translated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``float(10**400)`` raises ``OverflowError``, which the old
+        ``except (TypeError, ValueError)`` guard on the ``float(score)``
+        boundary did not catch. An int too large to represent as a float is an
+        ordinary outcome from a backend this repo does not control — nothing
+        stops a multi-label or misconfigured model from emitting one — so it
+        must translate to ``RetrievalError`` like every other coercion
+        failure rather than escape as a raw ``OverflowError``.
+        """
+        import groundkit.retrieval.rerank as rerank_module
+
+        class _HugeIntCrossEncoder:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def predict(self, pairs: list[list[str]]) -> list[int]:
+                return [10**400 for _ in pairs]
+
+        monkeypatch.setattr(
+            rerank_module,
+            "_import_cross_encoder",
+            lambda: (_HugeIntCrossEncoder, "IDENTITY"),
+        )
+
+        async def run() -> None:
+            reranker = CrossEncoderReranker()
+            with pytest.raises(RetrievalError, match="non-scalar score at position 0"):
+                await reranker.rerank("q", [_result("c1")], top_k=1)
+
+        asyncio.run(run())
+
+    def test_iteration_failure_other_than_type_error_is_translated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ``list(raw)`` boundary was guarded for ``TypeError`` only.
+
+        A prediction object whose ``__iter__`` raises something else entirely
+        — here a plain ``RuntimeError``, standing in for whatever a
+        third-party backend this repo does not control might do — escaped
+        untyped. Any single named exception is a guess at another library's
+        behavior, which is why the fix catches ``Exception`` generally rather
+        than enumerating a tuple.
+        """
+        import groundkit.retrieval.rerank as rerank_module
+
+        class _ExplodingIterable:
+            def __iter__(self) -> None:
+                raise RuntimeError("iteration exploded")
+
+        class _ExplodingIterableCrossEncoder:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def predict(self, pairs: list[list[str]]) -> _ExplodingIterable:
+                return _ExplodingIterable()
+
+        monkeypatch.setattr(
+            rerank_module,
+            "_import_cross_encoder",
+            lambda: (_ExplodingIterableCrossEncoder, "IDENTITY"),
+        )
+
+        async def run() -> None:
+            reranker = CrossEncoderReranker()
+            with pytest.raises(RetrievalError, match="non-iterable prediction"):
+                await reranker.rerank("q", [_result("c1")], top_k=1)
+
+        asyncio.run(run())
+
     def test_numpy_style_scalars_are_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The conversion must coerce, never ``isinstance``-check.
 

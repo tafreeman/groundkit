@@ -53,11 +53,27 @@ carries a real cost that alternative did not:
 - Its delta against `stages[0]` is **not** the reranker's contribution when
   the input was fusion — it sums fusion's gain over BM25 with rerank's gain
   over fusion, one number with nothing separating the two effects.
-  `derive_rerank_attribution` (`evals/delta.py`) closes this by diffing the
-  `rerank` stage against its own input stage rather than against `stages[0]`,
-  and `_print_eval_summary` (`cli.py`) prints both: the baseline delta every
+  `derive_rerank_attribution` (`evals/delta.py`) diffs the `rerank` stage
+  against its own input stage rather than against `stages[0]`, and
+  `_print_eval_summary` (`cli.py`) prints both: the baseline delta every
   other stage gets, and the attribution, labelled by `baseline_stage` so a
-  renderer needs no special-casing to know which is which.
+  renderer needs no special-casing to know which is which. **That diff is a
+  clean isolation of the cross-encoder's contribution only when the input
+  stage's own ranking is invariant to fetch depth.** BM25 scores each
+  document independently of `top_k` (`index/bm25.py`; `top_k` only truncates
+  an already-sorted list), so `bm25@50` is a strict prefix of `bm25@10` and
+  the reranker sees a superset of exactly what the baseline stage scored —
+  the attribution is clean. Fusion is not depth-invariant: RRF sums
+  `1/(rrf_k + rank)` over the rankings a chunk is *visible in* at the fetched
+  depth (`retrieval/fusion.py`), so `fusion@50` is a different ranking
+  function from `fusion@10`, not a deeper slice of it — verified empirically,
+  a chunk absent entirely from the depth-10 fused list has ranked first at
+  depth 50. A fusion-input attribution therefore measures the rerank
+  pipeline at `rerank_candidates` depth against the fusion stage as reported
+  in the same report, which is a real production comparison and **not** the
+  cross-encoder's isolated contribution. See Consequences below, and
+  `evals/delta.py`'s module docstring, which this ADR must agree with rather
+  than restate independently.
 - It needs a running embedding provider **and** the rerank extra to produce
   the number that matters on a dense run, where always-reranking-BM25 would
   have needed only the extra.
@@ -216,6 +232,21 @@ report.
   list it was handed — the ceiling on any rerank gain is set by the upstream
   stage's own recall at that candidate depth, not by anything the
   cross-encoder does.
+- **The fusion-input attribution is confounded, and closing it is a
+  deliberate non-fix.** `derive_rerank_attribution` isolates the
+  cross-encoder's own contribution cleanly only when `rerank_input` is
+  `bm25`; when it is `fusion`, the wider `rerank_candidates` fetch changes
+  RRF's ranking itself rather than merely exposing more of an unchanged one
+  (decision 1 above), so the reported attribution measures the rerank
+  pipeline at that candidate depth against fusion as reported, not the
+  reranker's isolated effect. Closing that gap needs a fourth comparison
+  stage — fusion recomputed at the rerank candidate depth — which is not
+  built: on the current golden corpus it would sharpen a number that stays
+  uninterpretable regardless, because the noise floor here is set by corpus
+  size (R2, `docs/specs/phase-3-hybrid-retrieval.md`) rather than by this
+  confound, and `recall@10` is already saturated on the rerank stage.
+  Revisit when the corpus is large enough that a two-to-three query
+  difference clears that noise floor.
 
 ## References
 

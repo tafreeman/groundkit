@@ -29,12 +29,38 @@ deltas must not add one.
 against the BM25 baseline — and that stays the report's spine. But a rerank
 stage reorders the best upstream stage available (ADR-0012 decision 1), so on
 a dense run its baseline delta is ``fusion``'s gain *plus* the reranker's,
-summed into one number with nothing separating them. That is a real
-measurement of the whole pipeline and a useless one for the question "did the
-cross-encoder help", which is the question the Phase 3 gate is actually
-asking. :func:`derive_rerank_attribution` answers the second question from
-the same artifact, against ``RunConfig.rerank_input``. Neither is stored;
-both are recomputed from the report's own numbers on every call.
+summed into one number with nothing separating them.
+:func:`derive_rerank_attribution` diffs the rerank stage against the stage
+named by ``RunConfig.rerank_input`` instead. Neither is stored; both are
+recomputed from the report's own numbers on every call.
+
+**How clean that attribution is depends on the input stage, and the
+difference is not cosmetic.** The rerank stage fetches ``rerank_candidates``
+results where its input stage fetched ``top_k``:
+
+- **BM25 input: a clean isolation.** BM25 scores each document independently
+  of ``top_k`` (``index/bm25.py``), which only truncates an already-sorted
+  list. ``bm25@50`` is therefore a strict prefix of ``bm25@10``, the
+  reranker sees a superset of exactly what the baseline stage scored, and
+  the delta is attributable to the cross-encoder alone.
+- **Fusion input: NOT a clean isolation.** RRF sums ``1/(rrf_k + rank)``
+  over the rankings a chunk is *visible in* at the fetched depth
+  (``retrieval/fusion.py``), so widening the fetch adds contributions that
+  did not exist at the narrower one. ``fusion@50`` is a different ranking
+  function, not a deeper slice of ``fusion@10`` — a chunk absent from the
+  depth-10 fused list can rank first at depth 50. The resulting delta
+  therefore measures *the rerank pipeline at candidate depth N versus the
+  fusion stage as reported*, which is a real and useful production
+  comparison, and it is **not** the cross-encoder's isolated contribution.
+  Do not read it as one.
+
+Closing that gap needs a fourth comparison stage — fusion recomputed at the
+rerank candidate depth — which is deliberately not built. On the current
+golden corpus it would sharpen a number that stays uninterpretable anyway:
+the noise floor is set by corpus size rather than by this confound, and
+``recall@10`` is already saturated. The revisit trigger is a corpus large
+enough that a two-to-three query difference clears noise (R2,
+``docs/specs/phase-3-hybrid-retrieval.md``).
 """
 
 from __future__ import annotations
@@ -43,6 +69,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict
 
+from groundkit.errors import EvalError
 from groundkit.evals.schema import StageName
 
 if TYPE_CHECKING:
@@ -140,9 +167,15 @@ def derive_rerank_attribution(report: EvalReport) -> StageDelta | None:
     The companion to :func:`derive_stage_deltas`, and the reason
     :class:`~groundkit.evals.schema.RunConfig.rerank_input` is recorded
     rather than inferred. Against ``stages[0]`` a rerank stage that reordered
-    ``fusion`` reports the two effects added together; this reports the
-    reranker's own contribution, which is what ADR-0012's "report a delta,
-    including when it loses" obligation is about.
+    ``fusion`` reports fusion's gain and the reranker's added together; this
+    separates them as far as the input stage's ranking allows.
+
+    **Read the module docstring before interpreting the fusion-input case.**
+    This is the reranker's isolated contribution only when the input stage's
+    ranking is depth-invariant. That holds for ``bm25`` and does not hold for
+    ``fusion``: the rerank stage fetches a wider candidate pool, and RRF is a
+    function of the fetch depth, so part of a fusion-input delta belongs to
+    the wider pool rather than to the cross-encoder.
 
     The returned :class:`StageDelta` carries ``baseline_stage =
     rerank_input``, so a renderer that prints ``delta[{stage} vs
@@ -233,17 +266,27 @@ def _quality_deltas(stage: MetricSet, baseline: MetricSet) -> dict[str, float]:
     }
 
 
-class RerankInputMissingError(ValueError):
+class RerankInputMissingError(EvalError):
     """A report's ``rerank_input`` names a stage the report does not contain.
 
     Raised by :func:`derive_rerank_attribution`. Separate from
     :class:`MetricFieldMismatchError` because it describes an inconsistent
     *artifact* rather than an inconsistent *module*, and a caller may
     reasonably want to catch one without the other.
+
+    **Rooted in** :class:`~groundkit.errors.GroundkitError`, via
+    :class:`~groundkit.errors.EvalError`, and that is load-bearing rather
+    than tidy. This class began as a bare ``ValueError`` — which made it the
+    only reachable exception in the package outside the local root, so the
+    one guard written to *fail closed* on an inconsistent artifact was
+    itself the untyped escape every other failure here is wrapped to
+    prevent. ``cli.py``'s ``except GroundkitError`` would have missed it and
+    ``grk eval`` would have died on a raw traceback while reporting a
+    perfectly ordinary artifact problem.
     """
 
 
-class MetricFieldMismatchError(ValueError):
+class MetricFieldMismatchError(EvalError):
     """:data:`QUALITY_METRIC_FIELDS` names a field ``MetricSet`` does not have.
 
     Raised by :func:`assert_metric_fields_exist`, which

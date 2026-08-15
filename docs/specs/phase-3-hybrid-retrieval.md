@@ -232,8 +232,14 @@ changeset that leaves the tree green.
 - **Eval delta (SPEC.md §9): a `rerank` stage over the best upstream stage
   the run produced, with its own delta.** ✅ `run_eval` accepts an optional
   `reranker` and `rerank_candidates`; `grk eval --rerank` wires the CLI, and
-  `derive_rerank_attribution` (`evals/delta.py`) derives the reranker's own
-  contribution alongside the plain baseline delta. Proved at two depths,
+  `derive_rerank_attribution` (`evals/delta.py`) derives a second delta
+  against the input stage rather than against `stages[0]`. That second delta
+  is the reranker's own contribution only when the run reranked `bm25` —
+  reranking `fusion` widens the candidate fetch past what fusion itself was
+  scored at, which changes RRF's ranking rather than merely revealing more
+  of an unchanged one, so that case reports the rerank pipeline against
+  fusion as measured, not an isolated cross-encoder effect (ADR-0012
+  Consequences; `evals/delta.py`'s module docstring). Proved at two depths,
   deliberately: the default suite exercises the whole path — `run_eval`, the
   CLI flags, `RunConfig`'s `rerank_*` fields, the attribution derivation, the
   CLI's provenance line — through a protocol-conformant stub reranker, so CI

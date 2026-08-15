@@ -250,7 +250,42 @@ per SPEC.md §9:
   the input was `fusion`** — it sums fusion's gain over BM25 with rerank's
   gain over fusion into one number. `derive_rerank_attribution`
   (`evals/delta.py`) diffs the `rerank` stage against its own input stage
-  instead, and the CLI prints both.
+  instead, and the CLI prints both — but that diff is a clean isolation of
+  the cross-encoder's own contribution only when the input is `bm25`. BM25
+  scores independently of `top_k`, so the wider candidate fetch reranking
+  uses only adds a superset of what the baseline stage already scored. RRF
+  does not: it sums `1/(rrf_k + rank)` over the rankings a chunk is visible
+  in at the fetched depth, so `fusion@50` is a different ranking function
+  from `fusion@10`, not a deeper slice of it — a chunk absent entirely from
+  the depth-10 fused list has ranked first at depth 50. A fusion-input
+  attribution therefore measures the rerank pipeline at the wider candidate
+  depth against fusion as reported, a real production comparison, and not
+  the cross-encoder's isolated contribution (ADR-0012 Consequences).
+
+  **A gated run** (`RERANK_GATED=1`, `cross-encoder/ms-marco-MiniLM-L-6-v2`
+  reranking `bm25`, with `nomic-embed-text` via local Ollama for the dense
+  pair) **found the BM25-input rerank stage improving on the baseline with no
+  metric regressing** — the values are in the generated artifact, never
+  restated in docs (SPEC.md §2), and that comparison is the clean one
+  described above. **The fusion-input delta supports no conclusion**, for two
+  independent reasons rather than one: the attribution is confounded exactly
+  as described above, and separately, its movement sits within a small
+  number of query flips on the answerable judgment set — inside the noise
+  band R2 (`docs/specs/phase-3-hybrid-retrieval.md`) already warns about.
+  Read it as neither a win nor a loss on this corpus, not as a weak
+  positive.
+
+  The same run exposed two further caveats:
+
+  - `recall@10` reached its ceiling on the rerank stage, so on this corpus
+    that metric can no longer discriminate a better reranker from this one.
+  - The reported p99 latency is the sample maximum — `MetricSet`'s
+    percentiles are nearest-rank over the same small per-judgment sample
+    noted under Phase 2 caveats below — and it is dominated by the one-time
+    cross-encoder model load, not steady-state inference. A reader comparing
+    `latency_p99_ms` across stages without knowing that would read a
+    once-per-process cost as a tail-latency regression in the reranker
+    itself.
 
   **Candidate depth is over-fetched to `MAX_TOP_K`,** pinned rather than
   exposed as a CLI knob, because a depth equal to `top_k` would hand the
@@ -265,6 +300,20 @@ per SPEC.md §9:
   in torch) stays out of the default install and out of the dev group, so
   the default suite never loads a model — only the pure surface (the
   sigmoid, ordering, fail-closed paths) is proved offline.
+
+  **A related reproducibility trap: `uv run mypy` disagreed with itself
+  depending on whether the `rerank` extra was installed.** With
+  `sentence-transformers` (and therefore torch) resolved, the
+  `type: ignore[import-not-found]` comments guarding the optional import in
+  `retrieval/rerank.py` became unused and mypy failed on them; without the
+  extra, mypy needed those comments and passed. Fixed by also listing
+  `unused-ignore` on both codes, but the general shape is worth recording
+  because the fix is local and the gap that let it happen is not: no CI job
+  runs mypy with the extra installed — `rerank-gated.yml`, the one workflow
+  that installs it, runs `pytest` only — so this class of
+  environment-dependent typecheck failure is not caught automatically
+  anywhere, and only surfaces to whoever happens to run `uv sync --extra
+  rerank && uv run mypy` locally.
 - **`score_threshold` does not apply to hybrid results.** ADR-0005
   decision 6: an RRF-fused score is a function of result-set size and
   retriever count, not a probability, and thresholding it would silently

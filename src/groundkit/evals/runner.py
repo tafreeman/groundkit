@@ -30,8 +30,12 @@ in two ways that the code below is arranged around:
   ``rerank_input``, ``rerank_candidates`` and ``rerank_model``, and why
   :func:`~groundkit.evals.delta.derive_rerank_attribution` exists: against
   ``stages[0]`` the rerank delta measures fusion *and* rerank together, so
-  the contribution of the reranker alone has to be derivable separately or
-  it is not derivable at all.
+  the two have to be separable or neither is interpretable. How cleanly they
+  separate depends on the input stage — cleanly for ``bm25``, only partly
+  for ``fusion``, because RRF is not depth-invariant and the rerank stage
+  fetches a wider pool than the fusion stage reported. That distinction is
+  spelled out in :mod:`groundkit.evals.delta`'s module docstring and must
+  not be flattened when quoting either number.
 
 **A losing stage is reported, not dropped.** There is no filtering anywhere
 in this module — every configured stage lands in ``report.stages`` with
@@ -557,6 +561,21 @@ def _rerank_input_stage(plans: tuple[_StagePlan, ...]) -> StageName | None:
     """
     for position, plan in enumerate(plans):
         if plan.reranks:
+            if position == 0:
+                # `plans[-1]` would silently return the LAST stage's name
+                # rather than raising IndexError, so a rerank plan that ever
+                # reached index 0 would stamp a confident, wrong
+                # `rerank_input` into the artifact — contract-legal and
+                # corrupt, the combination this repo treats as worse than a
+                # crash. Unreachable today, since `_planned_stages` always
+                # seeds the bm25 baseline first, which is exactly why it is
+                # asserted rather than trusted: the guarantee lives in
+                # another function that a later stage insertion could change
+                # without anyone touching this one.
+                raise EvalError(
+                    "a rerank stage cannot be first in the plan: it reorders an upstream "
+                    "stage's results, and at index 0 there is no stage before it"
+                )
             return plans[position - 1].stage
     return None
 

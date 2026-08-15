@@ -9,8 +9,12 @@ machinery driven by an actual multi-stage run.
 
 from __future__ import annotations
 
+import importlib
+import pkgutil
+
 import pytest
 
+from groundkit.errors import GroundkitError
 from groundkit.evals.delta import (
     QUALITY_METRIC_FIELDS,
     MetricFieldMismatchError,
@@ -544,3 +548,68 @@ class TestAttributionIsAdditive:
         assert [delta.stage for delta in deltas] == ["dense", "fusion", "rerank"]
         rerank_delta = deltas[-1]
         assert rerank_delta.baseline_stage == "bm25"
+
+
+def _custom_exception_classes() -> list[type[BaseException]]:
+    """Every exception class defined anywhere under the ``groundkit`` package.
+
+    Walks every submodule — not just ``errors.py`` and ``evals/delta.py``, the
+    two known homes today — so an exception class added anywhere else in the
+    package in the future is caught by this same guard rather than needing a
+    new hand-written assertion each time. Filtered on
+    ``obj.__module__ == module.__name__`` so an exception merely *imported*
+    into a module (e.g. ``EvalError`` imported into ``runner.py`` to raise
+    it) is not double-counted as if it were defined there too.
+    """
+    import groundkit
+
+    classes: list[type[BaseException]] = []
+    for module_info in pkgutil.walk_packages(groundkit.__path__, prefix="groundkit."):
+        module = importlib.import_module(module_info.name)
+        for obj in vars(module).values():
+            if (
+                isinstance(obj, type)
+                and issubclass(obj, BaseException)
+                and obj.__module__ == module.__name__
+            ):
+                classes.append(obj)
+    return classes
+
+
+class TestErrorHierarchyRootedInGroundkitError:
+    """Fix 1: every custom exception must be catchable at ``cli.py``'s ``main()``
+    boundary via ``except GroundkitError``.
+
+    ``RerankInputMissingError`` and ``MetricFieldMismatchError`` began as bare
+    ``ValueError`` subclasses — the only reachable exceptions in the package
+    outside the local root — so the one guard written to *fail closed* on an
+    inconsistent artifact was itself the untyped escape every other failure
+    here is wrapped to prevent: ``grk eval`` would have died on a raw
+    traceback instead of reporting a typed, catchable error.
+    """
+
+    def test_rerank_input_missing_error_is_rooted_in_groundkit_error(self) -> None:
+        """Not merely raisable as itself — specifically an instance of the
+        package's root exception, which is what makes ``except GroundkitError``
+        at the CLI boundary actually catch it."""
+        assert issubclass(RerankInputMissingError, GroundkitError)
+
+    def test_metric_field_mismatch_error_is_rooted_in_groundkit_error(self) -> None:
+        assert issubclass(MetricFieldMismatchError, GroundkitError)
+
+    def test_every_custom_exception_in_the_package_is_rooted_in_groundkit_error(
+        self,
+    ) -> None:
+        """Package-wide guard against the recurring defect class, not just the
+        two instances fixed here: any exception defined anywhere under
+        ``src/groundkit`` that is not a ``GroundkitError`` is exactly the kind
+        of untyped escape ``cli.py``'s ``except GroundkitError`` cannot catch.
+        """
+        offenders = [
+            cls for cls in _custom_exception_classes() if not issubclass(cls, GroundkitError)
+        ]
+
+        assert offenders == [], (
+            "exception classes not rooted in GroundkitError: "
+            f"{[f'{cls.__module__}.{cls.__qualname__}' for cls in offenders]}"
+        )
