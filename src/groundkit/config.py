@@ -145,6 +145,73 @@ def resolve_embedding_config(
         raise ConfigurationError(f"invalid embedding configuration ({details})") from exc
 
 
+#: Default chat model for the Phase 5 boundary features. The tag is explicit
+#: (``:3b``) rather than a floating alias so the gated real-model measurement
+#: means one thing: two runs under this default exercised the same weights.
+DEFAULT_CHAT_MODEL: str = "llama3.2:3b"
+
+
+class ChatConfig(BaseModel):
+    """Configuration for the chat/completion provider (Phase 5, ADR-0017).
+
+    The exact peer of :class:`EmbeddingConfig`: local-first, Ollama by
+    default, cloud opt-in. There is no ``"scripted"`` provider literal on
+    purpose — :class:`~groundkit.providers.llm.ScriptedChatProvider` is a
+    test double constructed directly with its script; a config claiming to
+    describe one would name a runtime artifact no config can reconstruct.
+
+    Attributes:
+        provider: ``"ollama"`` (default, local) or ``"openai_compatible"``
+            (opt-in cloud; its egress is redacted — ADR-0017).
+        model_name: Model identifier for the provider.
+        base_url: Provider endpoint. Defaults to the local Ollama endpoint.
+        api_key_env: Name of the environment variable holding the API key for
+            ``openai_compatible``. Read at call time, never stored or logged.
+        timeout_seconds: Per-request timeout.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider: Literal["ollama", "openai_compatible"] = "ollama"
+    model_name: str = DEFAULT_CHAT_MODEL
+    base_url: str = DEFAULT_OLLAMA_BASE_URL
+    api_key_env: str = "GROUNDKIT_OPENAI_API_KEY"
+    timeout_seconds: float = Field(default=60.0, gt=0)
+
+
+def resolve_chat_config(
+    *,
+    provider: Literal["ollama", "openai_compatible"] | None,
+    model_name: str | None,
+    base_url: str | None,
+    api_key_env: str | None,
+) -> ChatConfig:
+    """Build a :class:`ChatConfig`, defaulting any ``None`` field.
+
+    The same boundary-translation shape as :func:`resolve_embedding_config`,
+    for the same reasons — see its docstring for the typing rationale and why
+    the ``ValidationError`` is translated exactly here.
+
+    Raises:
+        ConfigurationError: A supplied value violates a :class:`ChatConfig`
+            invariant.
+    """
+    defaults = ChatConfig()
+    try:
+        return ChatConfig(
+            provider=provider if provider is not None else defaults.provider,
+            model_name=model_name if model_name is not None else defaults.model_name,
+            base_url=base_url if base_url is not None else defaults.base_url,
+            api_key_env=api_key_env if api_key_env is not None else defaults.api_key_env,
+        )
+    except ValidationError as exc:
+        details = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+            for error in exc.errors()
+        )
+        raise ConfigurationError(f"invalid chat configuration ({details})") from exc
+
+
 class IndexConfig(BaseModel):
     """Configuration for the persisted index.
 
