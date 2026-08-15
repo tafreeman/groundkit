@@ -1,0 +1,148 @@
+site_name: groundkit
+site_description: >-
+  Grounded, citation-verifiable hybrid retrieval: a persisted BM25 + dense
+  index, a named MCP server, and a retrieval eval harness. Local by default.
+site_url: https://tafreeman.github.io/groundkit/
+repo_url: https://github.com/tafreeman/groundkit
+repo_name: tafreeman/groundkit
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+
+# Every validation channel is a warning, and CI builds with `--strict`, which
+# promotes warnings to errors (SPEC.md §10 lists the strict docs build as part
+# of CI green). Consequences worth stating, because each one is a gate someone
+# will eventually hit and be tempted to downgrade:
+#
+#   omitted_files      a new page under docs/ that nobody added to `nav` fails
+#                      the build instead of becoming an orphan reachable only
+#                      by URL. ADRs are the recurring case — one lands, and
+#                      the nav entry is the easy half to forget.
+#   unrecognized_links a relative link to a file that is not on the site fails
+#                      the build. This is the check that keeps the ADR
+#                      cross-references honest as records are added.
+#   anchors            a `#fragment` that no heading produces fails the build.
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+theme:
+  name: material
+  # Dark-only, per SPEC.md §3's token list: it pins one background (#08080c)
+  # and no light counterpart, so offering a light scheme would mean inventing
+  # tokens the spec does not define.
+  palette:
+    scheme: slate
+  # Material loads exactly the families named here from Google Fonts. Both of
+  # SPEC.md §3's faces have to be requested for stylesheets/tokens.css to be
+  # able to use them, which is why the display serif is declared as `text`
+  # even though tokens.css then assigns it to headings only and gives body
+  # copy the mono. Changing either name here silently unloads a font that
+  # tokens.css still references.
+  font:
+    text: DM Serif Display
+    code: JetBrains Mono
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - navigation.footer
+    - toc.follow
+    - search.highlight
+    - search.suggest
+    - content.code.copy
+    - content.action.edit
+  icon:
+    repo: fontawesome/brands/github
+
+extra_css:
+  - stylesheets/tokens.css
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          # src-layout: the package is under src/, not the repo root.
+          paths: [src]
+          options:
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+            show_signature_annotations: true
+            separate_signature: true
+            merge_init_into_class: true
+            heading_level: 3
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  # Lets the site publish the repo-root documents (SECURITY.md,
+  # KNOWN_LIMITATIONS.md, LICENSE) by transclusion rather than by copying
+  # them under docs/. A copy is the failure mode SPEC.md §10 names directly —
+  # "KNOWN_LIMITATIONS.md honest and current" is unenforceable against a
+  # duplicate that drifts. `check_paths` makes a missing source a build
+  # failure rather than a silently empty page.
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: getting-started/installation.md
+      - Quickstart: getting-started/quickstart.md
+  - Guides:
+      - Retrieval modes: guides/retrieval-modes.md
+      - Eval harness: guides/evals.md
+  - Architecture:
+      - Overview: architecture/index.md
+      - The LLM boundary: architecture/llm-boundary.md
+      - Phase 3 spec — hybrid retrieval: specs/phase-3-hybrid-retrieval.md
+  - API reference:
+      - Contracts: reference/contracts.md
+      - Configuration: reference/config.md
+      - Retrieval: reference/retrieval.md
+      - Errors: reference/errors.md
+  - Decisions:
+      - Overview: adr/index.md
+      - "ADR-0001 — Promote vs rewrite": adr/ADR-0001-promote-vs-rewrite.md
+      - "ADR-0002 — Index persistence": adr/ADR-0002-index-persistence.md
+      - "ADR-0003 — Eval corpus and metrics": adr/ADR-0003-eval-corpus-and-metrics.md
+      - "ADR-0004 — Embedding identity binding": adr/ADR-0004-embedding-identity-binding.md
+      - "ADR-0005 — Fusion and rerank scoring": adr/ADR-0005-fusion-and-rerank-scoring.md
+      - "ADR-0006 — Dense seam returns chunk/score pairs": adr/ADR-0006-dense-seam-returns-chunk-score-pairs.md
+      - "ADR-0007 — Default retrieval mode": adr/ADR-0007-default-retrieval-mode.md
+      - "ADR-0008 — Dense search requires a dense collection": adr/ADR-0008-dense-search-requires-a-dense-collection.md
+      - "ADR-0009 — Incremental skip key": adr/ADR-0009-incremental-skip-key-is-a-processing-fingerprint.md
+      - "ADR-0010 — Ingestion pipeline is not the ingest path": adr/ADR-0010-ingestion-pipeline-is-not-the-ingest-path.md
+      - "ADR-0011 — BM25-only ingest refuses a dense collection": adr/ADR-0011-bm25-only-ingest-refuses-a-dense-collection.md
+      - "ADR-0012 — Rerank eval stage": adr/ADR-0012-rerank-eval-stage-reorders-upstream-stage.md
+  - Project:
+      - Security: security.md
+      - Known limitations: limitations.md
+      - License: license.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/tafreeman/groundkit
+      name: groundkit on GitHub
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/p/groundkit
+      name: groundkit on PyPI

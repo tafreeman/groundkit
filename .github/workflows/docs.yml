@@ -1,0 +1,70 @@
+# Deploy the docs site to GitHub Pages (SPEC.md §3: "Docs site: MkDocs →
+# GitHub Pages").
+#
+# Triggered by a successful `ci` run on main rather than by the push itself.
+# ci.yml already builds the site with `--strict` as one of its jobs, so
+# gating on its conclusion means a site that fails its own build gate is
+# never the site that gets published — a push-triggered deploy would race
+# CI and could publish a commit CI was in the middle of rejecting.
+name: docs
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Pages allows one concurrent deployment. Never cancel one in progress:
+# an interrupted deploy can leave the published site in a partial state,
+# and the next successful run is only moments behind anyway.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # `workflow_run` fires on failed runs too, so the conclusion has to be
+    # checked explicitly — without this the job would publish the docs of a
+    # commit whose tests just failed.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Check out the exact commit CI passed on, not whatever main points
+          # at now. `workflow_run` events carry the triggering run's SHA, and
+          # main can move between CI finishing and this job starting.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+
+      - run: uv sync --locked --group docs --extra dense
+
+      # Built with --strict here as well, not just in ci.yml. The two runs are
+      # not redundant: this one can be reached by workflow_dispatch, which
+      # bypasses CI entirely.
+      - run: uv run mkdocs build --strict
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

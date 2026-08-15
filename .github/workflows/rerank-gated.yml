@@ -17,24 +17,21 @@
 # is `continue-on-error` — SPEC.md §3 forbids that for exactly this case.
 name: rerank-gated
 
-# TRIGGERS — deliberately manual-only, matching `eval-gated.yml`.
+# TRIGGERS — schedule + label, matching `eval-gated.yml`.
 #
-# Every run downloads a model and a multi-gigabyte torch wheel. During active
-# development the gated suite is run locally far more often than a cron would
-# add value, and a schedule firing against a moving branch produces a stream of
-# results nobody reads — which is how a gate quietly becomes noise.
+# Re-enabled in Phase 7, per the note that stood here. Offset half an hour
+# after eval-gated.yml's cron so the two heavy jobs do not contend for runners
+# on the same minute.
 #
-# REVISIT AT END OF DEVELOPMENT (Phase 7, alongside the release checklist):
-# turn on a schedule and re-add the `rerank-gated` PR label trigger, so the
-# real-model path is proven on a cadence once `main` is stable enough for the
-# result to mean something. The label-gating condition below is left in place
-# and inert so that re-enabling is a two-line change to this block.
-#
-#   schedule:
-#     - cron: "30 6 * * 1"         # weekly, Mondays 06:30 UTC
-#   pull_request:
-#     types: [opened, synchronize, reopened, labeled]
+# The label trigger stays opt-in per PR for a blunter reason than eval-gated's:
+# every run downloads a multi-gigabyte torch wheel plus a model. An unlabelled
+# `pull_request` trigger would impose that on every PR, which is what the
+# job's label-gating condition below exists to prevent.
 on:
+  schedule:
+    - cron: "30 6 * * 1"         # weekly, Mondays 06:30 UTC
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 permissions:
@@ -43,10 +40,9 @@ permissions:
 jobs:
   gated-rerank:
     runs-on: ubuntu-latest
-    # Inert while `on:` is dispatch-only. Kept rather than deleted so that
-    # re-enabling the PR trigger does not also require remembering to re-add
-    # label gating — the half of the change that is easy to miss and expensive
-    # to get wrong: without it, every PR pulls torch.
+    # Live as of Phase 7. Non-PR events (schedule, dispatch) always run; a PR
+    # runs only when explicitly labelled `rerank-gated`. Without this, the
+    # `pull_request` trigger above would pull torch on every PR.
     if: >-
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'rerank-gated')

@@ -1,19 +1,40 @@
 # groundkit
 
+<!-- Badges are live endpoints only, never hand-written values (SPEC.md §2:
+     "Real data only ... numbers come from generated eval artifacts or dynamic
+     badges, or are omitted"). A badge showing a stale number is the failure
+     this policy exists to prevent, so nothing here is a literal.
+
+     The PyPI badges resolve once the first release is published — publishing
+     is triggered by a published GitHub release, see .github/workflows/publish.yml.
+     Until then they render as "not found", which is the accurate state. -->
+
+[![ci](https://github.com/tafreeman/groundkit/actions/workflows/ci.yml/badge.svg)](https://github.com/tafreeman/groundkit/actions/workflows/ci.yml)
+[![docs](https://github.com/tafreeman/groundkit/actions/workflows/docs.yml/badge.svg)](https://tafreeman.github.io/groundkit/)
+[![PyPI](https://img.shields.io/pypi/v/groundkit)](https://pypi.org/p/groundkit)
+[![Python](https://img.shields.io/pypi/pyversions/groundkit)](https://pypi.org/p/groundkit)
+[![License: MIT](https://img.shields.io/badge/license-MIT-informational)](LICENSE)
+
 Grounded, citation-verifiable hybrid retrieval: a persisted BM25 + dense index,
 a named MCP server, and a retrieval eval harness — fully local by default.
 
-> **Status: Phase 3 in progress.** BM25 retrieval, a persisted index,
-> citation-bearing search, and a retrieval eval harness work end-to-end
-> locally with no cloud credentials — see the Quickstart below. Dense and
-> hybrid (RRF) retrieval now work too, opt-in behind `--dense` / `--mode`
-> and requiring a local embedding provider; the eval harness reports their
-> delta against the BM25 baseline. A local cross-encoder reranker is now
-> available behind the optional `rerank` extra; it is not yet wired into the
-> eval harness, so it has no measured delta and is not part of `grk search`.
-> The MCP server,
-> REST API, and IaC are not yet built. See [SPEC.md](SPEC.md) for what is
-> being built and in what order, and
+**Documentation: <https://tafreeman.github.io/groundkit/>**
+
+> **Status: Phases 0–3 done; Phase 7's docs and release machinery landed
+> early.** BM25 retrieval, a persisted index, citation-bearing search, and a
+> retrieval eval harness work end-to-end locally with no cloud credentials —
+> see the Quickstart below. Dense and hybrid (RRF) retrieval work too, opt-in
+> behind `--dense` / `--mode` and requiring a local embedding provider. A
+> local cross-encoder reranker is available behind the optional `rerank`
+> extra and is wired into the eval harness, so it reports a measured delta
+> like every other retrieval feature ([ADR-0012](docs/adr/ADR-0012-rerank-eval-stage-reorders-upstream-stage.md));
+> it is not part of `grk search`.
+>
+> **The MCP server, the REST API, the synthesis/redaction boundary, and the
+> IaC are not built** — Phases 4–6. groundkit is not installable from PyPI
+> yet and is not released: the publish workflow exists, but the v0.1.0 tag
+> waits on the definition of done in [SPEC.md](SPEC.md) §10. See SPEC.md for
+> what is being built and in what order, and
 > [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for what is deliberately out
 > of scope or presently broken.
 
@@ -31,6 +52,11 @@ a named MCP server, and a retrieval eval harness — fully local by default.
   providers are opt-in and sit behind a redaction boundary.
 
 Deterministic core, LLM at the boundary: no LLM runs in the retrieval path.
+Where text can and cannot leave the process is written down in full —
+[docs/architecture/llm-boundary.md](docs/architecture/llm-boundary.md) — including
+the fact that the redaction pass named above is Phase 5 work that does not
+exist yet, so the opt-in cloud provider currently sends document text
+unredacted.
 
 ## Quickstart (Phase 1: BM25 + persisted index)
 
@@ -150,9 +176,24 @@ uv run pytest --cov && uv run coverage report
 CI enforces an 80% coverage floor twice, so neither gate can hide the other:
 once on the whole package, and again on the SPEC.md §8 core subset —
 `retrieval/` (retrieval + citation resolution), `ingestion/chunking.py`
-(chunking), and `index/bm25.py` (scoring). The core subset is the literal
-list in `pyproject.toml`'s `[tool.groundkit.coverage]` table; optional
-providers (e.g. `providers/embeddings.py`) are excluded from it.
+(chunking), `index/bm25.py` (lexical scoring), and `index/dense.py` (vector
+scoring). The core subset is the literal list in `pyproject.toml`'s
+`[tool.groundkit.coverage]` table; optional providers (e.g.
+`providers/embeddings.py`) are excluded from it. That table also records the
+one caveat this subset carries — `index/dense.py` is a mixed file, and gating
+it wholesale admits inside one file the offsetting the subset exists to
+prevent.
+
+To build the documentation site:
+
+```bash
+uv sync --group docs --extra dense
+uv run mkdocs serve            # or: uv run mkdocs build --strict
+```
+
+CI builds it with `--strict`, which promotes MkDocs warnings to errors: a
+broken relative link, a `#fragment` no heading produces, or a page under
+`docs/` that was never added to the nav all fail the build.
 
 ## Provenance
 

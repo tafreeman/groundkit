@@ -12,27 +12,24 @@
 # sole proof of a backend, and this is the sole proof of the Ollama path.
 name: eval-gated
 
-# TRIGGERS — deliberately manual-only for now.
+# TRIGGERS — schedule + label, as SPEC.md §6 specifies.
 #
-# SPEC.md §6 describes this workflow as running "on schedule/label". It does
-# neither yet, on purpose: every run pulls an embedding model, and during
-# active development the eval is run locally far more often than a weekly
-# cron would add value. A schedule that fires against a moving branch also
-# produces a stream of results nobody reads, which is how a gate quietly
-# becomes noise.
+# Re-enabled in Phase 7, which is what the note that stood here reserved this
+# change for. The reasoning it recorded for the temporary `workflow_dispatch`
+# -only period was that a cron firing against a fast-moving branch produces a
+# stream of results nobody reads. That cost is now the smaller one: the
+# retrieval path this proves is complete through Phase 3, so a weekly result
+# is a regression signal rather than noise about half-built code.
 #
-# REVISIT AT END OF DEVELOPMENT (Phase 7, alongside the release checklist):
-# turn the weekly `schedule` back on and re-add the `eval-gated` PR label
-# trigger, so the real-model path is proven on a cadence once `main` is
-# stable enough for the result to mean something. The label-gating condition
-# on the job below is left in place and inert precisely so that re-enabling
-# is a two-line change to this block, not a rewrite.
-#
-#   schedule:
-#     - cron: "0 6 * * 1"          # weekly, Mondays 06:00 UTC
-#   pull_request:
-#     types: [opened, synchronize, reopened, labeled]
+# The label trigger stays opt-in per PR — `pull_request` alone would pull an
+# embedding model on every PR, which is why the job's label-gating condition
+# below was kept inert rather than deleted. Re-enabling was the two-line
+# change to this block that the note predicted.
 on:
+  schedule:
+    - cron: "0 6 * * 1"          # weekly, Mondays 06:00 UTC
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 permissions:
@@ -41,12 +38,11 @@ permissions:
 jobs:
   gated-eval:
     runs-on: ubuntu-latest
-    # Inert while `on:` is dispatch-only — `workflow_dispatch` never matches
-    # the pull_request branch, so this always passes today. Kept rather than
-    # deleted so re-enabling the PR trigger (see the note above `on:`) does
-    # not also require remembering to re-add label gating, which is the half
-    # of the change that would be easy to miss and expensive to get wrong:
-    # without it, every PR pulls a model.
+    # Live as of Phase 7. Non-PR events (schedule, dispatch) always run; a PR
+    # runs only when explicitly labelled `eval-gated`. Without this condition
+    # the `pull_request` trigger above would pull an embedding model on every
+    # PR — which is exactly why it was kept inert rather than deleted while
+    # the triggers were disabled.
     if: >-
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'eval-gated')
