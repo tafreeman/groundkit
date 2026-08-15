@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+import threading
+import time
 
 import pytest
 
@@ -319,6 +321,83 @@ class TestCrossEncoderRerankerFailsClosed:
             candidates = [_result("c1", start=0), _result("c2", start=10)]
             await reranker.rerank("q", candidates, top_k=2)
             await reranker.rerank("q", candidates, top_k=2)
+
+        asyncio.run(run())
+
+        assert loads["count"] == 1
+
+    def test_model_is_loaded_off_the_event_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Loading must not block the loop, exactly as ``predict`` must not.
+
+        The load is the *more* expensive of the two: a torch import plus, on a
+        cold cache, a weight download. Left on the event loop it stalls every
+        other coroutine for its whole duration and prevents any cancellation or
+        timeout from firing.
+        """
+        import groundkit.retrieval.rerank as rerank_module
+
+        threads: dict[str, int] = {}
+
+        class _ThreadRecordingCrossEncoder:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                threads["load"] = threading.get_ident()
+
+            def predict(self, pairs: list[list[str]]) -> list[float]:
+                return [0.0] * len(pairs)
+
+        monkeypatch.setattr(
+            rerank_module,
+            "_import_cross_encoder",
+            lambda: (_ThreadRecordingCrossEncoder, "IDENTITY"),
+        )
+
+        async def run() -> None:
+            threads["loop"] = threading.get_ident()
+            reranker = CrossEncoderReranker()
+            await reranker.rerank("q", [_result("c1")], top_k=1)
+
+        asyncio.run(run())
+
+        assert threads["load"] != threads["loop"], "model was constructed on the event loop thread"
+
+    def test_concurrent_first_calls_build_only_one_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Initialization is serialized, not merely cached.
+
+        Two coroutines reaching a cold reranker together both see ``_model is
+        None``. Without a lock held across the load, both proceed and build a
+        model — duplicating a multi-gigabyte allocation and, on a cold cache,
+        the download with it. The stub sleeps inside ``__init__`` to make the
+        window the lock closes reliably reachable rather than a race the test
+        would usually lose.
+        """
+        import groundkit.retrieval.rerank as rerank_module
+
+        loads = {"count": 0}
+
+        class _SlowCrossEncoder:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                time.sleep(0.05)
+                loads["count"] += 1
+
+            def predict(self, pairs: list[list[str]]) -> list[float]:
+                return [0.0] * len(pairs)
+
+        monkeypatch.setattr(
+            rerank_module,
+            "_import_cross_encoder",
+            lambda: (_SlowCrossEncoder, "IDENTITY"),
+        )
+
+        async def run() -> None:
+            reranker = CrossEncoderReranker()
+            candidates = [_result("c1")]
+            await asyncio.gather(
+                reranker.rerank("q", candidates, top_k=1),
+                reranker.rerank("q", candidates, top_k=1),
+                reranker.rerank("q", candidates, top_k=1),
+            )
 
         asyncio.run(run())
 

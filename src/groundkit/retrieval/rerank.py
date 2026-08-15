@@ -251,14 +251,53 @@ class CrossEncoderReranker:
         self._model_name = model_name
         self._max_length = max_length
         self._model: Any | None = None
+        self._lock = asyncio.Lock()
 
     @property
     def model_name(self) -> str:
         """The configured cross-encoder identifier."""
         return self._model_name
 
+    async def _ensure_model(self) -> Any:
+        """Load the model once, off the event loop, even under concurrency.
+
+        :meth:`_load_model` is the expensive call in this class by a wide
+        margin — importing torch alone costs seconds, and a first load also
+        downloads and deserializes weights, which is a network round trip
+        measured in minutes. Running that directly in an ``async`` method
+        blocks the event loop for its whole duration: no other coroutine
+        progresses, and no cancellation or timeout can fire, which in Phase 4
+        means one cold rerank stalls every other in-flight request. So it goes
+        to a worker thread for exactly the reason :meth:`rerank` already sends
+        ``predict`` to one.
+
+        The lock makes initialization *serialized* as well as offloaded.
+        Without it, two coroutines reaching a cold reranker together both see
+        ``_model is None``, both await, and both build a model — duplicating a
+        multi-gigabyte allocation and, on a cold cache, the download too. The
+        outer check is a fast path that skips the lock once loaded; the inner
+        one re-checks after acquiring it, because the coroutine that waited may
+        find the model already built by the one that held it.
+
+        Returns:
+            The loaded cross-encoder.
+
+        Raises:
+            RerankerNotConfiguredError: Propagated from :meth:`_load_model`.
+        """
+        if self._model is not None:
+            return self._model
+        async with self._lock:
+            if self._model is not None:
+                return self._model
+            return await asyncio.to_thread(self._load_model)
+
     def _load_model(self) -> Any:
         """Load and cache the cross-encoder, with an explicit identity activation.
+
+        Synchronous and blocking by design — :meth:`_ensure_model` is the only
+        caller that should reach it from async code, and it does so in a worker
+        thread. The gated suite calls it directly to inspect raw model output.
 
         Raises:
             RerankerNotConfiguredError: The extra is missing, or the model
@@ -311,10 +350,14 @@ class CrossEncoderReranker:
         return ``[]`` would make an empty upstream stage pay the reranker's
         entire cost.
 
-        Scoring runs in a worker thread. The underlying ``predict`` is
-        synchronous, CPU-bound, and can take seconds on a real batch; calling
-        it directly on the event loop would stall every other coroutine —
-        including, in Phase 4, every other in-flight request.
+        **Both** blocking steps run in a worker thread: the first-call model
+        load (:meth:`_ensure_model`, also serialized so concurrent cold calls
+        build one model rather than several) and then ``predict`` itself. Each
+        is synchronous and long enough to matter — the load costs a torch
+        import and possibly a weight download, ``predict`` costs seconds on a
+        real batch — and either one left on the event loop would stall every
+        other coroutine, including, in Phase 4, every other in-flight request,
+        along with the cancellations and timeouts meant to bound it.
 
         Args:
             query: The user query, scored jointly against each passage.
@@ -336,7 +379,7 @@ class CrossEncoderReranker:
         if not results:
             return []
 
-        model = self._load_model()
+        model = await self._ensure_model()
         pairs = [[query, result.content] for result in results]
         raw = await asyncio.to_thread(model.predict, pairs)
         logits = [float(score) for score in raw]
