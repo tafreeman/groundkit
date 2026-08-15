@@ -14,3 +14,4 @@ that were considered; deviating from SPEC.md requires an ADR proposal first.
 | [ADR-0006](ADR-0006-dense-seam-returns-chunk-score-pairs.md) | The dense seam returns `(Chunk, score)`, not `RetrievalResult` | Accepted |
 | [ADR-0007](ADR-0007-default-retrieval-mode.md) | Hybrid is recommended where configured; BM25 stays the default | Accepted |
 | [ADR-0008](ADR-0008-dense-search-requires-a-dense-collection.md) | A dense or hybrid search refuses a collection that has no vectors | Accepted |
+| [ADR-0009](ADR-0009-incremental-skip-key-is-a-processing-fingerprint.md) | The incremental skip key is a processing fingerprint, not a content hash | Accepted |

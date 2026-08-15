@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from typing import Final
 
 import httpx
 import pytest
@@ -491,6 +492,118 @@ class TestOpenAICompatibleEmbedder:
         assert "https://embed-proxy.example.com" in message
         assert "/openai-proxy" in message
         assert api_key not in message
+
+
+# ── vector value validation (shared by both HTTP parsers) ─────────────────
+
+
+#: Response bodies whose vectors are the right *width* but hold values that
+#: must never reach an index. Passed as raw JSON text, not a dict, because
+#: two of them are only expressible as literals: ``json.loads`` accepts
+#: JavaScript's bare ``NaN`` / ``Infinity`` by default, which is exactly how
+#: a real provider's reply would carry them through ``response.json()``.
+_POISONED_VECTORS: Final[list[tuple[str, str]]] = [
+    ("bare NaN literal", "[NaN, 0.5]"),
+    ("bare Infinity literal", "[Infinity, 0.5]"),
+    ("bare -Infinity literal", "[-Infinity, 0.5]"),
+    ("NaN as a string", '["NaN", 0.5]'),
+    ("Infinity as a string", '["Infinity", 0.5]'),
+    ("overflowing literal", "[1e400, 0.5]"),
+    ("numeric-looking string", '["0.25", 0.5]'),
+    ("boolean", "[true, 0.5]"),
+    ("null", "[null, 0.5]"),
+]
+
+
+class TestVectorValuesAreValidatedNotCoerced:
+    """A right-width vector full of garbage must be refused, not stored.
+
+    Both parsers used to convert every component with a bare ``float()``,
+    which accepts ``NaN``, ``Infinity``, numeric strings and booleans.
+    ``_check_dimensions`` never catches any of it — the width is correct in
+    every case — so the values landed in the persisted index. A single
+    ``NaN`` component poisons every cosine similarity computed against that
+    vector, and ``NaN`` compares false against everything, so the chunk's
+    rank stops being a function of relevance; it also satisfies
+    ``RetrievalResult.score``'s ``ge=0.0`` bound silently. SPEC.md §2 calls
+    for rejection over coercion at exactly this boundary.
+    """
+
+    @pytest.mark.parametrize(("label", "vector_json"), _POISONED_VECTORS)
+    def test_ollama_rejects(self, label: str, vector_json: str) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                content=f'{{"embeddings": [{vector_json}]}}',
+                headers={"content-type": "application/json"},
+            )
+
+        config = EmbeddingConfig(provider="ollama", dimensions=2)
+        embedder = OllamaEmbedder(config, client=_client(handler))
+
+        with pytest.raises(EmbeddingError, match=r"non-finite|non-numeric"):
+            asyncio.run(embedder.embed(["x"]))
+
+    @pytest.mark.parametrize(("label", "vector_json"), _POISONED_VECTORS)
+    def test_openai_compatible_rejects(
+        self, label: str, vector_json: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GROUNDKIT_OPENAI_API_KEY", "test-key")
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                content=f'{{"data": [{{"index": 0, "embedding": {vector_json}}}]}}',
+                headers={"content-type": "application/json"},
+            )
+
+        config = EmbeddingConfig(provider="openai_compatible", dimensions=2)
+        embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
+
+        with pytest.raises(EmbeddingError, match=r"non-finite|non-numeric"):
+            asyncio.run(embedder.embed(["x"]))
+
+    def test_a_boolean_index_cannot_reorder_an_openai_batch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``isinstance(True, int)`` is True — the same coercion trap, on ``index``.
+
+        A JSON ``true`` passed the integer check and was sorted as index 1,
+        which silently misattributes a vector to the wrong input text.
+        """
+        monkeypatch.setenv("GROUNDKIT_OPENAI_API_KEY", "test-key")
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"index": 0, "embedding": [0.1, 0.2]},
+                        {"index": True, "embedding": [0.3, 0.4]},
+                    ]
+                },
+            )
+
+        config = EmbeddingConfig(provider="openai_compatible", dimensions=2)
+        embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
+
+        with pytest.raises(EmbeddingError, match="integer 'index'"):
+            asyncio.run(embedder.embed(["x", "y"]))
+
+    def test_ordinary_finite_values_still_parse(self) -> None:
+        """The guard must not reject the values a real provider actually sends.
+
+        Integers included: JSON has one number type, so a provider is free
+        to serialize ``0`` rather than ``0.0``.
+        """
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"embeddings": [[0, -1.5, 2.25, 1e-9]]})
+
+        config = EmbeddingConfig(provider="ollama", dimensions=4)
+        embedder = OllamaEmbedder(config, client=_client(handler))
+
+        assert asyncio.run(embedder.embed(["x"])) == [[0.0, -1.5, 2.25, 1e-9]]
 
 
 # ── build_embedder / EmbeddingProtocol conformance ─────────────────────────

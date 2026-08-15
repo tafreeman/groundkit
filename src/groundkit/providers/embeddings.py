@@ -238,6 +238,67 @@ def _sanitize_url(url: str, secret: str | None) -> str:
     return _scrub(sanitized, secret)
 
 
+def _coerce_vector(values: list[object], *, provider_label: str) -> list[float]:
+    """Convert one provider-supplied vector to floats, rejecting anything unusable.
+
+    The single validation point both parsers share. It used to be a bare
+    ``[float(value) for value in item]``, which is a *coercion* where this
+    repo's contract calls for a rejection (SPEC.md §2: malformed provider
+    output is refused, never coerced), and it let three distinct kinds of
+    garbage into a persisted index:
+
+    - **Non-finite numbers.** ``json.loads`` accepts JavaScript's ``NaN``,
+      ``Infinity`` and ``-Infinity`` literals by default — so does
+      ``httpx``'s ``response.json()`` — and ``float()`` accepts the strings
+      ``"NaN"`` / ``"Infinity"`` too, as well as any overflowing literal
+      such as ``1e400``. A single ``NaN`` component makes every cosine
+      similarity computed against that vector ``NaN``, which is neither
+      greater nor less than anything: the affected chunk's rank becomes a
+      function of sort order rather than relevance, and ``_clamp_score``
+      passes it straight through to a ``RetrievalResult.score`` field whose
+      ``ge=0.0`` bound ``NaN`` silently satisfies. ``Infinity`` is worse in
+      one direction — it dominates every ranking it appears in.
+    - **Numeric-looking strings.** ``float("0.5")`` succeeds, so a provider
+      returning quoted numbers was accepted rather than reported.
+    - **Booleans.** ``bool`` is a subclass of ``int``, so ``float(True)``
+      is ``1.0`` and a JSON ``true`` entered the index as a legitimate
+      component.
+
+    None of this survives ``_check_dimensions``, which only counts
+    components. The vector's *width* is right in every case above.
+
+    Args:
+        values: The raw JSON array the provider returned for one input.
+        provider_label: Provider name for the error message.
+
+    Returns:
+        The vector as floats.
+
+    Raises:
+        EmbeddingError: A component is not a finite JSON number.
+    """
+    vector: list[float] = []
+    for position, value in enumerate(values):
+        # bool first: it is a subclass of int and would pass the isinstance
+        # check below.
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise EmbeddingError(
+                f"{provider_label} embedding response contained a non-numeric vector "
+                f"value at position {position} (got {type(value).__name__}); refusing "
+                "to coerce it into an index"
+            )
+        number = float(value)
+        if not math.isfinite(number):
+            raise EmbeddingError(
+                f"{provider_label} embedding response contained a non-finite vector "
+                f"value at position {position} ({number}); NaN and infinities corrupt "
+                "every similarity computed against the vector, so it is refused rather "
+                "than stored"
+            )
+        vector.append(number)
+    return vector
+
+
 def _parse_ollama_embeddings(data: object, *, expected_count: int) -> list[list[float]]:
     """Parse Ollama's ``POST /api/embed`` response body.
 
@@ -251,8 +312,8 @@ def _parse_ollama_embeddings(data: object, *, expected_count: int) -> list[list[
 
     Raises:
         EmbeddingError: If the payload is not the expected shape, does not
-            contain ``expected_count`` vectors, or a vector holds a
-            non-numeric value.
+            contain ``expected_count`` vectors, or a vector holds a value
+            that is not a finite JSON number (:func:`_coerce_vector`).
     """
     if not isinstance(data, dict):
         raise EmbeddingError(
@@ -270,12 +331,7 @@ def _parse_ollama_embeddings(data: object, *, expected_count: int) -> list[list[
     for item in embeddings:
         if not isinstance(item, list):
             raise EmbeddingError("Ollama embedding response contained a non-list vector")
-        try:
-            vectors.append([float(value) for value in item])
-        except (TypeError, ValueError) as exc:
-            raise EmbeddingError(
-                "Ollama embedding response contained a non-numeric vector value"
-            ) from exc
+        vectors.append(_coerce_vector(item, provider_label="Ollama"))
     return vectors
 
 
@@ -295,7 +351,8 @@ def _parse_openai_embeddings(data: object, *, expected_count: int) -> list[list[
     Raises:
         EmbeddingError: If the payload is not the expected shape, does not
             contain exactly one item per input index (0..expected_count-1),
-            or an item holds a non-numeric vector value.
+            or an item holds a vector value that is not a finite JSON
+            number (:func:`_coerce_vector`).
     """
     if not isinstance(data, dict):
         raise EmbeddingError(
@@ -326,22 +383,21 @@ def _parse_openai_item(item: object) -> tuple[int, list[float]]:
     """Parse one element of an OpenAI-compatible ``data`` list.
 
     Raises:
-        EmbeddingError: If the item is malformed or holds a non-numeric value.
+        EmbeddingError: If the item is malformed or holds a vector value
+            that is not a finite JSON number.
     """
     if not isinstance(item, dict):
         raise EmbeddingError("OpenAI-compatible embedding response item was not a JSON object")
     index = item.get("index")
-    if not isinstance(index, int):
+    # `isinstance(True, int)` is True, so a JSON `true` would otherwise be
+    # accepted here and reorder the batch as index 1 — the same coercion
+    # trap _coerce_vector closes for the components themselves.
+    if isinstance(index, bool) or not isinstance(index, int):
         raise EmbeddingError("OpenAI-compatible embedding response item has no integer 'index'")
     vector = item.get("embedding")
     if not isinstance(vector, list):
         raise EmbeddingError("OpenAI-compatible embedding response item has no 'embedding' list")
-    try:
-        return index, [float(value) for value in vector]
-    except (TypeError, ValueError) as exc:
-        raise EmbeddingError(
-            "OpenAI-compatible embedding response contained a non-numeric vector value"
-        ) from exc
+    return index, _coerce_vector(vector, provider_label="OpenAI-compatible")
 
 
 class _HttpEmbedder(abc.ABC):

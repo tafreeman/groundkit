@@ -161,8 +161,10 @@ changeset that leaves the tree green.
 - `replace_document` parity delivered: deleting, replacing, renaming, or
   emptying a document deletes its vectors in the same logical operation.
 - Incremental re-index re-embeds only changed documents — the existing
-  content-hash gate short-circuits before chunking, extended rather than
-  duplicated.
+  incremental skip gate short-circuits before chunking, extended rather than
+  duplicated. (That gate's key became a processing fingerprint in ADR-0009;
+  the sharing described here is unchanged, and the fingerprint is what makes
+  a chunking change re-embed rather than silently keep stale vectors.)
 - Manifest verified on ingest and fails closed: `verify_manifest` runs
   before any load/chunk/embed/delete work, and `write_manifest` binds the
   collection on the first real dense write. `Retriever.open()`

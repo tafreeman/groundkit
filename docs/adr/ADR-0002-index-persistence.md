@@ -43,7 +43,13 @@ revisit the BM25 library choice (ADR-0001) or the dense store (Phase 3).
 3. **Incremental re-ingest is content-hash gated.** `upsert_document` records
    a `content_hash` per `source`; the ingestion pipeline (outside this
    module's scope) calls `get_document_hash(source)` first and skips
-   re-chunking/re-embedding when the hash is unchanged. When a source *is*
+   re-chunking/re-embedding when the hash is unchanged.
+   *(Superseded in part by
+   [ADR-0009](ADR-0009-incremental-skip-key-is-a-processing-fingerprint.md):
+   the gate and the column are unchanged, but the value stored in them is a
+   fingerprint over the content plus the chunker and chunking configuration.
+   Content alone let a settings change hash-match and leave stale chunks in
+   place.)* When a source *is*
    re-ingested, `upsert_document` explicitly deletes the prior document row
    and its chunks (by the previously-registered `document_id`, which may
    differ from the new one) before inserting the replacement — explicit

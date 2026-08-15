@@ -242,6 +242,102 @@ def test_search_embed_flag_without_dense_mode_fails_closed(
     assert "--mode" in err
 
 
+@pytest.mark.parametrize("bad_dimensions", ["0", "-1"])
+def test_invalid_embed_dimensions_fails_cleanly_not_with_a_traceback(
+    corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str], bad_dimensions: str
+) -> None:
+    """A bad ``--embed-dimensions`` must exit 1 with ``error:``, not raise.
+
+    ``EmbeddingConfig.dimensions`` is ``Field(gt=0)``, and the CLI's only
+    construction site passed argparse's already-int-converted value straight
+    in. Pydantic's ``ValidationError`` is not a ``GroundkitError``, so
+    ``main``'s handler never saw it and the command died on a raw traceback
+    — every other rejected flag on the same command prints one ``error:``
+    line. Asserted through ``main`` rather than the helper, since the escape
+    was the exception crossing ``main``'s boundary.
+    """
+    idx = str(tmp_path / "idx")
+
+    assert (
+        main(
+            [
+                "ingest",
+                str(corpus),
+                "--index-dir",
+                idx,
+                "--dense",
+                "--embed-provider",
+                "inmemory",
+                "--embed-dimensions",
+                bad_dimensions,
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "dimensions" in err
+    assert "Traceback" not in err
+
+
+def test_invalid_embed_dimensions_on_search_and_eval_fail_cleanly_too(
+    corpus: Path,
+    eval_corpus: Path,
+    eval_judgments: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The same guard covers every command sharing the ``--embed-*`` flags.
+
+    All three route through one ``_resolve_embedding_config``, so this pins
+    that the translation lives at that shared site rather than in whichever
+    command happened to be tested first.
+    """
+    idx = str(tmp_path / "idx")
+    main(["ingest", str(corpus), "--index-dir", idx])
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "search",
+                "reciprocal rank fusion",
+                "--index-dir",
+                idx,
+                "--mode",
+                "dense",
+                "--embed-provider",
+                "inmemory",
+                "--embed-dimensions",
+                "0",
+            ]
+        )
+        == 1
+    )
+    assert "error:" in capsys.readouterr().err
+
+    assert (
+        main(
+            [
+                "eval",
+                "--corpus-dir",
+                str(eval_corpus),
+                "--judgments",
+                str(eval_judgments),
+                "--output",
+                str(tmp_path / "out.json"),
+                "--dense",
+                "--embed-provider",
+                "inmemory",
+                "--embed-dimensions",
+                "0",
+            ]
+        )
+        == 1
+    )
+    assert "error:" in capsys.readouterr().err
+
+
 def test_search_dense_identity_mismatch_fails_closed(
     corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

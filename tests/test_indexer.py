@@ -23,6 +23,7 @@ from typing import Any, Final
 
 import pytest
 
+from groundkit.config import ChunkingConfig
 from groundkit.contracts import Chunk, Document
 from groundkit.errors import (
     ConfigurationError,
@@ -359,6 +360,158 @@ def test_reindex_skips_unchanged_and_replaces_changed(corpus: Path, tmp_path: Pa
             contents = " ".join(c.content for c in await store.get_chunks())
             assert "Completely new alpha content" in contents
             assert "Restarts do not lose data" not in contents
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def _write_splittable_corpus(root: Path) -> Path:
+    """One document long enough that chunk_size actually changes the row count.
+
+    The shared ``corpus`` fixture's documents are all under 70 characters,
+    so every chunk_size worth testing yields the same single chunk and no
+    assertion could tell a rebuild from a skip.
+    """
+    docs = root / "wide-docs"
+    docs.mkdir(parents=True)
+    (docs / "long.md").write_text(" ".join(f"tok{i:03d}" for i in range(120)), encoding="utf-8")
+    return docs
+
+
+def test_reindex_with_changed_chunking_config_rebuilds_instead_of_skipping(
+    tmp_path: Path,
+) -> None:
+    """A chunking-settings change must not hash-match its way past the skip.
+
+    The skip key used to be a hash of the document *content* alone, which
+    answers "have these bytes changed?" rather than the question it is
+    actually asked, "would re-processing this source produce different
+    rows?". Re-ingesting the identical corpus under a different
+    ``ChunkingConfig`` therefore skipped every document and left the
+    collection holding chunks built to the *previous* configuration — no
+    error, nothing recorded, and permanent, since every later run makes the
+    same comparison and reaches the same answer.
+
+    Asserted on chunk *widths* rather than counts: a count can coincide
+    across two configurations, while a chunk longer than the configured
+    ``chunk_size`` is proof the row predates the change.
+    """
+    corpus = _write_splittable_corpus(tmp_path)
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            narrow = Indexer(
+                store,
+                FileLoader(allowed_base_dir=corpus),
+                chunking_config=ChunkingConfig(chunk_size=100, chunk_overlap=0),
+            )
+            first = await narrow.index_directory(str(corpus))
+            assert first.documents_indexed == 1
+            narrow_chunks = await store.get_chunks()
+            assert max(len(c.content) for c in narrow_chunks) <= 100
+
+            wide = Indexer(
+                store,
+                FileLoader(allowed_base_dir=corpus),
+                chunking_config=ChunkingConfig(chunk_size=400, chunk_overlap=0),
+            )
+            second = await wide.index_directory(str(corpus))
+            assert second.documents_indexed == 1
+            assert second.documents_skipped == 0
+
+            wide_chunks = await store.get_chunks()
+            assert max(len(c.content) for c in wide_chunks) > 100
+
+            # And the new settings are themselves now stable: a third run
+            # under the same config must skip, or every run re-indexes.
+            third = await wide.index_directory(str(corpus))
+            assert third.documents_indexed == 0
+            assert third.documents_skipped == 1
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_reindex_with_an_explicit_default_chunking_config_still_skips(
+    corpus: Path, tmp_path: Path
+) -> None:
+    """``None`` and an explicit ``ChunkingConfig()`` must fingerprint alike.
+
+    ``RecursiveChunker`` resolves a missing config to ``ChunkingConfig()``,
+    so the two produce byte-identical chunks. A fingerprint that hashed the
+    two spellings differently would re-index an entire corpus for a change
+    that is not one — the opposite failure to the one above, and just as
+    much a defect.
+    """
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            implicit = Indexer(store, FileLoader(allowed_base_dir=corpus))
+            await implicit.index_directory(str(corpus))
+
+            explicit = Indexer(
+                store, FileLoader(allowed_base_dir=corpus), chunking_config=ChunkingConfig()
+            )
+            second = await explicit.index_directory(str(corpus))
+            assert second.documents_indexed == 0
+            assert second.documents_skipped == 3
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_reindex_with_a_different_chunker_rebuilds_instead_of_skipping(
+    tmp_path: Path,
+) -> None:
+    """Swapping the chunker changes the rows as surely as changing its settings.
+
+    The same defect class as the config case: the fingerprint has to cover
+    every input that decides what the content becomes, and the chunker
+    itself is one of them.
+    """
+    corpus = _write_splittable_corpus(tmp_path)
+
+    class _SingleChunkChunker:
+        """Chunker that emits the whole document as one chunk."""
+
+        def chunk(self, document: Document, **kwargs: Any) -> list[Chunk]:
+            return [
+                Chunk(
+                    document_id=document.document_id,
+                    chunk_index=0,
+                    content=document.content,
+                    start_offset=0,
+                    end_offset=len(document.content),
+                    metadata={"source": document.source},
+                )
+            ]
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            default = Indexer(
+                store,
+                FileLoader(allowed_base_dir=corpus),
+                chunking_config=ChunkingConfig(chunk_size=100, chunk_overlap=0),
+            )
+            await default.index_directory(str(corpus))
+            assert max(len(c.content) for c in await store.get_chunks()) <= 100
+
+            swapped = Indexer(
+                store,
+                FileLoader(allowed_base_dir=corpus),
+                chunker=_SingleChunkChunker(),
+                chunking_config=ChunkingConfig(chunk_size=100, chunk_overlap=0),
+            )
+            second = await swapped.index_directory(str(corpus))
+            assert second.documents_indexed == 1
+            assert second.documents_skipped == 0
+            assert max(len(c.content) for c in await store.get_chunks()) > 100
         finally:
             await store.close()
 

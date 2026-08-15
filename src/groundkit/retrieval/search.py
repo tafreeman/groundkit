@@ -13,7 +13,12 @@ import time
 from typing import TYPE_CHECKING, Final, Literal
 
 from groundkit.config import RetrievalConfig
-from groundkit.contracts import EmbeddingIdentity, RetrievalResult, SearchResponse
+from groundkit.contracts import (
+    CollectionManifest,
+    EmbeddingIdentity,
+    RetrievalResult,
+    SearchResponse,
+)
 from groundkit.errors import ConfigurationError, RetrievalError
 from groundkit.index.bm25 import BM25Index
 from groundkit.index.dense import verify_dense_side_present
@@ -123,6 +128,28 @@ class Retriever:
         search against it is refused in :meth:`search` (ADR-0008), because
         there are no vectors for either mode to read.
 
+        **That verification is the single source of the dense-bound
+        verdict**, which is why ``verify_manifest`` returns the manifest it
+        checked instead of this method reading it again afterwards. Deciding
+        "is this collection dense-bound" from a *later* read than the one
+        the identity was checked against is a TOCTOU hole with a silent
+        wrong answer at the end of it: an unbound collection passes the
+        identity check trivially, and if a concurrent dense ingest (another
+        task, or another process — the store's lock spans neither) binds it
+        to a different provider before the later read, that read reports
+        "bound" and this retriever proceeds to answer ``dense`` and
+        ``hybrid`` queries by matching *this* embedder's query vectors
+        against *that* provider's index. Mixed embedding spaces, the exact
+        corruption ADR-0004 exists to make unrepresentable, with no error
+        anywhere. One read decides both, so the two answers cannot disagree.
+
+        The residual window is deliberately biased closed: a collection
+        bound *after* this read is treated as unbound, so ``dense`` and
+        ``hybrid`` are refused rather than answered. That is also the
+        already-documented snapshot semantics — a retriever never observes
+        writes that land after ``open()``, and a dense side that did not
+        exist at ``open()`` is no exception.
+
         Args:
             store: The collection's metadata store.
             config: Retrieval settings (defaults if omitted).
@@ -148,21 +175,25 @@ class Retriever:
         """
         cfg = config or RetrievalConfig()
         _validate_dense_pair(embedder, vector_store)
+        manifest: CollectionManifest | None = None
         if embedder is not None:
-            await store.verify_manifest(_identity_of(embedder))
+            # Verdict and manifest from one read: see the docstring for the
+            # mixed-embedding-space race a second read would open.
+            manifest = await store.verify_manifest(_identity_of(embedder))
         if embedder is not None and vector_store is not None:
-            await verify_dense_side_present(store, vector_store, embedder.dimensions)
+            await verify_dense_side_present(
+                store, vector_store, embedder.dimensions, manifest=manifest
+            )
         bm25 = await BM25Index.from_store(store, k1=cfg.bm25_k1, b=cfg.bm25_b)
         documents_at_open: frozenset[str] | None = None
-        dense_bound = False
         if embedder is not None:
             documents_at_open = frozenset(await store.get_document_sources())
-            # Recorded, not enforced, here. A collection with no manifest was
-            # never dense-ingested, which is a legitimate state to open with
-            # a dense pair — the caller may only ever search "bm25". It is
-            # searching *dense* or *hybrid* against it that cannot be
-            # answered, so the refusal lives in search(), per mode.
-            dense_bound = await store.get_manifest() is not None
+        # Recorded, not enforced, here. A collection with no manifest was
+        # never dense-ingested, which is a legitimate state to open with a
+        # dense pair — the caller may only ever search "bm25". It is
+        # searching *dense* or *hybrid* against it that cannot be answered,
+        # so the refusal lives in search(), per mode.
+        dense_bound = manifest is not None
         logger.info("Retriever opened over %d chunks", bm25.size)
         return cls(
             store,
@@ -314,7 +345,7 @@ class Retriever:
                 "vectors have ever been written to it. Refusing rather than returning "
                 "lexical results labelled as dense or fused. Note that enabling the "
                 "dense path over an existing collection does not backfill it (the "
-                "content-hash gate runs before embedding): re-ingest the corpus into a "
+                "incremental skip gate runs before embedding): re-ingest the corpus into a "
                 "fresh collection with `grk ingest --dense`."
             )
         return self._embedder, self._vector_store

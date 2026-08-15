@@ -80,13 +80,24 @@ class MetadataStoreProtocol(Protocol):
         """
         ...
 
-    async def verify_manifest(self, identity: EmbeddingIdentity) -> None:
+    async def verify_manifest(self, identity: EmbeddingIdentity) -> CollectionManifest | None:
         """Verify ``identity`` matches the collection's stored identity manifest.
 
         A collection with no manifest yet (no dense write has ever
         happened) has nothing to conflict with, so verification passes
         trivially. Never a re-embed, never a fallback, never a
         warn-and-continue: a real mismatch always raises.
+
+        Returns:
+            The manifest that was verified against, or ``None`` when the
+            collection has none. Returned rather than left to a follow-up
+            :meth:`get_manifest` call because a caller that needs *both*
+            "does this identity match" and "is this collection dense-bound
+            at all" must get both answers from one read: two reads admit a
+            state change in between, and a caller deciding "dense-bound"
+            from a later read than the one it checked identity against
+            would accept a collection bound to a different embedding space
+            (see ``Retriever.open``).
 
         Raises:
             IndexIdentityError: The store predates the embedding-identity

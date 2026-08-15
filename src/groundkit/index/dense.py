@@ -100,7 +100,7 @@ import re
 from pathlib import Path
 from typing import Any, Final
 
-from groundkit.contracts import Chunk
+from groundkit.contracts import Chunk, CollectionManifest
 from groundkit.errors import StorageError
 from groundkit.index.protocols import MetadataStoreProtocol, VectorStoreProtocol
 
@@ -731,11 +731,15 @@ class LanceDBVectorStore:
 
 
 async def verify_dense_side_present(
-    store: MetadataStoreProtocol, vector_store: VectorStoreProtocol, dimensions: int
+    store: MetadataStoreProtocol,
+    vector_store: VectorStoreProtocol,
+    dimensions: int,
+    *,
+    manifest: CollectionManifest | None,
 ) -> None:
     """Fail closed when a dense-bound collection has lost its vectors.
 
-    The dense analogue of the content-hash skip key's blind spot. SQLite is
+    The dense analogue of the incremental skip key's blind spot. SQLite is
     the durable truth for documents and chunks (ADR-0002) and its
     ``content_hash`` decides what gets re-indexed — but that hash records
     only whether the *content* changed, never whether the vectors derived
@@ -770,12 +774,21 @@ async def verify_dense_side_present(
         store: The collection's metadata store.
         vector_store: The dense store paired with it.
         dimensions: Embedding width, used to shape the probe vector.
+        manifest: The collection's manifest as the caller last read it, or
+            ``None`` if it has none — keyword-only, and deliberately passed
+            in rather than read here. Every caller reaches this function
+            immediately after ``store.verify_manifest``, which returns the
+            manifest it checked; reusing that value keeps the whole
+            open/ingest preamble reasoning about one manifest snapshot. A
+            second read here could observe a *newly* bound manifest whose
+            first vectors have not landed yet and report a healthy
+            collection as a lost dense side.
 
     Raises:
         StorageError: The collection is manifest-bound and holds documents,
             but its vector store is empty.
     """
-    if await store.get_manifest() is None:
+    if manifest is None:
         return
     sources = await store.get_document_sources()
     if not sources:
@@ -792,7 +805,7 @@ async def verify_dense_side_present(
         f"{len(sources)} document(s) still in SQLite. The vectors were lost while the "
         "metadata store survived (an ephemeral vector store paired with a persisted "
         "SQLite store, or a deleted/moved LanceDB directory). Refusing to continue: "
-        "the content-hash gate would report every document unchanged, re-embed "
+        "the incremental skip gate would report every document unchanged, re-embed "
         "nothing, and return nothing from the dense side, silently. Rebuild the "
         "collection, or restore the vector store alongside its SQLite file."
     )

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 
@@ -34,6 +34,9 @@ from groundkit.providers.protocols import EmbeddingProtocol
 from groundkit.retrieval.citations import resolve_citation, verify_citation
 from groundkit.retrieval.fusion import reciprocal_rank_fusion
 from groundkit.retrieval.search import MAX_TOP_K, Retriever, SearchMode
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 DOC_TEXTS = {
     "alpha.md": "Retrieval systems rank documents. BM25 is a lexical ranking function.",
@@ -160,7 +163,9 @@ class TestRetriever:
             async def write_manifest(self, identity: EmbeddingIdentity) -> None:
                 raise NotImplementedError
 
-            async def verify_manifest(self, identity: EmbeddingIdentity) -> None:
+            async def verify_manifest(
+                self, identity: EmbeddingIdentity
+            ) -> CollectionManifest | None:
                 raise NotImplementedError
 
             async def get_manifest(self) -> CollectionManifest | None:
@@ -554,6 +559,101 @@ class TestManifestVerificationAtOpen:
                 await store.close()
 
         asyncio.run(run())
+
+    def test_collection_bound_after_the_identity_check_is_never_treated_as_dense_bound(
+        self, tmp_path: Path
+    ) -> None:
+        """The manifest TOCTOU: one read must decide identity *and* dense-bound.
+
+        ``open()`` used to check identity against one manifest read and then
+        decide "is this collection dense-bound" from a second, later one.
+        An unbound collection passes the first check trivially, so a dense
+        ingest landing in between — another task, or another process, which
+        the store's ``asyncio.Lock`` does not span — left this retriever
+        answering ``dense`` and ``hybrid`` queries against *another
+        provider's* vectors with this embedder's query vectors. Mixed
+        embedding spaces, no error: exactly what ADR-0004 exists to make
+        unrepresentable.
+
+        The store here fires that concurrent ingest from inside
+        ``verify_manifest``, which is precisely the interleaving the two-read
+        version could not survive. The requirement is only that the two
+        answers cannot disagree, so either outcome is acceptable — refuse
+        the search (the collection was unbound when read, which is what this
+        asserts) or raise ``IndexIdentityError`` — while returning provider
+        B's hits is not.
+        """
+
+        async def run() -> None:
+            docs_dir = tmp_path / "docs"
+            docs_dir.mkdir()
+            (docs_dir / "alpha.md").write_text(
+                "Retrieval systems rank documents by relevance.", encoding="utf-8"
+            )
+            vector_store = InMemoryVectorStore()
+            embedder_b = _IdentityEmbedder(provider="provider-b", model_name="model-b")
+            store = await SQLiteMetadataStore.open(tmp_path / "idx", "default")
+
+            async def concurrent_dense_ingest() -> None:
+                indexer = Indexer(
+                    store,
+                    FileLoader(allowed_base_dir=docs_dir),
+                    embedder=embedder_b,
+                    vector_store=vector_store,
+                )
+                await indexer.index_directory(str(docs_dir))
+
+            racing_store = _BindsManifestDuringVerify(store, concurrent_dense_ingest)
+            embedder_a = _IdentityEmbedder(provider="provider-a", model_name="model-a")
+
+            try:
+                retriever = await Retriever.open(
+                    racing_store, embedder=embedder_a, vector_store=vector_store
+                )
+                # The race really did bind the collection to the other provider.
+                bound = await store.get_manifest()
+                assert bound is not None
+                assert (bound.provider, bound.model_name) == ("provider-b", "model-b")
+
+                modes: tuple[SearchMode, ...] = ("dense", "hybrid")
+                for mode in modes:
+                    with pytest.raises(ConfigurationError, match="no embedding-identity manifest"):
+                        await retriever.search("retrieval", mode=mode)
+            finally:
+                await store.close()
+
+        asyncio.run(run())
+
+
+class _BindsManifestDuringVerify:
+    """Metadata store that runs a concurrent dense ingest inside ``verify_manifest``.
+
+    Delegates everything to a real :class:`SQLiteMetadataStore`; the only
+    behavior it adds is firing ``on_verify`` once, immediately after the
+    first ``verify_manifest`` call returns. That is the exact instant a
+    second reader/writer can slip between "identity checked" and any later
+    manifest read, so it makes the TOCTOU window deterministic instead of
+    hoping a real thread race lands in it.
+
+    Satisfies :class:`MetadataStoreProtocol` structurally, by delegation.
+    """
+
+    def __init__(
+        self, inner: SQLiteMetadataStore, on_verify: Callable[[], Awaitable[None]]
+    ) -> None:
+        self._inner = inner
+        self._on_verify = on_verify
+        self._fired = False
+
+    async def verify_manifest(self, identity: EmbeddingIdentity) -> CollectionManifest | None:
+        manifest = await self._inner.verify_manifest(identity)
+        if not self._fired:
+            self._fired = True
+            await self._on_verify()
+        return manifest
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
 
 
 class TestNoBackfillDenseRead:

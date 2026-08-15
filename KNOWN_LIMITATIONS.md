@@ -99,13 +99,25 @@ per SPEC.md §9:
   O(corpus) BM25 rebuild does any work. A mismatch raises
   `IndexIdentityError`, never a re-embed and never a fallback. A collection
   with no manifest (never dense-ingested) verifies trivially — there is
-  nothing yet for a mismatch to exist against.
+  nothing yet for a mismatch to exist against. **That one verification is
+  also the sole source of the dense-bound verdict** ADR-0008's per-mode
+  refusal reads: `verify_manifest` returns the manifest it checked, rather
+  than `open()` reading it a second time afterwards. Two reads admitted a
+  race with a real silent-corruption outcome — an unbound collection passes
+  the identity check trivially, and a concurrent dense ingest (another task,
+  or another process, neither of which the store's `asyncio.Lock` spans)
+  binding it to a different provider in between made the later read report
+  "bound", so the retriever answered `dense` and `hybrid` by matching this
+  embedder's query vectors against that provider's index. The residual
+  window is biased closed: a collection bound *after* the read is treated as
+  unbound and both modes are refused, which is the same snapshot rule that
+  already governs everything else a retriever cannot see after `open()`.
 - **Cross-store writes are not atomic.** SQLite and the vector store share
   no transaction. The write order — chunk, embed, write the manifest (once,
   before the first vector add), add the new vectors, delete the previous
   document's, commit SQLite last — is chosen so SQLite is never ahead of the
   dense store, and so the document is never left with *no* vectors at any
-  point. A dense store *behind* SQLite is silent: the content-hash skip key
+  point. A dense store *behind* SQLite is silent: the incremental skip key
   means that document is never retried and never appears in dense results. A
   dense store *ahead* of SQLite is detectable: `Retriever.search` already
   fails closed on a hit whose document has no stored source. The residue of
@@ -117,7 +129,7 @@ per SPEC.md §9:
 - **Adding before deleting trades a silent failure for a loud one; it does
   not eliminate the residue.** Deleting first was worse — it opened a window
   with no vectors at all, and a crash there followed by a content reversion
-  (`git checkout`) left SQLite's `content_hash` matching the restored bytes,
+  (`git checkout`) left SQLite's stored fingerprint matching the restored bytes,
   so the document was hash-skipped forever and silently absent from dense
   results. Adding first closes that: the previous vectors survive, so the
   reverted content still resolves. What it costs is that the interrupted
@@ -136,9 +148,13 @@ per SPEC.md §9:
   chunks and zero vectors — strict equality would fail a completely
   healthy upgrade.
 - **Turning the dense path on does not backfill an existing collection.**
-  The incremental content-hash gate runs before chunking and therefore
-  before embedding — that is exactly what keeps an unchanged document from
-  being re-embedded on every run. The cost is that enabling an embedder and
+  The incremental skip gate runs before chunking and therefore before
+  embedding — that is exactly what keeps an unchanged document from being
+  re-embedded on every run. Its key is a fingerprint over content, chunker
+  and chunking configuration (ADR-0009), and deliberately *not* over the
+  embedding identity: including that would turn `--dense` on an existing
+  collection into an implicit full re-embed, which is the auto-backfill
+  ADR-0008 declined. The cost is that enabling an embedder and
   vector store over a collection already ingested BM25-only leaves every
   unchanged document without vectors: it is skipped, so it is never
   embedded. Only documents whose content actually changes afterwards gain
@@ -264,6 +280,15 @@ per SPEC.md §9:
 - Baseline deltas are intra-run only. `evals/results/` is gitignored, so no
   historical artifact reliably exists to diff across runs. Later stages
   compare against the baseline stage inside the same report.
+- `MetricSet`'s cutoffs are fixed at 1/5/10, so `run_eval` refuses a
+  `top_k` below 10 (`MIN_EVAL_TOP_K`) rather than publishing an `@10` field
+  computed from a shorter list. The floor used to live only in `cli.py`,
+  which left a library caller free to emit a report whose `recall_at_10`
+  was a `recall@1` under a `@10` name — a gold chunk at rank 7 scoring
+  `0.000` or `1.000` from identical inputs depending on a cutoff nothing
+  reading the field is obliged to cross-check. Evaluating a genuinely
+  top-3 system is therefore not expressible here; that needs configurable
+  cutoffs in the schema, not a smaller `top_k`.
 - Latency percentiles are computed from a small sample (one measurement per
   judgment), so p95/p99 are order-of-magnitude indicators, not reliable
   tail estimates.
