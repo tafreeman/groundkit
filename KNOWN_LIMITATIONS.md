@@ -363,8 +363,9 @@ per SPEC.md §9:
 - PDF/HTML loaders and URL ingestion (with the SSRF guard) — v1 scope, not
   yet scheduled into a phase; the loader currently reads `.md`/`.markdown`/
   `.txt` only.
-- Synthesis, query rewrite, redaction (Phase 5); IaC and OTel observability
-  (Phase 6); docs site (Phase 7).
+- Synthesis, query rewrite, redaction (Phase 5); OTel observability (Phase 6's
+  second change — the IaC half has landed, see the Phase 6 section below);
+  docs site (Phase 7).
 - BM25 rebuilds in memory at open — O(corpus) startup cost, accepted and
   bounded by ADR-0002's revisit trigger.
 - A UTF-8 BOM is not stripped at load (`utf-8`, not `utf-8-sig`), so a
@@ -456,6 +457,87 @@ per SPEC.md §9:
   legitimately need, to close a bypass in the same trust domain as
   `base_url` itself. The threat model is operator misconfiguration, not a
   hostile operator (ADR-0014 Consequences).
+
+## Phase 6 — IaC landed, observability has not
+
+Phase 6 lands in two changes (`docs/specs/phase-6-iac-observability.md` §3). The
+first is `infra/` plus its ADRs and docs and **changes nothing under `src/`**;
+the second adds the OpenTelemetry instrumentation and the JSON log formatter.
+Everything below describes the state between the two.
+
+- **Nothing emits a span, and the compose stack's collector and Jaeger receive
+  nothing.** SPEC.md §3 requires spans on ingest, retrieve and synthesize; there
+  is no `opentelemetry` dependency in the tree, no tracer, and no exporter. The
+  topology is real and correctly wired, so the Jaeger UI being empty is the
+  expected state rather than a misconfiguration — `infra/README.md` and the
+  deployment guide both say so where a reader would otherwise conclude the
+  opposite. The collector→Jaeger leg is provable on its own with a synthetic
+  OTLP payload in the meantime.
+- **`synthesize` spans are deferred past Phase 6 entirely, not just past its
+  first change.** Query rewrite and cited synthesis are Phase 5 and are being
+  built concurrently; instrumenting a module that does not exist is not
+  possible, and guessing at a seam still under construction is worse than
+  waiting. SPEC.md §3's three-site list will therefore be satisfied two-thirds
+  when Phase 6 completes, and closing the third is an obligation on whichever
+  change lands synthesis — in the same sense that ADR-0001's hazard list is an
+  obligation on the phase that ports each defect.
+- **The read-only-mount deferral is discharged in part, and the part is worth
+  stating precisely.** The "read-only does not mean the process writes no bytes"
+  entry above deferred filesystem-level enforcement to this phase. What that
+  buys is the **corpus** mount: `/data/corpus` is a read-only mount in every
+  deployment surface, so the documents each citation resolves against are
+  unwritable by the serving process, enforced by the kernel rather than scoped
+  in Python. `/data/index` remains read-write and no mount flag changes that
+  while ADR-0002 keeps the store in WAL mode — `SQLiteMetadataStore.open` writes
+  its sidecars, runs `CREATE TABLE IF NOT EXISTS`, and chmods, on every open. So
+  read-only is now true of the corpus and still false of the index (ADR-0021
+  decision 2). A read-only *open path* in `index/metadata.py` would close the
+  rest and is a separate `src/` change with its own ADR.
+- **A container cannot enforce the loopback bind, so the image is not safe to
+  run with the obvious short command.** Inside a container a process bound to
+  `127.0.0.1` is reachable from nothing, so the image binds `0.0.0.0` with
+  `--allow-remote-access` and the guarantee moves to the publish boundary:
+  host-loopback publish in compose, a ClusterIP Service in Kubernetes, no
+  ingress rules at all in Terraform (ADR-0021 decision 1, ADR-0020 decision 2).
+  `docker run -p 8765:8765` and `--network host` both publish an
+  unauthenticated, content-bearing surface on every interface of the host, and
+  the image cannot tell those cases from the safe one. What was a refusal in
+  Phase 4 is a warning in a container.
+- **The Kubernetes probes target a real operation because there is no health
+  endpoint.** `GET /v1/collections` proves the process is serving HTTP and the
+  index directory is listable; it does **not** prove any collection is usable,
+  because `handle_list_collections` returns `[]` for a missing or empty index
+  directory rather than failing. A pod with an unmounted volume therefore
+  reports ready. Adding `/healthz` means widening ADR-0014 decision 2's
+  route-parity exclusion set — a security-relevant `src/` change deliberately
+  not taken in a change that touches no `src/` file
+  (`docs/specs/phase-6-iac-observability.md` §4.2, Q1).
+- **The Kubernetes manifests do not solve getting documents onto the volume.**
+  `pod-corpus-loader.yaml` is a `kubectl cp` target and a recipe, not a
+  mechanism. A real deployment substitutes whatever it already uses.
+- **No groundkit image is published to any registry**, so the image reference in
+  `deployment.yaml` is a placeholder that will not pull, and the Terraform
+  module's `container_image` has no default.
+- **The Terraform module creates no backups.** `prevent_destroy` on the data
+  volume means the index survives instance replacement and nothing more; there
+  is no snapshot schedule and no DLM policy. SPEC.md §7 names backup scope,
+  retention and deletion behaviour as product decisions owed before any
+  deployment that is not a single user's local machine, and ADR-0020 decision 4
+  settles exactly one of them. It is also a single instance: every AMI or
+  instance-type change is downtime.
+- **Most IaC paths are not yet verified, and `infra/README.md` is the status
+  board.** SPEC.md §1.4 requires each path be verified with the date recorded
+  and SPEC.md §2 forbids recording a date no run produced, so some rows are
+  empty. The machine this tree was written on had a Docker CLI with **no running
+  daemon**, a `kubectl` with **no cluster context**, and no cloud credential —
+  nothing was built, pulled, applied or planned there. What *was* executed and
+  observed: the compose file parses and interpolates, the Kubernetes base
+  renders and every manifest parses, the Terraform module passes `fmt -check`
+  and `validate` against AWS provider 5.100.0 and 6.60.0, and the user-data
+  template renders to a script that passes `bash -n`. CI now gates the image
+  build, the pinned third-party tags, the Kubernetes render and the Terraform
+  checks on every pull request; a real `compose up`, a cluster apply and a
+  Terraform apply remain the operator's to run.
 
 ## Phase 2 caveats
 
