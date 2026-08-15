@@ -156,6 +156,17 @@ def make_eval_report(**overrides: object) -> EvalReport:
     return EvalReport(**defaults)  # type: ignore[arg-type]
 
 
+def make_rerank_run_config(**overrides: object) -> RunConfig:
+    """A ``RunConfig`` with all three ``rerank_*`` fields set together."""
+    defaults: dict[str, object] = {
+        "rerank_input": "bm25",
+        "rerank_candidates": 20,
+        "rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    }
+    defaults.update(overrides)
+    return make_run_config(**defaults)
+
+
 class TestRunConfig:
     def test_frozen(self) -> None:
         c = make_run_config()
@@ -168,6 +179,77 @@ class TestRunConfig:
 
     def test_threshold_none_accepted(self) -> None:
         assert make_run_config(score_threshold=None).score_threshold is None
+
+
+class TestRerankFields:
+    """ADR-0012: the three ``rerank_*`` fields are all-or-nothing, with extra bounds."""
+
+    def test_all_three_none_is_valid(self) -> None:
+        """Every pre-rerank artifact has all three unset — backward compatibility."""
+        c = make_run_config()
+        assert c.rerank_input is None
+        assert c.rerank_candidates is None
+        assert c.rerank_model is None
+
+    def test_all_three_set_is_valid(self) -> None:
+        c = make_rerank_run_config()
+        assert c.rerank_input == "bm25"
+        assert c.rerank_candidates == 20
+        assert c.rerank_model == "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+    @pytest.mark.parametrize(
+        "present_fields",
+        [
+            pytest.param(["rerank_input"], id="only-input"),
+            pytest.param(["rerank_candidates"], id="only-candidates"),
+            pytest.param(["rerank_model"], id="only-model"),
+            pytest.param(["rerank_input", "rerank_candidates"], id="input-and-candidates"),
+            pytest.param(["rerank_input", "rerank_model"], id="input-and-model"),
+            pytest.param(["rerank_candidates", "rerank_model"], id="candidates-and-model"),
+        ],
+    )
+    def test_partial_rerank_fields_rejected(self, present_fields: list[str]) -> None:
+        """Every partial shape (1-of-3 and 2-of-3) is rejected, not just one sample."""
+        full: dict[str, object] = {
+            "rerank_input": "bm25",
+            "rerank_candidates": 20,
+            "rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        }
+        overrides = {name: (full[name] if name in present_fields else None) for name in full}
+        with pytest.raises(ValidationError, match="must be set together"):
+            make_run_config(**overrides)
+
+    def test_rerank_input_naming_itself_rejected(self) -> None:
+        """A stage cannot be its own input."""
+        with pytest.raises(ValidationError, match="rerank_input must name"):
+            make_rerank_run_config(rerank_input="rerank")
+
+    def test_rerank_candidates_below_top_k_rejected(self) -> None:
+        """Reranking cannot return more results than it was given."""
+        with pytest.raises(ValidationError, match="must be at least top_k"):
+            make_rerank_run_config(top_k=10, rerank_candidates=9)
+
+    def test_rerank_candidates_equal_to_top_k_accepted(self) -> None:
+        """Legal — it just pins the @10 metrics since reranking can only permute."""
+        c = make_rerank_run_config(top_k=10, rerank_candidates=10)
+        assert c.rerank_candidates == c.top_k
+
+    @pytest.mark.parametrize("bad_value", [0, -1, -100])
+    def test_rerank_candidates_non_positive_rejected(self, bad_value: int) -> None:
+        """The ``gt=0`` bound on ``rerank_candidates``."""
+        with pytest.raises(ValidationError):
+            make_rerank_run_config(rerank_candidates=bad_value)
+
+    def test_extra_fields_still_rejected_with_rerank_set(self) -> None:
+        """Adding the rerank fields must not have loosened ``extra="forbid"``."""
+        with pytest.raises(ValidationError):
+            make_rerank_run_config(surprise=True)
+
+    def test_frozen_still_holds_with_rerank_set(self) -> None:
+        """Adding the rerank fields must not have loosened ``frozen=True``."""
+        c = make_rerank_run_config()
+        with pytest.raises(ValidationError):
+            c.rerank_model = "other-model"
 
 
 class TestRunMetadata:
@@ -328,6 +410,11 @@ class TestStageResult:
         with pytest.raises(ValidationError):
             make_stage_result(stage="cross_encoder")
 
+    def test_rerank_stage_literal_accepted(self) -> None:
+        """``"rerank"`` is already a legal ``StageName`` (ADR-0012)."""
+        s = make_stage_result(stage="rerank", is_baseline=False)
+        assert s.stage == "rerank"
+
     def test_extra_fields_rejected(self) -> None:
         with pytest.raises(ValidationError):
             make_stage_result(surprise=True)
@@ -363,6 +450,13 @@ class TestEvalReport:
         dense_baseline = make_stage_result(stage="dense", is_baseline=True)
         with pytest.raises(ValidationError, match="baseline stage must be 'bm25'"):
             make_eval_report(stages=[dense_baseline])
+
+    def test_rerank_as_baseline_rejected(self) -> None:
+        """Adding the ``rerank`` stage must not have weakened the baseline invariant:
+        a report whose ``stages[0]`` is ``rerank`` is still rejected."""
+        rerank_baseline = make_stage_result(stage="rerank", is_baseline=True)
+        with pytest.raises(ValidationError, match="baseline stage must be 'bm25'"):
+            make_eval_report(stages=[rerank_baseline])
 
     def test_empty_stages_rejected(self) -> None:
         with pytest.raises(ValidationError, match="stages must not be empty"):

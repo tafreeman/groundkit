@@ -2,7 +2,7 @@
 
 Honest and current, per repo policy. Updated with each phase.
 
-## Current state (Phase 3, Wave D — all waves built, eval stage outstanding)
+## Current state (Phase 3, all waves built)
 
 Hybrid retrieval works end-to-end locally, behind opt-in flags: `grk
 ingest --dense` embeds each chunk into a LanceDB vector store alongside the
@@ -210,34 +210,61 @@ per SPEC.md §9:
   `<index-dir>/<collection>.lance`, beside `<collection>.sqlite3`. The
   default install, default commands, and CI need no Ollama and are
   unchanged by any of this.
-- **The cross-encoder reranker exists but nothing calls it, and it has no
-  measured delta.** Wave D built `retrieval/rerank.py` — `CrossEncoderReranker`
-  behind `RerankerProtocol`, with ADR-0001 hazard 2 closed by a sigmoid that
-  is total and monotonic, so no logit however negative can violate
-  `RetrievalResult.score`'s `ge=0.0` bound and the ranking is never altered by
-  the normalization. What does **not** yet exist is any caller:
-  `Retriever.search` has no rerank mode, `run_eval` accepts no reranker, and
-  `grk` exposes no flag. `rerank` is already a legal `StageName`, so a report
-  *could* carry the stage — and none does.
+- **The cross-encoder reranker is now called by the eval harness; `Retriever.search`
+  and `grk search` still cannot reach it.** `run_eval` accepts an optional
+  `reranker` and, when supplied, appends a `rerank` stage over the best
+  upstream stage the run produced — `fusion` with a dense pair, `bm25`
+  without — and `grk eval --rerank` wires it to the CLI. That is deliberate
+  and narrow, not a partial rollout waiting to be finished: ADR-0012
+  decision 2 keeps rerank out of `retrieval/search.py` entirely, so it is
+  reachable only through `grk eval --rerank`, `SearchMode` stays the
+  three-way `Literal` ADR-0007 already settled, and a reranked `grk search`
+  remains genuinely out of scope for Phase 3.
 
-  The consequence to be honest about: **rerank is unmeasured.** Every other
-  Phase 3 retrieval stage reports a signed delta against the BM25 baseline,
-  including when it loses; rerank reports nothing, so no claim that it improves
-  retrieval on this corpus is currently supported by anything in this repo.
-  SPEC.md §9 makes that delta a Phase 3 completion requirement, which is why
-  Phase 3 is not done. The two design decisions blocking it — which upstream
-  stage rerank reorders, and whether it reaches `Retriever.search` at all — are
-  written up in `docs/specs/phase-3-hybrid-retrieval.md` under Wave D.
+  **A delta is now emitted and derivable, and reported honestly including
+  when it loses (SPEC.md §6) — but which run produced it matters exactly as
+  much as it does for the dense/fusion numbers above.** The default `uv run
+  pytest` suite exercises the `rerank` stage's full wiring — `run_eval`, the
+  CLI flags, `RunConfig`'s three `rerank_*` fields, `derive_rerank_attribution`
+  — through a protocol-conformant stub reranker rather than a cross-encoder,
+  because the `rerank` extra is not in the dev group (below) and CI must not
+  pull torch. That stub's delta is the same trap `InMemoryEmbedder` carries
+  for dense: structurally valid, semantically noise with a sign. A delta that
+  means anything needs `RERANK_GATED=1` with `uv sync --extra rerank`
+  (`tests/test_eval_rerank_gated.py`, the companion to `test_rerank_gated.py`
+  that drives a real cross-encoder through `run_eval` itself rather than in
+  isolation), and — like the Ollama eval gate above —
+  `.github/workflows/rerank-gated.yml` is `workflow_dispatch`-only during
+  active development, so **nothing re-measures this automatically**.
 
-  Also true of the reranker as built: it needs the optional `rerank` extra
-  (torch, multi-gigabyte), which is deliberately absent from the dev group, so
-  the default suite never loads a model. The pure surface is covered offline;
-  the real model is proved only by `RERANK_GATED=1`, which — like the Ollama
-  eval gate above — is `workflow_dispatch`-only during active development and
-  therefore **re-measures nothing automatically**. Truncation to `top_k`
-  happens after reranking, so a reranker can promote a candidate the upstream
-  stage ranked below the cut only if that candidate was inside the list it was
-  handed; it cannot recover a document the upstream stage never retrieved.
+  **The rerank row's meaning is configuration-dependent, and the artifact
+  says so rather than leaving it implicit.** A reranker reorders whichever
+  stage was best available for the run, so two reports can agree on
+  `corpus_hash`/`judgments_hash` and still describe two different
+  experiments. `RunConfig.rerank_input`, `rerank_candidates`, and
+  `rerank_model` are therefore recorded together or not at all — a validator
+  enforces it — precisely so two reports are never silently incomparable in
+  this one dimension.
+
+  **The delta against `stages[0]` is not the reranker's own contribution when
+  the input was `fusion`** — it sums fusion's gain over BM25 with rerank's
+  gain over fusion into one number. `derive_rerank_attribution`
+  (`evals/delta.py`) diffs the `rerank` stage against its own input stage
+  instead, and the CLI prints both.
+
+  **Candidate depth is over-fetched to `MAX_TOP_K`,** pinned rather than
+  exposed as a CLI knob, because a depth equal to `top_k` would hand the
+  reranker a set it can only permute — its `recall_at_10` would then equal
+  the input stage's by arithmetic, not by measurement. Truncation to `top_k`
+  still happens *after* reranking, so a reranker can promote a candidate the
+  upstream stage ranked below the cut only if that candidate was inside the
+  list it was handed; it cannot recover a document the upstream stage never
+  retrieved. That remains the ceiling on any gain.
+
+  Also still true: the `rerank` extra (`sentence-transformers`, which pulls
+  in torch) stays out of the default install and out of the dev group, so
+  the default suite never loads a model — only the pure surface (the
+  sigmoid, ordering, fail-closed paths) is proved offline.
 - **`score_threshold` does not apply to hybrid results.** ADR-0005
   decision 6: an RRF-fused score is a function of result-set size and
   retriever count, not a probability, and thresholding it would silently
