@@ -78,6 +78,156 @@ jobs:
       - run: uv sync --locked --group docs --extra dense
       - run: uv run mkdocs build --strict
 
+  # SPEC.md §1.4 requires each IaC path be "verified to work". A GitHub runner
+  # has a Docker daemon and can reach a registry, which is more than the machine
+  # this infrastructure was written on had (see
+  # docs/specs/phase-6-iac-observability.md §6.1) — so this job is where several
+  # of those verifications actually happen, on every pull request rather than
+  # once by hand.
+  #
+  # NOT continue-on-error, per SPEC.md §3: this job is the sole proof that the
+  # image builds at all.
+  infra:
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_BUILDKIT: "1"
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
+    steps:
+      - uses: actions/checkout@v7
+      # For the two YAML-parsing steps below. `uv run --no-project --with` gives
+      # them an ephemeral interpreter with PyYAML rather than relying on
+      # whatever the runner image happens to ship, and uses the tool every other
+      # job here already uses.
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+
+      # -- compose ------------------------------------------------------
+      # Parses, interpolates and resolves every service. Needs no daemon.
+      - name: Compose file is valid
+        run: docker compose -f infra/compose/docker-compose.yml config -q
+
+      # A pinned tag is a claim about a registry. `imagetools inspect` resolves
+      # the manifest without downloading layers, which turns the pin into a
+      # checked claim rather than a guess — the tags in this repo were chosen
+      # without a container runtime available to confirm them. buildx rather
+      # than `docker manifest inspect` because the latter is still gated behind
+      # the experimental CLI flag.
+      - name: Pinned third-party image tags resolve
+        run: |
+          set -euo pipefail
+          docker compose --profile ingest --profile setup \
+            -f infra/compose/docker-compose.yml config --images \
+            | grep -v '^groundkit:local$' > images.txt
+          uv run --no-project --with pyyaml python - <<'PY' >> images.txt
+          import glob
+          import yaml
+          for path in sorted(glob.glob("infra/k8s/*.yaml")):
+              for doc in yaml.safe_load_all(open(path, encoding="utf-8")):
+                  if not isinstance(doc, dict):
+                      continue
+                  spec = doc.get("spec") or {}
+                  pod = (spec.get("template") or {}).get("spec") or spec
+                  for container in pod.get("containers") or []:
+                      image = container["image"]
+                      # The groundkit reference is a documented placeholder:
+                      # no image is published to any registry (ADR-0021).
+                      if not image.startswith("ghcr.io/tafreeman/groundkit"):
+                          print(image)
+          PY
+          sort -u -o images.txt images.txt
+          cat images.txt
+          while read -r image; do
+            echo "::group::$image"
+            docker buildx imagetools inspect "$image" > /dev/null
+            echo "::endgroup::"
+          done < images.txt
+
+      # -- image --------------------------------------------------------
+      - name: Image builds
+        run: docker build -f infra/docker/Dockerfile -t groundkit:ci .
+
+      # The three properties ADR-0021 decisions 2 and 3 make part of the image's
+      # contract, checked against the built image rather than against the
+      # Dockerfile's text.
+      - name: Image runs as uid 10001 and its CLI works
+        run: |
+          set -euo pipefail
+          test "$(docker run --rm --entrypoint id groundkit:ci -u)" = "10001"
+          docker run --rm groundkit:ci --version
+          # Read-only root plus the two named scratch mounts is the deployed
+          # shape; if a future change writes somewhere else, this fails here
+          # rather than in production.
+          docker run --rm --read-only \
+            --tmpfs /tmp:mode=1777 \
+            --tmpfs /home/groundkit:mode=0700,uid=10001,gid=10001 \
+            groundkit:ci --help > /dev/null
+
+      # -- kubernetes ---------------------------------------------------
+      - name: Install kubectl
+        run: |
+          set -euo pipefail
+          # Installed explicitly rather than relying on the runner image's tool
+          # list: this job is a gate, and a gate that silently stops running
+          # because a preinstalled binary moved is worse than no gate.
+          version="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+          curl -fsSL -o kubectl \
+            "https://dl.k8s.io/release/${version}/bin/linux/amd64/kubectl"
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+          rm -f kubectl
+          kubectl version --client
+
+      # Offline: `kustomize` renders without contacting a cluster. It catches a
+      # missing resource, a broken patch, and a manifest that is not valid YAML.
+      # It does NOT validate against a cluster's schema — that needs a cluster,
+      # and infra/README.md's status table says so.
+      - name: Kubernetes manifests render and parse
+        run: |
+          set -euo pipefail
+          kubectl kustomize infra/k8s > rendered.yaml
+          uv run --no-project --with pyyaml python - <<'PY'
+          import glob
+          import yaml
+          rendered = [d for d in yaml.safe_load_all(open("rendered.yaml", encoding="utf-8")) if d]
+          kinds = sorted(d["kind"] for d in rendered)
+          print("rendered:", kinds)
+          assert kinds == ["Deployment", "Namespace", "PersistentVolumeClaim", "Service"], kinds
+          # The one-shots are deliberately outside the kustomization (a Job's
+          # pod template is immutable; a loader pod would hold the RWO claim),
+          # so they are parsed here rather than left unchecked.
+          for path in sorted(glob.glob("infra/k8s/*.yaml")):
+              docs = [d for d in yaml.safe_load_all(open(path, encoding="utf-8")) if d]
+              assert docs, f"{path} parsed to nothing"
+          print("all infra/k8s manifests parse")
+          PY
+
+      # -- terraform ----------------------------------------------------
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          # Pinned to the version the module was written and validated against.
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-plugins-${{ hashFiles('infra/terraform/**/versions.tf') }}
+          restore-keys: tf-plugins-
+
+      - name: Terraform module is formatted and valid
+        working-directory: infra/terraform/aws-ec2
+        run: |
+          set -euo pipefail
+          mkdir -p "${TF_PLUGIN_CACHE_DIR}"
+          terraform fmt -check -diff -recursive .
+          # -backend=false: this is a reusable module, not a root configuration,
+          # so it has no backend and no state. `validate` resolves the provider
+          # schema and every expression, including the user_data templatefile
+          # call — it does NOT make an API call, so a missing IAM permission or
+          # an AMI filter that matches nothing stays invisible to it.
+          terraform init -backend=false -input=false
+          terraform validate -no-color
+
   audit:
     runs-on: ubuntu-latest
     steps:
