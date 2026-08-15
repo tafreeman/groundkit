@@ -16,6 +16,27 @@ delta each stage owes SPEC.md §6 is derivable within that artifact
 deliberately: a per-stage rebuild would let corpus or chunking differences
 leak into what is supposed to be a comparison of retrieval strategies alone.
 
+Given a reranker, one more stage follows (ADR-0012). It is unlike the others
+in two ways that the code below is arranged around:
+
+- **It is a post-step, not a mode.** A reranker reorders
+  ``list[RetrievalResult]``; it does not produce candidates. So there is no
+  fourth ``SearchMode`` and nothing in ``retrieval/search.py`` changed — the
+  runner asks the retriever for the *input* stage's results and reranks what
+  comes back. ADR-0012 decision 2.
+- **Its input is the best stage available** — ``fusion`` with a dense pair,
+  ``bm25`` without. That makes the row's meaning configuration-dependent,
+  which is why :class:`~groundkit.evals.schema.RunConfig` records
+  ``rerank_input``, ``rerank_candidates`` and ``rerank_model``, and why
+  :func:`~groundkit.evals.delta.derive_rerank_attribution` exists: against
+  ``stages[0]`` the rerank delta measures fusion *and* rerank together, so
+  the two have to be separable or neither is interpretable. How cleanly they
+  separate depends on the input stage — cleanly for ``bm25``, only partly
+  for ``fusion``, because RRF is not depth-invariant and the rerank stage
+  fetches a wider pool than the fusion stage reported. That distinction is
+  spelled out in :mod:`groundkit.evals.delta`'s module docstring and must
+  not be flattened when quoting either number.
+
 **A losing stage is reported, not dropped.** There is no filtering anywhere
 in this module — every configured stage lands in ``report.stages`` with
 whatever numbers it earned. SPEC.md §6's baseline discipline makes that a
@@ -44,6 +65,7 @@ import hashlib
 import logging
 import math
 import tempfile
+import time
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -92,9 +114,15 @@ if TYPE_CHECKING:
     from groundkit.evals.corpus import GoldSpan, Judgment
     from groundkit.index.protocols import MetadataStoreProtocol, VectorStoreProtocol
     from groundkit.providers.protocols import EmbeddingProtocol
+    from groundkit.retrieval.protocols import RerankerProtocol
     from groundkit.retrieval.search import SearchMode
 
 logger = logging.getLogger(__name__)
+
+#: Nanoseconds per millisecond, matching ``retrieval/search.py``'s own
+#: conversion so a rerank stage's latency is expressed in the same unit as
+#: the retrieval latency it is added to.
+_NS_PER_MS: float = 1_000_000.0
 
 #: Eval stage -> the :meth:`Retriever.search` mode that produces it, in the
 #: order stages are appended to a report. ``stages[0]`` must be ``"bm25"``
@@ -110,6 +138,25 @@ _DENSE_STAGE_MODES: tuple[tuple[StageName, SearchMode], ...] = (
     ("dense", "dense"),
     ("fusion", "hybrid"),
 )
+
+
+class _StagePlan(NamedTuple):
+    """One stage the run will emit, and how to produce it.
+
+    Attributes:
+        stage: The stage's name in the artifact.
+        mode: The :meth:`Retriever.search` mode that produces this stage's
+            candidates. For a rerank stage this is the *input* stage's mode
+            — a reranker consumes results rather than producing them, so it
+            has no mode of its own (ADR-0012 decision 2).
+        reranks: Whether the candidates are passed through the run's
+            reranker before scoring.
+    """
+
+    stage: StageName
+    mode: SearchMode
+    reranks: bool = False
+
 
 #: Floor on ``run_eval``'s ``top_k``, enforced here rather than only at the
 #: CLI boundary. Every stage publishes ``recall@10`` and ``nDCG@10``
@@ -152,6 +199,8 @@ async def run_eval(
     top_k: int = 10,
     embedder: EmbeddingProtocol | None = None,
     vector_store: VectorStoreProtocol | None = None,
+    reranker: RerankerProtocol | None = None,
+    rerank_candidates: int = MAX_TOP_K,
 ) -> EvalReport:
     """Run the retrieval eval over a corpus and judgment set, one stage per strategy.
 
@@ -170,6 +219,24 @@ async def run_eval(
     produce ``dense`` and ``fusion`` stages, so the three differ only in
     retrieval strategy and their deltas
     (:func:`~groundkit.evals.delta.derive_stage_deltas`) measure that alone.
+
+    A ``reranker`` appends one more stage, over whichever upstream stage the
+    run actually produced — ``fusion`` with a dense pair, ``bm25`` without
+    (ADR-0012 decision 1). Two consequences are worth stating outright
+    because neither is visible from the numbers alone:
+
+    - **Its delta against ``stages[0]`` is not the reranker's contribution**
+      whenever the input was ``fusion``: that delta sums what fusion gained
+      over BM25 and what rerank gained over fusion.
+      :func:`~groundkit.evals.delta.derive_rerank_attribution` separates
+      them, and the CLI prints both.
+    - **``rerank_candidates`` decides whether ``recall_at_10`` can move at
+      all.** Reranking truncates to ``top_k`` after reordering, so a
+      candidate depth equal to ``top_k`` hands the model a set it can only
+      permute — its ``recall_at_10`` then equals the input stage's for
+      arithmetic reasons, not measured ones. The default over-fetches to
+      :data:`~groundkit.retrieval.search.MAX_TOP_K`, the retriever's own
+      ceiling, so every metric is free to move in both directions.
 
     Passing :class:`~groundkit.providers.embeddings.InMemoryEmbedder` is
     supported and *logged as a warning*: it exercises the dense and fusion
@@ -200,11 +267,19 @@ async def run_eval(
             Pass a fresh store, never a live collection's — see
             :func:`_require_empty_vector_store` for what goes wrong
             otherwise.
+        reranker: Optional reranker enabling the ``rerank`` stage
+            (keyword-only). Independent of the dense pair: a reranker with
+            no dense pair reorders the ``bm25`` baseline, which is a
+            complete and self-contained measurement.
+        rerank_candidates: How many candidates the upstream stage is asked
+            for before the reranker truncates back to ``top_k``. Between
+            ``top_k`` and :data:`~groundkit.retrieval.search.MAX_TOP_K`;
+            ignored, and not recorded, when ``reranker`` is ``None``.
 
     Returns:
         An :class:`EvalReport` whose ``stages[0]`` is always the ``bm25``
         baseline, followed by ``dense`` and ``fusion`` when a dense pair was
-        supplied.
+        supplied and ``rerank`` when a reranker was.
 
     Raises:
         ConfigurationError: Exactly one of ``embedder`` / ``vector_store``
@@ -212,7 +287,13 @@ async def run_eval(
         EvalError: A judgment or gold span fails to load or resolve against
             the corpus, or a gold span's document (or a retrieved hit's
             document) has no corresponding entry among the corpus's
-            actually-indexed documents.
+            actually-indexed documents, or ``rerank_candidates`` is out of
+            range.
+        RerankerNotConfiguredError: A ``reranker`` was supplied but cannot
+            load its model — for :class:`CrossEncoderReranker`, the
+            ``rerank`` extra is not installed. Never a silent passthrough:
+            an unreranked stage labelled ``rerank`` would be a fabricated
+            measurement.
         IngestionError: Ingesting ``corpus_dir`` fails.
         StorageError: The throwaway index fails to open or write.
         RetrievalError: A search call fails (e.g. an index inconsistency,
@@ -231,6 +312,14 @@ async def run_eval(
             "always going to be rejected."
         )
     _validate_dense_pair(embedder, vector_store)
+    if reranker is not None and not top_k <= rerank_candidates <= MAX_TOP_K:
+        raise EvalError(
+            f"rerank_candidates must be between top_k ({top_k}) and {MAX_TOP_K}, got "
+            f"{rerank_candidates}. Below top_k the reranker could not return a full "
+            f"result list; above {MAX_TOP_K} Retriever.search would reject the request "
+            "— and both are checked here, before an ingest and a model load are spent "
+            "on a run that was always going to be rejected."
+        )
     if embedder is not None and vector_store is not None:
         await _require_empty_vector_store(vector_store, embedder.dimensions)
     if embedder is not None and embedder.provider == INMEMORY_PROVIDER:
@@ -244,6 +333,22 @@ async def run_eval(
             "retrieval-quality measurement (SPEC.md section 2). Use a real embedding "
             "provider for any number that is meant to mean something.",
             INMEMORY_PROVIDER,
+        )
+
+    planned = _planned_stages(embedder, vector_store, reranker)
+    rerank_input = _rerank_input_stage(planned)
+    rerank_model = _reranker_identity(reranker) if reranker is not None else None
+    if reranker is not None:
+        # Named at INFO rather than buried in the artifact alone: which stage
+        # was reranked is the single fact that decides what this run's rerank
+        # row means, and a reader watching a console should not have to open
+        # the JSON to learn it.
+        logger.info(
+            "Eval will rerank the %r stage with %r, over %d candidates truncated to %d",
+            rerank_input,
+            rerank_model,
+            rerank_candidates,
+            top_k,
         )
 
     started_at = datetime.now(UTC).isoformat()
@@ -334,7 +439,7 @@ async def run_eval(
             }
 
             stages: list[StageResult] = []
-            for stage_name, mode in _planned_stages(embedder, vector_store):
+            for plan in planned:
                 query_results: list[QueryResult] = []
                 for judgment in judgments:
                     query_results.append(
@@ -343,14 +448,16 @@ async def run_eval(
                             gold_by_query[judgment.query_id],
                             retriever=retriever,
                             top_k=top_k,
-                            mode=mode,
+                            mode=plan.mode,
                             document_id_to_relpath=document_id_to_relpath,
+                            reranker=reranker if plan.reranks else None,
+                            rerank_candidates=rerank_candidates,
                         )
                     )
                 stages.append(
                     _build_stage_result(
                         query_results,
-                        stage=stage_name,
+                        stage=plan.stage,
                         is_baseline=not stages,
                     )
                 )
@@ -385,6 +492,12 @@ async def run_eval(
             # the configured value into the artifact anyway would describe a
             # computation that did not happen.
             rrf_k=retrieval_config.rrf_k if embedder is not None else None,
+            # All three keyed off the same condition, which RunConfig's
+            # validator then re-checks: a rerank record that is half present
+            # is the silently-incomparable artifact ADR-0012 forbids.
+            rerank_input=rerank_input,
+            rerank_candidates=rerank_candidates if reranker is not None else None,
+            rerank_model=rerank_model,
         ),
     )
     logger.info(
@@ -398,8 +511,10 @@ async def run_eval(
 
 
 def _planned_stages(
-    embedder: EmbeddingProtocol | None, vector_store: VectorStoreProtocol | None
-) -> tuple[tuple[StageName, SearchMode], ...]:
+    embedder: EmbeddingProtocol | None,
+    vector_store: VectorStoreProtocol | None,
+    reranker: RerankerProtocol | None = None,
+) -> tuple[_StagePlan, ...]:
     """The stages this run will emit, baseline first.
 
     Args:
@@ -407,16 +522,92 @@ def _planned_stages(
         vector_store: The run's vector store, or ``None``. Pairing is
             already validated by the caller; both are read here so the
             dense stages cannot be planned off half a pair.
+        reranker: The run's reranker, or ``None``. When supplied, a
+            ``rerank`` stage is appended over the best upstream stage
+            available (ADR-0012 decision 1).
 
     Returns:
-        ``(stage_name, search_mode)`` pairs. Always starts with the
-        ``bm25`` baseline; appends :data:`_DENSE_STAGE_MODES` when a dense
-        pair is present.
+        The ordered stage plan. Always starts with the ``bm25`` baseline;
+        appends :data:`_DENSE_STAGE_MODES` when a dense pair is present, and
+        a rerank stage last when a reranker is present.
     """
-    baseline: tuple[tuple[StageName, SearchMode], ...] = (("bm25", "bm25"),)
-    if embedder is None or vector_store is None:
-        return baseline
-    return baseline + _DENSE_STAGE_MODES
+    plans: tuple[_StagePlan, ...] = (_StagePlan("bm25", "bm25"),)
+    if embedder is not None and vector_store is not None:
+        plans += tuple(_StagePlan(stage, mode) for stage, mode in _DENSE_STAGE_MODES)
+    if reranker is not None:
+        # "Best available" is read off the plan already built rather than
+        # re-deriving it from the dense pair: the input stage named in the
+        # artifact is then the same stage the report actually contains, by
+        # construction, instead of two independent answers to the same
+        # question that could disagree.
+        upstream = plans[-1]
+        plans += (_StagePlan("rerank", upstream.mode, reranks=True),)
+    return plans
+
+
+def _rerank_input_stage(plans: tuple[_StagePlan, ...]) -> StageName | None:
+    """The stage a ``rerank`` plan reorders, or ``None`` if there is none.
+
+    Derived from the plan rather than recomputed from the dense pair, for
+    the reason :func:`_planned_stages` gives: ``RunConfig.rerank_input`` must
+    name a stage that is genuinely in this report.
+
+    Args:
+        plans: The run's stage plan.
+
+    Returns:
+        The upstream stage's name, or ``None`` when no rerank stage is
+        planned.
+    """
+    for position, plan in enumerate(plans):
+        if plan.reranks:
+            if position == 0:
+                # `plans[-1]` would silently return the LAST stage's name
+                # rather than raising IndexError, so a rerank plan that ever
+                # reached index 0 would stamp a confident, wrong
+                # `rerank_input` into the artifact — contract-legal and
+                # corrupt, the combination this repo treats as worse than a
+                # crash. Unreachable today, since `_planned_stages` always
+                # seeds the bm25 baseline first, which is exactly why it is
+                # asserted rather than trusted: the guarantee lives in
+                # another function that a later stage insertion could change
+                # without anyone touching this one.
+                raise EvalError(
+                    "a rerank stage cannot be first in the plan: it reorders an upstream "
+                    "stage's results, and at index 0 there is no stage before it"
+                )
+            return plans[position - 1].stage
+    return None
+
+
+def _reranker_identity(reranker: RerankerProtocol) -> str:
+    """Best available identity string for ``reranker``, for the artifact.
+
+    Read with ``getattr`` rather than through the protocol, deliberately.
+    :class:`~groundkit.retrieval.protocols.RerankerProtocol` encodes
+    ADR-0001 hazard 4 and is held to exact signature parity by
+    ``tests/test_protocol_conformance.py``; widening it with a ``model_name``
+    member to satisfy a reporting need would change a seam for a reason that
+    has nothing to do with the seam.
+
+    A test double has no model name, so it falls back to its class name —
+    and that is the useful outcome, not a degraded one. It puts
+    ``"_StubReranker"`` in ``RunConfig.rerank_model`` where a real run puts
+    ``"cross-encoder/ms-marco-MiniLM-L-6-v2"``, so the artifact self-labels
+    which of the two it is, exactly as ``embedding.provider == "inmemory"``
+    does for the dense stages (SPEC.md §2).
+
+    Args:
+        reranker: The run's reranker.
+
+    Returns:
+        The reranker's ``model_name`` if it exposes a non-empty string one,
+        otherwise its class name.
+    """
+    model_name = getattr(reranker, "model_name", None)
+    if isinstance(model_name, str) and model_name:
+        return model_name
+    return type(reranker).__name__
 
 
 async def _require_empty_vector_store(vector_store: VectorStoreProtocol, dimensions: int) -> None:
@@ -644,8 +835,17 @@ async def _evaluate_judgment(
     top_k: int,
     mode: SearchMode,
     document_id_to_relpath: dict[str, str],
+    reranker: RerankerProtocol | None = None,
+    rerank_candidates: int = MAX_TOP_K,
 ) -> QueryResult:
     """Score one judgment against a live retriever in one retrieval mode.
+
+    With a ``reranker``, this asks the retriever for ``rerank_candidates``
+    results rather than ``top_k`` and reranks them back down. The wider
+    fetch is the whole point: reranking truncates *after* reordering, so
+    handing the model exactly ``top_k`` candidates leaves it able only to
+    permute a fixed set, and every ``@k`` metric at the full cutoff is then
+    pinned to the input stage's by arithmetic (ADR-0012 decision 1a).
 
     Args:
         judgment: The judgment to score.
@@ -653,9 +853,14 @@ async def _evaluate_judgment(
         retriever: An open retriever snapshotting the freshly-ingested
             corpus.
         top_k: Results requested for this query.
-        mode: The retrieval mode this stage measures.
+        mode: The retrieval mode this stage measures. For a rerank stage
+            this is the *input* stage's mode.
         document_id_to_relpath: ``document_id`` -> corpus-relative path, for
             labeling retrieved hits.
+        reranker: Reranker to apply to this stage's candidates, or ``None``
+            for a plain retrieval stage.
+        rerank_candidates: Candidates fetched before reranking. Unused when
+            ``reranker`` is ``None``.
 
     Returns:
         This judgment's fully-scored :class:`~groundkit.evals.schema.QueryResult`.
@@ -664,16 +869,34 @@ async def _evaluate_judgment(
         EvalError: A retrieved hit's document has no corresponding entry
             among the indexed corpus documents, so the result cannot be
             labeled.
+        RerankerNotConfiguredError: The reranker cannot load its model.
+        RetrievalError: The reranker failed while scoring.
     """
     is_no_answer = judgment.category == "no_answer"
     gold_ids = gold.chunk_ids
     gold_results = gold.spans
 
-    response = await retriever.search(judgment.query, top_k=top_k, mode=mode)
-    ranked_ids = [result.chunk_id for result in response.results]
+    fetch_k = rerank_candidates if reranker is not None else top_k
+    response = await retriever.search(judgment.query, top_k=fetch_k, mode=mode)
+    latency_ms = float(response.metadata["latency_ms"])
+    results = response.results
+
+    if reranker is not None:
+        # Timed here and ADDED to the retrieval latency, rather than
+        # replacing it or being dropped. The cross-encoder is by a wide
+        # margin the most expensive thing in this stage — it is the cost a
+        # reader is weighing the quality gain against — so a rerank stage
+        # reporting only its retrieval time would show the model as very
+        # nearly free, which is the opposite of true and is the number
+        # `latency_p50_delta_ms` would then publish.
+        rerank_started = time.perf_counter_ns()
+        results = await reranker.rerank(judgment.query, list(results), top_k=top_k)
+        latency_ms += (time.perf_counter_ns() - rerank_started) / _NS_PER_MS
+
+    ranked_ids = [result.chunk_id for result in results]
 
     retrieved: list[RetrievedHit] = []
-    for rank, result in enumerate(response.results, start=1):
+    for rank, result in enumerate(results, start=1):
         document = document_id_to_relpath.get(result.document_id)
         if document is None:
             raise EvalError(
@@ -690,8 +913,6 @@ async def _evaluate_judgment(
                 is_relevant=result.chunk_id in gold_ids,
             )
         )
-
-    latency_ms = float(response.metadata["latency_ms"])
 
     metrics: QueryMetrics | None = None
     total_relevant_chunks = 0

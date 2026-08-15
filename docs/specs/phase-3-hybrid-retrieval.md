@@ -202,7 +202,7 @@ changeset that leaves the tree green.
   Both remain opt-in: the default install, default commands, and CI need no
   Ollama, and `grk search` still defaults to `bm25` (Q1, below).
 
-### Wave D — optional cross-encoder rerank (**Landed, except the eval stage**)
+### Wave D — optional cross-encoder rerank (**Landed**)
 
 - `retrieval/rerank.py` behind `RerankerProtocol`, optional extra. ✅
   `CrossEncoderReranker` plus two pure functions, `sigmoid` and
@@ -229,24 +229,69 @@ changeset that leaves the tree green.
   `tests/test_rerank_gated.py` behind `RERANK_GATED=1` and
   `.github/workflows/rerank-gated.yml`, which is the sole proof of this
   backend and is correspondingly not `continue-on-error`.
+- **Eval delta (SPEC.md §9): a `rerank` stage over the best upstream stage
+  the run produced, with its own delta.** ✅ `run_eval` accepts an optional
+  `reranker` and `rerank_candidates`; `grk eval --rerank` wires the CLI, and
+  `derive_rerank_attribution` (`evals/delta.py`) derives a second delta
+  against the input stage rather than against `stages[0]`. That second delta
+  is the reranker's own contribution only when the run reranked `bm25` —
+  reranking `fusion` widens the candidate fetch past what fusion itself was
+  scored at, which changes RRF's ranking rather than merely revealing more
+  of an unchanged one, so that case reports the rerank pipeline against
+  fusion as measured, not an isolated cross-encoder effect (ADR-0012
+  Consequences; `evals/delta.py`'s module docstring). Proved at two depths,
+  deliberately: the default suite exercises the whole path — `run_eval`, the
+  CLI flags, `RunConfig`'s `rerank_*` fields, the attribution derivation, the
+  CLI's provenance line — through a protocol-conformant stub reranker, so CI
+  never loads a model; a delta that means anything about retrieval quality is
+  proved only by `RERANK_GATED=1` with `uv sync --extra rerank`
+  (`tests/test_eval_rerank_gated.py`, the companion to `test_rerank_gated.py`
+  that drives a real cross-encoder through `run_eval` itself),
+  `workflow_dispatch`-only for now like the Ollama gate above. See
+  `KNOWN_LIMITATIONS.md` for exactly what each of those two runs does and
+  does not license claiming.
 
-**Outstanding, and it is the Phase 3 gate.** SPEC.md §9 requires each Phase 3
-retrieval feature to report an eval delta against the BM25 baseline, and rerank
-does not have one yet: `run_eval` takes no reranker, and `rerank` — though
-already a legal `StageName` — is never appended to a report. Two decisions are
-open and neither should be settled by omission:
+**Decided during Wave D — ADR-0012.**
+The two decisions this section previously left open are now settled. Recording
+the resolution alone would understate what each cost — both traded something
+away, and the trade is what makes the artifact's shape (`RunConfig`'s three
+`rerank_*` fields, `derive_rerank_attribution`) necessary rather than
+decorative:
 
-1. **Which stage does rerank rerank?** A reranker reorders `RetrievalResult`s,
-   so it is a post-step over some upstream stage rather than a `SearchMode`. The
-   natural default is the best available upstream stage (fusion when a dense
-   pair is present, BM25 otherwise), but that makes the `rerank` row's meaning
-   depend on the run's configuration, which the artifact must then record
-   explicitly or else two reports are silently incomparable.
-2. **Does rerank reach `Retriever.search`?** Wave D deliberately did not wire it
-   in. Doing so adds a fourth mode to a `SearchMode` literal that ADR-0007
-   settled, and a reranked `grk search` would need the extra installed to
-   answer at all — so the fail-closed behaviour of the default path has to be
-   decided before, not after.
+1. **Which stage does rerank rerank? — Best-available upstream input:**
+   `fusion` when the run has a dense pair, `bm25` when it does not. What that
+   costs: the `rerank` row's meaning is now configuration-dependent — two
+   reports can agree on `corpus_hash` and `judgments_hash` and still describe
+   two different experiments, one reranking BM25 and the other reranking
+   fusion. The artifact closes that rather than leaving it silent:
+   `RunConfig.rerank_input` (with `rerank_candidates` and `rerank_model`, all
+   three together or none, enforced by a validator) names the input stage
+   explicitly, and `derive_rerank_attribution` diffs the `rerank` stage
+   against *that* stage instead of `stages[0]` — because against the
+   baseline, a rerank-over-fusion delta sums fusion's gain with the
+   reranker's own, and the two numbers answer different questions. The CLI
+   prints both deltas rather than picking one.
+2. **Does rerank reach `Retriever.search`? — No.** ADR-0012 decision 2 keeps
+   rerank out of `retrieval/search.py` entirely: there is no fourth
+   `SearchMode`, the `Literal` ADR-0007 settled is untouched, and
+   `retrieval/search.py` has no diff in this wave. What that costs: rerank is
+   reachable from `grk eval --rerank` only, so nothing outside the eval
+   harness benefits from it, and a caller who wants a reranked `grk search`
+   still cannot get one. Deferred to Phase 4, where the fail-closed behavior
+   of a default search path needing an uninstalled extra can be decided on
+   its own rather than folded into an eval-harness change.
+
+A third decision was forced by decision 1 rather than anticipated by the
+original two, and it is load-bearing enough to belong here rather than only
+in the ADR: **candidate depth.** Reranking truncates to `top_k` *after*
+reordering, so if the upstream stage were asked for only `top_k` candidates,
+the reranker could only permute a fixed set — `recall_at_10` would then equal
+the input stage's by arithmetic, not by measurement, and the run would look
+like it tested rerank while actually testing nothing. Candidates are
+therefore over-fetched to `MAX_TOP_K` (`retrieval/search.py`'s own ceiling),
+pinned in the runner rather than exposed as a CLI knob: a knob here would let
+two runs be silently incomparable in the one dimension a reader is least
+likely to check before comparing their numbers.
 
 ### Wave E — eval deltas (the phase gate) (**Landed**)
 

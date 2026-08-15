@@ -69,14 +69,29 @@ jobs:
       - name: Run the gated cross-encoder suite
         run: uv run pytest tests/test_rerank_gated.py -v
 
+      # The eval-harness half of the same proof: that run_eval can drive a
+      # real CrossEncoderReranker end to end and still produce an honestly
+      # reported artifact (tests/test_eval_rerank_gated.py's module docstring
+      # has the full case for why this is a separate file from the one
+      # above rather than more cases bolted onto it). Same env, same job,
+      # same non-negotiable "never continue-on-error" as every other step
+      # here — it is the only place this path is proven at all.
+      - name: Run the gated rerank eval suite
+        run: uv run pytest tests/test_eval_rerank_gated.py -v
+
       # A gate that silently skips is indistinguishable from a gate that
       # passed, which would make this job's green tick meaningless — the exact
       # failure mode SPEC.md §3 is guarding against. Assert the tests actually
-      # ran.
+      # ran. Both gated files are checked: a skip in either one is the same
+      # false-green risk, so neither can hide behind the other passing.
       - name: Fail if the gate skipped instead of running
         run: |
-          uv run pytest tests/test_rerank_gated.py -q --collect-only >/dev/null
+          uv run pytest tests/test_rerank_gated.py tests/test_eval_rerank_gated.py -q --collect-only >/dev/null
           if uv run pytest tests/test_rerank_gated.py -q 2>&1 | grep -qE '[0-9]+ skipped'; then
             echo "Gated rerank tests skipped despite RERANK_GATED=1 — the gate did not open." >&2
+            exit 1
+          fi
+          if uv run pytest tests/test_eval_rerank_gated.py -q 2>&1 | grep -qE '[0-9]+ skipped'; then
+            echo "Gated rerank eval tests skipped despite RERANK_GATED=1 — the gate did not open." >&2
             exit 1
           fi

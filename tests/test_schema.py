@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from groundkit.contracts import EmbeddingIdentity
 from groundkit.evals.schema import (
     EvalReport,
     GoldSpanResult,
@@ -156,6 +157,17 @@ def make_eval_report(**overrides: object) -> EvalReport:
     return EvalReport(**defaults)  # type: ignore[arg-type]
 
 
+def make_rerank_run_config(**overrides: object) -> RunConfig:
+    """A ``RunConfig`` with all three ``rerank_*`` fields set together."""
+    defaults: dict[str, object] = {
+        "rerank_input": "bm25",
+        "rerank_candidates": 20,
+        "rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    }
+    defaults.update(overrides)
+    return make_run_config(**defaults)
+
+
 class TestRunConfig:
     def test_frozen(self) -> None:
         c = make_run_config()
@@ -168,6 +180,77 @@ class TestRunConfig:
 
     def test_threshold_none_accepted(self) -> None:
         assert make_run_config(score_threshold=None).score_threshold is None
+
+
+class TestRerankFields:
+    """ADR-0012: the three ``rerank_*`` fields are all-or-nothing, with extra bounds."""
+
+    def test_all_three_none_is_valid(self) -> None:
+        """Every pre-rerank artifact has all three unset — backward compatibility."""
+        c = make_run_config()
+        assert c.rerank_input is None
+        assert c.rerank_candidates is None
+        assert c.rerank_model is None
+
+    def test_all_three_set_is_valid(self) -> None:
+        c = make_rerank_run_config()
+        assert c.rerank_input == "bm25"
+        assert c.rerank_candidates == 20
+        assert c.rerank_model == "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+    @pytest.mark.parametrize(
+        "present_fields",
+        [
+            pytest.param(["rerank_input"], id="only-input"),
+            pytest.param(["rerank_candidates"], id="only-candidates"),
+            pytest.param(["rerank_model"], id="only-model"),
+            pytest.param(["rerank_input", "rerank_candidates"], id="input-and-candidates"),
+            pytest.param(["rerank_input", "rerank_model"], id="input-and-model"),
+            pytest.param(["rerank_candidates", "rerank_model"], id="candidates-and-model"),
+        ],
+    )
+    def test_partial_rerank_fields_rejected(self, present_fields: list[str]) -> None:
+        """Every partial shape (1-of-3 and 2-of-3) is rejected, not just one sample."""
+        full: dict[str, object] = {
+            "rerank_input": "bm25",
+            "rerank_candidates": 20,
+            "rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        }
+        overrides = {name: (full[name] if name in present_fields else None) for name in full}
+        with pytest.raises(ValidationError, match="must be set together"):
+            make_run_config(**overrides)
+
+    def test_rerank_input_naming_itself_rejected(self) -> None:
+        """A stage cannot be its own input."""
+        with pytest.raises(ValidationError, match="rerank_input must name"):
+            make_rerank_run_config(rerank_input="rerank")
+
+    def test_rerank_candidates_below_top_k_rejected(self) -> None:
+        """Reranking cannot return more results than it was given."""
+        with pytest.raises(ValidationError, match="must be at least top_k"):
+            make_rerank_run_config(top_k=10, rerank_candidates=9)
+
+    def test_rerank_candidates_equal_to_top_k_accepted(self) -> None:
+        """Legal — it just pins the @10 metrics since reranking can only permute."""
+        c = make_rerank_run_config(top_k=10, rerank_candidates=10)
+        assert c.rerank_candidates == c.top_k
+
+    @pytest.mark.parametrize("bad_value", [0, -1, -100])
+    def test_rerank_candidates_non_positive_rejected(self, bad_value: int) -> None:
+        """The ``gt=0`` bound on ``rerank_candidates``."""
+        with pytest.raises(ValidationError):
+            make_rerank_run_config(rerank_candidates=bad_value)
+
+    def test_extra_fields_still_rejected_with_rerank_set(self) -> None:
+        """Adding the rerank fields must not have loosened ``extra="forbid"``."""
+        with pytest.raises(ValidationError):
+            make_rerank_run_config(surprise=True)
+
+    def test_frozen_still_holds_with_rerank_set(self) -> None:
+        """Adding the rerank fields must not have loosened ``frozen=True``."""
+        c = make_rerank_run_config()
+        with pytest.raises(ValidationError):
+            c.rerank_model = "other-model"
 
 
 class TestRunMetadata:
@@ -328,6 +411,11 @@ class TestStageResult:
         with pytest.raises(ValidationError):
             make_stage_result(stage="cross_encoder")
 
+    def test_rerank_stage_literal_accepted(self) -> None:
+        """``"rerank"`` is already a legal ``StageName`` (ADR-0012)."""
+        s = make_stage_result(stage="rerank", is_baseline=False)
+        assert s.stage == "rerank"
+
     def test_extra_fields_rejected(self) -> None:
         with pytest.raises(ValidationError):
             make_stage_result(surprise=True)
@@ -363,6 +451,13 @@ class TestEvalReport:
         dense_baseline = make_stage_result(stage="dense", is_baseline=True)
         with pytest.raises(ValidationError, match="baseline stage must be 'bm25'"):
             make_eval_report(stages=[dense_baseline])
+
+    def test_rerank_as_baseline_rejected(self) -> None:
+        """Adding the ``rerank`` stage must not have weakened the baseline invariant:
+        a report whose ``stages[0]`` is ``rerank`` is still rejected."""
+        rerank_baseline = make_stage_result(stage="rerank", is_baseline=True)
+        with pytest.raises(ValidationError, match="baseline stage must be 'bm25'"):
+            make_eval_report(stages=[rerank_baseline])
 
     def test_empty_stages_rejected(self) -> None:
         with pytest.raises(ValidationError, match="stages must not be empty"):
@@ -406,3 +501,87 @@ class TestEvalReport:
         assert restored == report
         assert restored.run.config.top_k == report.run.config.top_k
         assert restored.stages[0].queries[0].query_id == report.stages[0].queries[0].query_id
+
+
+def make_embedding_identity(**overrides: object) -> EmbeddingIdentity:
+    """The ADR-0004 identity triple, for the dense-pairing tests below."""
+    defaults: dict[str, object] = {
+        "provider": "ollama",
+        "model_name": "nomic-embed-text",
+        "dimensions": 768,
+    }
+    defaults.update(overrides)
+    return EmbeddingIdentity(**defaults)  # type: ignore[arg-type]
+
+
+class TestDenseFieldPairing:
+    """``embedding`` and ``rrf_k`` are set together or not at all.
+
+    The invariant existed before the validator did, but only as a
+    coincidence of ``runner.py`` gating both assignments on the same
+    predicate at the single production call site. Nothing stopped a
+    hand-built config, a test double, or a second library caller from
+    emitting half a pair — and the halves lie in opposite directions, so
+    neither is a benign omission.
+    """
+
+    def test_both_absent_is_valid(self) -> None:
+        """The BM25-only shape, and every artifact written before Wave E."""
+        config = make_run_config()
+
+        assert config.embedding is None
+        assert config.rrf_k is None
+
+    def test_both_present_is_valid(self) -> None:
+        """The dense shape: an embedder ran, so a fusion stage ran too."""
+        config = make_run_config(embedding=make_embedding_identity(), rrf_k=60)
+
+        assert config.embedding is not None
+        assert config.rrf_k == 60
+
+    def test_embedding_without_rrf_k_is_rejected(self) -> None:
+        """Hides which semantic space the fusion stage was measured in."""
+        with pytest.raises(ValidationError, match="rrf_k"):
+            make_run_config(embedding=make_embedding_identity())
+
+    def test_rrf_k_without_embedding_is_rejected(self) -> None:
+        """Stamps a fusion constant onto a run that never fused anything.
+
+        The same "describes a computation that did not happen" defect that
+        made ``rrf_k`` conditional in ``runner.py`` in the first place.
+        """
+        with pytest.raises(ValidationError, match="embedding"):
+            make_run_config(rrf_k=60)
+
+    def test_the_error_names_which_half_is_missing(self) -> None:
+        """A validator that only says "inconsistent" makes the caller guess."""
+        with pytest.raises(ValidationError) as excinfo:
+            make_run_config(rrf_k=60)
+
+        message = str(excinfo.value)
+        assert "embedding" in message
+        assert "rrf_k" in message
+
+    def test_dense_and_rerank_groups_are_independent(self) -> None:
+        """A BM25-input rerank run has rerank fields and no dense ones.
+
+        The two validators must not be coupled: reranking the BM25 baseline
+        is a complete, self-contained configuration that embeds nothing, and
+        requiring dense fields alongside rerank fields would make it
+        unrepresentable.
+        """
+        config = make_rerank_run_config()
+
+        assert config.rerank_input == "bm25"
+        assert config.embedding is None
+        assert config.rrf_k is None
+
+    def test_both_groups_populated_is_valid(self) -> None:
+        """The fusion-input rerank run: dense pair and reranker together."""
+        config = make_rerank_run_config(
+            rerank_input="fusion", embedding=make_embedding_identity(), rrf_k=60
+        )
+
+        assert config.rerank_input == "fusion"
+        assert config.embedding is not None
+        assert config.rrf_k == 60

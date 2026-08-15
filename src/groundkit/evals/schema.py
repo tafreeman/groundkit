@@ -18,6 +18,13 @@ is gitignored, so every artifact in existence is produced by the code
 reading it. Should that ever stop being true, the next field is a version
 bump, not another default.
 
+The ``rerank`` stage (ADR-0012) extends :class:`RunConfig` by three more
+fields on the same terms and for the same reason it is safe: still no kept
+artifact, still additive-with-default. That condition has now been relied on
+twice, so it is worth restating as the live constraint it is rather than a
+historical note — the moment an artifact outlives the code that wrote it,
+the next field is a ``schema_version`` bump.
+
 Deltas are **not** here. They are derived at read time by
 :mod:`groundkit.evals.delta`, which returns a ``StageDelta`` that is never a
 field of :class:`EvalReport` — see that module and :class:`EvalReport` for
@@ -56,11 +63,33 @@ class RunConfig(BaseModel):
     fusion stages, both optional and both ``None``-meaning-absent rather
     than ``None``-meaning-defaulted: a BM25-only run has no embedding
     identity and no fusion constant, and inventing one would put a number in
-    the artifact that nothing produced. ``embedding`` in particular is what
+    the artifact that nothing produced. They are enforced as a pair by
+    :meth:`_validate_dense_fields` — see there for why the coupling is a
+    property of today's stage plan rather than a law, and what a future
+    dense-only mode would have to revisit. ``embedding`` in particular is what
     stops the corpus/judgment hashes from overstating comparability — two
     runs over identical golden data with *different* embedders agree on
     every existing field here while measuring two different semantic spaces,
     which is ADR-0004's silent-mixing failure one layer above the index.
+
+    The three ``rerank_*`` fields exist for a sharper version of that same
+    problem, and are not optional documentation (ADR-0012). A ``rerank``
+    stage reorders **the best upstream stage available** — ``fusion`` when
+    the run had a dense pair, ``bm25`` when it did not — so unlike every
+    other stage in this schema, what the ``rerank`` row measured is a
+    function of how the run was configured. Two reports can hold a ``rerank``
+    stage each, agree on ``corpus_hash``, ``judgments_hash`` and every other
+    field here, and describe two different experiments. ``rerank_input`` is
+    what makes that difference visible; without it the incomparability is
+    silent, which is the one outcome ADR-0012 refuses. ``rerank_candidates``
+    matters for a reason that is easy to miss: the reranker truncates to
+    ``top_k`` *after* reordering, so a run whose candidate depth equals
+    ``top_k`` hands the model a set it can only permute, and that run's
+    ``recall_at_10`` is pinned to the upstream stage's by construction rather
+    than measured. A reader comparing two ``rerank`` rows needs the depth to
+    know whether a flat recall delta was a finding or an arithmetic
+    inevitability. ``rerank_model`` closes the ADR-0004 argument one more
+    layer up: two cross-encoders are two different measurements.
 
     Attributes:
         chunk_size: Target chunk size in characters
@@ -80,6 +109,19 @@ class RunConfig(BaseModel):
             a footnote a reader has to remember.
         rrf_k: The RRF constant used by the fusion stage (ADR-0005), or
             ``None`` if this run produced no fusion stage.
+        rerank_input: The stage whose results the ``rerank`` stage
+            reordered, or ``None`` if this run produced no rerank stage.
+            Never ``"rerank"`` — a stage cannot be its own input.
+        rerank_candidates: How many candidates the upstream stage was asked
+            for before reranking truncated them back to ``top_k``, or
+            ``None`` if this run produced no rerank stage. Never below
+            ``top_k``.
+        rerank_model: Identity of the reranker that produced the stage, or
+            ``None`` if this run produced no rerank stage. A value that
+            names a class rather than a model — anything other than a real
+            cross-encoder identifier — marks the stage's numbers as
+            structurally valid and semantically meaningless, exactly as
+            ``embedding.provider == "inmemory"`` does for the dense stages.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -92,6 +134,86 @@ class RunConfig(BaseModel):
     score_threshold: float | None
     embedding: EmbeddingIdentity | None = None
     rrf_k: int | None = Field(default=None, gt=0)
+    rerank_input: StageName | None = None
+    rerank_candidates: int | None = Field(default=None, gt=0)
+    rerank_model: str | None = None
+
+    def _require_all_or_none(self, group: tuple[str, ...], subject: str) -> None:
+        """Reject a half-populated field group.
+
+        Shared by both validators below rather than written twice, because
+        the defect being prevented is one defect: a field group describing a
+        stage that either ran or did not, recorded as though it half did.
+        An artifact like that does not fail anywhere — it is read, believed,
+        and compared against another run that meant something different.
+
+        Args:
+            group: Field names that must all be set or all be ``None``.
+            subject: What the group describes, named in the error.
+
+        Raises:
+            ValueError: Some but not all of ``group`` are set.
+        """
+        present = [name for name in group if getattr(self, name) is not None]
+        if present and len(present) != len(group):
+            missing = [name for name in group if getattr(self, name) is None]
+            raise ValueError(
+                f"{', '.join(group)} describe {subject} and must be set together or not "
+                f"at all; got {sorted(present)} without {sorted(missing)}"
+            )
+
+    @model_validator(mode="after")
+    def _validate_dense_fields(self) -> RunConfig:
+        """``embedding`` and ``rrf_k`` are both present or both absent.
+
+        Added after the ``rerank_*`` trio below made the gap visible: these
+        two carry the same pairing semantics — both set on a dense run,
+        both ``None`` on a BM25-only one — and until now the invariant held
+        only because ``runner.py`` happens to gate both assignments on the
+        same ``embedder is not None`` predicate at the single production
+        call site. A hand-built config, a test double, or a second library
+        caller could produce half a pair with no error, and the two halves
+        lie in different directions: ``embedding`` without ``rrf_k`` hides
+        which semantic space was measured for the fusion stage, and
+        ``rrf_k`` without ``embedding`` stamps a fusion constant onto a run
+        that never fused anything — the exact "describes a computation that
+        did not happen" defect ``runner.py``'s own comment cites as the
+        reason ``rrf_k`` is conditional in the first place.
+
+        **The coupling is a coincidence of today's stage plan, not a law.**
+        The honest invariants are per-field — ``embedding`` present iff the
+        run embedded, ``rrf_k`` present iff a fusion stage ran — and they
+        coincide only because a dense pair always produces *both* a ``dense``
+        and a ``fusion`` stage (``_DENSE_STAGE_MODES``). A future dense-only
+        mode would legitimately set one without the other, and this
+        validator would then fail loudly rather than silently accept a
+        mislabelled artifact. That is the intended outcome: it forces the
+        decision back through here instead of letting the meaning drift.
+        """
+        self._require_all_or_none(("embedding", "rrf_k"), "a dense/fusion run")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_rerank_fields(self) -> RunConfig:
+        """The three ``rerank_*`` fields are all present or all absent.
+
+        Half a rerank record is worse than none: a ``rerank`` stage whose
+        ``rerank_input`` is ``None`` is precisely the silently-incomparable
+        artifact ADR-0012 exists to prevent, and a ``rerank_input`` with no
+        stage to describe claims a measurement the run never made. Neither
+        is representable.
+        """
+        self._require_all_or_none(
+            ("rerank_input", "rerank_candidates", "rerank_model"), "a rerank stage"
+        )
+        if self.rerank_input == "rerank":
+            raise ValueError("rerank_input must name the stage rerank reordered, not 'rerank'")
+        if self.rerank_candidates is not None and self.rerank_candidates < self.top_k:
+            raise ValueError(
+                f"rerank_candidates ({self.rerank_candidates}) must be at least top_k "
+                f"({self.top_k}); reranking cannot return more results than it was given"
+            )
+        return self
 
 
 class RunMetadata(BaseModel):

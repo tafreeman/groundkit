@@ -211,23 +211,38 @@ def _coerce_logits(raw: Any, *, model_name: str) -> list[float]:
     Raises:
         RetrievalError: ``raw`` is not iterable, or an element is not a scalar.
     """
+    # Both boundaries below catch `Exception`, not a named tuple, and that is
+    # the fix for a *class* of defect rather than the two instances of it.
+    # Enumerating the exceptions a conversion can raise has now failed twice
+    # here: `list(raw)` was guarded for `TypeError` only, and `float(score)`
+    # for `(TypeError, ValueError)` only — which misses `OverflowError` from
+    # an int too large to represent, an ordinary outcome for a backend this
+    # repo does not control. Both operands come from a caller-named model
+    # (`--rerank-model`), so their `__iter__`/`__float__` are third-party
+    # code that may raise anything at all; any named list is a guess at what
+    # someone else's library does. An untyped escape here crosses the seam as
+    # an arbitrary exception and `cli.py`'s `except GroundkitError` misses it,
+    # which is the exact failure this function exists to prevent. Matches how
+    # `rerank()` already wraps `model.predict` below.
     try:
         values = list(raw)
-    except TypeError as exc:
+    except Exception as exc:
         raise RetrievalError(
             f"Cross-encoder {model_name!r} returned a non-iterable prediction "
-            f"({type(raw).__name__}); one score per query/passage pair is required"
+            f"({type(raw).__name__}, which raised {type(exc).__name__}); one score "
+            "per query/passage pair is required"
         ) from exc
 
     logits: list[float] = []
     for position, score in enumerate(values):
         try:
             logits.append(float(score))
-        except (TypeError, ValueError) as exc:
+        except Exception as exc:
             raise RetrievalError(
                 f"Cross-encoder {model_name!r} returned a non-scalar score at position "
-                f"{position} ({type(score).__name__}). A multi-label model emits one row "
-                "per label rather than a single relevance score; this reranker requires a "
+                f"{position} ({type(score).__name__}, which raised "
+                f"{type(exc).__name__}). A multi-label model emits one row per label "
+                "rather than a single relevance score; this reranker requires a "
                 "single-label cross-encoder."
             ) from exc
     return logits
@@ -254,8 +269,21 @@ def _import_cross_encoder() -> tuple[Any, Any]:
         # extra is deliberately absent from the dev group, so mypy cannot see
         # them in the checked environment. The ignore is scoped to these two
         # lines rather than relaxing the strict settings repo-wide.
-        import torch  # type: ignore[import-not-found]
-        from sentence_transformers import CrossEncoder  # type: ignore[import-not-found]
+        #
+        # `unused-ignore` is listed alongside because whether the first code
+        # fires depends on the environment, not on this file: with the extra
+        # absent (CI's default job, a base install) the import is unresolved
+        # and the ignore is required; with it present (`uv sync --extra
+        # rerank`, which the gated workflow and anyone reproducing a real
+        # rerank measurement must run) the import resolves and mypy reports
+        # the ignore itself as unused. Naming only the first code made
+        # `uv run mypy` fail for exactly the people following the documented
+        # gated-run instructions, and no CI job catches it because the gated
+        # workflow runs pytest only.
+        import torch  # type: ignore[import-not-found,unused-ignore]
+        from sentence_transformers import (  # type: ignore[import-not-found,unused-ignore]
+            CrossEncoder,
+        )
 
         identity_activation = torch.nn.Identity()
     except ImportError as exc:

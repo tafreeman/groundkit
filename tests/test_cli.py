@@ -7,7 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from groundkit.cli import main
+from groundkit.cli import _build_parser, _print_eval_summary, main
+from groundkit.evals.schema import (
+    EvalReport,
+    MetricSet,
+    RunConfig,
+    RunMetadata,
+    StageName,
+    StageResult,
+)
 from groundkit.retrieval.search import MAX_TOP_K
 
 
@@ -814,3 +822,238 @@ def test_eval_dense_verdict_matches_the_artifact_it_describes(
         assert "improvement vs baseline" in out
     else:
         assert "no change vs baseline" in out
+
+
+# --- --rerank / --rerank-model: argument validation, mirroring --embed-* ---
+
+
+def test_eval_rerank_flag_defaults_to_false_and_parses_when_supplied() -> None:
+    """The parser accepts --rerank and it defaults to False when absent."""
+    assert _build_parser().parse_args(["eval"]).rerank is False
+    assert _build_parser().parse_args(["eval", "--rerank"]).rerank is True
+
+
+def test_eval_rerank_model_without_rerank_fails_closed(
+    eval_corpus: Path,
+    eval_judgments: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A --rerank-model without --rerank is an error, mirroring the --embed-* rule.
+
+    Same fail-closed shape as ``test_eval_embed_flags_without_dense_fail_cleanly``:
+    a flag that would configure a path the run never takes is a mistake to
+    name, not one to silently ignore.
+    """
+    output = tmp_path / "results" / "latest.json"
+    assert (
+        main(
+            [
+                "eval",
+                "--corpus-dir",
+                str(eval_corpus),
+                "--judgments",
+                str(eval_judgments),
+                "--output",
+                str(output),
+                "--rerank-model",
+                "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "--rerank" in err
+    assert "requires --rerank" in err
+
+
+def test_eval_rerank_model_without_rerank_fails_before_touching_corpus_or_judgments(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Flag validation runs before any corpus read or judgments load.
+
+    Both the corpus dir and the judgments path are nonexistent. If the CLI
+    did any real work before validating ``--rerank-model``, this would fail
+    with the missing-judgments ``EvalError`` instead — the same ordering
+    ``test_eval_top_k_above_the_cap_fails_before_writing_a_report`` pins for
+    ``--top-k``.
+    """
+    output = tmp_path / "results" / "latest.json"
+    assert (
+        main(
+            [
+                "eval",
+                "--corpus-dir",
+                str(tmp_path / "no-such-corpus"),
+                "--judgments",
+                str(tmp_path / "no-such-judgments.jsonl"),
+                "--output",
+                str(output),
+                "--rerank-model",
+                "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "requires --rerank" in err
+    assert "judgments file not found" not in err
+    assert not output.exists()
+
+
+# --- Rerank provenance and attribution printing, driven by a hand-built
+# EvalReport rather than a real CrossEncoderReranker. The 'rerank' extra
+# (torch, multi-gigabyte) is deliberately absent from the dev group, so these
+# tests build a valid report directly instead of running --rerank end to end.
+
+
+def _metric_set() -> MetricSet:
+    """A structurally valid MetricSet; the specific values are not asserted on."""
+    return MetricSet(
+        query_count=2,
+        recall_at_1=0.5,
+        recall_at_5=0.5,
+        recall_at_10=0.5,
+        mrr=0.5,
+        ndcg_at_10=0.5,
+    )
+
+
+def _stage_result(stage: StageName, *, is_baseline: bool) -> StageResult:
+    """A structurally valid, empty-queries StageResult for the given stage name."""
+    return StageResult(
+        stage=stage,
+        is_baseline=is_baseline,
+        aggregate=_metric_set(),
+        by_category={},
+        no_answer_query_count=0,
+        no_answer_abstained_count=0,
+        latency_p50_ms=1.0,
+        latency_p95_ms=2.0,
+        latency_p99_ms=3.0,
+        queries=[],
+    )
+
+
+def _rerank_report(
+    *,
+    stage_names: list[StageName],
+    top_k: int,
+    rerank_input: StageName,
+    rerank_candidates: int,
+    rerank_model: str,
+) -> EvalReport:
+    """A hand-built, schema-valid EvalReport carrying a rerank stage.
+
+    No retrieval, no index, no model — every field is either fixed or taken
+    from the caller, which is what lets this exercise ``_print_eval_summary``
+    and ``_print_rerank_provenance`` without the optional 'rerank' extra.
+    """
+    stages = [_stage_result(name, is_baseline=(i == 0)) for i, name in enumerate(stage_names)]
+    config = RunConfig(
+        chunk_size=512,
+        chunk_overlap=64,
+        top_k=top_k,
+        bm25_k1=1.5,
+        bm25_b=0.75,
+        score_threshold=None,
+        rerank_input=rerank_input,
+        rerank_candidates=rerank_candidates,
+        rerank_model=rerank_model,
+    )
+    run = RunMetadata(
+        started_at="2026-08-15T00:00:00+00:00",
+        groundkit_version="0.1.0.dev0",
+        corpus_hash="deadbeef",
+        judgments_hash="cafebabe",
+        document_count=2,
+        chunk_count=2,
+        judgment_count=2,
+        config=config,
+    )
+    return EvalReport(run=run, stages=stages)
+
+
+def test_eval_rerank_provenance_line_reports_input_model_candidates(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    report = _rerank_report(
+        stage_names=["bm25", "rerank"],
+        top_k=10,
+        rerank_input="bm25",
+        rerank_candidates=MAX_TOP_K,
+        rerank_model="cross-encoder/ms-marco-MiniLM-L-6-v2",
+    )
+    _print_eval_summary(report, tmp_path / "out.json")
+    out = capsys.readouterr().out
+    assert (
+        "rerank: input=bm25 model=cross-encoder/ms-marco-MiniLM-L-6-v2 "
+        f"candidates={MAX_TOP_K} truncated_to=10"
+    ) in out
+    assert "WARNING" not in out
+
+
+def test_eval_rerank_provenance_warns_when_candidates_equal_top_k(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    report = _rerank_report(
+        stage_names=["bm25", "rerank"],
+        top_k=10,
+        rerank_input="bm25",
+        rerank_candidates=10,
+        rerank_model="cross-encoder/ms-marco-MiniLM-L-6-v2",
+    )
+    _print_eval_summary(report, tmp_path / "out.json")
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "candidate depth equals top_k" in out
+
+
+def test_eval_rerank_provenance_warning_absent_when_candidates_exceed_top_k(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    report = _rerank_report(
+        stage_names=["bm25", "rerank"],
+        top_k=10,
+        rerank_input="bm25",
+        rerank_candidates=MAX_TOP_K,
+        rerank_model="cross-encoder/ms-marco-MiniLM-L-6-v2",
+    )
+    _print_eval_summary(report, tmp_path / "out.json")
+    assert "WARNING" not in capsys.readouterr().out
+
+
+def test_eval_rerank_attribution_delta_not_duplicated_on_bm25_input(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """On a BM25-only run, the attribution would be byte-identical to the
+    baseline delta already printed for 'rerank' — so it must not repeat."""
+    report = _rerank_report(
+        stage_names=["bm25", "rerank"],
+        top_k=10,
+        rerank_input="bm25",
+        rerank_candidates=MAX_TOP_K,
+        rerank_model="cross-encoder/ms-marco-MiniLM-L-6-v2",
+    )
+    _print_eval_summary(report, tmp_path / "out.json")
+    out = capsys.readouterr().out
+    assert out.count("delta[rerank vs bm25]:") == 1
+
+
+def test_eval_rerank_attribution_delta_printed_on_fusion_input(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """On a dense run, both the baseline delta and the reranker's own
+    contribution against 'fusion' must be printed — two different facts."""
+    report = _rerank_report(
+        stage_names=["bm25", "dense", "fusion", "rerank"],
+        top_k=10,
+        rerank_input="fusion",
+        rerank_candidates=MAX_TOP_K,
+        rerank_model="cross-encoder/ms-marco-MiniLM-L-6-v2",
+    )
+    _print_eval_summary(report, tmp_path / "out.json")
+    out = capsys.readouterr().out
+    assert "delta[rerank vs bm25]:" in out
+    assert "delta[rerank vs fusion]:" in out

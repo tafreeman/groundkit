@@ -212,7 +212,7 @@ alike. Revert the source (not the test), run, restore, run.
 | 0 | Inventory & spec | ADR-0001 + SPEC v1 + skeleton, gates green, owner review | done 2026-08-10 |
 | 1 | Deterministic core | ingest→chunk→BM25→embedding interface→persisted index→citation-resolving retrieval; unit tests; coverage gate on; chunker loop + loader fixes in with regression tests | done 2026-08-10 |
 | 2 | Eval harness | golden corpus + metrics engine + BM25 baseline report as reference artifact | done 2026-08-11 |
-| 3 | Hybrid + rerank | dense (LanceDB w/ metadata filtering), RRF, optional cross-encoder (normalized scores); each with eval delta vs baseline | pending |
+| 3 | Hybrid + rerank | dense (LanceDB w/ metadata filtering), RRF, optional cross-encoder (normalized scores); each with eval delta vs baseline | done 2026-08-15 |
 | 4 | Service + MCP | FastAPI + MCP server + CLI; `grk ingest ./docs && grk serve-mcp` connectable from Claude Desktop/Code with documented client config | pending |
 | 5 | Boundary features | optional query rewrite + cited synthesis; redaction pass (names → tokens, configurable patterns); advisory faithfulness judge | pending |
 | 6 | IaC + observability | multi-stage non-root Dockerfile; compose (service+Ollama+collector+Jaeger); k8s (deployment, service, PVC, probes); Terraform module for one concrete provider; OTel verified end-to-end in compose | pending |
