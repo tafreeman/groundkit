@@ -4,6 +4,20 @@ Ports ARP's ``agentic_v2/rag/ingestion.py`` (promote decision, ADR-0001) and
 adds the directory-scale entry point ARP never had (ADR-0001 gap #2):
 ``ingest()`` alone cannot meet the "directory-scale ingestion" v1
 requirement (SPEC.md §4).
+
+**This is not the ingest path** (ADR-0010). It loads and chunks; it never
+touches a collection. Writing to a collection is
+:class:`~groundkit.indexer.Indexer`'s alone, and the two must not be merged:
+``Indexer`` skips an unchanged document on its processing fingerprint
+*before* chunking (ADR-0009), and that same gate is what keeps an unchanged
+document from being re-embedded. :meth:`IngestionPipeline.ingest` always
+chunks, so composing it into the indexer would move chunking ahead of the
+gate and re-embed an unchanged corpus on every run — billable against a
+hosted provider, and silent: nothing would fail, the collection would stay
+correct, and only the bill and the wall-clock would move. The resemblance
+between the two modules is therefore deliberate and bounded to
+:func:`discover_files` and :data:`DEFAULT_MAX_CONCURRENT`, which find files
+rather than process them.
 """
 
 from __future__ import annotations

@@ -54,5 +54,17 @@ class RetrievalError(GroundkitError):
     """Error during retrieval or search."""
 
 
+class RerankerNotConfiguredError(RetrievalError):
+    """A reranker was requested but its backend is unavailable. Never falls back.
+
+    Raised when the optional ``rerank`` extra is not installed, or when the
+    configured cross-encoder model cannot be loaded. Deliberately **not** a
+    silent passthrough of the input ordering: a reranker that quietly returns
+    what it was given is indistinguishable from one that worked, so a
+    misconfigured deployment would report rerank-stage numbers that are really
+    the upstream stage's (SPEC.md §2, fail closed).
+    """
+
+
 class EvalError(GroundkitError):
     """Error loading, validating, or resolving the golden eval corpus."""

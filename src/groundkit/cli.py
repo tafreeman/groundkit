@@ -28,11 +28,13 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from pydantic import ValidationError
+
 from groundkit import __version__
 from groundkit.config import EmbeddingConfig, RetrievalConfig
 from groundkit.errors import ConfigurationError, EvalError, GroundkitError
 from groundkit.evals.delta import StageDelta, derive_stage_deltas
-from groundkit.evals.runner import run_eval, write_report
+from groundkit.evals.runner import MIN_EVAL_TOP_K, run_eval, write_report
 from groundkit.evals.schema import EvalReport
 from groundkit.index.dense import InMemoryVectorStore, LanceDBVectorStore
 from groundkit.index.metadata import SQLiteMetadataStore
@@ -47,10 +49,6 @@ if TYPE_CHECKING:
 
 #: Characters of chunk content shown per result in text output.
 _SNIPPET_CHARS: int = 160
-
-#: Floor on ``grk eval --top-k``: recall@10 cannot be computed from fewer
-#: than 10 retrieved results per query.
-_MIN_EVAL_TOP_K: int = 10
 
 #: ``--embed-*`` flags shared by ``ingest --dense`` and ``search --mode
 #: {dense,hybrid}``, and the ``argparse.Namespace`` attribute each maps to.
@@ -144,7 +142,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--top-k",
         type=int,
         default=10,
-        help=f"Results retrieved per query ({_MIN_EVAL_TOP_K}-{MAX_TOP_K}).",
+        help=f"Results retrieved per query ({MIN_EVAL_TOP_K}-{MAX_TOP_K}).",
     )
     eval_parser.add_argument("--json", action="store_true", help="Emit the full report as JSON.")
     eval_parser.add_argument(
@@ -218,16 +216,38 @@ def _resolve_embedding_config(args: argparse.Namespace) -> EmbeddingConfig:
     already constrains it, so this is defense in depth, not the only check).
     Defaults come from a fresh :class:`EmbeddingConfig` — one source of truth,
     not a second copy of its field defaults.
+
+    Pydantic's own field invariants (``dimensions`` must be ``> 0``, and any
+    other bound :class:`EmbeddingConfig` grows later) are enforced here and
+    nowhere else on this path, so the ``ValidationError`` they raise is
+    translated into a :class:`~groundkit.errors.ConfigurationError`.
+    Untranslated it is not a ``GroundkitError``, so ``main``'s handler does
+    not see it and ``grk ingest --dense --embed-dimensions 0`` exits on a
+    pydantic traceback rather than the one-line ``error:`` message every
+    other bad flag produces. Translating at this single construction site
+    rather than re-checking each bound in argparse keeps
+    :class:`EmbeddingConfig` the only place a bound is stated.
+
+    Raises:
+        ConfigurationError: A supplied ``--embed-*`` value violates an
+            :class:`EmbeddingConfig` invariant.
     """
     defaults = EmbeddingConfig()
-    return EmbeddingConfig(
-        provider=args.embed_provider if args.embed_provider is not None else defaults.provider,
-        model_name=args.embed_model if args.embed_model is not None else defaults.model_name,
-        dimensions=(
-            args.embed_dimensions if args.embed_dimensions is not None else defaults.dimensions
-        ),
-        base_url=args.embed_base_url if args.embed_base_url is not None else defaults.base_url,
-    )
+    try:
+        return EmbeddingConfig(
+            provider=args.embed_provider if args.embed_provider is not None else defaults.provider,
+            model_name=args.embed_model if args.embed_model is not None else defaults.model_name,
+            dimensions=(
+                args.embed_dimensions if args.embed_dimensions is not None else defaults.dimensions
+            ),
+            base_url=args.embed_base_url if args.embed_base_url is not None else defaults.base_url,
+        )
+    except ValidationError as exc:
+        details = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+            for error in exc.errors()
+        )
+        raise ConfigurationError(f"invalid embedding configuration ({details})") from exc
 
 
 async def _open_dense_deps(
@@ -358,10 +378,12 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
     # --top-k embeds the whole corpus and only then gets rejected inside the
     # stage loop, spending real provider work — billable, against a hosted
     # endpoint — on an invocation that could never have produced a report.
-    if args.top_k < _MIN_EVAL_TOP_K:
+    # run_eval enforces both bounds itself; these restate them in --top-k's
+    # own vocabulary, and share run_eval's constants so the two cannot drift.
+    if args.top_k < MIN_EVAL_TOP_K:
         raise EvalError(
-            f"--top-k must be at least {_MIN_EVAL_TOP_K} (recall@10 cannot be computed "
-            f"from fewer than {_MIN_EVAL_TOP_K} retrieved results), got {args.top_k}"
+            f"--top-k must be at least {MIN_EVAL_TOP_K} (recall@10 cannot be computed "
+            f"from fewer than {MIN_EVAL_TOP_K} retrieved results), got {args.top_k}"
         )
     if args.top_k > MAX_TOP_K:
         raise EvalError(

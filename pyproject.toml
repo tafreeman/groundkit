@@ -34,6 +34,18 @@ dependencies = [
 dense = [
   "lancedb>=0.13,<1",
 ]
+# Cross-encoder rerank (Phase 3 Wave D, ADR-0005 decision 4). Deliberately
+# *not* mirrored into the dev group, unlike `dense` above: torch is a
+# multi-gigabyte install and Wave D's plan requires that CI's default job never
+# pull it. The backend is proved instead by the gated suite
+# (`RERANK_GATED=1 uv run pytest tests/test_rerank_gated.py`), which is the sole
+# proof of this backend and is correspondingly never `continue-on-error`
+# (SPEC.md §3). Everything in `retrieval/rerank.py` that does not need a model —
+# the sigmoid, the ordering, the contract re-validation, every failure path — is
+# pure and covered by the default suite.
+rerank = [
+  "sentence-transformers>=3,<6",
+]
 
 [project.scripts]
 grk = "groundkit.cli:main"

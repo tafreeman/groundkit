@@ -20,7 +20,13 @@ from groundkit.config import ChunkingConfig, RetrievalConfig
 from groundkit.contracts import Chunk, Document
 from groundkit.errors import ConfigurationError, EvalError, GroundkitError
 from groundkit.evals.delta import derive_stage_deltas
-from groundkit.evals.runner import EVAL_CHUNKING_CONFIG, _percentile, run_eval, write_report
+from groundkit.evals.runner import (
+    EVAL_CHUNKING_CONFIG,
+    MIN_EVAL_TOP_K,
+    _percentile,
+    run_eval,
+    write_report,
+)
 from groundkit.evals.schema import EvalReport, MetricSet, RunConfig, RunMetadata, StageResult
 from groundkit.index.dense import InMemoryVectorStore
 from groundkit.index.protocols import VectorStoreProtocol
@@ -118,16 +124,22 @@ class TestGroundTruth:
     def test_runner_ground_truth_counts_all_overlapping_chunks_not_only_retrieved(
         self, tmp_path: Path
     ) -> None:
-        """``total_relevant_chunks`` must include a chunk ``top_k`` excluded.
+        """``total_relevant_chunks`` must include chunks ``top_k`` excluded.
 
         Builds one long document of unique tokens so ``EVAL_CHUNKING_CONFIG``
         (chunk_size=512, overlap=64) splits it into several chunks with
         adjacent chunks sharing an overlap region. The real chunker (not a
         hand-computed offset) locates that overlap and a unique token fully
         inside it, so the resulting gold span provably overlaps exactly two
-        persisted chunks. Retrieving with ``top_k=1`` then returns only one
-        of those two chunks — proving ``total_relevant_chunks`` was computed
-        from every persisted chunk, not from what came back on the wire.
+        persisted chunks — while the query retrieves a different chunk
+        entirely, proving ``total_relevant_chunks`` was computed from every
+        persisted chunk rather than from what came back on the wire.
+
+        This used to make the same point with ``top_k=1``. ``run_eval`` now
+        floors ``top_k`` at ``MIN_EVAL_TOP_K``, because every stage
+        publishes ``recall@10`` and a shorter list cannot honestly produce
+        one — so the divergence is created by the *query* here instead of by
+        a cutoff, which pins the property more directly anyway.
         """
         corpus = tmp_path / "corpus"
         corpus.mkdir()
@@ -156,6 +168,12 @@ class TestGroundTruth:
             cursor = idx + 1
         assert quote is not None, "expected a whole token to fit inside the overlap region"
 
+        # A token from the very start of the document, far outside the
+        # overlap region: BM25 drops zero-scored chunks, so querying it
+        # retrieves the chunk holding *it* and neither gold chunk.
+        distant_token = tokens[0]
+        assert distant_token != quote
+
         async def run() -> EvalReport:
             judgments_path = tmp_path / "judgments.jsonl"
             _write_judgments(
@@ -163,19 +181,20 @@ class TestGroundTruth:
                 [
                     {
                         "query_id": "overlap-probe",
-                        "query": quote,
+                        "query": distant_token,
                         "category": "normal",
                         "gold": [{"doc": "gamma.md", "quote": quote}],
                     }
                 ],
             )
-            return await run_eval(corpus, judgments_path, top_k=1)
+            return await run_eval(corpus, judgments_path, top_k=MIN_EVAL_TOP_K)
 
         report = asyncio.run(run())
         query_result = report.stages[0].queries[0]
 
         assert query_result.total_relevant_chunks == 2
-        assert len(query_result.retrieved) == 1
+        relevant_retrieved = sum(1 for hit in query_result.retrieved if hit.is_relevant)
+        assert relevant_retrieved < query_result.total_relevant_chunks
 
 
 class TestNoAnswerHandling:
@@ -760,7 +779,7 @@ class TestTopKBoundIsCheckedBeforeAnyWork:
             _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
             return await run_eval(corpus, judgments_path, top_k=MAX_TOP_K + 1)
 
-        with pytest.raises(EvalError, match=f"between 1 and {MAX_TOP_K}"):
+        with pytest.raises(EvalError, match=f"between {MIN_EVAL_TOP_K} and {MAX_TOP_K}"):
             asyncio.run(run())
 
     def test_top_k_below_one_is_rejected(self, corpus: Path, tmp_path: Path) -> None:
@@ -771,8 +790,42 @@ class TestTopKBoundIsCheckedBeforeAnyWork:
             _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
             return await run_eval(corpus, judgments_path, top_k=0)
 
-        with pytest.raises(EvalError, match=f"between 1 and {MAX_TOP_K}"):
+        with pytest.raises(EvalError, match=f"between {MIN_EVAL_TOP_K} and {MAX_TOP_K}"):
             asyncio.run(run())
+
+    def test_top_k_below_the_eval_floor_is_rejected_by_the_runner_not_only_the_cli(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """A library caller must not be able to publish a short-list ``recall@10``.
+
+        ``MIN_EVAL_TOP_K`` used to live in ``cli.py`` and be enforced only
+        there, so ``grk eval --top-k 1`` was refused while
+        ``run_eval(top_k=1)`` ran happily and emitted a report whose
+        ``recall_at_10`` and ``ndcg_at_10`` were computed over a list capped
+        at one result. Those are not a stricter measurement — a gold chunk at
+        rank 7 scores ``recall_at_10 = 0.0`` under that cutoff and ``1.0``
+        under a real one, from the identical corpus and judgments, both
+        published under the same field name.
+
+        Every value strictly inside ``1..MIN_EVAL_TOP_K`` is rejected, not
+        just the ends: the schema's ``@10`` fields are what makes anything
+        below the floor mislabelled, and there is no cutoff in that range
+        where they become honest again.
+        """
+
+        async def run(top_k: int) -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(corpus, judgments_path, top_k=top_k)
+
+        for top_k in range(1, MIN_EVAL_TOP_K):
+            with pytest.raises(EvalError, match=f"between {MIN_EVAL_TOP_K} and {MAX_TOP_K}"):
+                asyncio.run(run(top_k))
+
+        # The floor itself is accepted — the check is a floor, not an
+        # accidental ban on the boundary value the CLI defaults to.
+        report = asyncio.run(run(MIN_EVAL_TOP_K))
+        assert report.run.config.top_k == MIN_EVAL_TOP_K
 
     def test_the_cap_is_rejected_before_the_embedder_is_ever_called(
         self, corpus: Path, tmp_path: Path
@@ -815,7 +868,7 @@ class TestTopKBoundIsCheckedBeforeAnyWork:
                 vector_store=InMemoryVectorStore(),
             )
 
-        with pytest.raises(EvalError, match=f"between 1 and {MAX_TOP_K}"):
+        with pytest.raises(EvalError, match=f"between {MIN_EVAL_TOP_K} and {MAX_TOP_K}"):
             asyncio.run(run())
 
     def test_the_cap_itself_is_accepted(self, corpus: Path, tmp_path: Path) -> None:

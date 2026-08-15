@@ -2,7 +2,7 @@
 
 Honest and current, per repo policy. Updated with each phase.
 
-## Current state (Phase 3, Wave E)
+## Current state (Phase 3, Wave D — all waves built, eval stage outstanding)
 
 Hybrid retrieval works end-to-end locally, behind opt-in flags: `grk
 ingest --dense` embeds each chunk into a LanceDB vector store alongside the
@@ -99,13 +99,25 @@ per SPEC.md §9:
   O(corpus) BM25 rebuild does any work. A mismatch raises
   `IndexIdentityError`, never a re-embed and never a fallback. A collection
   with no manifest (never dense-ingested) verifies trivially — there is
-  nothing yet for a mismatch to exist against.
+  nothing yet for a mismatch to exist against. **That one verification is
+  also the sole source of the dense-bound verdict** ADR-0008's per-mode
+  refusal reads: `verify_manifest` returns the manifest it checked, rather
+  than `open()` reading it a second time afterwards. Two reads admitted a
+  race with a real silent-corruption outcome — an unbound collection passes
+  the identity check trivially, and a concurrent dense ingest (another task,
+  or another process, neither of which the store's `asyncio.Lock` spans)
+  binding it to a different provider in between made the later read report
+  "bound", so the retriever answered `dense` and `hybrid` by matching this
+  embedder's query vectors against that provider's index. The residual
+  window is biased closed: a collection bound *after* the read is treated as
+  unbound and both modes are refused, which is the same snapshot rule that
+  already governs everything else a retriever cannot see after `open()`.
 - **Cross-store writes are not atomic.** SQLite and the vector store share
   no transaction. The write order — chunk, embed, write the manifest (once,
   before the first vector add), add the new vectors, delete the previous
   document's, commit SQLite last — is chosen so SQLite is never ahead of the
   dense store, and so the document is never left with *no* vectors at any
-  point. A dense store *behind* SQLite is silent: the content-hash skip key
+  point. A dense store *behind* SQLite is silent: the incremental skip key
   means that document is never retried and never appears in dense results. A
   dense store *ahead* of SQLite is detectable: `Retriever.search` already
   fails closed on a hit whose document has no stored source. The residue of
@@ -117,7 +129,7 @@ per SPEC.md §9:
 - **Adding before deleting trades a silent failure for a loud one; it does
   not eliminate the residue.** Deleting first was worse — it opened a window
   with no vectors at all, and a crash there followed by a content reversion
-  (`git checkout`) left SQLite's `content_hash` matching the restored bytes,
+  (`git checkout`) left SQLite's stored fingerprint matching the restored bytes,
   so the document was hash-skipped forever and silently absent from dense
   results. Adding first closes that: the previous vectors survive, so the
   reverted content still resolves. What it costs is that the interrupted
@@ -136,9 +148,13 @@ per SPEC.md §9:
   chunks and zero vectors — strict equality would fail a completely
   healthy upgrade.
 - **Turning the dense path on does not backfill an existing collection.**
-  The incremental content-hash gate runs before chunking and therefore
-  before embedding — that is exactly what keeps an unchanged document from
-  being re-embedded on every run. The cost is that enabling an embedder and
+  The incremental skip gate runs before chunking and therefore before
+  embedding — that is exactly what keeps an unchanged document from being
+  re-embedded on every run. Its key is a fingerprint over content, chunker
+  and chunking configuration (ADR-0009), and deliberately *not* over the
+  embedding identity: including that would turn `--dense` on an existing
+  collection into an implicit full re-embed, which is the auto-backfill
+  ADR-0008 declined. The cost is that enabling an embedder and
   vector store over a collection already ingested BM25-only leaves every
   unchanged document without vectors: it is skipped, so it is never
   embedded. Only documents whose content actually changes afterwards gain
@@ -153,18 +169,32 @@ per SPEC.md §9:
   manifest-bound but only partially embedded — documents that changed after
   the dense path was enabled — is still not detected, and remains the
   genuine half-dense case this entry describes.
-- **A BM25-only indexer will orphan a vector-bearing collection.** The
-  inverse of the above: an `Indexer` constructed without an embedder or
-  vector store still happily replaces, prunes, and deletes documents in a
-  collection whose vectors were written by an earlier dense-enabled run.
-  It has no vector store to delete from, so those vectors survive their
-  documents. The orphans are loud, not silent: Wave C's dense read path
-  fails closed on them — `Retriever.search` (dense and hybrid modes)
-  raises `RetrievalError` on a hit whose document has no stored source,
-  with regression tests for both the deleted-after-open and
-  deleted-before-open cases. Nothing prevents the situation being created
-  in the first place, because the store carries no record that dense
-  writes ever happened beyond the manifest itself.
+- **A BM25-only indexer can no longer orphan a manifest-bound collection —
+  it is refused (ADR-0011).** An `Indexer` constructed without an embedder or
+  vector store has no vector store to delete from, so replacing or pruning a
+  document in a collection whose vectors an earlier dense run wrote left those
+  vectors surviving their documents. This was tolerated until 2026-08-15 on the
+  grounds that the orphans are *loud* — Wave C's dense read path fails closed on
+  them, `Retriever.search` raising `RetrievalError` on a hit whose document has
+  no stored source, with regression tests for both the deleted-after-open and
+  deleted-before-open cases.
+
+  That argument stopped holding when ADR-0009 changed the skip key. A content
+  hash matched on unchanged content, so reaching the hazard required a document
+  to actually change; a fingerprint derived differently matches nothing an
+  earlier build stored, so the *first* BM25-only ingest after that change
+  rewrites every document and orphans the whole dense side in one ordinary
+  command — permanently, because the same write stores the new fingerprint and a
+  later dense run then hash-skips every one of them. What was loud is the
+  eventual read failure, not the write that caused it, and that failure names an
+  index inconsistency rather than the ingest three steps upstream.
+
+  `Indexer._verify_identity` now refuses a run whose indexer has no embedder
+  when the collection is manifest-bound, before any load, chunk or write, with
+  a `ConfigurationError` naming both remedies. The residual hazard is what the
+  manifest cannot see: a collection holding vectors whose manifest was never
+  written, or an `Indexer` holding a store handle from before a manifest
+  appeared. Neither is reachable through the CLI.
 - **The CLI exposes the dense path, entirely opt-in.** `grk ingest --dense`
   embeds and writes vectors alongside the SQLite write; `grk search --mode
   {bm25,dense,hybrid}` reads them back (default `bm25`, and it stays there —
@@ -180,6 +210,34 @@ per SPEC.md §9:
   `<index-dir>/<collection>.lance`, beside `<collection>.sqlite3`. The
   default install, default commands, and CI need no Ollama and are
   unchanged by any of this.
+- **The cross-encoder reranker exists but nothing calls it, and it has no
+  measured delta.** Wave D built `retrieval/rerank.py` — `CrossEncoderReranker`
+  behind `RerankerProtocol`, with ADR-0001 hazard 2 closed by a sigmoid that
+  is total and monotonic, so no logit however negative can violate
+  `RetrievalResult.score`'s `ge=0.0` bound and the ranking is never altered by
+  the normalization. What does **not** yet exist is any caller:
+  `Retriever.search` has no rerank mode, `run_eval` accepts no reranker, and
+  `grk` exposes no flag. `rerank` is already a legal `StageName`, so a report
+  *could* carry the stage — and none does.
+
+  The consequence to be honest about: **rerank is unmeasured.** Every other
+  Phase 3 retrieval stage reports a signed delta against the BM25 baseline,
+  including when it loses; rerank reports nothing, so no claim that it improves
+  retrieval on this corpus is currently supported by anything in this repo.
+  SPEC.md §9 makes that delta a Phase 3 completion requirement, which is why
+  Phase 3 is not done. The two design decisions blocking it — which upstream
+  stage rerank reorders, and whether it reaches `Retriever.search` at all — are
+  written up in `docs/specs/phase-3-hybrid-retrieval.md` under Wave D.
+
+  Also true of the reranker as built: it needs the optional `rerank` extra
+  (torch, multi-gigabyte), which is deliberately absent from the dev group, so
+  the default suite never loads a model. The pure surface is covered offline;
+  the real model is proved only by `RERANK_GATED=1`, which — like the Ollama
+  eval gate above — is `workflow_dispatch`-only during active development and
+  therefore **re-measures nothing automatically**. Truncation to `top_k`
+  happens after reranking, so a reranker can promote a candidate the upstream
+  stage ranked below the cut only if that candidate was inside the list it was
+  handed; it cannot recover a document the upstream stage never retrieved.
 - **`score_threshold` does not apply to hybrid results.** ADR-0005
   decision 6: an RRF-fused score is a function of result-set size and
   retriever count, not a probability, and thresholding it would silently
@@ -264,6 +322,15 @@ per SPEC.md §9:
 - Baseline deltas are intra-run only. `evals/results/` is gitignored, so no
   historical artifact reliably exists to diff across runs. Later stages
   compare against the baseline stage inside the same report.
+- `MetricSet`'s cutoffs are fixed at 1/5/10, so `run_eval` refuses a
+  `top_k` below 10 (`MIN_EVAL_TOP_K`) rather than publishing an `@10` field
+  computed from a shorter list. The floor used to live only in `cli.py`,
+  which left a library caller free to emit a report whose `recall_at_10`
+  was a `recall@1` under a `@10` name — a gold chunk at rank 7 scoring
+  `0.000` or `1.000` from identical inputs depending on a cutoff nothing
+  reading the field is obliged to cross-check. Evaluating a genuinely
+  top-3 system is therefore not expressible here; that needs configurable
+  cutoffs in the schema, not a smaller `top_k`.
 - Latency percentiles are computed from a small sample (one measurement per
   judgment), so p95/p99 are order-of-magnitude indicators, not reliable
   tail estimates.

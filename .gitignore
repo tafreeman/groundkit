@@ -29,6 +29,12 @@ evals/results/
 # of truth; a fresh clone is governed by those.
 CLAUDE.md
 
+# External review scratch — build scripts and rendered artifacts produced by
+# agent review runs against this repo. Not repo content, and not held to its
+# gates: `ruff check .` walks it otherwise and reports errors from code this
+# project neither owns nor ships.
+.codex-artifacts/
+
 # Editors / OS
 .idea/
 .vscode/

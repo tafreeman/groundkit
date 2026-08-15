@@ -51,7 +51,6 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from groundkit import __version__
 from groundkit.config import ChunkingConfig, RetrievalConfig
-from groundkit.contracts import EmbeddingIdentity
 from groundkit.errors import ConfigurationError, EvalError, GroundkitError
 from groundkit.evals.corpus import (
     chunk_overlaps_span,
@@ -79,6 +78,7 @@ from groundkit.evals.schema import (
     StageName,
     StageResult,
 )
+from groundkit.identity import identity_of, validate_dense_pair
 from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.indexer import Indexer
 from groundkit.ingestion.loaders import FileLoader
@@ -110,6 +110,21 @@ _DENSE_STAGE_MODES: tuple[tuple[StageName, SearchMode], ...] = (
     ("dense", "dense"),
     ("fusion", "hybrid"),
 )
+
+#: Floor on ``run_eval``'s ``top_k``, enforced here rather than only at the
+#: CLI boundary. Every stage publishes ``recall@10`` and ``nDCG@10``
+#: (``MetricSet``'s fields are fixed at 1/5/10), and both are sliced from
+#: the single ranked list retrieval returned — so a run below this floor
+#: does not measure recall@10 at a different cutoff, it computes the
+#: ``@10`` metrics over a list that was never allowed to reach ten and
+#: publishes the shortfall under the ``@10`` name. ``top_k=1`` scoring an
+#: otherwise-perfect rank-7 hit as ``recall_at_10 = 0.0`` is not a stricter
+#: measurement; it is a mislabelled one, and ``RunConfig.top_k`` recording
+#: the cutoff does not undo the mislabelling because nothing reading
+#: ``recall_at_10`` is obliged to cross-check it. The CLI has always
+#: rejected this; a library caller reaching :func:`run_eval` directly could
+#: not, which is the gap this closes.
+MIN_EVAL_TOP_K: int = 10
 
 
 #: Chunking config pinned for eval runs, with every value stated
@@ -169,9 +184,13 @@ async def run_eval(
             ``evals/corpus/``, or a synthetic fixture built the same way).
         judgments_path: Path to a JSONL judgments file, as read by
             :func:`~groundkit.evals.corpus.load_judgments`.
-        top_k: Results requested per query. Retrieval runs exactly once per
-            query per stage at this cutoff; recall@1/5/10 are all sliced
-            from that single ranked list rather than re-querying per ``k``.
+        top_k: Results requested per query, at least
+            :data:`MIN_EVAL_TOP_K` and at most
+            :data:`~groundkit.retrieval.search.MAX_TOP_K`. Retrieval runs
+            exactly once per query per stage at this cutoff; recall@1/5/10
+            are all sliced from that single ranked list rather than
+            re-querying per ``k`` — which is why the floor exists, since a
+            shorter list cannot produce an ``@10`` metric worth the name.
         embedder: Optional embedding provider enabling the ``dense`` and
             ``fusion`` stages (keyword-only; both or neither with
             ``vector_store``, mirroring ``Indexer`` and ``Retriever``).
@@ -199,13 +218,17 @@ async def run_eval(
         RetrievalError: A search call fails (e.g. an index inconsistency,
             or an out-of-range ``top_k``).
     """
-    if not 1 <= top_k <= MAX_TOP_K:
+    if not MIN_EVAL_TOP_K <= top_k <= MAX_TOP_K:
         raise EvalError(
-            f"top_k must be between 1 and {MAX_TOP_K}, got {top_k}. Checked here rather "
-            "than left to Retriever.search, which enforces the same bound but only "
-            "inside the stage loop — by then a dense run has embedded the entire "
-            "corpus, doing real and possibly billable provider work for an invocation "
-            "that was always going to be rejected."
+            f"top_k must be between {MIN_EVAL_TOP_K} and {MAX_TOP_K}, got {top_k}. The "
+            f"floor is not Retriever.search's (which accepts 1): every stage publishes "
+            f"recall@10 and nDCG@10 sliced from this one ranked list, so below "
+            f"{MIN_EVAL_TOP_K} those fields report a list that was never allowed to "
+            "reach ten under the @10 name. The upper bound is checked here rather than "
+            "left to Retriever.search, which enforces the same one but only inside the "
+            "stage loop — by then a dense run has embedded the entire corpus, doing "
+            "real and possibly billable provider work for an invocation that was "
+            "always going to be rejected."
         )
     _validate_dense_pair(embedder, vector_store)
     if embedder is not None and vector_store is not None:
@@ -356,7 +379,7 @@ async def run_eval(
             bm25_k1=retrieval_config.bm25_k1,
             bm25_b=retrieval_config.bm25_b,
             score_threshold=retrieval_config.score_threshold,
-            embedding=_identity_of(embedder) if embedder is not None else None,
+            embedding=identity_of(embedder) if embedder is not None else None,
             # Recorded only when a fusion stage actually ran: on a BM25-only
             # run the constant was never applied to anything, and stamping
             # the configured value into the artifact anyway would describe a
@@ -501,39 +524,21 @@ def _validate_dense_pair(
 ) -> None:
     """Reject half a dense pair before any corpus work starts.
 
-    Mirrors the identical checks on ``Indexer`` and ``Retriever``. Done here
-    too, rather than left to whichever of them raises first, so the eval
-    fails on the caller's mistake before spending a full ingest on it.
+    The branch structure is shared with ``Indexer`` and ``Retriever``
+    (:func:`groundkit.identity.validate_dense_pair`). Checked here too, rather
+    than left to whichever of them raises first, so the eval fails on the
+    caller's mistake before spending a full ingest on it.
 
     Raises:
         ConfigurationError: Exactly one of ``embedder`` / ``vector_store``
             was supplied.
     """
-    if embedder is not None and vector_store is None:
-        raise ConfigurationError(
-            "run_eval was given an embedder but no vector_store. The pair is "
-            "inseparable: there would be no dense index to search. Pass both or neither."
-        )
-    if vector_store is not None and embedder is None:
-        raise ConfigurationError(
-            "run_eval was given a vector_store but no embedder. The pair is "
-            "inseparable: queries could never be embedded. Pass both or neither."
-        )
-
-
-def _identity_of(embedder: EmbeddingProtocol) -> EmbeddingIdentity:
-    """Read the ADR-0004 identity triple off the embedder itself.
-
-    Mirrors the helpers of the same name in ``indexer.py`` and
-    ``retrieval/search.py``, and for the same reason: sourcing all three
-    fields from the object that actually embeds makes an artifact that
-    names a different model than the one that produced its vectors
-    unrepresentable.
-    """
-    return EmbeddingIdentity(
-        provider=embedder.provider,
-        model_name=embedder.model_name,
-        dimensions=embedder.dimensions,
+    validate_dense_pair(
+        embedder,
+        vector_store,
+        subject="run_eval",
+        without_store="there would be no dense index to search.",
+        without_embedder="queries could never be embedded.",
     )
 
 

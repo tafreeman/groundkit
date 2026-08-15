@@ -528,7 +528,7 @@ class SQLiteMetadataStore:
 
         await self._run(_op)
 
-    async def verify_manifest(self, identity: EmbeddingIdentity) -> None:
+    async def verify_manifest(self, identity: EmbeddingIdentity) -> CollectionManifest | None:
         """Verify ``identity`` matches the collection's stored identity manifest.
 
         A collection with no manifest yet — no dense write has ever
@@ -540,6 +540,15 @@ class SQLiteMetadataStore:
         Args:
             identity: The active embedding identity to check.
 
+        Returns:
+            The manifest this call verified ``identity`` against, or
+            ``None`` when the collection has none. The verdict and the
+            manifest come out of the *same* read, inside one :meth:`_run`,
+            which is what lets a caller decide "is this collection
+            dense-bound" without a second read that could observe a
+            different state — see ``Retriever.open`` for the concrete race
+            this closes.
+
         Raises:
             IndexIdentityError: This store predates the embedding-identity
                 manifest (ADR-0004) and cannot be used for dense work, or
@@ -549,13 +558,13 @@ class SQLiteMetadataStore:
         """
         self._require_manifest_capable("verify")
 
-        def _op() -> None:
+        def _op() -> CollectionManifest | None:
             existing = self._select_manifest()
             if existing is None or _manifest_matches(existing, identity):
-                return
+                return existing
             raise IndexIdentityError(_identity_mismatch_message(existing, identity))
 
-        await self._run(_op)
+        return await self._run(_op)
 
     async def get_manifest(self) -> CollectionManifest | None:
         """Return the collection's embedding-identity manifest, or None if unset.

@@ -2,8 +2,11 @@
 
 This is the wiring ARP never had (ADR-0001 gap #1: a persistence-capable
 store existed but no entry point used it). The :class:`Indexer` connects the
-loader/chunker to the metadata store and skips sources whose content hash is
-unchanged (ADR-0002 incremental re-index).
+loader/chunker to the metadata store and skips sources whose processing
+fingerprint is unchanged (ADR-0002 incremental re-index) — content *plus*
+the chunker and chunking configuration that decide what rows the content
+becomes, so a settings change re-indexes instead of hash-matching its way
+into a collection of stale chunks (see :func:`_processing_fingerprint`).
 
 Phase 3 Wave B adds an optional dense write path: constructed with an
 embedder *and* a vector store, the same pipeline also embeds every changed
@@ -11,8 +14,17 @@ document's chunks and keeps the vector store in lockstep with SQLite —
 replacing or pruning a document deletes its vectors in the same logical
 operation, the ADR-0004 embedding-identity manifest is verified before any
 dense mutation and bound on the first dense write, and the existing
-content-hash gate doubles as the re-embed gate. With neither supplied, the
+fingerprint gate doubles as the re-embed gate. With neither supplied, the
 behaviour is exactly the Phase 1 BM25-only path.
+
+**This is the only ingest path** (ADR-0010). The directory walk below
+resembles :meth:`~groundkit.ingestion.pipeline.IngestionPipeline.ingest_directory`
+and shares its :func:`~groundkit.ingestion.pipeline.discover_files` and
+concurrency bound, but the two are not merged and must not be: the
+fingerprint comparison in :meth:`Indexer._process` runs *before* chunking,
+which is what makes an unchanged document cost neither a re-chunk nor a
+re-embed. ``IngestionPipeline`` always chunks, so routing this path through
+it would separate the skip from the work it exists to skip.
 """
 
 from __future__ import annotations
@@ -27,15 +39,15 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from groundkit.contracts import EmbeddingIdentity
+from groundkit.config import ChunkingConfig
 from groundkit.errors import ConfigurationError, IngestionError
+from groundkit.identity import identity_of, validate_dense_pair
 from groundkit.index.dense import verify_dense_side_present
 from groundkit.ingestion.chunking import RecursiveChunker
 from groundkit.ingestion.pipeline import DEFAULT_MAX_CONCURRENT, discover_files
 from groundkit.utils.path_safety import is_within_base
 
 if TYPE_CHECKING:
-    from groundkit.config import ChunkingConfig
     from groundkit.contracts import Chunk, Document
     from groundkit.index.protocols import MetadataStoreProtocol, VectorStoreProtocol
     from groundkit.ingestion.protocols import ChunkerProtocol, LoaderProtocol
@@ -50,8 +62,9 @@ class IndexReport(BaseModel):
     Attributes:
         files_seen: Files considered (matched a supported extension).
         documents_indexed: Documents newly written or replaced.
-        documents_skipped: Documents skipped because their content hash was
-            unchanged since the last run.
+        documents_skipped: Documents skipped because their processing
+            fingerprint — content, chunker, and chunking configuration —
+            was unchanged since the last run.
         chunks_written: Total chunks persisted this run.
         documents_pruned: Stored documents deleted because their source no
             longer has anything to index. Two distinct cases feed this
@@ -129,8 +142,12 @@ class Indexer:
     cleanup retries to completion. Prefer the loud residue over the silent
     one. (A BM25-only ``Indexer`` mutating a collection that *does* hold
     vectors cannot honor the dense half at all — it has no handle to the
-    vector store — and the residue it can leave, orphaned vectors, is again
-    the loud kind, never the silent kind.)
+    vector store — so it is no longer allowed to try: :meth:`_verify_identity`
+    refuses a manifest-bound collection outright, per ADR-0011. Tolerating it
+    for the loudness of the residue was defensible while only edited documents
+    were at risk; ADR-0009's fingerprint made the *first* such run rewrite
+    every document at once, which is a whole collection's dense side for one
+    ordinary command.)
 
     Args:
         store: The collection's metadata store (durable truth, ADR-0002).
@@ -170,18 +187,18 @@ class Indexer:
         # The dense pair is validated at construction, not discovered
         # mid-ingest: half a dense path is always a caller bug, and each
         # half fails differently (see the messages), so name the missing one.
-        if embedder is not None and vector_store is None:
-            raise ConfigurationError(
-                "Indexer was given an embedder but no vector_store. The pair is "
-                "inseparable: with no store to receive them, every vector the "
-                "embedder produced would be silently discarded. Pass both or neither."
-            )
-        if vector_store is not None and embedder is None:
-            raise ConfigurationError(
-                "Indexer was given a vector_store but no embedder. The pair is "
-                "inseparable: with nothing to produce vectors, the store could "
-                "never be written to. Pass both or neither."
-            )
+        validate_dense_pair(
+            embedder,
+            vector_store,
+            subject="Indexer",
+            without_store=(
+                "with no store to receive them, every vector the embedder produced "
+                "would be silently discarded."
+            ),
+            without_embedder=(
+                "with nothing to produce vectors, the store could never be written to."
+            ),
+        )
         self._store = store
         self._loader = loader
         self._chunker: ChunkerProtocol
@@ -358,9 +375,39 @@ class Indexer:
         )
 
     async def _verify_identity(self) -> None:
-        """Verify the collection manifest before a dense-enabled run does any work.
+        """Verify the collection manifest before any run does work.
 
-        No-op on a BM25-only indexer. On a dense-enabled one this is the
+        On a **BM25-only** indexer this refuses a collection that is already
+        manifest-bound, which is to say one that has a dense side. Such a run
+        cannot maintain that side: every replacement and both prune paths
+        delete vectors only when a vector store is present, while
+        ``replace_document`` installs a fresh document id regardless. The old
+        vectors keep the old id, SQLite stops referencing it, and they are
+        orphaned — and because the same write also stores the new processing
+        fingerprint, a later dense run hash-skips those documents and never
+        re-embeds them, so the orphans are permanent. Dense and hybrid
+        searches then fail closed on the first orphan that ranks into a
+        candidate window, with an error naming an index inconsistency rather
+        than the BM25-only ingest that caused it.
+
+        ADR-0009 is what makes this urgent rather than occasional. When the
+        skip key was a content hash, a BM25-only re-ingest of unchanged
+        content matched and skipped, so nothing was rewritten and nothing was
+        orphaned; only genuinely edited documents were at risk. A fingerprint
+        derived differently matches nothing stored by an earlier build, so the
+        *first* BM25-only ingest after that change rewrites every document in
+        the collection and orphans the entire dense side in one ordinary
+        command. Refusing is the ADR-0004 decision 3 ingest boundary applied
+        to the case it previously skipped: this method returned immediately
+        whenever there was no embedder, which is exactly the configuration
+        that cannot keep the two stores in step.
+
+        The refusal is narrow by construction. A collection with no manifest
+        was never dense-ingested, so a BM25-only run over it is ordinary and
+        proceeds — including the documented BM25-first-then-dense flow, where
+        the manifest does not exist until the first dense write.
+
+        On a dense-enabled indexer this is the
         first thing every run does — before loading, chunking, embedding,
         or deleting — for two reasons: it fails fast rather than after the
         expensive walk-and-embed work, and, decisively, an identity
@@ -379,6 +426,9 @@ class Indexer:
         collection would name the wrong problem.
 
         Raises:
+            ConfigurationError: This indexer has no dense pair but the
+                collection is manifest-bound. Names the remedy, matching
+                ADR-0008's symmetric refusal on the read side.
             IndexIdentityError: The collection is bound to a different
                 embedding identity (never a re-embed, never a fallback).
             StorageError: The collection is manifest-bound and holds
@@ -386,11 +436,22 @@ class Indexer:
                 :func:`~groundkit.index.dense.verify_dense_side_present`.
         """
         if self._embedder is None:
+            if await self._store.get_manifest() is not None:
+                raise ConfigurationError(
+                    "This collection has a dense side (it is bound to an embedding "
+                    "identity), but this Indexer was built without an embedder and "
+                    "vector store. Writing to it would strand every rewritten "
+                    "document's vectors under an id SQLite no longer references, and "
+                    "the processing fingerprint stored by the same write would stop a "
+                    "later dense run from ever re-embedding them. Supply the same "
+                    "embedder and vector store the collection was built with, or "
+                    "delete the collection and re-ingest it from scratch."
+                )
             return
-        await self._store.verify_manifest(_identity_of(self._embedder))
+        manifest = await self._store.verify_manifest(identity_of(self._embedder))
         if self._vector_store is not None:
             await verify_dense_side_present(
-                self._store, self._vector_store, self._embedder.dimensions
+                self._store, self._vector_store, self._embedder.dimensions, manifest=manifest
             )
 
     async def _ensure_manifest(self, embedder: EmbeddingProtocol) -> None:
@@ -415,7 +476,7 @@ class Indexer:
         """
         if self._manifest_bound:
             return
-        await self._store.write_manifest(_identity_of(embedder))
+        await self._store.write_manifest(identity_of(embedder))
         self._manifest_bound = True
 
     async def _persist_document(
@@ -583,11 +644,14 @@ class Indexer:
         so the stale document and its chunks would remain in the store
         forever even though the source no longer contains them.
 
-        The content-hash gate is also the dense path's re-embed gate: an
-        unchanged document ``continue``s before chunking, so it is never
-        embedded either. Incremental re-embedding is therefore a property
-        of the one existing skip, not a second mechanism that could drift
-        from it.
+        The fingerprint gate (:func:`_processing_fingerprint`) is also the
+        dense path's re-embed gate: an unchanged document ``continue``s
+        before chunking, so it is never embedded either. Incremental
+        re-embedding is therefore a property of the one existing skip, not a
+        second mechanism that could drift from it — which is also why the
+        fingerprint has to cover chunking settings. A chunk-boundary change
+        that skipped here would have kept the *old* vectors as well, since
+        they are written per chunk.
 
         Returns:
             A :class:`_SourceOutcome` tallying this source's documents,
@@ -606,7 +670,7 @@ class Indexer:
 
         indexed = skipped = chunks_written = vectors_written = vectors_deleted = 0
         for doc in documents:
-            doc_hash = _content_hash(doc)
+            doc_hash = _processing_fingerprint(doc, self._chunker, self._chunking_config)
             stored = await self._store.get_document_hash(doc.source)
             if stored == doc_hash:
                 logger.debug("Unchanged, skipping: %s", doc.source)
@@ -670,21 +734,6 @@ class Indexer:
         return 0, 0
 
 
-def _identity_of(embedder: EmbeddingProtocol) -> EmbeddingIdentity:
-    """Read the ADR-0004 identity triple off the embedder itself.
-
-    Never derived from a config object: sourcing all three fields from the
-    object that actually produces the vectors makes "the manifest describes
-    a different model than the one that embedded" unrepresentable, rather
-    than a divergence a caller has to be trusted not to introduce.
-    """
-    return EmbeddingIdentity(
-        provider=embedder.provider,
-        model_name=embedder.model_name,
-        dimensions=embedder.dimensions,
-    )
-
-
 def _aggregate(outcomes: list[_SourceOutcome]) -> _SourceOutcome:
     """Sum per-source outcomes into a new combined outcome (inputs untouched)."""
     return _SourceOutcome(
@@ -697,6 +746,59 @@ def _aggregate(outcomes: list[_SourceOutcome]) -> _SourceOutcome:
     )
 
 
-def _content_hash(document: Document) -> str:
-    """SHA-256 of the document content — the incremental re-index skip key."""
-    return hashlib.sha256(document.content.encode()).hexdigest()
+def _processing_fingerprint(
+    document: Document, chunker: ChunkerProtocol, chunking_config: ChunkingConfig | None
+) -> str:
+    """SHA-256 over every input that decides a document's stored chunks.
+
+    The incremental re-index skip key, and deliberately *not* a hash of the
+    content alone. Content-only, the skip answered "have these bytes
+    changed?" when the question it is actually asked is "would re-processing
+    this source produce different rows?" — so re-ingesting with a different
+    ``ChunkingConfig`` (or a different chunker) hash-matched, skipped, and
+    left the collection holding chunks built to the *previous* configuration
+    with nothing anywhere recording that. Silent, permanent, and invisible
+    to every later run: exactly the shape SPEC.md §2's fail-closed rule
+    exists to keep out. It is also the dense path's re-embed gate, so those
+    stale chunks kept their stale vectors too.
+
+    Three inputs, all of them things the indexer can actually see:
+
+    - the document content;
+    - the chunking configuration, normalized through ``ChunkingConfig()``
+      so a caller passing ``None`` and a caller passing the defaults
+      explicitly agree — ``RecursiveChunker`` resolves ``None`` to exactly
+      that, and a fingerprint that disagreed would re-index a corpus for a
+      no-op change;
+    - the chunker's type name, because swapping the chunker changes the
+      output as surely as changing its settings does. Type name rather than
+      anything richer: ``ChunkerProtocol`` exposes no identity, and a name
+      is the strongest signal available without widening that seam.
+
+    The consequence on an existing collection is one full re-index the
+    first time this runs — the stored hashes were computed the old way, so
+    nothing matches. That is correct rather than merely tolerable: those
+    chunks were produced under a configuration this store never recorded,
+    and re-deriving them is seconds of work (ADR-0004 decision 5's
+    reasoning, applied to chunks rather than vectors).
+
+    Args:
+        document: The freshly loaded document.
+        chunker: The chunker that will split it.
+        chunking_config: The configuration it will be split under, or
+            ``None`` to accept the chunker's defaults.
+
+    Returns:
+        Hex-encoded SHA-256 digest over all three, domain-separated by NULs
+        so no concatenation of one field can impersonate another.
+    """
+    config = chunking_config if chunking_config is not None else ChunkingConfig()
+    hasher = hashlib.sha256()
+    for part in (
+        document.content.encode(),
+        type(chunker).__qualname__.encode(),
+        config.model_dump_json().encode(),
+    ):
+        hasher.update(part)
+        hasher.update(b"\0")
+    return hasher.hexdigest()

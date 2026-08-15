@@ -8,7 +8,10 @@ a named MCP server, and a retrieval eval harness — fully local by default.
 > locally with no cloud credentials — see the Quickstart below. Dense and
 > hybrid (RRF) retrieval now work too, opt-in behind `--dense` / `--mode`
 > and requiring a local embedding provider; the eval harness reports their
-> delta against the BM25 baseline. Cross-encoder rerank, the MCP server,
+> delta against the BM25 baseline. A local cross-encoder reranker is now
+> available behind the optional `rerank` extra; it is not yet wired into the
+> eval harness, so it has no measured delta and is not part of `grk search`.
+> The MCP server,
 > REST API, and IaC are not yet built. See [SPEC.md](SPEC.md) for what is
 > being built and in what order, and
 > [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for what is deliberately out
