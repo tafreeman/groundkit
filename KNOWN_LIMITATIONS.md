@@ -169,18 +169,32 @@ per SPEC.md §9:
   manifest-bound but only partially embedded — documents that changed after
   the dense path was enabled — is still not detected, and remains the
   genuine half-dense case this entry describes.
-- **A BM25-only indexer will orphan a vector-bearing collection.** The
-  inverse of the above: an `Indexer` constructed without an embedder or
-  vector store still happily replaces, prunes, and deletes documents in a
-  collection whose vectors were written by an earlier dense-enabled run.
-  It has no vector store to delete from, so those vectors survive their
-  documents. The orphans are loud, not silent: Wave C's dense read path
-  fails closed on them — `Retriever.search` (dense and hybrid modes)
-  raises `RetrievalError` on a hit whose document has no stored source,
-  with regression tests for both the deleted-after-open and
-  deleted-before-open cases. Nothing prevents the situation being created
-  in the first place, because the store carries no record that dense
-  writes ever happened beyond the manifest itself.
+- **A BM25-only indexer can no longer orphan a manifest-bound collection —
+  it is refused (ADR-0011).** An `Indexer` constructed without an embedder or
+  vector store has no vector store to delete from, so replacing or pruning a
+  document in a collection whose vectors an earlier dense run wrote left those
+  vectors surviving their documents. This was tolerated until 2026-08-15 on the
+  grounds that the orphans are *loud* — Wave C's dense read path fails closed on
+  them, `Retriever.search` raising `RetrievalError` on a hit whose document has
+  no stored source, with regression tests for both the deleted-after-open and
+  deleted-before-open cases.
+
+  That argument stopped holding when ADR-0009 changed the skip key. A content
+  hash matched on unchanged content, so reaching the hazard required a document
+  to actually change; a fingerprint derived differently matches nothing an
+  earlier build stored, so the *first* BM25-only ingest after that change
+  rewrites every document and orphans the whole dense side in one ordinary
+  command — permanently, because the same write stores the new fingerprint and a
+  later dense run then hash-skips every one of them. What was loud is the
+  eventual read failure, not the write that caused it, and that failure names an
+  index inconsistency rather than the ingest three steps upstream.
+
+  `Indexer._verify_identity` now refuses a run whose indexer has no embedder
+  when the collection is manifest-bound, before any load, chunk or write, with
+  a `ConfigurationError` naming both remedies. The residual hazard is what the
+  manifest cannot see: a collection holding vectors whose manifest was never
+  written, or an `Indexer` holding a store handle from before a manifest
+  appeared. Neither is reachable through the CLI.
 - **The CLI exposes the dense path, entirely opt-in.** `grk ingest --dense`
   embeds and writes vectors alongside the SQLite write; `grk search --mode
   {bm25,dense,hybrid}` reads them back (default `bm25`, and it stays there —

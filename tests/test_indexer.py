@@ -1649,3 +1649,77 @@ def test_bm25_only_collection_is_not_mistaken_for_a_lost_dense_side(
             await store.close()
 
     asyncio.run(run())
+
+
+def test_bm25_only_ingest_refuses_a_manifest_bound_collection(corpus: Path, tmp_path: Path) -> None:
+    """A BM25-only run must not write to a collection that has a dense side.
+
+    Such a run cannot keep the two stores in step: every replacement deletes
+    vectors only when a vector store is present, while ``replace_document``
+    installs a fresh document id regardless. The old vectors keep the old id,
+    SQLite stops referencing it, and they are orphaned — permanently, because
+    the same write stores the new processing fingerprint, so a later dense run
+    hash-skips those documents and never re-embeds them.
+
+    ADR-0009 turned this from occasional into total. A content-hash skip key
+    matched on unchanged content, so a BM25-only re-ingest rewrote nothing; a
+    fingerprint derived differently matches nothing an earlier build stored, so
+    the first such ingest rewrites *every* document at once.
+    """
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            dense = Indexer(
+                store,
+                FileLoader(allowed_base_dir=corpus),
+                embedder=_CountingEmbedder(),
+                vector_store=InMemoryVectorStore(),
+            )
+            assert (await dense.index_directory(str(corpus))).vectors_written > 0
+
+            bm25_only = Indexer(store, FileLoader(allowed_base_dir=corpus))
+            with pytest.raises(ConfigurationError, match="dense side"):
+                await bm25_only.index_directory(str(corpus))
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_refused_bm25_only_ingest_leaves_the_dense_side_intact(
+    corpus: Path, tmp_path: Path
+) -> None:
+    """The refusal must land before any write, not part-way through one.
+
+    A guard that fired after the first document was rewritten would still have
+    orphaned that document's vectors. ``_verify_identity`` runs before loading,
+    chunking or persisting anything, so both stores must be exactly as the
+    dense run left them.
+    """
+
+    async def run() -> None:
+        store = await _open(tmp_path)
+        try:
+            vector_store = InMemoryVectorStore()
+            dense = Indexer(
+                store,
+                FileLoader(allowed_base_dir=corpus),
+                embedder=_CountingEmbedder(),
+                vector_store=vector_store,
+            )
+            await dense.index_directory(str(corpus))
+            rows_before = len(await _dense_rows(vector_store))
+            ids_before = {c.document_id for c in await store.get_chunks()}
+
+            bm25_only = Indexer(store, FileLoader(allowed_base_dir=corpus))
+            with pytest.raises(ConfigurationError):
+                await bm25_only.index_directory(str(corpus))
+
+            assert len(await _dense_rows(vector_store)) == rows_before
+            assert {c.document_id for c in await store.get_chunks()} == ids_before
+            await _assert_dense_matches_sqlite(store, vector_store)
+        finally:
+            await store.close()
+
+    asyncio.run(run())

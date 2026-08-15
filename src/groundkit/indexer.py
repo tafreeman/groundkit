@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, ConfigDict, Field
 
 from groundkit.config import ChunkingConfig
-from groundkit.errors import IngestionError
+from groundkit.errors import ConfigurationError, IngestionError
 from groundkit.identity import identity_of, validate_dense_pair
 from groundkit.index.dense import verify_dense_side_present
 from groundkit.ingestion.chunking import RecursiveChunker
@@ -142,8 +142,12 @@ class Indexer:
     cleanup retries to completion. Prefer the loud residue over the silent
     one. (A BM25-only ``Indexer`` mutating a collection that *does* hold
     vectors cannot honor the dense half at all — it has no handle to the
-    vector store — and the residue it can leave, orphaned vectors, is again
-    the loud kind, never the silent kind.)
+    vector store — so it is no longer allowed to try: :meth:`_verify_identity`
+    refuses a manifest-bound collection outright, per ADR-0011. Tolerating it
+    for the loudness of the residue was defensible while only edited documents
+    were at risk; ADR-0009's fingerprint made the *first* such run rewrite
+    every document at once, which is a whole collection's dense side for one
+    ordinary command.)
 
     Args:
         store: The collection's metadata store (durable truth, ADR-0002).
@@ -371,9 +375,39 @@ class Indexer:
         )
 
     async def _verify_identity(self) -> None:
-        """Verify the collection manifest before a dense-enabled run does any work.
+        """Verify the collection manifest before any run does work.
 
-        No-op on a BM25-only indexer. On a dense-enabled one this is the
+        On a **BM25-only** indexer this refuses a collection that is already
+        manifest-bound, which is to say one that has a dense side. Such a run
+        cannot maintain that side: every replacement and both prune paths
+        delete vectors only when a vector store is present, while
+        ``replace_document`` installs a fresh document id regardless. The old
+        vectors keep the old id, SQLite stops referencing it, and they are
+        orphaned — and because the same write also stores the new processing
+        fingerprint, a later dense run hash-skips those documents and never
+        re-embeds them, so the orphans are permanent. Dense and hybrid
+        searches then fail closed on the first orphan that ranks into a
+        candidate window, with an error naming an index inconsistency rather
+        than the BM25-only ingest that caused it.
+
+        ADR-0009 is what makes this urgent rather than occasional. When the
+        skip key was a content hash, a BM25-only re-ingest of unchanged
+        content matched and skipped, so nothing was rewritten and nothing was
+        orphaned; only genuinely edited documents were at risk. A fingerprint
+        derived differently matches nothing stored by an earlier build, so the
+        *first* BM25-only ingest after that change rewrites every document in
+        the collection and orphans the entire dense side in one ordinary
+        command. Refusing is the ADR-0004 decision 3 ingest boundary applied
+        to the case it previously skipped: this method returned immediately
+        whenever there was no embedder, which is exactly the configuration
+        that cannot keep the two stores in step.
+
+        The refusal is narrow by construction. A collection with no manifest
+        was never dense-ingested, so a BM25-only run over it is ordinary and
+        proceeds — including the documented BM25-first-then-dense flow, where
+        the manifest does not exist until the first dense write.
+
+        On a dense-enabled indexer this is the
         first thing every run does — before loading, chunking, embedding,
         or deleting — for two reasons: it fails fast rather than after the
         expensive walk-and-embed work, and, decisively, an identity
@@ -392,6 +426,9 @@ class Indexer:
         collection would name the wrong problem.
 
         Raises:
+            ConfigurationError: This indexer has no dense pair but the
+                collection is manifest-bound. Names the remedy, matching
+                ADR-0008's symmetric refusal on the read side.
             IndexIdentityError: The collection is bound to a different
                 embedding identity (never a re-embed, never a fallback).
             StorageError: The collection is manifest-bound and holds
@@ -399,6 +436,17 @@ class Indexer:
                 :func:`~groundkit.index.dense.verify_dense_side_present`.
         """
         if self._embedder is None:
+            if await self._store.get_manifest() is not None:
+                raise ConfigurationError(
+                    "This collection has a dense side (it is bound to an embedding "
+                    "identity), but this Indexer was built without an embedder and "
+                    "vector store. Writing to it would strand every rewritten "
+                    "document's vectors under an id SQLite no longer references, and "
+                    "the processing fingerprint stored by the same write would stop a "
+                    "later dense run from ever re-embedding them. Supply the same "
+                    "embedder and vector store the collection was built with, or "
+                    "delete the collection and re-ingest it from scratch."
+                )
             return
         manifest = await self._store.verify_manifest(identity_of(self._embedder))
         if self._vector_store is not None:

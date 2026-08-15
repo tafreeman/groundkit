@@ -16,3 +16,4 @@ that were considered; deviating from SPEC.md requires an ADR proposal first.
 | [ADR-0008](ADR-0008-dense-search-requires-a-dense-collection.md) | A dense or hybrid search refuses a collection that has no vectors | Accepted |
 | [ADR-0009](ADR-0009-incremental-skip-key-is-a-processing-fingerprint.md) | The incremental skip key is a processing fingerprint, not a content hash | Accepted |
 | [ADR-0010](ADR-0010-ingestion-pipeline-is-not-the-ingest-path.md) | `IngestionPipeline` is a load→chunk utility, not the ingest path | Accepted |
+| [ADR-0011](ADR-0011-bm25-only-ingest-refuses-a-dense-collection.md) | A BM25-only ingest refuses a collection that has a dense side | Accepted |
