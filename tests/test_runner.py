@@ -269,22 +269,46 @@ class TestIsolation:
     """The runner never writes its throwaway index anywhere durable."""
 
     def test_runner_leaves_no_files_in_repo_tree(self, corpus: Path, tmp_path: Path) -> None:
-        """No ``.sqlite3`` (or any other) file appears under the corpus dir or repo tree."""
+        """``run_eval`` adds no ``.sqlite3`` to the corpus dir or the repo tree.
+
+        Asserted as a **before/after difference**, not as absolute absence.
+        Absence was the original spelling and it was wrong in both directions:
+
+        * It failed on a developer who had followed the quickstart. The first
+          command there is ``grk ingest ./docs``, which writes
+          ``.groundkit/default.sqlite3`` — a gitignored, entirely legitimate
+          local index. That turned "I used the tool as documented" into a red
+          suite, from a test that had nothing to say about it. CI never saw it
+          because CI never runs the quickstart.
+        * It was simultaneously *too weak*: in a tree that already contained a
+          ``.sqlite3``, it could only fail, so a genuine leak by ``run_eval``
+          would have been masked by the pre-existing file rather than reported.
+
+        A difference measures what this test actually means — that the runner
+        builds its index in a temp directory and leaves nothing behind — and it
+        keeps meaning that regardless of what else is on disk.
+        """
 
         async def run() -> EvalReport:
             judgments_path = tmp_path / "judgments.jsonl"
             _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
             return await run_eval(corpus, judgments_path)
 
+        repo_root = Path(__file__).resolve().parents[1]
         before = sorted(p.name for p in corpus.rglob("*"))
+        sqlite_before = {p.resolve() for p in repo_root.rglob("*.sqlite3")}
+
         asyncio.run(run())
+
         after = sorted(p.name for p in corpus.rglob("*"))
+        sqlite_after = {p.resolve() for p in repo_root.rglob("*.sqlite3")}
 
         assert after == before
         assert not any(corpus.rglob("*.sqlite3"))
-
-        repo_root = Path(__file__).resolve().parents[1]
-        assert not any(repo_root.rglob("*.sqlite3"))
+        assert sqlite_after == sqlite_before, (
+            "run_eval leaked a persisted index into the repo tree: "
+            f"{sorted(str(p) for p in sqlite_after - sqlite_before)}"
+        )
 
 
 class TestCorpusHash:

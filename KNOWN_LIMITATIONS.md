@@ -372,9 +372,31 @@ per SPEC.md §9:
   content and in citations resolved from it. Cosmetic — offsets stay
   correct because the loader and the citation resolver use identical
   decoding.
-- `resolve_citation` detects source drift only by length (`end_offset >
-  len(text)`); a same-length in-place edit to a source file goes undetected
-  and can resolve to silently wrong text.
+- **`search` results are not verified against their sources; `fetch_chunk` is
+  the step that verifies.** `search` returns the *indexed* text, because
+  verifying per hit is one file read per result per query. `fetch_chunk`
+  re-reads the cited span and byte-compares it to the indexed chunk, which does
+  catch a same-length in-place edit, and reports `verified` / `drifted` /
+  `unresolvable`. So a caller who quotes a `search` hit directly is quoting
+  unverified text, and one who calls `fetch_chunk` first is not. That division
+  is deliberate, and it is the thing to know about this surface.
+
+  Read literally, `resolve_citation` alone only detects drift by length
+  (`end_offset > len(text)`) — but it is a *resolver*, not the verifier.
+  `verify_citation` and `fetch_chunk` both do the full comparison.
+
+  **A stored checksum would not improve this and is deliberately not added.**
+  Verification already compares the actual bytes, and a digest comparison is at
+  best equal to a byte comparison and at worst admits collisions. A hash only
+  helps when the expected content is unavailable, and it never is: `Chunk`
+  requires `content == document.content[start_offset:end_offset]` and that
+  content is persisted. A per-chunk hash would be redundant state that can
+  disagree with its own input — the same reason `evals/schema.py` stores no
+  delta and `index/bm25.py` keeps no on-disk form.
+
+  What remains genuinely open is time-of-check/time-of-use: verification
+  describes the file as of the read, and nothing stops an edit a millisecond
+  later. No checksum closes that either.
 - Total ingestion size is unbounded: individual files cap at 10 MiB, but
   nothing caps file count or aggregate bytes for a directory run.
 - **No authentication. The 127.0.0.1 bind is load-bearing, not a default.**
