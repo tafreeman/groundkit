@@ -570,6 +570,128 @@ class TestCrossEncoderRerankerFailsClosed:
 
         asyncio.run(run())
 
+    def test_backend_import_failure_that_is_not_an_import_error_is_typed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ "Installed" and "usable" are different states, and only one is ImportError.
+
+        torch raises ``OSError`` when a native library is missing — the
+        WinError 126 / missing-CUDA-``.so`` family — which is an environment
+        fault, not a missing package. Catching only ``ImportError`` let those
+        escape untyped from a function documented to raise
+        ``RerankerNotConfiguredError``.
+        """
+        import builtins
+
+        from groundkit.retrieval.rerank import _import_cross_encoder
+
+        real_import = builtins.__import__
+
+        def _import_raising_oserror(name: str, *args: object, **kwargs: object) -> object:
+            if name == "torch":
+                raise OSError("[WinError 126] The specified module could not be found")
+            return real_import(name, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(builtins, "__import__", _import_raising_oserror)
+
+        with pytest.raises(RerankerNotConfiguredError, match="failed to initialize"):
+            _import_cross_encoder()
+
+    def test_non_scalar_prediction_output_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A multi-label model emits a row per label, not a relevance score.
+
+        ``model_name`` is caller-supplied, so nothing stops one being pointed
+        at a multi-label cross-encoder. ``float()`` on a row raises
+        ``TypeError``, which escaped the prediction handler because the
+        conversion sat outside it.
+        """
+        import groundkit.retrieval.rerank as rerank_module
+
+        class _MultiLabelCrossEncoder:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def predict(self, pairs: list[list[str]]) -> list[list[float]]:
+                return [[0.1, 0.9] for _ in pairs]
+
+        monkeypatch.setattr(
+            rerank_module,
+            "_import_cross_encoder",
+            lambda: (_MultiLabelCrossEncoder, "IDENTITY"),
+        )
+
+        async def run() -> None:
+            reranker = CrossEncoderReranker("some/multi-label-model")
+            with pytest.raises(RetrievalError, match="non-scalar score at position 0"):
+                await reranker.rerank("q", [_result("c1")], top_k=1)
+
+        asyncio.run(run())
+
+    def test_non_iterable_prediction_output_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import groundkit.retrieval.rerank as rerank_module
+
+        class _ScalarReturningCrossEncoder:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def predict(self, pairs: list[list[str]]) -> float:
+                return 0.5
+
+        monkeypatch.setattr(
+            rerank_module,
+            "_import_cross_encoder",
+            lambda: (_ScalarReturningCrossEncoder, "IDENTITY"),
+        )
+
+        async def run() -> None:
+            reranker = CrossEncoderReranker()
+            with pytest.raises(RetrievalError, match="non-iterable prediction"):
+                await reranker.rerank("q", [_result("c1")], top_k=1)
+
+        asyncio.run(run())
+
+    def test_numpy_style_scalars_are_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The conversion must coerce, never ``isinstance``-check.
+
+        ``numpy.float32`` is not a subclass of Python's ``float``, so a type
+        test would reject exactly what a real cross-encoder returns while every
+        stub here — returning Python floats — kept passing. This stands in for
+        that value: a scalar that converts but fails an ``isinstance(x, float)``
+        test, so the check can never quietly be tightened into one.
+        """
+        import groundkit.retrieval.rerank as rerank_module
+
+        class _Float32Like:
+            def __init__(self, value: float) -> None:
+                self._value = value
+
+            def __float__(self) -> float:
+                return self._value
+
+        class _NumpyLikeCrossEncoder:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def predict(self, pairs: list[list[str]]) -> list[_Float32Like]:
+                return [_Float32Like(-2.0), _Float32Like(3.0)][: len(pairs)]
+
+        monkeypatch.setattr(
+            rerank_module,
+            "_import_cross_encoder",
+            lambda: (_NumpyLikeCrossEncoder, "IDENTITY"),
+        )
+
+        async def run() -> None:
+            reranker = CrossEncoderReranker()
+            candidates = [_result("c1", start=0), _result("c2", start=10)]
+            reranked = await reranker.rerank("q", candidates, top_k=2)
+            assert [r.chunk_id for r in reranked] == ["c2", "c1"]
+            assert all(r.score >= 0.0 for r in reranked)
+
+        asyncio.run(run())
+
     def test_max_length_is_forwarded_to_the_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import groundkit.retrieval.rerank as rerank_module
 

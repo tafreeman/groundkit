@@ -183,6 +183,56 @@ def rerank_by_logits(
     return rescored[:top_k]
 
 
+def _coerce_logits(raw: Any, *, model_name: str) -> list[float]:
+    """Convert a backend's prediction output into a flat list of floats.
+
+    The conversion is a seam, not a formality: ``predict`` returns whatever the
+    configured model returns, and ``model_name`` is caller-supplied, so the
+    shape is not something this repo controls. A multi-label
+    sequence-classification model emits one row per label — an ``(n, labels)``
+    array — and ``float()`` on a row raises ``TypeError`` rather than producing
+    a score. Left bare, that escaped as an arbitrary exception from a method
+    documented to raise :class:`~groundkit.errors.RetrievalError`.
+
+    Deliberately **not** an ``isinstance`` check. ``numpy.float32`` is not a
+    subclass of Python's ``float`` (``numpy.float64`` is), so a type test would
+    reject the very values a real cross-encoder produces while every stub in
+    the default suite, returning Python floats, kept passing — a failure only
+    the gated run could find. Coercing and translating the failure tests what
+    actually matters: whether the value converts to one number.
+
+    Args:
+        raw: Whatever ``predict`` returned.
+        model_name: Named in errors so a misconfigured model identifies itself.
+
+    Returns:
+        One float per element of ``raw``.
+
+    Raises:
+        RetrievalError: ``raw`` is not iterable, or an element is not a scalar.
+    """
+    try:
+        values = list(raw)
+    except TypeError as exc:
+        raise RetrievalError(
+            f"Cross-encoder {model_name!r} returned a non-iterable prediction "
+            f"({type(raw).__name__}); one score per query/passage pair is required"
+        ) from exc
+
+    logits: list[float] = []
+    for position, score in enumerate(values):
+        try:
+            logits.append(float(score))
+        except (TypeError, ValueError) as exc:
+            raise RetrievalError(
+                f"Cross-encoder {model_name!r} returned a non-scalar score at position "
+                f"{position} ({type(score).__name__}). A multi-label model emits one row "
+                "per label rather than a single relevance score; this reranker requires a "
+                "single-label cross-encoder."
+            ) from exc
+    return logits
+
+
 def _import_cross_encoder() -> tuple[Any, Any]:
     """Import ``sentence_transformers.CrossEncoder`` and ``torch`` on demand.
 
@@ -206,6 +256,8 @@ def _import_cross_encoder() -> tuple[Any, Any]:
         # lines rather than relaxing the strict settings repo-wide.
         import torch  # type: ignore[import-not-found]
         from sentence_transformers import CrossEncoder  # type: ignore[import-not-found]
+
+        identity_activation = torch.nn.Identity()
     except ImportError as exc:
         raise RerankerNotConfiguredError(
             "CrossEncoderReranker requires the optional 'rerank' extra: install with "
@@ -213,7 +265,23 @@ def _import_cross_encoder() -> tuple[Any, Any]:
             "No fallback is attempted — an unreranked list returned from a reranker "
             "would be indistinguishable from a reranked one."
         ) from exc
-    return CrossEncoder, torch.nn.Identity()
+    except Exception as exc:
+        # "Installed" and "usable" are different states, and only the first is
+        # an ImportError. torch raises OSError when a native library is missing
+        # — the WinError 126 / missing-CUDA-.so family — and both packages can
+        # raise at import time over a version-incompatible transitive
+        # dependency. Those escaped as arbitrary backend exceptions while this
+        # function advertised a typed failure, so the distinction is reported
+        # rather than the case being folded into "not installed", which would
+        # send someone to reinstall a package they already have.
+        raise RerankerNotConfiguredError(
+            f"The 'rerank' extra is installed but failed to initialize "
+            f"({type(exc).__name__}). This is an environment fault rather than a "
+            "missing package — a missing native library or an incompatible "
+            "transitive dependency — so reinstalling the extra alone may not fix "
+            "it; see the chained cause."
+        ) from exc
+    return CrossEncoder, identity_activation
 
 
 class CrossEncoderReranker:
@@ -428,7 +496,7 @@ class CrossEncoderReranker:
                 f"{len(pairs)} query/passage pairs ({type(exc).__name__}); "
                 "see the chained cause for the backend's own message"
             ) from exc
-        logits = [float(score) for score in raw]
+        logits = _coerce_logits(raw, model_name=self._model_name)
         logger.debug(
             "Reranked %d candidates to %d with %s",
             len(results),
