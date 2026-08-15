@@ -13,6 +13,16 @@ see :func:`_post_json` and :func:`_raise_embedding_error`. There is no
 cross-provider fallback chain: mixed semantic spaces would corrupt a
 persisted index silently (SPEC.md §2), so an unconfigured or failing provider
 is always a typed error, never a substitution.
+
+Hardened further per ADR-0014 decision 10 (Phase 4 makes ``base_url``
+reachable from a network-facing caller for the first time): every
+``_HttpEmbedder`` validates its configured endpoint's *shape* once at
+construction (:func:`~groundkit.utils.url_safety.validate_endpoint_shape`)
+and its resolved *address* once per request, immediately before the POST
+(:func:`~groundkit.utils.url_safety.ensure_safe_endpoint`).
+:class:`OllamaEmbedder` alone is exempted from the address check's
+loopback/private refusal, via a class attribute rather than a constructor
+parameter — see its ``_allow_private_endpoint``.
 """
 
 from __future__ import annotations
@@ -24,7 +34,7 @@ import logging
 import math
 import os
 import struct
-from typing import Final, NoReturn
+from typing import ClassVar, Final, NoReturn
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -32,6 +42,7 @@ import httpx
 from groundkit.config import EmbeddingConfig
 from groundkit.errors import EmbeddingError, ProviderNotConfiguredError
 from groundkit.providers.protocols import EmbeddingProtocol
+from groundkit.utils.url_safety import ensure_safe_endpoint, validate_endpoint_shape
 
 logger = logging.getLogger(__name__)
 
@@ -211,15 +222,29 @@ def _scrub(text: str, secret: str | None) -> str:
 
 
 def _sanitize_url(url: str, secret: str | None) -> str:
-    """Return *url* with every query-parameter value redacted and *secret* scrubbed.
+    """Return *url* with every query-parameter value and any userinfo redacted,
+    and *secret* scrubbed.
 
     Query values are redacted unconditionally, not just when they match
     *secret*: ``base_url`` is free-form operator-controlled configuration, so
     an Azure-style ``?api-key=...`` or Google-style ``?key=...`` credential
     must never reach a log line or exception message, even one this function
-    was not told to expect (ADR-0001 hazard 6 / SPEC.md §7). Scheme, host,
-    and path are left intact so the sanitized URL still names which endpoint
-    failed.
+    was not told to expect (ADR-0001 hazard 6 / SPEC.md §7).
+
+    Userinfo (``user:pass@host``) is redacted the same way, for the same
+    reason (ADR-0014 fact 1). The straightforward rebuild —
+    ``urlunsplit((scheme, parsed.netloc, path, ...))`` — carries
+    ``user:password@`` straight through, because ``netloc`` is the *raw*
+    authority component and redacting the query does nothing to it: run
+    against that version, ``https://user:hunter2@api.example.com/v1/
+    embeddings?api-key=sk-live-123`` sanitized to ``.../embeddings?api-
+    key=***`` with the password still verbatim in the URL. This function
+    rebuilds the netloc from ``hostname``/``port`` instead of reusing
+    ``parsed.netloc``, so there is no component left for a credential to
+    hide in.
+
+    Scheme, host, and path are left intact so the sanitized URL still names
+    which endpoint failed.
 
     Args:
         url: The request URL to sanitize.
@@ -228,13 +253,24 @@ def _sanitize_url(url: str, secret: str | None) -> str:
 
     Returns:
         ``url`` with its query string's values redacted, its fragment
-        dropped, and *secret* scrubbed from the result.
+        dropped, any userinfo redacted, and *secret* scrubbed from the
+        result.
     """
     parsed = urlsplit(url)
     redacted_query = urlencode(
         [(key, _REDACTED_PLACEHOLDER) for key, _ in parse_qsl(parsed.query, keep_blank_values=True)]
     )
-    sanitized = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, redacted_query, ""))
+
+    host = parsed.hostname or ""
+    if ":" in host:
+        # An IPv6 literal — urlsplit().hostname strips the brackets, so they
+        # must go back on or the rebuilt netloc is not a valid authority.
+        host = f"[{host}]"
+    netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+    if parsed.username is not None or parsed.password is not None:
+        netloc = f"{_REDACTED_PLACEHOLDER}@{netloc}"
+
+    sanitized = urlunsplit((parsed.scheme, netloc, parsed.path, redacted_query, ""))
     return _scrub(sanitized, secret)
 
 
@@ -418,14 +454,40 @@ class _HttpEmbedder(abc.ABC):
             exercise the full request/parse/error path with zero network
             access. When omitted, a real client is built with the configured
             timeout.
+
+    Raises:
+        ConfigurationError: If ``config.base_url``'s shape is invalid —
+            wrong scheme, no host, userinfo, or a query/fragment
+            (:func:`~groundkit.utils.url_safety.validate_endpoint_shape`,
+            ADR-0014 decision 10).
     """
 
+    #: Whether this provider is exempted from
+    #: :func:`~groundkit.utils.url_safety.ensure_safe_endpoint`'s
+    #: loopback/private refusal. A ``ClassVar``, not a constructor keyword —
+    #: a keyword would make requesting the exception for *any* provider a
+    #: legal thing to write, which scopes the allowance over the guard
+    #: rather than around one specific, named provider. Named for permitting
+    #: private endpoints generally, not loopback specifically: SPEC.md §9's
+    #: Phase 6 compose topology reaches Ollama at an RFC1918 bridge-network
+    #: address, not just at 127.0.0.1. Does not relax
+    #: :func:`~groundkit.utils.url_safety.validate_endpoint_shape` — that
+    #: check runs identically for every subclass.
+    _allow_private_endpoint: ClassVar[bool] = False
+
     def __init__(self, config: EmbeddingConfig, client: httpx.AsyncClient | None = None) -> None:
+        validate_endpoint_shape(config.base_url)
         self._config = config
         if client is not None:
             self._client = client
         else:
-            self._client = httpx.AsyncClient(timeout=config.timeout_seconds)
+            # follow_redirects=False is hardening, not a fix: an unfollowed
+            # redirect already raises via raise_for_status() (verified by
+            # execution against unmodified source, ADR-0014 decision 11) —
+            # httpx's own current default. Pinned explicitly against a
+            # future httpx default change, or an injected client that sets
+            # it True.
+            self._client = httpx.AsyncClient(timeout=config.timeout_seconds, follow_redirects=False)
 
     @property
     @abc.abstractmethod
@@ -461,6 +523,13 @@ class _HttpEmbedder(abc.ABC):
                 response vector whose width does not match
                 ``config.dimensions``.
             ProviderNotConfiguredError: If a required credential is unset.
+            ConfigurationError: If the configured endpoint's resolved address
+                is not permitted — loopback, private, link-local, multicast,
+                reserved, unspecified, or RFC6598 shared address space,
+                unless this provider is exempted
+                (:func:`~groundkit.utils.url_safety.ensure_safe_endpoint`,
+                ADR-0014 decision 10). Checked per request, immediately
+                before the POST.
         """
         if not texts:
             return []
@@ -512,6 +581,12 @@ class OllamaEmbedder(_HttpEmbedder):
     Satisfies :class:`EmbeddingProtocol`.
     """
 
+    #: Ollama is the local-first default (SPEC.md §7's one named exception to
+    #: the outbound SSRF guard) and its address must resolve to a
+    #: loopback/private target to be reachable at all — see the class
+    #: attribute's docstring on ``_HttpEmbedder``.
+    _allow_private_endpoint: ClassVar[bool] = True
+
     @property
     def provider(self) -> str:
         """Provider identity."""
@@ -519,6 +594,7 @@ class OllamaEmbedder(_HttpEmbedder):
 
     async def _request_batch(self, batch: list[str]) -> list[list[float]]:
         url = f"{self._config.base_url}/api/embed"
+        await ensure_safe_endpoint(url, allow_private_endpoint=type(self)._allow_private_endpoint)
         payload: dict[str, object] = {"model": self._config.model_name, "input": list(batch)}
         result = await _post_json(self._client, url, payload, headers=None)
         if isinstance(result, Exception):
@@ -553,6 +629,7 @@ class OpenAICompatibleEmbedder(_HttpEmbedder):
     async def _request_batch(self, batch: list[str]) -> list[list[float]]:
         api_key = self._resolve_api_key()
         url = f"{self._config.base_url}/v1/embeddings"
+        await ensure_safe_endpoint(url, allow_private_endpoint=type(self)._allow_private_endpoint)
         payload: dict[str, object] = {"model": self._config.model_name, "input": list(batch)}
         headers = {"Authorization": f"Bearer {api_key}"}
         result = await _post_json(self._client, url, payload, headers=headers)
