@@ -164,8 +164,18 @@ tests on both paths.
   named, deliberate exception — it is loopback by design; the guard scopes
   around it, not over it.
 - pip-audit in CI; direct deps pinned with bounds; uv lockfile parity check.
-- Mutating REST routes: shared-secret header, constant-time compare, disabled
-  when the secret is unset; binds 127.0.0.1 by default.
+- Mutating REST routes **and mutating MCP operations**: shared-secret header,
+  constant-time compare, disabled when the secret is unset; binds 127.0.0.1 by
+  default. The rule is per *operation*, not per transport — an MCP tool that
+  ingests, deletes, or re-indexes is the same mutation a REST route would be,
+  and Phase 4 ships both surfaces over one runtime. Naming only REST here was
+  an omission, not a decision to leave MCP open.
+- SQLite is content-bearing data, not just an index. A collection store holds
+  document text, so deletion behavior, file permissions, backup scope, and
+  retention are product decisions owed before any deployment that is not a
+  single user's local machine — not operational details to settle afterwards.
+  Deleting a collection means deleting its `.sqlite3` *and* its `.lance`
+  sibling; neither is inferable from the other's absence.
 - Loader path containment via ported `path_safety` (`allowed_base_dir`), with
   the traversal test ARP never wrote.
 - Credential scrubbing covers exception messages **and** `__cause__` chains

@@ -16,6 +16,15 @@ operation, the ADR-0004 embedding-identity manifest is verified before any
 dense mutation and bound on the first dense write, and the existing
 fingerprint gate doubles as the re-embed gate. With neither supplied, the
 behaviour is exactly the Phase 1 BM25-only path.
+
+**This is the only ingest path** (ADR-0010). The directory walk below
+resembles :meth:`~groundkit.ingestion.pipeline.IngestionPipeline.ingest_directory`
+and shares its :func:`~groundkit.ingestion.pipeline.discover_files` and
+concurrency bound, but the two are not merged and must not be: the
+fingerprint comparison in :meth:`Indexer._process` runs *before* chunking,
+which is what makes an unchanged document cost neither a re-chunk nor a
+re-embed. ``IngestionPipeline`` always chunks, so routing this path through
+it would separate the skip from the work it exists to skip.
 """
 
 from __future__ import annotations
@@ -31,8 +40,8 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, ConfigDict, Field
 
 from groundkit.config import ChunkingConfig
-from groundkit.contracts import EmbeddingIdentity
-from groundkit.errors import ConfigurationError, IngestionError
+from groundkit.errors import IngestionError
+from groundkit.identity import identity_of, validate_dense_pair
 from groundkit.index.dense import verify_dense_side_present
 from groundkit.ingestion.chunking import RecursiveChunker
 from groundkit.ingestion.pipeline import DEFAULT_MAX_CONCURRENT, discover_files
@@ -174,18 +183,18 @@ class Indexer:
         # The dense pair is validated at construction, not discovered
         # mid-ingest: half a dense path is always a caller bug, and each
         # half fails differently (see the messages), so name the missing one.
-        if embedder is not None and vector_store is None:
-            raise ConfigurationError(
-                "Indexer was given an embedder but no vector_store. The pair is "
-                "inseparable: with no store to receive them, every vector the "
-                "embedder produced would be silently discarded. Pass both or neither."
-            )
-        if vector_store is not None and embedder is None:
-            raise ConfigurationError(
-                "Indexer was given a vector_store but no embedder. The pair is "
-                "inseparable: with nothing to produce vectors, the store could "
-                "never be written to. Pass both or neither."
-            )
+        validate_dense_pair(
+            embedder,
+            vector_store,
+            subject="Indexer",
+            without_store=(
+                "with no store to receive them, every vector the embedder produced "
+                "would be silently discarded."
+            ),
+            without_embedder=(
+                "with nothing to produce vectors, the store could never be written to."
+            ),
+        )
         self._store = store
         self._loader = loader
         self._chunker: ChunkerProtocol
@@ -391,7 +400,7 @@ class Indexer:
         """
         if self._embedder is None:
             return
-        manifest = await self._store.verify_manifest(_identity_of(self._embedder))
+        manifest = await self._store.verify_manifest(identity_of(self._embedder))
         if self._vector_store is not None:
             await verify_dense_side_present(
                 self._store, self._vector_store, self._embedder.dimensions, manifest=manifest
@@ -419,7 +428,7 @@ class Indexer:
         """
         if self._manifest_bound:
             return
-        await self._store.write_manifest(_identity_of(embedder))
+        await self._store.write_manifest(identity_of(embedder))
         self._manifest_bound = True
 
     async def _persist_document(
@@ -675,21 +684,6 @@ class Indexer:
                 logger.info("Emptied source, pruning stored document: %s", source)
                 return 1, vectors_deleted
         return 0, 0
-
-
-def _identity_of(embedder: EmbeddingProtocol) -> EmbeddingIdentity:
-    """Read the ADR-0004 identity triple off the embedder itself.
-
-    Never derived from a config object: sourcing all three fields from the
-    object that actually produces the vectors makes "the manifest describes
-    a different model than the one that embedded" unrepresentable, rather
-    than a divergence a caller has to be trusted not to introduce.
-    """
-    return EmbeddingIdentity(
-        provider=embedder.provider,
-        model_name=embedder.model_name,
-        dimensions=embedder.dimensions,
-    )
 
 
 def _aggregate(outcomes: list[_SourceOutcome]) -> _SourceOutcome:

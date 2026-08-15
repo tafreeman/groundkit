@@ -15,11 +15,11 @@ from typing import TYPE_CHECKING, Final, Literal
 from groundkit.config import RetrievalConfig
 from groundkit.contracts import (
     CollectionManifest,
-    EmbeddingIdentity,
     RetrievalResult,
     SearchResponse,
 )
 from groundkit.errors import ConfigurationError, RetrievalError
+from groundkit.identity import identity_of, validate_dense_pair
 from groundkit.index.bm25 import BM25Index
 from groundkit.index.dense import verify_dense_side_present
 from groundkit.retrieval.fusion import reciprocal_rank_fusion
@@ -179,7 +179,7 @@ class Retriever:
         if embedder is not None:
             # Verdict and manifest from one read: see the docstring for the
             # mixed-embedding-space race a second read would open.
-            manifest = await store.verify_manifest(_identity_of(embedder))
+            manifest = await store.verify_manifest(identity_of(embedder))
         if embedder is not None and vector_store is not None:
             await verify_dense_side_present(
                 store, vector_store, embedder.dimensions, manifest=manifest
@@ -491,37 +491,26 @@ class Retriever:
 def _validate_dense_pair(
     embedder: EmbeddingProtocol | None, vector_store: VectorStoreProtocol | None
 ) -> None:
-    """Reject half a dense pair at construction (mirrors ``Indexer``'s check).
+    """Reject half a dense pair at construction, in ``Retriever``'s vocabulary.
+
+    The branch structure is shared with ``Indexer`` and ``run_eval``
+    (:func:`groundkit.identity.validate_dense_pair`); only the consequence of
+    each missing half is stated per caller, because for a read path it differs
+    from a write path's.
 
     Raises:
         ConfigurationError: Exactly one of ``embedder`` / ``vector_store``
             was supplied.
     """
-    if embedder is not None and vector_store is None:
-        raise ConfigurationError(
-            "Retriever was given an embedder but no vector_store. The pair is "
-            "inseparable: an embedder alone can embed the query, but there is no "
-            "dense index to search with it. Pass both or neither."
-        )
-    if vector_store is not None and embedder is None:
-        raise ConfigurationError(
-            "Retriever was given a vector_store but no embedder. The pair is "
-            "inseparable: without an embedder the query can never be embedded, so "
-            "the store could never be searched. Pass both or neither."
-        )
-
-
-def _identity_of(embedder: EmbeddingProtocol) -> EmbeddingIdentity:
-    """Read the ADR-0004 identity triple off the embedder itself.
-
-    Mirrors ``indexer.py``'s helper of the same name (deliberately not
-    imported from it — retrieval does not depend on the ingest pipeline):
-    sourcing all three fields from the object that actually embeds makes
-    "the manifest is checked against a different model than the one
-    embedding the queries" unrepresentable.
-    """
-    return EmbeddingIdentity(
-        provider=embedder.provider,
-        model_name=embedder.model_name,
-        dimensions=embedder.dimensions,
+    validate_dense_pair(
+        embedder,
+        vector_store,
+        subject="Retriever",
+        without_store=(
+            "an embedder alone can embed the query, but there is no dense index to search with it."
+        ),
+        without_embedder=(
+            "without an embedder the query can never be embedded, so the store "
+            "could never be searched."
+        ),
     )

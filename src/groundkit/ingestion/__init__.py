@@ -5,7 +5,10 @@ Public API:
 - :class:`FileLoader` — single parametrized loader for markdown/text files.
 - :class:`RecursiveChunker` — offset-preserving recursive chunker.
 - :class:`IngestionPipeline` — load -> chunk orchestration, single-source and
-  directory-scale.
+  directory-scale. Chunks only: it never writes to a collection, and it is
+  deliberately *not* what ``grk ingest`` runs. Persisting to a collection is
+  :class:`~groundkit.indexer.Indexer`'s job alone, and ADR-0010 records why
+  the two stay separate.
 - :class:`LoaderProtocol`, :class:`ChunkerProtocol` — the structural seams
   the above satisfy.
 """

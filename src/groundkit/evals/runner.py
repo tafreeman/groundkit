@@ -51,7 +51,6 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from groundkit import __version__
 from groundkit.config import ChunkingConfig, RetrievalConfig
-from groundkit.contracts import EmbeddingIdentity
 from groundkit.errors import ConfigurationError, EvalError, GroundkitError
 from groundkit.evals.corpus import (
     chunk_overlaps_span,
@@ -79,6 +78,7 @@ from groundkit.evals.schema import (
     StageName,
     StageResult,
 )
+from groundkit.identity import identity_of, validate_dense_pair
 from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.indexer import Indexer
 from groundkit.ingestion.loaders import FileLoader
@@ -379,7 +379,7 @@ async def run_eval(
             bm25_k1=retrieval_config.bm25_k1,
             bm25_b=retrieval_config.bm25_b,
             score_threshold=retrieval_config.score_threshold,
-            embedding=_identity_of(embedder) if embedder is not None else None,
+            embedding=identity_of(embedder) if embedder is not None else None,
             # Recorded only when a fusion stage actually ran: on a BM25-only
             # run the constant was never applied to anything, and stamping
             # the configured value into the artifact anyway would describe a
@@ -524,39 +524,21 @@ def _validate_dense_pair(
 ) -> None:
     """Reject half a dense pair before any corpus work starts.
 
-    Mirrors the identical checks on ``Indexer`` and ``Retriever``. Done here
-    too, rather than left to whichever of them raises first, so the eval
-    fails on the caller's mistake before spending a full ingest on it.
+    The branch structure is shared with ``Indexer`` and ``Retriever``
+    (:func:`groundkit.identity.validate_dense_pair`). Checked here too, rather
+    than left to whichever of them raises first, so the eval fails on the
+    caller's mistake before spending a full ingest on it.
 
     Raises:
         ConfigurationError: Exactly one of ``embedder`` / ``vector_store``
             was supplied.
     """
-    if embedder is not None and vector_store is None:
-        raise ConfigurationError(
-            "run_eval was given an embedder but no vector_store. The pair is "
-            "inseparable: there would be no dense index to search. Pass both or neither."
-        )
-    if vector_store is not None and embedder is None:
-        raise ConfigurationError(
-            "run_eval was given a vector_store but no embedder. The pair is "
-            "inseparable: queries could never be embedded. Pass both or neither."
-        )
-
-
-def _identity_of(embedder: EmbeddingProtocol) -> EmbeddingIdentity:
-    """Read the ADR-0004 identity triple off the embedder itself.
-
-    Mirrors the helpers of the same name in ``indexer.py`` and
-    ``retrieval/search.py``, and for the same reason: sourcing all three
-    fields from the object that actually embeds makes an artifact that
-    names a different model than the one that produced its vectors
-    unrepresentable.
-    """
-    return EmbeddingIdentity(
-        provider=embedder.provider,
-        model_name=embedder.model_name,
-        dimensions=embedder.dimensions,
+    validate_dense_pair(
+        embedder,
+        vector_store,
+        subject="run_eval",
+        without_store="there would be no dense index to search.",
+        without_embedder="queries could never be embedded.",
     )
 
 
