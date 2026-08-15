@@ -47,7 +47,7 @@ _T = TypeVar("_T")
 #: conservative separators ``-``, ``_``, ``.``. The character class alone
 #: already excludes path separators (``/``, ``\``), drive/UNC prefixes
 #: (``:``), and whitespace — but a lone ``.`` or ``..`` matches this pattern
-#: too, so :func:`_validate_collection` rejects those explicitly.
+#: too, so :func:`validate_collection_name` rejects those explicitly.
 _COLLECTION_NAME_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9._-]+$")
 
 #: Schema for the persisted metadata store. ``IF NOT EXISTS`` makes this safe
@@ -195,7 +195,7 @@ class SQLiteMetadataStore:
                 corrupted file or a path occupied by something other than a
                 regular SQLite file).
         """
-        _validate_collection(collection)
+        validate_collection_name(collection)
         db_path = index_dir / f"{collection}.sqlite3"
 
         def _connect() -> tuple[sqlite3.Connection, bool]:
@@ -925,7 +925,7 @@ def _identity_mismatch_message(manifest: CollectionManifest, identity: Embedding
     )
 
 
-def _validate_collection(collection: str) -> None:
+def validate_collection_name(collection: str) -> None:
     """Validate that ``collection`` is safe to interpolate into a file path.
 
     This is the first of two containment layers for :meth:`SQLiteMetadataStore.open`
