@@ -216,7 +216,28 @@ alike. Revert the source (not the test), run, restore, run.
 | 4 | Service + MCP | FastAPI + MCP server + CLI; `grk ingest ./docs && grk serve-mcp` connectable from Claude Desktop/Code with documented client config | pending |
 | 5 | Boundary features | optional query rewrite + cited synthesis; redaction pass (names → tokens, configurable patterns); advisory faithfulness judge | pending |
 | 6 | IaC + observability | multi-stage non-root Dockerfile; compose (service+Ollama+collector+Jaeger); k8s (deployment, service, PVC, probes); Terraform module for one concrete provider; OTel verified end-to-end in compose | pending |
-| 7 | Docs + release | MkDocs site, README live badges only, MIT, v0.1.0 tag, PyPI publish workflow | pending |
+| 7 | Docs + release | MkDocs site, README live badges only, MIT, v0.1.0 tag, PyPI publish workflow | machinery done 2026-08-15; **release blocked on Phases 4–6** |
+
+Phase 7 ran out of order, deliberately and partially. Everything in it that
+does not describe Phases 4–6 has landed: the MkDocs site (strict build, gated
+in CI and as a release gate), the LLM-boundary document §2 assigns to this
+phase, live-badge-only README, the PyPI trusted-publishing workflow, the
+release-gate suite that blocks it, and the re-enabled `eval-gated` /
+`rerank-gated` schedules those workflows reserved for "end of development".
+
+What has **not** happened is the release itself. No v0.1.0 tag, no GitHub
+release, nothing published to PyPI — §10's definition of done is unmet while
+the MCP server, the service surface and the IaC do not exist, and a 0.1.0 on
+PyPI describing a retrieval library with no service surface would be a version
+number that cannot be withdrawn and reused. The publish workflow is inert
+until a release is published, and its gate refuses a tag whose version
+disagrees with `pyproject.toml` — which today still carries `0.1.0.dev0`, so
+the machinery fails closed against exactly this premature release.
+
+The docs site describes only what is built, and states the gaps where they
+fall. When Phases 4–6 land, the docs owed are the service/MCP pages, the IaC
+verification dates, and the row in the LLM-boundary egress inventory that must
+stop saying the redaction pass does not exist.
 
 ## 10. Definition of done (v1)
 

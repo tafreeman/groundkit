@@ -26,6 +26,13 @@ dependencies = [
   "httpx>=0.27,<1",
 ]
 
+[project.urls]
+Homepage = "https://github.com/tafreeman/groundkit"
+Repository = "https://github.com/tafreeman/groundkit"
+Documentation = "https://tafreeman.github.io/groundkit/"
+Issues = "https://github.com/tafreeman/groundkit/issues"
+Changelog = "https://github.com/tafreeman/groundkit/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
 # Dense retrieval backend (Phase 3, ADR-0004). Optional so a BM25-only install
 # stays light — but pinned in the dev group below as well, because CI must
@@ -59,6 +66,22 @@ dev = [
   "pip-audit>=2.7,<3",
   "pre-commit>=4,<6",
   "lancedb>=0.13,<1",
+]
+# Docs site (Phase 7). A separate group, not part of `dev`: the docs build is
+# its own CI job and its own gate, and every other job — lint, typecheck, the
+# three-version test matrix, audit — would otherwise pay to install a static
+# site generator it never invokes.
+#
+# `mkdocstrings` imports groundkit to render the API reference, which is what
+# makes the strict docs build a real check on the package's docstrings rather
+# than on its prose alone. It is also why the docs job installs the `dense`
+# extra: `retrieval/` and `index/` import lancedb-backed modules, and a
+# missing optional dependency surfaces as a broken API page, not an import
+# error the build would otherwise swallow.
+docs = [
+  "mkdocs>=1.6,<2",
+  "mkdocs-material>=9.5,<10",
+  "mkdocstrings[python]>=0.26,<1",
 ]
 
 [tool.hatch.build.targets.wheel]

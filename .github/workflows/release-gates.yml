@@ -1,0 +1,171 @@
+# Offline release gates (SPEC.md §9, Phase 7).
+#
+# Everything that must hold before groundkit is uploaded to PyPI, as one
+# callable job. Modelled on agentic-evalkit's release-gates.yml with one
+# deliberate difference: that workflow is `workflow_dispatch`-only, so it
+# documents the gates without standing in front of anything. This one is
+# `workflow_call` first — publish.yml consumes it as a `needs:` dependency, so
+# a failing gate blocks the upload (SPEC.md §8) instead of relying on someone
+# remembering to dispatch it. `workflow_dispatch` is kept as well, for
+# rehearsing the gates before cutting a release.
+#
+# Deliberately offline and credential-free. The real-model paths live in
+# eval-gated.yml and rerank-gated.yml and stay out of the release path: each
+# pulls a model, and a network flake in either would block a release for a
+# reason unrelated to whether the release is sound. Dispatch those alongside
+# this workflow when the release is one where their result matters.
+name: release-gates
+
+on:
+  workflow_call:
+    inputs:
+      expected-version-ref:
+        description: >-
+          Release tag whose version must match pyproject.toml (e.g. v0.1.0).
+          Empty skips the parity check — correct for a rehearsal dispatch,
+          never for a real release.
+        type: string
+        required: false
+        default: ""
+  workflow_dispatch:
+    inputs:
+      expected-version-ref:
+        description: "Release tag to check against pyproject.toml (optional, e.g. v0.1.0)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# NO workflow-level `concurrency:` here, deliberately.
+#
+# Inside a reusable workflow `github.workflow` resolves to the *caller's*
+# workflow name, not this one. A `${{ github.workflow }}-${{ github.ref }}`
+# group would therefore evaluate to `publish-refs/tags/vX.Y.Z` — byte-identical
+# to publish.yml's own group, which the calling run already holds. With
+# `cancel-in-progress: false` on both, this job would queue behind the run that
+# is waiting on it and neither would ever proceed.
+#
+# The failure only ever appears on a real release, which is the worst place to
+# discover it, and it looks like a hung job rather than a misconfiguration.
+# There is nothing here that needs serializing anyway: the gates are read-only.
+
+jobs:
+  release-gates:
+    name: offline release gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+
+      # SPEC.md §7: "uv lockfile parity check". Run before the sync rather
+      # than after: `uv sync --locked` would fail on a stale lock anyway, but
+      # with an error about the sync, not about the lock being out of date.
+      - name: Lockfile parity
+        run: uv lock --check
+
+      - run: uv sync --locked --group dev --group docs
+
+      # The version claim under review. A GitHub release names a tag, and
+      # nothing in git makes that tag agree with pyproject.toml's `version` —
+      # which is the field PyPI actually publishes under. They disagree by
+      # default here, in fact: pyproject.toml carries a `.dev` version for the
+      # whole of pre-release development, so tagging `v0.1.0` against an
+      # unbumped tree would upload `0.1.0.dev0` under a release announcing
+      # 0.1.0. PyPI version numbers cannot be reused after a yank, so this has
+      # to fail before the upload rather than be corrected after it.
+      #
+      # Exact match after stripping one leading `v`, not PEP 440 equivalence:
+      # `v1.0` and `1.0.0` are the same release to PEP 440 but not the same
+      # string to a human reading the tag against the changelog, and a release
+      # gate should not be the component that quietly tolerates the drift.
+      - name: Tag/version parity
+        if: inputs.expected-version-ref != ''
+        env:
+          EXPECTED_REF: ${{ inputs.expected-version-ref }}
+        run: |
+          PROJECT_VERSION="$(uv run python -c \
+            "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          TAG_VERSION="${EXPECTED_REF#refs/tags/}"
+          TAG_VERSION="${TAG_VERSION#v}"
+          if [ "$TAG_VERSION" != "$PROJECT_VERSION" ]; then
+            echo "Release tag and pyproject.toml disagree about the version." >&2
+            echo "  tag:             ${EXPECTED_REF} (-> ${TAG_VERSION})" >&2
+            echo "  pyproject.toml:  ${PROJECT_VERSION}" >&2
+            echo "Bump pyproject.toml's version, or retag; do not publish this." >&2
+            exit 1
+          fi
+          echo "Version parity OK: ${PROJECT_VERSION}"
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Tests
+        run: uv run pytest --cov --cov-report=term
+
+      # Both coverage gates, matching ci.yml. Duplicated rather than skipped:
+      # a release can be cut from any ref, and "CI was green on main once" is
+      # not a statement about the commit being published.
+      - name: Coverage gate (whole package)
+        run: uv run coverage report
+
+      - name: Core-subset coverage gate (SPEC.md §8)
+        run: |
+          PATTERN=$(uv run python -c "import tomllib; print(','.join(tomllib.load(open('pyproject.toml', 'rb'))['tool']['groundkit']['coverage']['core_subset']))")
+          uv run coverage report --include="$PATTERN" --fail-under=80
+
+      # SPEC.md §10 names the strict docs build as part of CI green. It is also
+      # a release gate specifically: the docs site is a Phase 7 deliverable and
+      # a release that ships a site which no longer builds is a broken release.
+      - name: Docs strict build
+        run: uv run mkdocs build --strict
+
+      - name: Supply-chain audit
+        run: |
+          uv export --no-emit-project --group dev --format requirements.txt -o requirements-audit.txt
+          uv run pip-audit -r requirements-audit.txt --disable-pip
+
+      # What the tests cannot see: the tests run against the source tree, where
+      # `src/groundkit` is importable whether or not the packaging config would
+      # ship it. This installs the built wheel into an empty environment with no
+      # dev group, no extras, and no source tree on the path, then exercises the
+      # console entry point. It is the only step here that would catch a wheel
+      # missing `py.typed`, a subpackage absent from the build target, or a
+      # runtime import that only ever resolved through a dev dependency.
+      - name: Clean-wheel install gate
+        run: |
+          uv build
+          WHEEL="$(find "$PWD/dist" -maxdepth 1 -name '*.whl' | head -n 1)"
+          test -n "$WHEEL"
+          CLEANROOM="$(mktemp -d)"
+          cd "$CLEANROOM"
+          uv venv .venv
+          VIRTUAL_ENV="$CLEANROOM/.venv" uv pip install "$WHEEL"
+          # Run from the cleanroom, so a success cannot come from the checkout.
+          .venv/bin/python -c "import groundkit; print('groundkit', groundkit.__version__)"
+          .venv/bin/python -c "import importlib.resources as r; \
+            assert (r.files('groundkit') / 'py.typed').is_file(), 'wheel is missing py.typed'"
+          .venv/bin/grk --help >/dev/null
+          # `groundkit.__version__` is a second hand-maintained copy of
+          # pyproject.toml's `version` (SPEC.md §3 makes pyproject.toml the
+          # config source, so the literal in `__init__.py` is the derived
+          # one). Nothing keeps them in step, and the failure is silent in
+          # both directions: the wheel publishes pyproject's number while
+          # every runtime caller reads `__version__`. Asserted against the
+          # installed distribution metadata rather than against the file, so
+          # this measures what the wheel actually claims.
+          .venv/bin/python -c "import groundkit, importlib.metadata as m; \
+            d = m.version('groundkit'); \
+            assert d == groundkit.__version__, \
+              f'dist metadata {d!r} != groundkit.__version__ {groundkit.__version__!r}'"
+          echo "Clean-wheel gate OK"

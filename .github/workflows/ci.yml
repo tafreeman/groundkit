@@ -55,6 +55,29 @@ jobs:
           PATTERN=$(uv run python -c "import tomllib; print(','.join(tomllib.load(open('pyproject.toml', 'rb'))['tool']['groundkit']['coverage']['core_subset']))")
           uv run coverage report --include="$PATTERN" --fail-under=80
 
+  # SPEC.md §10 names the strict docs build as part of CI green, so it is a
+  # first-class job rather than a step bolted onto `lint`.
+  #
+  # `--strict` promotes MkDocs warnings to errors, which makes this a real
+  # gate on three things prose review does not catch: a relative link to a
+  # page that no longer exists, a `#fragment` no heading produces, and a new
+  # page under docs/ that was never added to `nav` (the recurring case is a
+  # freshly landed ADR — the record gets written and the nav entry is the
+  # half that gets forgotten).
+  #
+  # The `dense` extra is not decoration here: mkdocstrings imports groundkit
+  # to render the API reference, so a missing optional dependency would
+  # surface as a silently thin page rather than an import error.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+      - run: uv sync --locked --group docs --extra dense
+      - run: uv run mkdocs build --strict
+
   audit:
     runs-on: ubuntu-latest
     steps:

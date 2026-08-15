@@ -74,8 +74,8 @@ per SPEC.md §9:
   Either way `no_answer_abstained_count` is 0 for both stages as run, while
   the baseline abstains on every one, so abstention is not comparable across
   stages — read it per stage, never as a delta. See
-  [ADR-0007](docs/adr/ADR-0007-default-retrieval-mode.md), where this is the
-  reason the default stays BM25.
+  [ADR-0007](https://github.com/tafreeman/groundkit/blob/main/docs/adr/ADR-0007-default-retrieval-mode.md),
+  where this is the reason the default stays BM25.
 - **A dense/hybrid result list can still be shorter than `top_k` during the
   staleness window between an `open()` and the retriever's next reopen.**
   The dense path over-fetches to avoid this where it can: `_dense_candidates`

@@ -1,0 +1,121 @@
+# Publish groundkit to PyPI (SPEC.md §9, Phase 7).
+#
+# PyPI **trusted publishing** via GitHub OIDC: `id-token: write` is the entire
+# authentication mechanism. No PyPI API token is stored in this repository, its
+# secrets, or its environments, and none is referenced below. Before the first
+# release this workflow is inert in the safe direction — with no trusted
+# publisher registered on pypi.org it fails at the upload step with an explicit
+# "no matching trusted publisher" error rather than silently no-opping a real
+# release intent.
+#
+# TRIGGER — `release: published`, not `push: tags`.
+#
+# The portfolio has both patterns and they are not interchangeable here.
+# executionkit publishes on a pushed `v*` tag; agentic-evalkit publishes on a
+# published release. A tag alone does not create a release object, so
+# `GET /repos/tafreeman/groundkit/releases/latest` stays 404 forever under the
+# tag-triggered pattern — and that endpoint is exactly what the README's
+# version badge reads. SPEC.md §2 permits a number in a doc only when it comes
+# from a generated artifact or a dynamic badge, and Phase 7's deliverable is
+# "README live badges only". A tag trigger would leave the one badge that
+# states the released version permanently empty, with no honest way to fill it
+# in. Publishing on a published release is what makes the badge's data source
+# exist, so the trigger follows from the badge policy rather than from taste.
+#
+# The secondary effect is a safety one and points the same way: a release is a
+# deliberate, reviewable act with a body and a human behind it, while a tag can
+# be pushed by accident. Publishing to PyPI is irreversible — a version number
+# can be yanked but never reused.
+name: publish
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Unlike ci.yml, an in-flight upload is never cancelled by a second trigger:
+  # a half-published release is worse than a duplicate run, which PyPI rejects
+  # harmlessly as a re-upload of an existing version.
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # The full offline release-gate suite, as an actual blocking dependency of
+  # the upload rather than a checklist someone is trusted to have dispatched.
+  # This is the one deliberate departure from agentic-evalkit's shape, whose
+  # release-gates.yml is `workflow_dispatch`-only and therefore blocks nothing:
+  # it documents the gates without enforcing them. SPEC.md §8 ("a failing gate
+  # blocks the phase") reads as a requirement that the gate be in the path.
+  gates:
+    uses: ./.github/workflows/release-gates.yml
+    with:
+      # The release tag is the version claim under review. The gate refuses to
+      # let a tag and pyproject.toml's version disagree — see the parity step
+      # in release-gates.yml for why that check has to live at release time.
+      expected-version-ref: ${{ github.event.release.tag_name }}
+
+  build:
+    name: build distribution
+    needs: gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Verify both artifact kinds exist and are well-formed
+        run: |
+          test -n "$(find dist -maxdepth 1 -name '*.tar.gz')"
+          test -n "$(find dist -maxdepth 1 -name '*.whl')"
+          uvx twine check --strict dist/*
+
+      # Recorded as a build artifact rather than attached to the release: the
+      # workflow holds `contents: read`, and widening it to write just to
+      # upload an SBOM would grant this workflow the ability to mutate the
+      # repository it is publishing from.
+      - name: Generate SBOM
+        run: uvx --from cyclonedx-bom cyclonedx-py environment --of JSON --output-file sbom.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+          if-no-files-found: error
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # Register this exact repository + workflow filename (`publish.yml`) +
+    # environment name (`pypi`) as the trusted publisher on the PyPI project
+    # page. Protection rules on the `pypi` environment (required reviewers) are
+    # the human stop between a published release and an irreversible upload.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/groundkit
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1

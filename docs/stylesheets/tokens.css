@@ -1,0 +1,138 @@
+/* groundkit design tokens — SPEC.md §3.
+ *
+ * The spec pins the palette and the two typefaces; this file is the single
+ * place those values become CSS. Material's `palette:` key only accepts its
+ * own named colours (it has no `#d97757`), so the hexes are applied by
+ * overriding Material's custom properties instead. Anything that needs a
+ * groundkit colour reads a `--gk-*` token below rather than repeating a hex.
+ */
+
+:root {
+  /* SPEC.md §3 token list, verbatim. */
+  --gk-ember: #d97757;      /* primary accent */
+  --gk-accent-2: #e8a285;   /* secondary accent, hover/visited */
+  --gk-bg: #08080c;         /* page background */
+  --gk-cream: #ececde;      /* body text */
+  --gk-success: #4ade80;    /* success/affirmative state */
+
+  /* Derived surfaces. Not spec tokens — lifted from --gk-bg so that changing
+   * the one pinned background moves the whole surface stack with it. */
+  --gk-surface: #101018;
+  --gk-surface-2: #16161f;
+  --gk-border: #26262f;
+  --gk-muted: #9a9a92;
+}
+
+/* Material's slate scheme is the base; these override its defaults. */
+[data-md-color-scheme="slate"] {
+  --md-default-bg-color: var(--gk-bg);
+  --md-default-fg-color: var(--gk-cream);
+  --md-default-fg-color--light: var(--gk-muted);
+  --md-default-fg-color--lighter: var(--gk-border);
+  --md-default-fg-color--lightest: var(--gk-surface-2);
+
+  --md-primary-fg-color: var(--gk-bg);
+  --md-primary-bg-color: var(--gk-cream);
+  --md-accent-fg-color: var(--gk-accent-2);
+
+  --md-typeset-color: var(--gk-cream);
+  --md-typeset-a-color: var(--gk-ember);
+  --md-typeset-mark-color: rgba(217, 119, 87, 0.28);
+
+  --md-code-bg-color: var(--gk-surface);
+  --md-code-fg-color: var(--gk-cream);
+  --md-code-hl-string-color: var(--gk-success);
+  --md-code-hl-keyword-color: var(--gk-ember);
+  --md-code-hl-function-color: var(--gk-accent-2);
+
+  --md-footer-bg-color: var(--gk-surface);
+  --md-footer-bg-color--dark: var(--gk-bg);
+}
+
+/* Typography.
+ *
+ * SPEC.md §3 names exactly two faces, so each one has to earn its role:
+ * DM Serif Display is a display face and is unreadable as body copy at
+ * paragraph length, which leaves JetBrains Mono for running text and the
+ * serif for headings. Both are loaded by mkdocs.yml's `theme.font` — the
+ * display face is declared there as `text` purely so Material requests it,
+ * and this file is what actually assigns it.
+ */
+body,
+input,
+.md-typeset {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* Mono at prose length needs the extra leading and a touch less weight. */
+  line-height: 1.7;
+  font-size: 0.82rem;
+}
+
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3,
+.md-header__topic > .md-ellipsis {
+  font-family: "DM Serif Display", Georgia, "Times New Roman", serif;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+}
+
+.md-typeset h1 {
+  color: var(--gk-cream);
+}
+
+.md-typeset h2 {
+  /* The one structural use of the primary accent: section boundaries. */
+  border-bottom: 1px solid var(--gk-border);
+  padding-bottom: 0.2em;
+}
+
+/* Code blocks sit on the raised surface so they separate from the near-black
+ * page background, which #08080c alone does not do. */
+.md-typeset pre > code {
+  border: 1px solid var(--gk-border);
+  border-radius: 3px;
+}
+
+.md-typeset code {
+  font-size: 0.92em;
+}
+
+/* Admonitions: only the three groundkit uses semantically. `success` is the
+ * one place --gk-success appears, and it marks a claim the repo can actually
+ * back — a gate that holds, a path that is proven. */
+.md-typeset .admonition.note,
+.md-typeset details.note {
+  border-color: var(--gk-accent-2);
+}
+
+.md-typeset .admonition.warning,
+.md-typeset details.warning {
+  border-color: var(--gk-ember);
+}
+
+.md-typeset .admonition.success,
+.md-typeset details.success {
+  border-color: var(--gk-success);
+}
+
+.md-typeset .admonition.success > .admonition-title::before,
+.md-typeset details.success > summary::before {
+  background-color: var(--gk-success);
+}
+
+/* Tables read as data, not prose: keep them on the raised surface. */
+.md-typeset table:not([class]) th {
+  background-color: var(--gk-surface-2);
+  color: var(--gk-cream);
+}
+
+.md-typeset table:not([class]) {
+  border: 1px solid var(--gk-border);
+}
+
+/* mkdocstrings API headings inherit the serif from the rules above; the
+ * rendered signatures should stay mono and dim so the name is what reads. */
+.doc-signature,
+.doc-signature code {
+  color: var(--gk-muted);
+}
