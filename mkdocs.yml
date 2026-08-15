@@ -133,6 +133,9 @@ nav:
       - "ADR-0010 — Ingestion pipeline is not the ingest path": adr/ADR-0010-ingestion-pipeline-is-not-the-ingest-path.md
       - "ADR-0011 — BM25-only ingest refuses a dense collection": adr/ADR-0011-bm25-only-ingest-refuses-a-dense-collection.md
       - "ADR-0012 — Rerank eval stage": adr/ADR-0012-rerank-eval-stage-reorders-upstream-stage.md
+      - "ADR-0013 — Collection runtime and staleness marker": adr/ADR-0013-collection-runtime-persisted-staleness-marker.md
+      - "ADR-0014 — Read-only service surface and endpoint safety": adr/ADR-0014-read-only-service-surface-and-outbound-endpoint-safety.md
+      - "ADR-0015 — Service dependencies are base": adr/ADR-0015-service-dependencies-are-base-not-an-extra.md
   - Project:
       - Security: security.md
       - Known limitations: limitations.md
