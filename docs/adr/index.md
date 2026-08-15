@@ -21,3 +21,4 @@ that were considered; deviating from SPEC.md requires an ADR proposal first.
 | [ADR-0013](ADR-0013-collection-runtime-persisted-staleness-marker.md) | A cached `CollectionRuntime` whose validity is a marker persisted in SQLite | Accepted |
 | [ADR-0014](ADR-0014-read-only-service-surface-and-outbound-endpoint-safety.md) | Phase 4 is a read-only service surface, and outbound endpoints are guarded | Accepted |
 | [ADR-0015](ADR-0015-service-dependencies-are-base-not-an-extra.md) | Service dependencies are base requirements, not an optional extra | Accepted |
+| [ADR-0016](ADR-0016-citation-verifiability-for-extracted-and-remote-sources.md) | Citation verifiability for extracted and remote sources | Accepted |

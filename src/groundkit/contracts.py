@@ -15,13 +15,32 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 #: Score at or above which a retrieval result is considered high-confidence.
 #: Producers must normalize scores to be >= 0 (see RetrievalResult.score).
 HIGH_CONFIDENCE_SCORE: float = 0.7
+
+#: How a document's ``content`` relates to its source, and therefore how a
+#: citation into it is verified (ADR-0016).
+#:
+#: ``text`` — ``content`` **is** the source file's decoded bytes, so offsets into
+#: content are offsets into the file and re-reading reproduces them exactly. This
+#: is the only class that holds today, and the property the original
+#: ``resolve_citation`` quietly depends on.
+#:
+#: ``extracted`` — ``content`` is deterministic extractor output (PDF text, HTML
+#: with markup stripped). Re-reading the file does not reproduce the offsets;
+#: re-running the *same* extractor does, which is why an ``extracted`` document
+#: also records the extractor identity it was produced with.
+#:
+#: ``snapshot`` — ``content`` came from a remote resource whose bytes were stored
+#: locally at ingest. Verification resolves against that snapshot, never against
+#: a re-fetch: a re-fetch is a different observation at a different time, so a
+#: mismatch could not distinguish a stale index from a changed server.
+SourceClass = Literal["text", "extracted", "snapshot"]
 
 
 class Document(BaseModel):
@@ -31,6 +50,16 @@ class Document(BaseModel):
         document_id: Unique identifier (auto-generated UUID if omitted).
         source: File path, URL, or other source identifier.
         content: Raw text content of the document.
+        source_class: How ``content`` relates to ``source``, and therefore how a
+            citation into this document is verified (ADR-0016). Defaults to
+            ``"text"``, which is the only class a loader produced before
+            PDF/HTML/URL support and the one the plain re-read-and-compare
+            check assumes.
+        extractor: Identity of the extractor that produced ``content``, for
+            ``extracted`` documents only. Recorded because two extractor
+            versions produce two incompatible *offset* spaces under one name —
+            the same argument ADR-0004 makes about two embedding models and one
+            semantic space. ``None`` for every other class.
         metadata: Arbitrary key-value metadata (author, date, etc.).
     """
 
@@ -39,7 +68,32 @@ class Document(BaseModel):
     document_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     source: str
     content: str = Field(min_length=1)
+    source_class: SourceClass = "text"
+    extractor: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_extractor(self) -> Document:
+        """An extractor identity is required for ``extracted`` and meaningless otherwise.
+
+        Both directions are enforced, because both are wrong in a way that
+        surfaces late: an ``extracted`` document with no extractor cannot have
+        its offsets re-derived at citation time, and a ``text`` document
+        carrying one implies a re-extraction step that will never run.
+        """
+        if self.source_class == "extracted" and not self.extractor:
+            raise ValueError(
+                "an 'extracted' document must record the extractor identity that "
+                "produced its content — without it a citation's offsets cannot be "
+                "re-derived and verification would silently compare against the "
+                "wrong text (ADR-0016)"
+            )
+        if self.source_class != "extracted" and self.extractor is not None:
+            raise ValueError(
+                f"extractor is only meaningful for an 'extracted' document, "
+                f"got source_class={self.source_class!r}"
+            )
+        return self
 
 
 class Chunk(BaseModel):
@@ -98,6 +152,12 @@ class Citation(BaseModel):
         document_id: ID of the source document.
         chunk_id: ID of the cited chunk.
         source: The document's source identifier (path/URL).
+        source_class: How to resolve ``source`` back to text (ADR-0016).
+            Carried on the citation rather than looked up at resolution time so
+            a resolver cannot verify a document under a different class's
+            assumptions than the one it was ingested under.
+        extractor: Extractor identity for an ``extracted`` source; a resolver
+            must refuse rather than slice when its own differs.
         start_offset: Character offset where the cited span starts.
         end_offset: One past the last character of the cited span.
     """
@@ -107,6 +167,8 @@ class Citation(BaseModel):
     document_id: str
     chunk_id: str
     source: str
+    source_class: SourceClass = "text"
+    extractor: str | None = None
     start_offset: int = Field(ge=0)
     end_offset: int = Field(gt=0)
 
@@ -136,6 +198,8 @@ class RetrievalResult(BaseModel):
     document_id: str
     chunk_id: str
     source: str
+    source_class: SourceClass = "text"
+    extractor: str | None = None
     start_offset: int = Field(ge=0)
     end_offset: int = Field(gt=0)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -154,6 +218,8 @@ class RetrievalResult(BaseModel):
             document_id=self.document_id,
             chunk_id=self.chunk_id,
             source=self.source,
+            source_class=self.source_class,
+            extractor=self.extractor,
             start_offset=self.start_offset,
             end_offset=self.end_offset,
         )

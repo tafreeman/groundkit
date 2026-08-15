@@ -136,6 +136,7 @@ nav:
       - "ADR-0013 — Collection runtime and staleness marker": adr/ADR-0013-collection-runtime-persisted-staleness-marker.md
       - "ADR-0014 — Read-only service surface and endpoint safety": adr/ADR-0014-read-only-service-surface-and-outbound-endpoint-safety.md
       - "ADR-0015 — Service dependencies are base": adr/ADR-0015-service-dependencies-are-base-not-an-extra.md
+      - "ADR-0016 — Citation verifiability for extracted and remote sources": adr/ADR-0016-citation-verifiability-for-extracted-and-remote-sources.md
   - Project:
       - Security: security.md
       - Known limitations: limitations.md
