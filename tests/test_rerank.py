@@ -492,6 +492,84 @@ class TestCrossEncoderRerankerFailsClosed:
 
         assert attempts["count"] == 2
 
+    def test_inference_failure_is_translated_to_a_retrieval_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A backend exception during scoring must not cross the seam raw.
+
+        Inference fails in ways this repo does not model — CUDA OOM, a
+        tokenizer rejecting an input, a device that went away. Every other
+        failure in this module already arrives typed, so leaving this one
+        untranslated would leave a caller handling ``RetrievalError`` (in
+        Phase 4, the request boundary) unprotected on the path most likely to
+        fail under load.
+        """
+        import groundkit.retrieval.rerank as rerank_module
+
+        class _ExplodingAtInferenceCrossEncoder:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def predict(self, pairs: list[list[str]]) -> list[float]:
+                raise RuntimeError("CUDA out of memory")
+
+        monkeypatch.setattr(
+            rerank_module,
+            "_import_cross_encoder",
+            lambda: (_ExplodingAtInferenceCrossEncoder, "IDENTITY"),
+        )
+
+        async def run() -> None:
+            reranker = CrossEncoderReranker()
+            with pytest.raises(RetrievalError) as excinfo:
+                await reranker.rerank("q", [_result("c1")], top_k=1)
+
+            # Chained, so the backend's own message survives in the traceback.
+            assert isinstance(excinfo.value.__cause__, RuntimeError)
+            assert "CUDA out of memory" in str(excinfo.value.__cause__)
+
+        asyncio.run(run())
+
+    def test_inference_failure_message_does_not_leak_query_or_content(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The raised message must not carry corpus text or the query.
+
+        Unlike a load failure, an inference failure routinely quotes the input
+        it choked on — here the query and the passages. The backend's message
+        is therefore chained rather than interpolated, so it reaches a
+        traceback without the raised error itself becoming a disclosure.
+        """
+        import groundkit.retrieval.rerank as rerank_module
+
+        private_query = "what is the patient's diagnosis"
+        private_content = "content of c1"
+
+        class _LeakyCrossEncoder:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def predict(self, pairs: list[list[str]]) -> list[float]:
+                raise ValueError(f"tokenizer failed on {pairs!r}")
+
+        monkeypatch.setattr(
+            rerank_module,
+            "_import_cross_encoder",
+            lambda: (_LeakyCrossEncoder, "IDENTITY"),
+        )
+
+        async def run() -> None:
+            reranker = CrossEncoderReranker()
+            with pytest.raises(RetrievalError) as excinfo:
+                await reranker.rerank(private_query, [_result("c1")], top_k=1)
+
+            message = str(excinfo.value)
+            assert private_query not in message
+            assert private_content not in message
+            assert "ValueError" in message  # the type is named; the text is not
+
+        asyncio.run(run())
+
     def test_max_length_is_forwarded_to_the_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import groundkit.retrieval.rerank as rerank_module
 

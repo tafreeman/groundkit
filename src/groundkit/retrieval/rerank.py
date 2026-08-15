@@ -54,7 +54,7 @@ import math
 from typing import TYPE_CHECKING, Any
 
 from groundkit.contracts import RetrievalResult
-from groundkit.errors import RerankerNotConfiguredError, RetrievalError
+from groundkit.errors import GroundkitError, RerankerNotConfiguredError, RetrievalError
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -392,8 +392,10 @@ class CrossEncoderReranker:
         Raises:
             RerankerNotConfiguredError: The optional extra is missing or the
                 model could not be loaded. Never a silent passthrough.
-            RetrievalError: ``top_k`` is not positive, or the model returned a
-                misaligned or non-finite batch.
+            RetrievalError: ``top_k`` is not positive, the model returned a
+                misaligned or non-finite batch, or inference itself failed —
+                every backend exception is translated, so a caller handling
+                this repo's error root is covered on the scoring path too.
         """
         if top_k <= 0:
             raise RetrievalError(f"rerank top_k must be > 0, got {top_k}")
@@ -402,7 +404,30 @@ class CrossEncoderReranker:
 
         model = await self._ensure_model()
         pairs = [[query, result.content] for result in results]
-        raw = await asyncio.to_thread(model.predict, pairs)
+        try:
+            raw = await asyncio.to_thread(model.predict, pairs)
+        except GroundkitError:
+            raise
+        except Exception as exc:
+            # Inference fails in ways the backend owns and this repo does not
+            # model — CUDA OOM, a tokenizer rejecting an input, a device that
+            # went away. Left unwrapped they cross the seam as arbitrary
+            # third-party exceptions, so a caller handling RetrievalError (in
+            # Phase 4, the request boundary) is unprotected on the one path
+            # most likely to fail under load, while every other failure in
+            # this module already arrives typed.
+            #
+            # The exception's message is deliberately NOT interpolated, unlike
+            # `_load_model`'s. A load failure cannot carry corpus text; an
+            # inference failure can — a tokenizer error routinely quotes the
+            # input it choked on, which here is the query and the passages.
+            # The cause is chained instead, so a traceback still carries the
+            # detail while the message this raises cannot itself leak content.
+            raise RetrievalError(
+                f"Cross-encoder {self._model_name!r} failed while scoring "
+                f"{len(pairs)} query/passage pairs ({type(exc).__name__}); "
+                "see the chained cause for the backend's own message"
+            ) from exc
         logits = [float(score) for score in raw]
         logger.debug(
             "Reranked %d candidates to %d with %s",
