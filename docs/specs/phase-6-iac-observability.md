@@ -185,10 +185,15 @@ some rows unfilled, and this is it.
 | `kubectl` | present, **no cluster context configured** |
 | `terraform` | **not installed** |
 
-Nothing was built, no image was pulled, no container ran, no manifest was
-applied to a cluster, and no Terraform plan was produced. `infra/README.md`
-carries the same table as a status board and is the file to update when a path
-is actually exercised.
+Nothing was built there, no image was pulled, no container ran, no manifest was
+applied to a cluster, and no Terraform plan was produced.
+
+That is what the CI job in §6.2 is for, and it is not a formality: a runner has
+a daemon and registry access, so on this change's first CI run the image built,
+ran as uid 10001 under a read-only root, and all six pinned third-party tags
+resolved — verifications this machine could not perform at all.
+`infra/README.md` carries the status table, marks which rows were earned on a
+runner, and is the file to update when a path is actually exercised.
 
 ### 6.2 The verification each path is owed
 

@@ -65,8 +65,12 @@ FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
 # volume from the image's mountpoint, and a host bind mount all have to name the
 # same identity. A uid that moves between rebuilds turns each of those into a
 # permission failure on a volume that was writable yesterday.
-RUN groupadd --system --gid 10001 groundkit \
- && useradd --system --uid 10001 --gid 10001 \
+#
+# Not `--system`: that flag's whole job is to allocate from the system uid range,
+# and this build allocates explicitly. Passing both makes useradd warn on every
+# build that 10001 exceeds SYS_UID_MAX, which reads like a problem and is not.
+RUN groupadd --gid 10001 groundkit \
+ && useradd --uid 10001 --gid 10001 \
       --home-dir /home/groundkit --create-home --shell /usr/sbin/nologin groundkit
 
 COPY --from=builder --chown=10001:10001 /opt/groundkit /opt/groundkit

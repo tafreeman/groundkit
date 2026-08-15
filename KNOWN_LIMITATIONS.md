@@ -534,10 +534,14 @@ Everything below describes the state between the two.
   observed: the compose file parses and interpolates, the Kubernetes base
   renders and every manifest parses, the Terraform module passes `fmt -check`
   and `validate` against AWS provider 5.100.0 and 6.60.0, and the user-data
-  template renders to a script that passes `bash -n`. CI now gates the image
-  build, the pinned third-party tags, the Kubernetes render and the Terraform
-  checks on every pull request; a real `compose up`, a cluster apply and a
-  Terraform apply remain the operator's to run.
+  template renders to a script that passes `bash -n`. The `infra` CI job covers
+  what that machine could not — on this change's first run the image built, ran
+  as uid 10001 under a read-only root, and all six pinned third-party tags
+  resolved — and it gates all of that on every pull request from now on. What
+  remains unrun: no container has served a request, no manifest has reached a
+  cluster, and `terraform validate` makes no API call, so a missing IAM
+  permission or an AMI filter matching nothing is invisible to it. A real
+  `compose up`, a cluster apply and a Terraform apply are the operator's to run.
 
 ## Phase 2 caveats
 

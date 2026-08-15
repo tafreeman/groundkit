@@ -106,9 +106,12 @@ model has to arrive somehow.
 None of these tags was pulled while this tree was written — no container runtime
 was available (phase spec §6.1). CI resolves each one with
 `docker buildx imagetools inspect`, which reads the manifest without downloading
-a layer and is what makes a pin a checked claim rather than a guess. They were
-chosen for confidence that they exist, not for recency: refresh them at the
-first real verification and record the date here.
+a layer and is what makes a pin a checked claim rather than a guess.
+**All six resolved on 2026-08-15** in the first run of that job; the two base
+images additionally proved themselves by building. They were chosen for
+confidence that they exist, not for recency, so a resolving tag is not
+necessarily a current one — refresh them at the first `compose up` and record
+that date here.
 
 | Image | Pin | Used by |
 |---|---|---|
@@ -128,12 +131,15 @@ run. Both hold here, so some rows are empty.
 **No container runtime, no cluster and no cloud account were available on the
 machine this tree was written on** — the Docker CLI was present but its daemon
 was not running, `kubectl` had no configured context, and there was no AWS
-credential. Nothing was built, pulled, applied or planned.
+credential. Nothing was built, pulled, applied or planned *there*. The rows
+marked *(CI)* were earned by the `infra` job on a runner instead, which is why
+that job exists rather than being a formality.
 
 | Path | Check | Status |
 |---|---|---|
-| Dockerfile | `docker build` | **not yet run** — gated in CI from this change on |
-| Dockerfile | container runs as uid 10001 with a read-only root | **not yet run** |
+| all | six pinned third-party tags resolve | **passed 2026-08-15** *(CI)* |
+| Dockerfile | `docker build` | **passed 2026-08-15** *(CI)* |
+| Dockerfile | container runs as uid 10001; CLI works; starts under `--read-only` with only the two named scratch mounts | **passed 2026-08-15** *(CI)* |
 | compose | `docker compose config` parses and interpolates | **passed 2026-08-15** |
 | compose | `up`, ingest, a real search over the loopback publish | **not yet run** |
 | compose | a groundkit span visible in Jaeger | **blocked** — needs the instrumentation change |
@@ -142,6 +148,12 @@ credential. Nothing was built, pulled, applied or planned.
 | terraform | `fmt -check`, `validate` on providers 5.100.0 and 6.60.0 | **passed 2026-08-15** |
 | terraform | `bootstrap.sh.tftpl` renders; rendered script passes `bash -n` | **passed 2026-08-15** |
 | terraform | `plan` / `apply` against a real account | **not yet run** |
+
+What the passing rows do **not** cover, so a full column of green is not read as
+more than it is: no container has served a request, no manifest has reached a
+cluster, and `terraform validate` makes no API call — a missing IAM permission,
+an instance type unavailable in the region, or an AMI filter matching nothing
+are all invisible to it.
 
 Update the rows, with the date, when you run one. Do not update a row you did
 not run.
