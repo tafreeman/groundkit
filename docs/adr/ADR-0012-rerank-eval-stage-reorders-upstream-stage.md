@@ -133,7 +133,7 @@ exactly the way two embedding models are two different measurements of
 `RerankerProtocol` with a `model_name` member. That protocol encodes
 ADR-0001 hazard 4 and is held to exact signature parity by
 `tests/test_protocol_conformance.py`
-(`TestRerankerProtocolConformance.test_cross_encoder_reranker_conforms`);
+(`test_cross_encoder_reranker_matches_reranker_protocol`);
 changing a seam to satisfy a reporting need is the wrong trade, and every
 other protocol in this repo is held to the same rule. A test double with no
 `model_name` attribute falls back to `type(reranker).__name__`, which makes a
@@ -193,7 +193,7 @@ report.
 ## Consequences
 
 - The measured delta this ADR unblocks is meaningful only under
-  `RERANK_GATED=1 uv run pytest tests/test_rerank_gated.py` with `uv sync
+  `RERANK_GATED=1 uv run pytest tests/test_eval_rerank_gated.py` with `uv sync
   --extra rerank` installed — a stub reranker's delta (an unconfigured
   `_StubReranker` or similar test double) is noise with a sign, the same
   trap `InMemoryEmbedder` sets for the dense stages (SPEC.md §2). A `rerank`

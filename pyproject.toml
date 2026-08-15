@@ -111,9 +111,40 @@ precision = 2
 # 1 lands, optional providers excluded, README states the subset honestly)."
 # ci.yml's core-subset gate step derives its `coverage report --include=`
 # patterns from this list so the two cannot drift out of sync.
+#
+# The `index/` entries are enumerated file-by-file, unlike the `retrieval/*`
+# glob, because the reasoning for each is per-file. Two consequences that must
+# not be left to omission (Phase 3 Wave F):
+#
+# 1. `index/dense.py` is IN, added in Wave F. It is scoring — `_cosine_similarity`,
+#    `_clamp_score`, `_matches_filter`, `_sort_by_score` — the vector peer of
+#    `bm25.py`, and it holds both live ADR-0001 hazards (3 and 5). Hazard 3 has
+#    already demonstrated that an ungated guard decays quietly: Wave A's filter
+#    tests seeded every chunk with the filter's key, so the membership guard
+#    survived its own mutation untested. `retrieval/fusion.py` is already gated
+#    by the glob above, so leaving `dense.py` out gated the combiner but not one
+#    of its two inputs.
+#
+#    Caveat, recorded because it is the honest cost: `dense.py` is a MIXED file
+#    — roughly two-thirds shared helpers plus `InMemoryVectorStore`, one-third
+#    `LanceDBVectorStore` behind the optional `dense` extra. Gating it wholesale
+#    admits, inside one file, the offsetting this subset exists to prevent:
+#    well-covered LanceDB rows can mask a thin in-memory path, or the reverse,
+#    and the gate cannot see the difference. Accepted only because `lancedb` is
+#    pinned in the dev group above, so CI genuinely covers both halves — that is
+#    a convention, not an invariant, and it is what makes this safe. Splitting
+#    `LanceDBVectorStore` into its own module is the clean fix; it is a real
+#    refactor with its own ADR, deliberately not ridden along here.
+#
+# 2. `index/metadata.py` stays OUT, and "it is core, so gate it" is not a reason
+#    to add it — that argument proves too much. `metadata.py` is the durable
+#    truth (ADR-0002) and is equally core by that test, which is exactly why the
+#    per-file reasoning above is written down rather than generalized into a
+#    rule. Stated explicitly so the next reader does not reopen it.
 [tool.groundkit.coverage]
 core_subset = [
   "src/groundkit/retrieval/*",            # search orchestration + citation resolution
   "src/groundkit/ingestion/chunking.py",  # chunking
-  "src/groundkit/index/bm25.py",          # scoring
+  "src/groundkit/index/bm25.py",          # lexical scoring
+  "src/groundkit/index/dense.py",         # vector scoring (Wave F; see caveats above)
 ]

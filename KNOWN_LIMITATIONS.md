@@ -285,10 +285,21 @@ per SPEC.md §9:
   for now. Structured metadata columns would fix it and are not built.
 - **Metadata filtering is equality-only.** A filter matches when every
   key/value pair is present and equal. No ranges, no negation, no nesting.
-- **`index/dense.py` is not in the coverage `core_subset`.** It sits at 100%
-  today, but the gate that would keep it there covers `retrieval/*`,
-  `ingestion/chunking.py`, and `index/bm25.py` only. Adding it is a Wave F
-  decision (see `docs/specs/phase-3-hybrid-retrieval.md`).
+- **`index/dense.py` is now in the coverage `core_subset`, and it is a mixed
+  file.** Wave F added it: it is scoring, the vector peer of the already-gated
+  `bm25.py`, it holds both live ADR-0001 hazards, and `retrieval/fusion.py` was
+  already gated by the `retrieval/*` glob, so leaving it out gated the combiner
+  but not one of its inputs. The residual gap is inside the file rather than
+  around it — roughly two-thirds shared helpers plus `InMemoryVectorStore`,
+  one-third `LanceDBVectorStore` behind the optional `dense` extra, all under a
+  single number. Well-covered LanceDB rows can therefore mask a thin in-memory
+  path or the reverse, which is the offsetting the subset exists to prevent,
+  admitted here at file granularity. What makes it safe is that `lancedb` is
+  pinned in the dev group so CI genuinely exercises both halves — a convention,
+  not an invariant. Splitting `LanceDBVectorStore` into its own module would
+  remove the caveat and is deliberately not bundled into Wave F.
+  `index/metadata.py` remains outside the subset by per-file reasoning, not
+  oversight (`pyproject.toml` records why).
 - **The two vector stores diverge on zero-magnitude vectors.** LanceDB's
   cosine search omits them from results entirely; `InMemoryVectorStore`
   returns them at score 0.0. Real embedding models do not emit zero vectors,
