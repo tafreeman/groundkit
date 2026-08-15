@@ -110,6 +110,7 @@ nav:
   - Guides:
       - Retrieval modes: guides/retrieval-modes.md
       - Eval harness: guides/evals.md
+      - MCP clients: guides/mcp-clients.md
   - Architecture:
       - Overview: architecture/index.md
       - The LLM boundary: architecture/llm-boundary.md
@@ -118,6 +119,7 @@ nav:
       - Contracts: reference/contracts.md
       - Configuration: reference/config.md
       - Retrieval: reference/retrieval.md
+      - Service: reference/service.md
       - Errors: reference/errors.md
   - Decisions:
       - Overview: adr/index.md

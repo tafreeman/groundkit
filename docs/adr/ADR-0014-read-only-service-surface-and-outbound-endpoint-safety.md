@@ -413,6 +413,52 @@ that caused ARP's signature drift (ADR-0001 hazard 4).
   `utils/url_safety.py` does not exist. That is stated plainly in the implementation notes
   rather than implied away.
 
+## Amendment (2026-08-15) — the not-found/bad-request boundary, settled
+
+Decision 9 maps `ConfigurationError` to a 400/`invalid_request`. Decision 3
+calls a request against a non-existent collection a *not-found*.
+`CollectionRegistry` itself raises `ConfigurationError` for exactly that
+case. Read against each other without their call sites, those two decisions
+look like they conflict.
+
+They do not, because decision 3 was never describing an exception path.
+**The not-found is produced structurally, not by discrimination between
+exception types.** `service/errors.py`'s `check_collection` runs as a
+precondition at the transport boundary, before any handler — and therefore
+before the registry — is reached: it validates the collection name, then
+checks `<index_dir>/<collection>.sqlite3` for existence, and returns a 404
+`ErrorRendering` directly when it is absent. The registry's own
+`ConfigurationError` for an unknown collection is defense-in-depth that a
+well-formed request never reaches, not a second opinion the mapper has to
+arbitrate between. No message is matched against the exception and no new
+exception type was introduced to distinguish the two cases — the two
+answers come from two different places in the call, which is why this is
+robust rather than a string comparison waiting to rot.
+
+**Name validation runs before the existence check**, and the order is
+itself the security property: a traversal attempt in the collection name is
+reported as a validation failure, not as a not-found that would have
+confirmed whether the traversed-to path exists. A probe learns nothing
+either way.
+
+**The residual, recorded rather than left to omission: a missing
+`chunk_id` surfaces as 400, not 404.** `handle_fetch_chunk` raises
+`ConfigurationError` for it, and there is no `check_chunk` precondition
+analogous to `check_collection` — a chunk cannot be checked for existence
+without first doing the lookup the handler exists to perform. Separating
+that case from an invalid collection name would need either a new
+exception type (forbidden by decision 9) or message matching (forbidden
+for fragility), and this ADR takes neither. 400 is also the reading
+decision 9's own rationale already gives: "every reachable one in Phase 4
+is caused by a request field," and `chunk_id` is a request field exactly as
+a collection name is.
+
+This amendment revises neither decision 3 nor decision 9; it records how
+they compose at the one call site where they meet.
+`src/groundkit/service/errors.py`'s module docstring states the same
+resolution for the same reason — a reader who hits a 400 on a `GET` for a
+missing chunk is meant to find it in either place.
+
 ## References
 
 - SPEC.md **§1.2** (the four tools, cited as the authority that ingest is not among them),

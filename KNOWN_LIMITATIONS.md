@@ -2,7 +2,7 @@
 
 Honest and current, per repo policy. Updated with each phase.
 
-## Current state (Phase 3, all waves built)
+## Current state (Phase 3 and Phase 4, service surface built)
 
 Hybrid retrieval works end-to-end locally, behind opt-in flags: `grk
 ingest --dense` embeds each chunk into a LanceDB vector store alongside the
@@ -363,15 +363,10 @@ per SPEC.md §9:
 - PDF/HTML loaders and URL ingestion (with the SSRF guard) — v1 scope, not
   yet scheduled into a phase; the loader currently reads `.md`/`.markdown`/
   `.txt` only.
-- REST API and MCP server (Phase 4); synthesis, query rewrite, redaction
-  (Phase 5); IaC and OTel observability (Phase 6); docs site (Phase 7).
+- Synthesis, query rewrite, redaction (Phase 5); IaC and OTel observability
+  (Phase 6); docs site (Phase 7).
 - BM25 rebuilds in memory at open — O(corpus) startup cost, accepted and
   bounded by ADR-0002's revisit trigger.
-- Cloud-provider embedding-endpoint SSRF guard and outbound redirect policy
-  (loopback/private/link-local/IPv6-mapped rejection) — lands with the
-  service phase (Phase 4); Phase 1's OpenAI-compatible embedding provider
-  accepts an operator-set `base_url` with no such validation today. See
-  SECURITY.md.
 - A UTF-8 BOM is not stripped at load (`utf-8`, not `utf-8-sig`), so a
   leading byte-order-mark character (U+FEFF) appears in the first chunk's
   content and in citations resolved from it. Cosmetic — offsets stay
@@ -382,6 +377,63 @@ per SPEC.md §9:
   and can resolve to silently wrong text.
 - Total ingestion size is unbounded: individual files cap at 10 MiB, but
   nothing caps file count or aggregate bytes for a directory run.
+- **No authentication. The 127.0.0.1 bind is load-bearing, not a default.**
+  Every Phase 4 response is unauthenticated by construction (ADR-0014
+  decision 1): the shared-secret header SPEC.md §7 requires for mutating
+  routes is not built, because the set of mutating operations is empty. The
+  loopback bind is therefore the service's only access control (decision 7),
+  and `--allow-remote-access` exposes an unauthenticated, content-bearing
+  surface — document text and absolute source paths over `search`,
+  collection topology over `index_status` and `list_collections` — to
+  anyone who can reach the port.
+- **No mutating operation over either transport.** No ingest, no delete, on
+  REST or MCP. Deliberate (ADR-0014 decision 1), not an omission: SPEC.md
+  §1.2's four tools — `search`, `fetch_chunk`, `list_collections`,
+  `index_status` — are the complete named surface, and the CLI covers
+  ingest at a strictly smaller surface: a local operator's typed argument,
+  not any caller reaching the port.
+- **A missing `chunk_id` returns 400, not 404.** `handle_fetch_chunk` raises
+  `ConfigurationError` for it, and separating that case from an invalid
+  collection name would need either a new exception type (forbidden by
+  ADR-0014 decision 9) or message matching (forbidden for fragility) —
+  neither is taken, so the asymmetry stands. A non-existent *collection*,
+  by contrast, does return not-found: `check_collection` refuses it as a
+  precondition before any handler runs, which is a boundary check rather
+  than an exception path (ADR-0014 decision 3; see
+  `src/groundkit/service/errors.py`).
+- **`chunk_count()` is O(corpus).** The store exposes no `COUNT(*)`, so
+  `index_status` materializes the full chunk list to measure it
+  (`CollectionRuntime.chunk_count`, `src/groundkit/runtime.py`). Adding
+  `COUNT(*)` to `MetadataStoreProtocol` would be cheaper and is deliberately
+  not done: that protocol is held to exact signature parity by conformance
+  tests, and widening it for a reporting convenience is the trade
+  ADR-0012 decision 3 already refused for `model_name`. This is a status
+  call, not a hot path.
+- **Read-only does not mean the process writes no bytes.** Opening a WAL
+  database updates its `-shm`/`-wal` sidecars, and `SQLiteMetadataStore.open`
+  runs `CREATE TABLE IF NOT EXISTS` and a best-effort chmod on every open
+  (ADR-0014 decision 4). The read-only claim is scoped to durable document,
+  chunk, and manifest state — enforced in Python, not by the filesystem:
+  the process holds a read-write file handle throughout. Filesystem-level
+  enforcement (a read-only mount) is deferred to Phase 6.
+- **Reranking a hybrid search returns a ranking no `grk search --mode
+  hybrid` produces.** RRF is not depth-invariant: it sums
+  `1/(rrf_k + rank)` over the rankings a chunk is visible in at the fetched
+  depth, so the wider candidate depth used for reranking fuses a different
+  set, not a deeper slice of the same one — a chunk absent from the
+  depth-10 fused list can rank first at depth 50 (ADR-0012 Consequences;
+  ADR-0014 Consequences). The response records the input depth so a client
+  can tell.
+- **DNS rebinding is not closed.** Between `url_safety`'s resolution and
+  httpx's own connect-time resolution, the answer can change — the window
+  is two resolutions in one process, small, not zero. Closing it needs
+  connections pinned to the validated address with the original host
+  preserved in `Host` and SNI, which is not built (ADR-0014 Consequences).
+- **The proxy bypass is not closed.** `trust_env=False` was rejected because
+  it also disables `SSL_CERT_FILE` and `.netrc`, which operators
+  legitimately need, to close a bypass in the same trust domain as
+  `base_url` itself. The threat model is operator misconfiguration, not a
+  hostile operator (ADR-0014 Consequences).
 
 ## Phase 2 caveats
 
