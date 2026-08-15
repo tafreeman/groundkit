@@ -403,6 +403,95 @@ class TestCrossEncoderRerankerFailsClosed:
 
         assert loads["count"] == 1
 
+    def test_cancelled_cold_call_does_not_orphan_a_second_load(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cancelled load must not free the lock while its worker still runs.
+
+        A worker thread cannot be cancelled, but the ``await`` in front of it
+        can. Holding the lock across the awaited ``to_thread`` therefore only
+        looks safe: cancellation unwinds ``async with``, frees the lock, and
+        leaves the worker building — so the next caller still sees ``_model is
+        None``, takes the free lock, and starts a second multi-gigabyte load.
+        Under a Phase 4 request timeout that is an ordinary event, not an
+        exotic one.
+        """
+        import groundkit.retrieval.rerank as rerank_module
+
+        loads = {"count": 0}
+
+        class _SlowCrossEncoder:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                time.sleep(0.2)
+                loads["count"] += 1
+
+            def predict(self, pairs: list[list[str]]) -> list[float]:
+                return [0.0] * len(pairs)
+
+        monkeypatch.setattr(
+            rerank_module,
+            "_import_cross_encoder",
+            lambda: (_SlowCrossEncoder, "IDENTITY"),
+        )
+
+        async def run() -> None:
+            reranker = CrossEncoderReranker()
+            candidates = [_result("c1")]
+
+            cold = asyncio.create_task(reranker.rerank("q", candidates, top_k=1))
+            await asyncio.sleep(0.05)  # let it reach the load, not past it
+            cold.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cold
+
+            # The abandoned worker is still inside its 0.2s __init__ here.
+            reranked = await reranker.rerank("q", candidates, top_k=1)
+            assert len(reranked) == 1
+
+        asyncio.run(run())
+
+        assert loads["count"] == 1
+
+    def test_a_failed_load_can_be_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A shared task that failed is replaced, not reused forever.
+
+        Reusing it would make one transient fault mid-download poison the
+        instance permanently, with every later call re-raising a stale
+        exception from a task that will never be retried.
+        """
+        import groundkit.retrieval.rerank as rerank_module
+
+        attempts = {"count": 0}
+
+        class _FailsOnceCrossEncoder:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                attempts["count"] += 1
+                if attempts["count"] == 1:
+                    raise RuntimeError("transient network fault")
+
+            def predict(self, pairs: list[list[str]]) -> list[float]:
+                return [0.0] * len(pairs)
+
+        monkeypatch.setattr(
+            rerank_module,
+            "_import_cross_encoder",
+            lambda: (_FailsOnceCrossEncoder, "IDENTITY"),
+        )
+
+        async def run() -> None:
+            reranker = CrossEncoderReranker()
+            candidates = [_result("c1")]
+
+            with pytest.raises(RerankerNotConfiguredError):
+                await reranker.rerank("q", candidates, top_k=1)
+
+            reranked = await reranker.rerank("q", candidates, top_k=1)
+            assert len(reranked) == 1
+
+        asyncio.run(run())
+
+        assert attempts["count"] == 2
+
     def test_max_length_is_forwarded_to_the_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import groundkit.retrieval.rerank as rerank_module
 

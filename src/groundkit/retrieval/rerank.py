@@ -252,6 +252,7 @@ class CrossEncoderReranker:
         self._max_length = max_length
         self._model: Any | None = None
         self._lock = asyncio.Lock()
+        self._load_task: asyncio.Task[Any] | None = None
 
     @property
     def model_name(self) -> str:
@@ -259,7 +260,7 @@ class CrossEncoderReranker:
         return self._model_name
 
     async def _ensure_model(self) -> Any:
-        """Load the model once, off the event loop, even under concurrency.
+        """Load the model once, off the event loop, surviving cancellation.
 
         :meth:`_load_model` is the expensive call in this class by a wide
         margin — importing torch alone costs seconds, and a first load also
@@ -271,26 +272,46 @@ class CrossEncoderReranker:
         to a worker thread for exactly the reason :meth:`rerank` already sends
         ``predict`` to one.
 
-        The lock makes initialization *serialized* as well as offloaded.
-        Without it, two coroutines reaching a cold reranker together both see
-        ``_model is None``, both await, and both build a model — duplicating a
-        multi-gigabyte allocation and, on a cold cache, the download too. The
-        outer check is a fast path that skips the lock once loaded; the inner
-        one re-checks after acquiring it, because the coroutine that waited may
-        find the model already built by the one that held it.
+        **The lock guards task creation, not the load itself**, and that
+        distinction is the whole design. Holding a lock across the awaited
+        ``to_thread`` looks equivalent and is not: a worker thread cannot be
+        cancelled, but the ``await`` in front of it can. A cold call cancelled
+        by a timeout unwinds ``async with`` and frees the lock *while the
+        worker keeps building*, so the next caller — still seeing ``_model is
+        None``, because the abandoned worker has not finished — acquires the
+        free lock and starts a second load. Under a Phase 4 request timeout
+        that is not exotic, and the failure mode is several multi-gigabyte
+        allocations and downloads running at once.
+
+        So the in-flight load is a *shared task*. Every caller awaits the same
+        one, and it is awaited through :func:`asyncio.shield` so that one
+        caller's cancellation cannot cancel the load every other caller is
+        waiting on. The lock is now held only long enough to create or adopt
+        that task — microseconds, never the length of the load.
+
+        A task that finished by failing is replaced rather than reused: a
+        transient fault mid-download would otherwise poison the instance
+        permanently, every later call re-raising a stale exception. A task that
+        finished by succeeding cannot reach that branch, since
+        :meth:`_load_model` sets ``_model`` before returning.
 
         Returns:
             The loaded cross-encoder.
 
         Raises:
             RerankerNotConfiguredError: Propagated from :meth:`_load_model`.
+            asyncio.CancelledError: This caller was cancelled. The shared load
+                continues for whoever else is waiting on it.
         """
         if self._model is not None:
             return self._model
         async with self._lock:
             if self._model is not None:
                 return self._model
-            return await asyncio.to_thread(self._load_model)
+            if self._load_task is None or self._load_task.done():
+                self._load_task = asyncio.create_task(asyncio.to_thread(self._load_model))
+            load_task = self._load_task
+        return await asyncio.shield(load_task)
 
     def _load_model(self) -> Any:
         """Load and cache the cross-encoder, with an explicit identity activation.
