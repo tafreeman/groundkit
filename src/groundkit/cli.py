@@ -17,6 +17,18 @@ the default install does not ship, against SPEC.md §10. Hybrid is documented
 as *recommended where a provider is configured*, which is a tradeoff a caller
 opts into rather than one they inherit.
 
+Phase 5 adds ``answer`` — retrieval composed with the optional LLM boundary
+(ADR-0019): optional query rewrite, cited synthesis whose citations can only
+be the retrieved results' own (ADR-0018), and the advisory faithfulness
+judge. It is a new verb rather than a ``search`` flag because a rewrite makes
+"the query" two strings and ``SearchResponse`` has one field for it; it is
+CLI-only because ADR-0019 keeps synthesis off the service surface (cost and
+egress amplification are not bounded by a loopback bind). ``grk eval
+--synthesis`` runs the planted-marker citation-echo check (SPEC.md §2)
+against a real chat provider, writing its own artifact — there is
+deliberately no offline double for it, because an echo number from one would
+be noise presented as a measurement.
+
 Phase 4 adds ``serve`` and ``serve-mcp``, the read-only service surface: one
 FastAPI app carrying both the REST routes and the mounted MCP streamable-HTTP
 transport, and the MCP stdio transport respectively (ADR-0014 decision 5).
@@ -36,14 +48,30 @@ import argparse
 import asyncio
 import json
 import sys
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from groundkit import __version__
-from groundkit.config import EmbeddingConfig, RetrievalConfig, resolve_embedding_config
+from groundkit.answer import AnswerPipeline, AnswerReport
+from groundkit.config import (
+    DEFAULT_CHAT_MODEL,
+    ChatConfig,
+    EmbeddingConfig,
+    RetrievalConfig,
+    resolve_chat_config,
+    resolve_embedding_config,
+)
 from groundkit.errors import ConfigurationError, EvalError, GroundkitError
 from groundkit.evals.delta import StageDelta, derive_rerank_attribution, derive_stage_deltas
+from groundkit.evals.echo import (
+    DEFAULT_ECHO_REPORT_PATH,
+    EchoReport,
+    run_echo_check,
+    write_echo_report,
+)
+from groundkit.evals.judge import FaithfulnessJudge
 from groundkit.evals.runner import MIN_EVAL_TOP_K, run_eval, write_report
 from groundkit.evals.schema import EvalReport
 from groundkit.index.dense import InMemoryVectorStore, LanceDBVectorStore
@@ -51,6 +79,9 @@ from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.indexer import Indexer
 from groundkit.ingestion.loaders import FileLoader
 from groundkit.providers.embeddings import INMEMORY_PROVIDER, build_embedder
+from groundkit.providers.llm import build_chat
+from groundkit.providers.query_rewrite import QueryRewriter
+from groundkit.providers.synthesis import Synthesizer
 
 # Importing this module never imports torch: `retrieval/rerank.py` defers the
 # optional dependency to `_import_cross_encoder`, which nothing reaches until a
@@ -77,7 +108,7 @@ if TYPE_CHECKING:
     from starlette.types import Receive, Scope, Send
 
     from groundkit.index.protocols import VectorStoreProtocol
-    from groundkit.providers.protocols import EmbeddingProtocol
+    from groundkit.providers.protocols import ChatProtocol, EmbeddingProtocol
     from groundkit.service.api import McpMount
 
 #: Characters of chunk content shown per result in text output.
@@ -90,6 +121,15 @@ _EMBED_FLAG_ATTRS: tuple[str, ...] = (
     "embed_model",
     "embed_dimensions",
     "embed_base_url",
+)
+
+#: ``--chat-*`` flags shared by ``answer`` and ``eval --synthesis``, and the
+#: ``argparse.Namespace`` attribute each maps to.
+_CHAT_FLAG_ATTRS: tuple[str, ...] = (
+    "chat_provider",
+    "chat_model",
+    "chat_base_url",
+    "chat_api_key_env",
 )
 
 
@@ -157,6 +197,49 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_embedding_args(search)
     search.set_defaults(func=_cmd_search)
 
+    answer = sub.add_parser(
+        "answer",
+        help=(
+            "Retrieve, then synthesize a cited answer with a chat model (ADR-0019). "
+            "The model may cite only retrieved spans; an out-of-set citation is an "
+            "error, never repaired (ADR-0018)."
+        ),
+    )
+    answer.add_argument("query", help="The question to answer.")
+    answer.add_argument("--index-dir", default=".groundkit", help="Index directory.")
+    answer.add_argument("--collection", default="default", help="Collection name.")
+    answer.add_argument(
+        "--top-k", type=int, default=None, help=f"Results to retrieve (1-{MAX_TOP_K})."
+    )
+    answer.add_argument(
+        "--mode",
+        choices=["bm25", "dense", "hybrid"],
+        default="bm25",
+        help="Retrieval mode feeding synthesis. Same semantics and tradeoffs as grk search.",
+    )
+    answer.add_argument(
+        "--rewrite",
+        action="store_true",
+        help=(
+            "Rewrite the query with the chat model before retrieval. Retrieval runs on "
+            "the rewritten query; synthesis and the judge still answer the original. A "
+            "rewrite failure is an error, never a silent fallback to the original query."
+        ),
+    )
+    answer.add_argument(
+        "--judge",
+        action="store_true",
+        help=(
+            "Run the advisory faithfulness judge over the answer. Advisory only: the "
+            "verdict is reported and gates nothing — the exit code does not depend on "
+            "it (SPEC.md §6; uncalibrated against human labels)."
+        ),
+    )
+    answer.add_argument("--json", action="store_true", help="Emit the full report as JSON.")
+    _add_embedding_args(answer)
+    _add_chat_args(answer)
+    answer.set_defaults(func=_cmd_answer)
+
     eval_parser = sub.add_parser(
         "eval", help="Run the BM25-baseline retrieval eval against a golden corpus."
     )
@@ -203,7 +286,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"Cross-encoder for --rerank (default: {DEFAULT_RERANK_MODEL}).",
     )
+    eval_parser.add_argument(
+        "--synthesis",
+        action="store_true",
+        help=(
+            "Also run the planted-marker citation-echo check (SPEC.md §2) through the "
+            "configured chat provider, writing its own artifact "
+            f"({DEFAULT_ECHO_REPORT_PATH}) alongside the main report. Requires a "
+            "running chat provider: there is deliberately no offline double for this "
+            "check, because an echo number from one would be noise presented as a "
+            "measurement (SPEC.md §2)."
+        ),
+    )
     _add_embedding_args(eval_parser)
+    _add_chat_args(eval_parser)
     eval_parser.set_defaults(func=_cmd_eval)
 
     serve = sub.add_parser(
@@ -353,9 +449,68 @@ def _add_embedding_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_chat_args(parser: argparse.ArgumentParser) -> None:
+    """Add the ``--chat-*`` flags shared by ``answer`` and ``eval --synthesis``.
+
+    All four default to ``None`` and are resolved into a
+    :class:`~groundkit.config.ChatConfig` (falling back to its own defaults)
+    by :func:`_resolve_chat_config`, the same shape the ``--embed-*`` flags
+    follow. The cloud path's egress is always redaction-wrapped by
+    :func:`~groundkit.providers.llm.build_chat` — there is no flag to turn
+    that off, by design (ADR-0017).
+    """
+    parser.add_argument(
+        "--chat-provider",
+        choices=["ollama", "openai_compatible"],
+        default=None,
+        help=(
+            "Chat provider for the synthesis boundary (default: ollama, local). "
+            "'openai_compatible' egress is always redaction-wrapped; there is no "
+            "opt-out (ADR-0017)."
+        ),
+    )
+    parser.add_argument(
+        "--chat-model", default=None, help=f"Chat model name (default: {DEFAULT_CHAT_MODEL})."
+    )
+    parser.add_argument(
+        "--chat-base-url",
+        default=None,
+        help="Chat provider endpoint (default: the local Ollama endpoint).",
+    )
+    parser.add_argument(
+        "--chat-api-key-env",
+        default=None,
+        help=(
+            "NAME of the environment variable holding the API key for "
+            "openai_compatible (default: GROUNDKIT_OPENAI_API_KEY). The value is read "
+            "at call time, never stored or logged (SPEC.md §7)."
+        ),
+    )
+
+
 def _embed_flags_supplied(args: argparse.Namespace) -> bool:
     """True if any ``--embed-*`` flag was explicitly supplied."""
     return any(getattr(args, attr) is not None for attr in _EMBED_FLAG_ATTRS)
+
+
+def _chat_flags_supplied(args: argparse.Namespace) -> bool:
+    """True if any ``--chat-*`` flag was explicitly supplied."""
+    return any(getattr(args, attr) is not None for attr in _CHAT_FLAG_ATTRS)
+
+
+def _resolve_chat_config(args: argparse.Namespace) -> ChatConfig:
+    """Unpack ``--chat-*`` flags and delegate to the promoted resolver.
+
+    The exact peer of :func:`_resolve_embedding_config`; see
+    :func:`groundkit.config.resolve_chat_config` for the defaulting rule and
+    the ``ValidationError`` -> ``ConfigurationError`` translation.
+    """
+    return resolve_chat_config(
+        provider=args.chat_provider,
+        model_name=args.chat_model,
+        base_url=args.chat_base_url,
+        api_key_env=args.chat_api_key_env,
+    )
 
 
 def _resolve_embedding_config(args: argparse.Namespace) -> EmbeddingConfig:
@@ -394,19 +549,20 @@ async def _open_dense_deps(
     return embedder, vector_store
 
 
-async def _maybe_aclose(embedder: EmbeddingProtocol | None) -> None:
-    """Close ``embedder``'s underlying resources if it exposes ``aclose``.
+async def _maybe_aclose(provider: object | None) -> None:
+    """Close ``provider``'s underlying resources if it exposes ``aclose``.
 
-    ``aclose`` is not part of :class:`EmbeddingProtocol` — ``InMemoryEmbedder``
-    has nothing to release and does not define it, while the HTTP-backed
-    providers do (``providers/embeddings.py``'s ``_HttpEmbedder.aclose``).
-    Duck-typed rather than an isinstance check against a concrete class, so a
-    future embedder with its own ``aclose`` is closed too without this
-    function needing to know about it.
+    ``aclose`` is part of neither :class:`EmbeddingProtocol` nor
+    ``ChatProtocol`` — the in-memory/scripted doubles have nothing to release
+    and do not define it, while the HTTP-backed providers do (and
+    ``RedactingChat`` delegates it to whatever it wraps). Duck-typed rather
+    than an isinstance check against a concrete class, so a future provider
+    with its own ``aclose`` is closed too without this function needing to
+    know about it.
     """
-    if embedder is None:
+    if provider is None:
         return
-    aclose = getattr(embedder, "aclose", None)
+    aclose = getattr(provider, "aclose", None)
     if callable(aclose):
         await aclose()
 
@@ -502,6 +658,75 @@ async def _cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_answer(args: argparse.Namespace) -> int:
+    if args.mode == "bm25" and _embed_flags_supplied(args):
+        raise ConfigurationError(
+            "--embed-provider/--embed-model/--embed-dimensions/--embed-base-url require "
+            "--mode dense or --mode hybrid; bm25 mode never touches the dense path"
+        )
+
+    # SQLiteMetadataStore.open validates the collection name before any
+    # path (including the LanceDB directory below) is built from it.
+    store = await SQLiteMetadataStore.open(Path(args.index_dir), args.collection)
+    embedder: EmbeddingProtocol | None = None
+    chat: ChatProtocol | None = None
+    try:
+        vector_store: VectorStoreProtocol | None = None
+        if args.mode != "bm25":
+            embedder, vector_store = await _open_dense_deps(args)
+        retriever = await Retriever.open(
+            store, RetrievalConfig(), embedder=embedder, vector_store=vector_store
+        )
+        chat = build_chat(_resolve_chat_config(args))
+        pipeline = AnswerPipeline(
+            retriever.search,
+            Synthesizer(chat),
+            rewriter=QueryRewriter(chat) if args.rewrite else None,
+            judge=FaithfulnessJudge(chat) if args.judge else None,
+        )
+        report = await pipeline.answer(args.query, top_k=args.top_k, mode=args.mode)
+    finally:
+        await store.close()
+        await _maybe_aclose(embedder)
+        await _maybe_aclose(chat)
+
+    if args.json:
+        print(json.dumps(report.model_dump(), indent=2))
+        return 0
+
+    _print_answer_report(report)
+    return 0
+
+
+def _print_answer_report(report: AnswerReport) -> None:
+    """Print the answer, its citations, and any advisory verdict.
+
+    An abstention (empty ``citations``) is stated in words rather than left
+    as an answer with nothing under it — the empty tuple IS the abstention
+    signal (ADR-0018), and the console should say so instead of relying on a
+    reader noticing an absence.
+
+    The verdict, when present, is labeled advisory in the output itself: it
+    gates nothing and the exit code never depends on it (SPEC.md §6).
+    """
+    if report.rewritten_query is not None:
+        print(f"rewritten query: {report.rewritten_query}")
+    print(report.answer)
+    if not report.citations:
+        print("(abstained: the answer cites no retrieved span)")
+    else:
+        print()
+        for rank, citation in enumerate(report.citations, start=1):
+            print(f"[{rank}] {citation.source}#{citation.start_offset}-{citation.end_offset}")
+    if report.verdict is not None:
+        verdict = "faithful" if report.verdict.faithful else "NOT faithful"
+        print(f"judge (advisory, uncalibrated): {verdict}")
+        for claim in report.verdict.unsupported_claims:
+            print(f"  unsupported: {claim}")
+        if report.verdict.reasoning:
+            print(f"  reasoning: {report.verdict.reasoning}")
+
+
 async def _cmd_eval(args: argparse.Namespace) -> int:
     # Both bounds are checked before anything is constructed or ingested. The
     # upper one matters most on the dense path: without it, an out-of-range
@@ -533,6 +758,12 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
         raise ConfigurationError(
             "--rerank-model requires --rerank; without --rerank there is no rerank "
             "stage for it to configure"
+        )
+    if not args.synthesis and _chat_flags_supplied(args):
+        # The same fail-closed rule the --embed-* flags follow.
+        raise ConfigurationError(
+            "--chat-provider/--chat-model/--chat-base-url/--chat-api-key-env require "
+            "--synthesis; without --synthesis the eval never touches a chat provider"
         )
 
     judgments_path = Path(args.judgments)
@@ -577,12 +808,46 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
     output_path = Path(args.output)
     write_report(report, output_path)
 
+    echo_report: EchoReport | None = None
+    if args.synthesis:
+        # The echo check builds its own synthetic marker corpus per run in an
+        # OS temp directory (its markers are generated fresh, so nesting the
+        # result inside the golden-corpus report would claim a provenance the
+        # two runs do not share — ADR-0018). It writes its own artifact.
+        chat: ChatProtocol | None = None
+        try:
+            chat = build_chat(_resolve_chat_config(args))
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                echo_report = await run_echo_check(chat, corpus_dir=Path(tmp_dir))
+        finally:
+            await _maybe_aclose(chat)
+        write_echo_report(echo_report, DEFAULT_ECHO_REPORT_PATH)
+
     if args.json:
         print(json.dumps(report.model_dump(), indent=2))
         return 0
 
     _print_eval_summary(report, output_path)
+    if echo_report is not None:
+        _print_echo_summary(echo_report)
     return 0
+
+
+def _print_echo_summary(report: EchoReport) -> None:
+    """Print the planted-marker echo check's aggregate counts and artifact path.
+
+    Every count is printed, including the failure-side ones — the same
+    no-filtering rule :func:`_print_eval_summary` follows: a check that
+    exists to catch citation echo failing must never render only its
+    successes.
+    """
+    print(
+        f"echo: cases={report.case_count} correct={report.correct_count} "
+        f"wrong_source={report.wrong_source_count} abstained={report.abstained_count} "
+        f"rejected={report.rejected_count} leaked={report.leaked_count}"
+    )
+    print(f"  chat: provider={report.chat_provider} model={report.chat_model}")
+    print(f"  echo report written to {DEFAULT_ECHO_REPORT_PATH}")
 
 
 def _print_eval_summary(report: EvalReport, output_path: Path) -> None:
