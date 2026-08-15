@@ -15,8 +15,19 @@ scores, so no configuration lets it return nothing for an unanswerable
 question) and because a hybrid default would require an embedding provider
 the default install does not ship, against SPEC.md §10. Hybrid is documented
 as *recommended where a provider is configured*, which is a tradeoff a caller
-opts into rather than one they inherit. ``serve`` and ``serve-mcp`` land in
-their phases per SPEC.md §9.
+opts into rather than one they inherit.
+
+Phase 4 adds ``serve`` and ``serve-mcp``, the read-only service surface: one
+FastAPI app carrying both the REST routes and the mounted MCP streamable-HTTP
+transport, and the MCP stdio transport respectively (ADR-0014 decision 5).
+Both build one :class:`~groundkit.service.tools.ServiceContext` over one
+:class:`~groundkit.runtime.CollectionRegistry` at serve time, so the index
+directory, the containment root, the reranker and every provider setting are
+resolved from the operator's own arguments and are unreachable from a request
+(ADR-0014 decision 6). ``grk serve`` binds loopback unless the operator
+acknowledges the exposure, which — with no authentication anywhere in Phase 4
+— is the service's only access control (ADR-0014 decision 7,
+:mod:`groundkit.service.binding`).
 """
 
 from __future__ import annotations
@@ -25,6 +36,7 @@ import argparse
 import asyncio
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -47,10 +59,26 @@ from groundkit.providers.embeddings import INMEMORY_PROVIDER, build_embedder
 # names the install command.
 from groundkit.retrieval.rerank import DEFAULT_RERANK_MODEL, CrossEncoderReranker
 from groundkit.retrieval.search import MAX_TOP_K, Retriever
+from groundkit.runtime import CollectionRegistry
+
+# Importing this module never imports FastAPI, uvicorn or the MCP SDK either.
+# `binding.py` is stdlib + `errors.py` only, and `service/tools.py` reaches no
+# further than pydantic and `contracts.py`; the web framework, the ASGI server
+# and the SDK are imported inside `_serve_http`/`_build_mcp_mount`/`_cmd_serve_mcp`
+# instead. They are base dependencies (ADR-0015), so the deferral is about
+# startup cost — `grk search` must not pay to import a server it never runs —
+# and never about availability.
+from groundkit.service.binding import DEFAULT_SERVE_HOST, DEFAULT_SERVE_PORT, ensure_bindable_host
+from groundkit.service.tools import ServiceContext
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from starlette.types import Receive, Scope, Send
+
     from groundkit.index.protocols import VectorStoreProtocol
     from groundkit.providers.protocols import EmbeddingProtocol
+    from groundkit.service.api import McpMount
 
 #: Characters of chunk content shown per result in text output.
 _SNIPPET_CHARS: int = 160
@@ -178,7 +206,114 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_embedding_args(eval_parser)
     eval_parser.set_defaults(func=_cmd_eval)
 
+    serve = sub.add_parser(
+        "serve",
+        help="Serve the read-only REST + MCP streamable-HTTP surface over one runtime.",
+    )
+    _add_serve_args(serve)
+    serve.add_argument(
+        "--host",
+        default=DEFAULT_SERVE_HOST,
+        help=(
+            f"Address to bind (default: {DEFAULT_SERVE_HOST}). A non-loopback address is "
+            "refused unless --allow-remote-access is also passed; a hostname such as "
+            "'localhost' is refused too, because only an address literal can be "
+            "classified without a resolver whose answer can change."
+        ),
+    )
+    serve.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_SERVE_PORT,
+        help=f"Port (default: {DEFAULT_SERVE_PORT}).",
+    )
+    serve.add_argument(
+        "--allow-remote-access",
+        action="store_true",
+        help=(
+            "Acknowledge binding a non-loopback address. This server has NO "
+            "authentication of any kind, so anyone who can reach the port can read "
+            "indexed document content and the absolute filesystem paths it was ingested "
+            "from. Passing this publishes the corpus."
+        ),
+    )
+    serve.set_defaults(func=_cmd_serve)
+
+    serve_mcp = sub.add_parser(
+        "serve-mcp",
+        help="Serve the MCP stdio transport (for Claude Desktop / Claude Code).",
+    )
+    _add_serve_args(serve_mcp)
+    serve_mcp.set_defaults(func=_cmd_serve_mcp)
+
     return parser
+
+
+def _add_serve_args(parser: argparse.ArgumentParser) -> None:
+    """Add the flags ``serve`` and ``serve-mcp`` share.
+
+    ``--host``, ``--port`` and ``--allow-remote-access`` are deliberately
+    *not* here: only the HTTP transport binds a socket, so ADR-0014 decision
+    7 applies to ``grk serve`` alone, and offering the flags on ``grk
+    serve-mcp`` would advertise a guard with nothing to guard.
+
+    Everything here is resolved once, at serve time, and reaches the handlers
+    only through :class:`~groundkit.service.tools.ServiceContext` — ADR-0014
+    decision 6, which is why no request model carries an index directory, a
+    containment root or a provider setting.
+    """
+    parser.add_argument(
+        "--index-dir",
+        default=".groundkit",
+        help=(
+            "Index directory. Must already exist: the service never creates an index "
+            "directory or a collection (ADR-0014 decision 3)."
+        ),
+    )
+    parser.add_argument(
+        "--base-dir",
+        required=True,
+        help=(
+            "Containment root every citation must resolve within. Required, not "
+            "defaulted: it is what resolve_citation checks against, and a service that "
+            "cannot verify any citation must not start, because verifiable citations are "
+            "the product claim (SPEC.md section 2, ADR-0014 decision 6)."
+        ),
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help=(
+            f"Results returned for a request that omits top_k (1-{MAX_TOP_K}). Defaults "
+            "to ServiceContext's own default rather than a second copy of it."
+        ),
+    )
+    parser.add_argument(
+        "--dense",
+        action="store_true",
+        help=(
+            "Serve dense and hybrid retrieval modes as well as bm25, reading each "
+            "collection's LanceDB store at <index-dir>/<collection>.lance. Opt-in "
+            "because it requires the optional 'dense' extra, which a default install "
+            "does not carry: pip install groundkit[dense]."
+        ),
+    )
+    parser.add_argument(
+        "--rerank",
+        action="store_true",
+        help=(
+            "Load a cross-encoder so requests may ask for rerank=true. Without it, such "
+            "a request is refused rather than served unreranked. Requires the optional "
+            "'rerank' extra: pip install groundkit[rerank]."
+        ),
+    )
+    parser.add_argument(
+        "--rerank-model",
+        default=None,
+        help=f"Cross-encoder for --rerank (default: {DEFAULT_RERANK_MODEL}).",
+    )
+    _add_embedding_args(parser)
 
 
 def _add_embedding_args(parser: argparse.ArgumentParser) -> None:
@@ -582,3 +717,191 @@ def _delta_verdict(delta: StageDelta) -> str:
     if delta.is_improvement:
         return "improvement vs baseline."
     return "no change vs baseline on any metric."
+
+
+# --- Phase 4: the read-only service surface (ADR-0014, ADR-0015) -----------
+
+
+def _build_service_context(args: argparse.Namespace) -> ServiceContext:
+    """Assemble the serve-time context both transports share.
+
+    Every setting a handler can reach is resolved *here*, once, from the
+    operator's own arguments. That is what makes ADR-0014 decision 6 hold by
+    construction rather than by review: there is no resolution path inside
+    ``service/`` for a request to reach, so no request model needs — or is
+    allowed — an ``index_dir``, a ``base_dir`` or an ``embed_*`` field.
+
+    ``default_top_k`` is applied with :func:`dataclasses.replace` only when
+    ``--top-k`` was supplied, so the unflagged default stays
+    :class:`~groundkit.service.tools.ServiceContext`'s own rather than a second
+    copy of it living here — the same single-source-of-truth rule
+    :func:`groundkit.config.resolve_embedding_config` follows for
+    ``EmbeddingConfig``.
+
+    Raises:
+        ConfigurationError: ``--rerank-model`` without ``--rerank``; any
+            ``--embed-*`` flag (see below); an out-of-range ``--top-k``; a
+            missing ``--index-dir``; or a missing ``--base-dir``.
+    """
+    if not args.rerank and args.rerank_model is not None:
+        # The same fail-closed rule `grk eval` applies: a flag configuring a
+        # path this process will not take is a mistake to name, not one to
+        # ignore. Silently accepting it lets an operator believe requests are
+        # being reranked by a model this server never loaded.
+        raise ConfigurationError(
+            "--rerank-model requires --rerank; without --rerank this server holds no "
+            "reranker for it to configure"
+        )
+
+    if not args.dense and _embed_flags_supplied(args):
+        # The same fail-closed rule `grk ingest` and `grk search` apply: a flag
+        # configuring a path this process will not take is a mistake to name,
+        # not one to ignore.
+        raise ConfigurationError(
+            "--embed-provider/--embed-model/--embed-dimensions/--embed-base-url require "
+            "--dense; without --dense this server serves bm25 only and has no dense path "
+            "for them to configure"
+        )
+
+    if args.top_k is not None and not 1 <= args.top_k <= MAX_TOP_K:
+        # Checked at startup because this value is the default applied to
+        # every request that omits top_k: out of range, it would fail those
+        # requests one at a time, from a fault the operator committed once.
+        raise ConfigurationError(f"--top-k must be between 1 and {MAX_TOP_K}, got {args.top_k}")
+
+    index_dir = Path(args.index_dir)
+    if not index_dir.is_dir():
+        raise ConfigurationError(
+            f"--index-dir {index_dir} does not exist. The service never creates an index "
+            "directory or a collection (ADR-0014 decision 3): reading one into existence "
+            "would make an unauthenticated surface a disk-fill primitive. Run "
+            "`grk ingest` first."
+        )
+
+    base_dir = Path(args.base_dir)
+    if not base_dir.is_dir():
+        raise ConfigurationError(
+            f"--base-dir {base_dir} does not exist. It is the containment root every "
+            "citation must resolve within, so a root that is not there can verify "
+            "nothing, and a service that cannot verify any citation must not start "
+            "(ADR-0014 decision 6)."
+        )
+
+    # Constructed, never loaded: CrossEncoderReranker.__init__ touches no
+    # model, no filesystem and no optional extra, so a server started with
+    # --rerank on an install without the extra starts, and the first request
+    # asking for rerank=true fails with RerankerNotConfiguredError instead of
+    # being served an unreranked list that would look identical to a reranked
+    # one.
+    reranker = (
+        CrossEncoderReranker(args.rerank_model or DEFAULT_RERANK_MODEL) if args.rerank else None
+    )
+
+    # The registry's factory takes the COLLECTION NAME, unlike a single
+    # runtime's, which takes nothing. That is what makes serving more than one
+    # dense collection correct: the LanceDB store is laid out per collection,
+    # so a collection-agnostic factory would search one collection's vectors
+    # and join the resulting chunk ids against another's SQLite — no error, just
+    # a silently thin result on a healthy collection.
+    async def _open_collection_store(collection: str) -> VectorStoreProtocol:
+        return await LanceDBVectorStore.open(index_dir / f"{collection}.lance")
+
+    embedder: EmbeddingProtocol | None = None
+    vector_store_factory: Callable[[str], Awaitable[VectorStoreProtocol]] | None = None
+    if args.dense:
+        embedder = build_embedder(_resolve_embedding_config(args))
+        vector_store_factory = _open_collection_store
+
+    ctx = ServiceContext(
+        registry=CollectionRegistry(
+            index_dir,
+            RetrievalConfig(),
+            embedder=embedder,
+            vector_store_factory=vector_store_factory,
+        ),
+        index_dir=index_dir,
+        base_dir=base_dir,
+        reranker=reranker,
+    )
+    if args.top_k is None:
+        return ctx
+    return replace(ctx, default_top_k=args.top_k)
+
+
+def _build_mcp_mount(ctx: ServiceContext) -> McpMount:
+    """Adapt the MCP session manager into the mount :func:`create_app` accepts.
+
+    ``StreamableHTTPSessionManager`` exposes two halves that ASGI keeps apart:
+    ``run()`` is an async context manager owning the transport's lifecycle,
+    and ``handle_request(scope, receive, send)`` is the per-connection entry
+    point. :class:`~groundkit.service.api.McpMount` carries them separately
+    for exactly that reason — the app's lifespan drives the first, the router
+    the second — so the method is wrapped in an ASGI callable here rather than
+    the manager being handed over as though it were an app.
+    """
+    from groundkit.service.api import McpMount
+    from groundkit.service.mcp_server import MCP_HTTP_PATH, create_session_manager
+
+    manager = create_session_manager(ctx)
+
+    async def mcp_app(scope: Scope, receive: Receive, send: Send) -> None:
+        await manager.handle_request(scope, receive, send)
+
+    return McpMount(path=MCP_HTTP_PATH, app=mcp_app, lifespan=manager.run)
+
+
+async def _serve_http(ctx: ServiceContext, *, host: str, port: int) -> None:
+    """Run uvicorn over the FastAPI app with the MCP transport mounted on it.
+
+    One runtime, two transports, one registry (ADR-0014 decision 5): the REST
+    routes and the MCP streamable-HTTP endpoint are the same operations over
+    the same ``ctx``, so two processes would mean two caches over one index
+    and two snapshots that drift.
+
+    A named module-level coroutine rather than an inline block, so the CLI's
+    own tests can substitute it and exercise every startup guard without
+    binding a socket.
+    """
+    import uvicorn
+
+    from groundkit.service.api import create_app
+
+    app = create_app(ctx, mcp_mount=_build_mcp_mount(ctx))
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
+    await server.serve()
+
+
+async def _cmd_serve(args: argparse.Namespace) -> int:
+    """Serve REST and MCP streamable-HTTP from one app.
+
+    The bind guard runs *first* — before the index directory is opened, before
+    a registry exists, before a reranker is constructed. A refused host must
+    cost nothing and touch nothing, and ordering it first is also what lets
+    its test assert the refusal without a valid index on disk.
+    """
+    ensure_bindable_host(args.host, allow_remote_access=args.allow_remote_access)
+    ctx = _build_service_context(args)
+    try:
+        await _serve_http(ctx, host=args.host, port=args.port)
+    finally:
+        await ctx.registry.aclose()
+    return 0
+
+
+async def _cmd_serve_mcp(args: argparse.Namespace) -> int:
+    """Serve the MCP stdio transport.
+
+    No socket is bound, so ADR-0014 decision 7's host guard has nothing to
+    apply to and the flags driving it are absent by design. The stdio-specific
+    rule that *is* load-bearing — stdout carries JSON-RPC frames and nothing
+    else — is why this command prints nothing at all: diagnostics go through
+    :mod:`logging`, which writes to stderr.
+    """
+    from groundkit.service.mcp_server import run_stdio
+
+    ctx = _build_service_context(args)
+    try:
+        await run_stdio(ctx)
+    finally:
+        await ctx.registry.aclose()
+    return 0
