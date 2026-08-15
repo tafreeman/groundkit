@@ -23,6 +23,18 @@ that a stage which does not beat baseline is *reported as such*. Every
 non-baseline stage in a report gets a :class:`StageDelta` whether it won,
 lost, or tied; there is no filtering step here, and callers that render
 deltas must not add one.
+
+**Two derivations, not one, once a rerank stage exists.**
+:func:`derive_stage_deltas` answers SPEC.md §6's question — every stage
+against the BM25 baseline — and that stays the report's spine. But a rerank
+stage reorders the best upstream stage available (ADR-0012 decision 1), so on
+a dense run its baseline delta is ``fusion``'s gain *plus* the reranker's,
+summed into one number with nothing separating them. That is a real
+measurement of the whole pipeline and a useless one for the question "did the
+cross-encoder help", which is the question the Phase 3 gate is actually
+asking. :func:`derive_rerank_attribution` answers the second question from
+the same artifact, against ``RunConfig.rerank_input``. Neither is stored;
+both are recomputed from the report's own numbers on every call.
 """
 
 from __future__ import annotations
@@ -122,6 +134,60 @@ def derive_stage_deltas(report: EvalReport) -> list[StageDelta]:
     return [_delta_for(stage, baseline) for stage in report.stages[1:]]
 
 
+def derive_rerank_attribution(report: EvalReport) -> StageDelta | None:
+    """Derive the ``rerank`` stage's delta against the stage it reordered.
+
+    The companion to :func:`derive_stage_deltas`, and the reason
+    :class:`~groundkit.evals.schema.RunConfig.rerank_input` is recorded
+    rather than inferred. Against ``stages[0]`` a rerank stage that reordered
+    ``fusion`` reports the two effects added together; this reports the
+    reranker's own contribution, which is what ADR-0012's "report a delta,
+    including when it loses" obligation is about.
+
+    The returned :class:`StageDelta` carries ``baseline_stage =
+    rerank_input``, so a renderer that prints ``delta[{stage} vs
+    {baseline_stage}]`` labels it correctly with no special-casing — the two
+    deltas are the same type saying different true things, not one of them
+    mislabelled.
+
+    On a BM25-only run the input stage *is* ``stages[0]``, so this returns
+    the same numbers :func:`derive_stage_deltas` already produced for that
+    stage. That duplication is deliberate: suppressing it would make the
+    presence of an attribution depend on the run's configuration, and a
+    caller would have to reimplement this function's logic to know whether
+    to expect one.
+
+    Args:
+        report: A validated report.
+
+    Returns:
+        The rerank stage's delta against its input stage, or ``None`` if the
+        report has no rerank stage.
+
+    Raises:
+        RerankInputMissingError: The report has a rerank stage whose
+            ``rerank_input`` names a stage the report does not contain.
+            Unreachable through :func:`~groundkit.evals.runner.run_eval`,
+            which derives the name from the plan it executed — but this
+            function is the one place that assumption is load-bearing, and
+            silently returning ``None`` would report "no rerank ran" for an
+            artifact that plainly contains one.
+    """
+    rerank_stage = next((stage for stage in report.stages if stage.stage == "rerank"), None)
+    if rerank_stage is None:
+        return None
+    input_name = report.run.config.rerank_input
+    input_stage = next((stage for stage in report.stages if stage.stage == input_name), None)
+    if input_stage is None:
+        raise RerankInputMissingError(
+            f"report has a 'rerank' stage whose rerank_input is {input_name!r}, which is "
+            f"not among its stages ({[stage.stage for stage in report.stages]}). The "
+            "reranker's own contribution cannot be attributed against a stage that is "
+            "not there."
+        )
+    return _delta_for(rerank_stage, input_stage)
+
+
 def _delta_for(stage: StageResult, baseline: StageResult) -> StageDelta:
     """Build one stage's delta against ``baseline``.
 
@@ -165,6 +231,16 @@ def _quality_deltas(stage: MetricSet, baseline: MetricSet) -> dict[str, float]:
         field: float(getattr(stage, field)) - float(getattr(baseline, field))
         for field in QUALITY_METRIC_FIELDS
     }
+
+
+class RerankInputMissingError(ValueError):
+    """A report's ``rerank_input`` names a stage the report does not contain.
+
+    Raised by :func:`derive_rerank_attribution`. Separate from
+    :class:`MetricFieldMismatchError` because it describes an inconsistent
+    *artifact* rather than an inconsistent *module*, and a caller may
+    reasonably want to catch one without the other.
+    """
 
 
 class MetricFieldMismatchError(ValueError):

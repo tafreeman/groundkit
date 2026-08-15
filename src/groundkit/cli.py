@@ -33,7 +33,7 @@ from pydantic import ValidationError
 from groundkit import __version__
 from groundkit.config import EmbeddingConfig, RetrievalConfig
 from groundkit.errors import ConfigurationError, EvalError, GroundkitError
-from groundkit.evals.delta import StageDelta, derive_stage_deltas
+from groundkit.evals.delta import StageDelta, derive_rerank_attribution, derive_stage_deltas
 from groundkit.evals.runner import MIN_EVAL_TOP_K, run_eval, write_report
 from groundkit.evals.schema import EvalReport
 from groundkit.index.dense import InMemoryVectorStore, LanceDBVectorStore
@@ -41,6 +41,13 @@ from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.indexer import Indexer
 from groundkit.ingestion.loaders import FileLoader
 from groundkit.providers.embeddings import INMEMORY_PROVIDER, build_embedder
+
+# Importing this module never imports torch: `retrieval/rerank.py` defers the
+# optional dependency to `_import_cross_encoder`, which nothing reaches until a
+# reranker actually loads a model. `grk --help` on a base install therefore
+# costs nothing, and `--rerank` fails at first use with the typed error that
+# names the install command.
+from groundkit.retrieval.rerank import DEFAULT_RERANK_MODEL, CrossEncoderReranker
 from groundkit.retrieval.search import MAX_TOP_K, Retriever
 
 if TYPE_CHECKING:
@@ -154,6 +161,21 @@ def _build_parser() -> argparse.ArgumentParser:
             "--embed-provider inmemory the stages run but their quality numbers are "
             "hash-derived noise, not a measurement (SPEC.md §2)."
         ),
+    )
+    eval_parser.add_argument(
+        "--rerank",
+        action="store_true",
+        help=(
+            "Also evaluate a cross-encoder rerank stage over the best upstream stage "
+            "the run produced (fusion with --dense, otherwise the BM25 baseline), "
+            "reporting its delta against the baseline AND against that input stage. "
+            "Requires the optional 'rerank' extra: pip install groundkit[rerank]."
+        ),
+    )
+    eval_parser.add_argument(
+        "--rerank-model",
+        default=None,
+        help=f"Cross-encoder for --rerank (default: {DEFAULT_RERANK_MODEL}).",
     )
     _add_embedding_args(eval_parser)
     eval_parser.set_defaults(func=_cmd_eval)
@@ -395,6 +417,15 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
             "--embed-provider/--embed-model/--embed-dimensions/--embed-base-url require "
             "--dense; without --dense the eval runs the BM25 baseline stage only"
         )
+    if not args.rerank and args.rerank_model is not None:
+        # Same fail-closed rule the --embed-* flags follow: a flag that
+        # configures a path the run will not take is a mistake to name, not
+        # one to ignore. Silently accepting it lets someone believe they
+        # measured a model the run never loaded.
+        raise ConfigurationError(
+            "--rerank-model requires --rerank; without --rerank there is no rerank "
+            "stage for it to configure"
+        )
 
     judgments_path = Path(args.judgments)
     if not judgments_path.is_file():
@@ -413,12 +444,24 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
             # to persist into and nothing that would outlive the run.
             embedder = build_embedder(_resolve_embedding_config(args))
             vector_store = InMemoryVectorStore()
+        reranker = (
+            CrossEncoderReranker(args.rerank_model or DEFAULT_RERANK_MODEL) if args.rerank else None
+        )
         report = await run_eval(
             Path(args.corpus_dir),
             judgments_path,
             top_k=args.top_k,
             embedder=embedder,
             vector_store=vector_store,
+            reranker=reranker,
+            # Pinned to the retriever's own ceiling rather than exposed as a
+            # flag (ADR-0012 decision 1a). The depth is what decides whether
+            # the stage's @10 metrics are free to move at all, so a knob here
+            # would let two CLI runs be silently incomparable in the one
+            # dimension a reader is least likely to check. run_eval keeps the
+            # parameter for library callers, and RunConfig records whatever
+            # was used either way.
+            rerank_candidates=MAX_TOP_K,
         )
     finally:
         await _maybe_aclose(embedder)
@@ -458,17 +501,24 @@ def _print_eval_summary(report: EvalReport, output_path: Path) -> None:
         )
 
     for delta in derive_stage_deltas(report):
-        # Signs are always explicit: a bare "0.040" leaves the reader to
-        # infer direction, which is exactly what baseline discipline is
-        # meant to remove.
-        quality = " ".join(f"{name}={value:+.3f}" for name, value in delta.quality.items())
-        print(f"delta[{delta.stage} vs {delta.baseline_stage}]: {quality}")
-        print(
-            f"  latency: p50={delta.latency_p50_delta_ms:+.1f}ms "
-            f"p95={delta.latency_p95_delta_ms:+.1f}ms "
-            f"p99={delta.latency_p99_delta_ms:+.1f}ms"
-        )
-        print(f"  {_delta_verdict(delta)}")
+        _print_delta(delta)
+
+    # Printed after the baseline deltas, never instead of them. On a dense
+    # run the rerank row's baseline delta sums fusion's gain with the
+    # reranker's; this is the reranker's own contribution, against the stage
+    # it actually reordered (ADR-0012). Both are true, and only both together
+    # answer "did the cross-encoder help".
+    #
+    # Skipped when the input stage IS the baseline — on a BM25-only run the
+    # attribution is byte-identical to the delta just printed above, so this
+    # suppresses a duplicate line, never a fact. `derive_rerank_attribution`
+    # deliberately still returns it, so a library caller never has to
+    # reimplement this check to know whether an attribution exists.
+    attribution = derive_rerank_attribution(report)
+    if attribution is not None and attribution.baseline_stage != report.stages[0].stage:
+        _print_delta(attribution)
+
+    _print_rerank_provenance(report)
 
     embedding = report.run.config.embedding
     if embedding is not None:
@@ -488,6 +538,60 @@ def _print_eval_summary(report: EvalReport, output_path: Path) -> None:
             )
     print(f"corpus: {report.run.document_count} documents, {report.run.chunk_count} chunks")
     print(f"report written to {output_path}")
+
+
+def _print_delta(delta: StageDelta) -> None:
+    """Print one derived delta, its latency change, and its verdict.
+
+    Shared by the baseline deltas and the rerank attribution so the two
+    render identically — they are the same type describing the same kind of
+    comparison, and formatting them differently would suggest one is more
+    authoritative than the other.
+
+    Args:
+        delta: The delta to render.
+    """
+    # Signs are always explicit: a bare "0.040" leaves the reader to
+    # infer direction, which is exactly what baseline discipline is
+    # meant to remove.
+    quality = " ".join(f"{name}={value:+.3f}" for name, value in delta.quality.items())
+    print(f"delta[{delta.stage} vs {delta.baseline_stage}]: {quality}")
+    print(
+        f"  latency: p50={delta.latency_p50_delta_ms:+.1f}ms "
+        f"p95={delta.latency_p95_delta_ms:+.1f}ms "
+        f"p99={delta.latency_p99_delta_ms:+.1f}ms"
+    )
+    print(f"  {_delta_verdict(delta)}")
+
+
+def _print_rerank_provenance(report: EvalReport) -> None:
+    """Print what the rerank stage reordered, with how much, if one ran.
+
+    The rerank row is the only stage in the report whose meaning depends on
+    how the run was configured (ADR-0012 decision 1), so the console states
+    it rather than leaving a reader to open the JSON. The candidate depth is
+    printed alongside because it is what decides whether the ``@10`` metrics
+    were free to move: reranking truncates after reordering, so a depth equal
+    to ``top_k`` can only permute a fixed set.
+
+    Args:
+        report: The completed report.
+    """
+    config = report.run.config
+    if config.rerank_input is None:
+        return
+    print(
+        f"rerank: input={config.rerank_input} model={config.rerank_model} "
+        f"candidates={config.rerank_candidates} truncated_to={config.top_k}"
+    )
+    if config.rerank_candidates == config.top_k:
+        # ASCII only, for the reason the embedding warning in
+        # `_print_eval_summary` gives.
+        print(
+            "  WARNING: candidate depth equals top_k, so the reranker could only "
+            "permute a fixed set. The @10 metrics above are pinned to the input "
+            "stage's by construction, not measured."
+        )
 
 
 def _delta_verdict(delta: StageDelta) -> str:
