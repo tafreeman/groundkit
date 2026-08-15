@@ -56,7 +56,7 @@ Add a `groundkit` entry to `mcpServers`:
 {
   "mcpServers": {
     "groundkit": {
-      "command": "grk",
+      "command": "/absolute/path/to/groundkit/.venv/bin/grk",
       "args": [
         "serve-mcp",
         "--index-dir", "/absolute/path/to/.groundkit",
@@ -67,7 +67,26 @@ Add a `groundkit` entry to `mcpServers`:
 }
 ```
 
-**Use absolute paths.** Claude Desktop launches `grk serve-mcp` with a working
+!!! warning "`command` must be a path the client can actually execute"
+
+    A bare `"command": "grk"` only works if `grk` is on the **PATH that the
+    client process inherits** — which is not the same PATH as your shell. If
+    groundkit lives in a virtual environment, as it does for anyone who
+    installed it with `uv sync` from a checkout, `grk` is on no PATH at all and
+    the client fails at launch. The error surfaces as the server disappearing
+    or "failed to start", which reads like a groundkit bug and is not one.
+
+    Use the absolute path to the entry point:
+
+    - **venv (Linux/macOS):** `<repo>/.venv/bin/grk`
+    - **venv (Windows):** `<repo>\.venv\Scripts\grk.exe`
+    - **`uv tool install groundkit` or a system-wide `pip install`:** bare `grk`
+      is fine, since those put it on a PATH the client inherits.
+
+    Check with `which grk` / `Get-Command grk`. If that prints nothing, you need
+    the absolute path.
+
+**Use absolute paths for the arguments too.** Claude Desktop launches the server with a working
 directory of its own choosing, not the directory you ingested from — a
 relative `--index-dir .groundkit` resolves against whatever that unpredictable
 working directory turns out to be, not against your project. `--base-dir` is
@@ -85,10 +104,14 @@ The equivalent registration from the command line:
 
 ```bash
 claude mcp add groundkit --scope project -- \
-  grk serve-mcp \
+  /absolute/path/to/groundkit/.venv/bin/grk serve-mcp \
   --index-dir /absolute/path/to/.groundkit \
   --base-dir /absolute/path/to/docs
 ```
+
+The same `command` rule from the Claude Desktop section applies: the executable
+after `--` must be a path the client can run, not a name it would have to
+resolve on a PATH it does not share.
 
 `--scope project` writes the entry to a `.mcp.json` at the project root
 instead of your personal, machine-local config, so a team can commit it
@@ -99,7 +122,7 @@ same shape as the Claude Desktop block above:
 {
   "mcpServers": {
     "groundkit": {
-      "command": "grk",
+      "command": "/absolute/path/to/groundkit/.venv/bin/grk",
       "args": [
         "serve-mcp",
         "--index-dir", "/absolute/path/to/.groundkit",
@@ -199,7 +222,23 @@ there before calling `search`, `fetch_chunk`, or `index_status` on a name you
 are not certain about.
 
 **If the client reports it cannot launch `grk` at all**, the process is
-usually started with a different `PATH` than your interactive shell has. Use
-the absolute path to the installed `grk` executable (e.g. the one printed by
-`pip show -f groundkit`, or your virtual environment's `bin`/`Scripts`
-directory) as the `command` value instead of the bare `grk`.
+started with a different `PATH` than your interactive shell has — see the
+`command` warning in the Claude Desktop section above. This is the single most
+common setup failure, and it is indistinguishable from a server crash in most
+clients' error reporting.
+
+**Test the command line before involving a client.** Every launch failure above
+is reproducible from a terminal, where the error is legible instead of being
+reported as "server failed to start". Run the exact `command` and `args` from
+your config by hand and send it one frame:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' \
+  | /absolute/path/to/.venv/bin/grk serve-mcp --index-dir /abs/.groundkit --base-dir /abs/docs
+```
+
+A JSON object on stdout naming `groundkit` means the server is fine and the
+problem is in the client config. Anything else — a traceback, a "not found", or
+silence — is the real error the client was hiding. Note that **stdout carries
+JSON-RPC frames and nothing else**: logs go to stderr, so any non-JSON line on
+stdout is itself a bug worth reporting.
