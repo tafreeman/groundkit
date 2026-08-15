@@ -30,6 +30,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from groundkit.errors import ConfigurationError, StorageError
@@ -55,6 +56,22 @@ if TYPE_CHECKING:
     #: collection's first dense ingest would refuse dense reads permanently
     #: afterwards, on a collection that had become perfectly healthy.
     VectorStoreFactory: TypeAlias = Callable[[], Awaitable[VectorStoreProtocol]]
+
+    #: The registry's factory, which takes the collection name. A
+    #: :class:`CollectionRuntime` is *one* collection, so its factory rightly
+    #: takes no argument; a :class:`CollectionRegistry` holds many, so its
+    #: factory must be told which one it is opening.
+    #:
+    #: The distinction is load-bearing rather than cosmetic. The dense store is
+    #: laid out per collection — ``<index_dir>/<collection>.lance``, sibling of
+    #: ``<collection>.sqlite3`` — so a registry that handed every runtime the
+    #: same handle would search one collection's vectors and then join the
+    #: resulting chunk ids against a *different* collection's SQLite. Those ids
+    #: do not match, so the failure is not an error: it is a silently empty or
+    #: under-populated result on a collection that is perfectly healthy. That is
+    #: the same silent-zero-results class ADR-0013 exists to close, reintroduced
+    #: one level up.
+    CollectionVectorStoreFactory: TypeAlias = Callable[[str], Awaitable[VectorStoreProtocol]]
 
 logger = logging.getLogger(__name__)
 
@@ -363,6 +380,11 @@ class CollectionRegistry:
     one costs a resident corpus. Hands runtimes out through an async context
     manager, which is the shape both a FastAPI dependency and an MCP tool
     handler want.
+
+    ``vector_store_factory`` takes the **collection name**, unlike
+    :class:`CollectionRuntime`'s, which takes nothing — see
+    :data:`CollectionVectorStoreFactory` for why that difference is load-bearing
+    rather than an inconsistency to tidy away.
     """
 
     def __init__(
@@ -371,7 +393,7 @@ class CollectionRegistry:
         config: RetrievalConfig | None = None,
         *,
         embedder: EmbeddingProtocol | None = None,
-        vector_store_factory: Callable[[], Awaitable[VectorStoreProtocol]] | None = None,
+        vector_store_factory: Callable[[str], Awaitable[VectorStoreProtocol]] | None = None,
         max_open_collections: int = DEFAULT_MAX_OPEN_COLLECTIONS,
     ) -> None:
         if max_open_collections < 1:
@@ -426,7 +448,7 @@ class CollectionRegistry:
                     collection,
                     self._config,
                     embedder=self._embedder,
-                    vector_store_factory=self._vector_store_factory,
+                    vector_store_factory=self._bind_factory(collection),
                 )
                 self._runtimes[collection] = runtime
                 self._refcounts[collection] = 0
@@ -434,6 +456,20 @@ class CollectionRegistry:
             # Re-insert so dict order is least-recently-checked-out first.
             self._runtimes[collection] = self._runtimes.pop(collection)
             return runtime
+
+    def _bind_factory(self, collection: str) -> Callable[[], Awaitable[VectorStoreProtocol]] | None:
+        """Bind the registry's collection-aware factory to one collection.
+
+        ``functools.partial`` rather than a ``lambda`` closing over
+        ``collection``: the loop-variable capture a closure would introduce is
+        the classic late-binding bug, and here it would not raise — it would
+        hand a runtime the *wrong* collection's vector store, which is exactly
+        the silent mis-join :data:`CollectionVectorStoreFactory` describes.
+        ``partial`` binds the value now, so the hazard cannot exist.
+        """
+        if self._vector_store_factory is None:
+            return None
+        return partial(self._vector_store_factory, collection)
 
     async def _checkin(self, collection: str) -> None:
         async with self._lock:

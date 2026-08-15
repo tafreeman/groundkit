@@ -20,6 +20,7 @@ import pytest
 from groundkit.contracts import Chunk, CollectionManifest, EmbeddingIdentity
 from groundkit.errors import ConfigurationError, StorageError
 from groundkit.index.metadata import SQLiteMetadataStore
+from groundkit.providers.embeddings import InMemoryEmbedder
 from groundkit.runtime import AcquiredRetriever, CollectionRegistry, CollectionRuntime
 
 
@@ -442,3 +443,79 @@ def test_registry_holds_open_rather_than_closing_a_runtime_in_use(tmp_path: Path
             await registry.aclose()
 
     asyncio.run(run())
+
+
+def test_each_collection_gets_its_own_vector_store(tmp_path: Path) -> None:
+    """The registry's factory is called with each collection's OWN name.
+
+    This is a real regression test, shown to fail against the unfixed source
+    (SPEC.md §8): before ``_bind_factory``, ``CollectionRegistry`` held one
+    zero-argument factory and handed the SAME awaited handle to every runtime
+    it opened.
+
+    The failure that produces is the nastiest kind this repo tracks. The dense
+    store is laid out per collection (``<index_dir>/<collection>.lance``), so a
+    shared handle searches one collection's vectors and then joins the
+    resulting chunk ids against a DIFFERENT collection's SQLite. Those ids do
+    not match, so nothing raises — the caller gets a silently empty or
+    under-populated result on a collection that is perfectly healthy. That is
+    the same silent-zero-results class ADR-0013 exists to close, reintroduced
+    one level up in the registry.
+
+    Asserting on the ARGUMENT rather than on returned results is deliberate:
+    it fails for the right reason and does not need a real dense corpus, whose
+    absence would make an empty result indistinguishable from the bug.
+    """
+    requested: list[str] = []
+
+    class _FakeVectorStore:
+        """Minimal stand-in; the runtime only stores the handle here."""
+
+        async def search(self, *args: object, **kwargs: object) -> list[object]:
+            return []
+
+    async def factory(collection: str) -> _FakeVectorStore:
+        requested.append(collection)
+        return _FakeVectorStore()
+
+    embedder = InMemoryEmbedder(dimensions=8)
+
+    async def run() -> None:
+        for name in ("alpha", "beta"):
+            # A manifest so the collection is dense-legal (ADR-0008), and
+            # deliberately NO documents: with documents present, `Retriever.open`
+            # fails closed because a stand-in vector store holds no vectors for
+            # them. That guard is correct and is not what this test is about —
+            # the factory is called during the rebuild either way, and the
+            # argument it receives is the whole assertion.
+            store = await SQLiteMetadataStore.open(tmp_path, name)
+            try:
+                await store.write_manifest(
+                    EmbeddingIdentity(
+                        provider=embedder.provider,
+                        model_name=embedder.model_name,
+                        dimensions=embedder.dimensions,
+                    )
+                )
+            finally:
+                await store.close()
+
+        registry = CollectionRegistry(
+            tmp_path,
+            embedder=embedder,
+            vector_store_factory=factory,  # type: ignore[arg-type]
+        )
+        try:
+            async with registry.acquire("alpha") as runtime:
+                await runtime.acquire()
+            async with registry.acquire("beta") as runtime:
+                await runtime.acquire()
+        finally:
+            await registry.aclose()
+
+    asyncio.run(run())
+
+    assert requested == ["alpha", "beta"], (
+        "each collection must get a vector store built for ITS OWN name; "
+        f"the factory was asked for {requested!r}"
+    )
