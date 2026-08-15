@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from groundkit.contracts import EmbeddingIdentity
 from groundkit.evals.schema import (
     EvalReport,
     GoldSpanResult,
@@ -500,3 +501,87 @@ class TestEvalReport:
         assert restored == report
         assert restored.run.config.top_k == report.run.config.top_k
         assert restored.stages[0].queries[0].query_id == report.stages[0].queries[0].query_id
+
+
+def make_embedding_identity(**overrides: object) -> EmbeddingIdentity:
+    """The ADR-0004 identity triple, for the dense-pairing tests below."""
+    defaults: dict[str, object] = {
+        "provider": "ollama",
+        "model_name": "nomic-embed-text",
+        "dimensions": 768,
+    }
+    defaults.update(overrides)
+    return EmbeddingIdentity(**defaults)  # type: ignore[arg-type]
+
+
+class TestDenseFieldPairing:
+    """``embedding`` and ``rrf_k`` are set together or not at all.
+
+    The invariant existed before the validator did, but only as a
+    coincidence of ``runner.py`` gating both assignments on the same
+    predicate at the single production call site. Nothing stopped a
+    hand-built config, a test double, or a second library caller from
+    emitting half a pair — and the halves lie in opposite directions, so
+    neither is a benign omission.
+    """
+
+    def test_both_absent_is_valid(self) -> None:
+        """The BM25-only shape, and every artifact written before Wave E."""
+        config = make_run_config()
+
+        assert config.embedding is None
+        assert config.rrf_k is None
+
+    def test_both_present_is_valid(self) -> None:
+        """The dense shape: an embedder ran, so a fusion stage ran too."""
+        config = make_run_config(embedding=make_embedding_identity(), rrf_k=60)
+
+        assert config.embedding is not None
+        assert config.rrf_k == 60
+
+    def test_embedding_without_rrf_k_is_rejected(self) -> None:
+        """Hides which semantic space the fusion stage was measured in."""
+        with pytest.raises(ValidationError, match="rrf_k"):
+            make_run_config(embedding=make_embedding_identity())
+
+    def test_rrf_k_without_embedding_is_rejected(self) -> None:
+        """Stamps a fusion constant onto a run that never fused anything.
+
+        The same "describes a computation that did not happen" defect that
+        made ``rrf_k`` conditional in ``runner.py`` in the first place.
+        """
+        with pytest.raises(ValidationError, match="embedding"):
+            make_run_config(rrf_k=60)
+
+    def test_the_error_names_which_half_is_missing(self) -> None:
+        """A validator that only says "inconsistent" makes the caller guess."""
+        with pytest.raises(ValidationError) as excinfo:
+            make_run_config(rrf_k=60)
+
+        message = str(excinfo.value)
+        assert "embedding" in message
+        assert "rrf_k" in message
+
+    def test_dense_and_rerank_groups_are_independent(self) -> None:
+        """A BM25-input rerank run has rerank fields and no dense ones.
+
+        The two validators must not be coupled: reranking the BM25 baseline
+        is a complete, self-contained configuration that embeds nothing, and
+        requiring dense fields alongside rerank fields would make it
+        unrepresentable.
+        """
+        config = make_rerank_run_config()
+
+        assert config.rerank_input == "bm25"
+        assert config.embedding is None
+        assert config.rrf_k is None
+
+    def test_both_groups_populated_is_valid(self) -> None:
+        """The fusion-input rerank run: dense pair and reranker together."""
+        config = make_rerank_run_config(
+            rerank_input="fusion", embedding=make_embedding_identity(), rrf_k=60
+        )
+
+        assert config.rerank_input == "fusion"
+        assert config.embedding is not None
+        assert config.rrf_k == 60
