@@ -111,10 +111,12 @@ nav:
       - Retrieval modes: guides/retrieval-modes.md
       - Eval harness: guides/evals.md
       - MCP clients: guides/mcp-clients.md
+      - Deployment: guides/deployment.md
   - Architecture:
       - Overview: architecture/index.md
       - The LLM boundary: architecture/llm-boundary.md
       - Phase 3 spec — hybrid retrieval: specs/phase-3-hybrid-retrieval.md
+      - Phase 6 spec — IaC and observability: specs/phase-6-iac-observability.md
   - API reference:
       - Contracts: reference/contracts.md
       - Configuration: reference/config.md
@@ -139,6 +141,9 @@ nav:
       - "ADR-0014 — Read-only service surface and endpoint safety": adr/ADR-0014-read-only-service-surface-and-outbound-endpoint-safety.md
       - "ADR-0015 — Service dependencies are base": adr/ADR-0015-service-dependencies-are-base-not-an-extra.md
       - "ADR-0016 — Citation verifiability for extracted and remote sources": adr/ADR-0016-citation-verifiability-for-extracted-and-remote-sources.md
+      - "ADR-0020 — Terraform target: one host with block storage": adr/ADR-0020-terraform-target-single-host-with-block-storage.md
+      - "ADR-0021 — Container exposure and filesystem hardening": adr/ADR-0021-container-exposure-and-filesystem-hardening.md
+      - "ADR-0022 — Observability dependency shape and span attributes": adr/ADR-0022-observability-dependency-shape-and-span-attribute-allowlist.md
   - Project:
       - Security: security.md
       - Known limitations: limitations.md

@@ -215,7 +215,7 @@ alike. Revert the source (not the test), run, restore, run.
 | 3 | Hybrid + rerank | dense (LanceDB w/ metadata filtering), RRF, optional cross-encoder (normalized scores); each with eval delta vs baseline | done 2026-08-15 |
 | 4 | Service + MCP | FastAPI + MCP server + CLI; `grk ingest ./docs && grk serve-mcp` connectable from Claude Desktop/Code with documented client config | done 2026-08-15 |
 | 5 | Boundary features | optional query rewrite + cited synthesis; redaction pass (names → tokens, configurable patterns); advisory faithfulness judge | pending |
-| 6 | IaC + observability | multi-stage non-root Dockerfile; compose (service+Ollama+collector+Jaeger); k8s (deployment, service, PVC, probes); Terraform module for one concrete provider; OTel verified end-to-end in compose | pending |
+| 6 | IaC + observability | multi-stage non-root Dockerfile; compose (service+Ollama+collector+Jaeger); k8s (deployment, service, PVC, probes); Terraform module for one concrete provider; OTel verified end-to-end in compose | in progress — `infra/` landed 2026-08-15 (ADR-0020/0018/0019, `docs/specs/phase-6-iac-observability.md`); OTel instrumentation and JSON logs outstanding, and most IaC paths are not yet verified — `infra/README.md` is the status board |
 | 7 | Docs + release | MkDocs site, README live badges only, MIT, v0.1.0 tag, PyPI publish workflow | machinery done 2026-08-15; **release blocked on Phases 4–6** |
 
 Phase 7 ran out of order, deliberately and partially. Everything in it that

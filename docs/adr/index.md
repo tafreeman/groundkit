@@ -22,3 +22,6 @@ that were considered; deviating from SPEC.md requires an ADR proposal first.
 | [ADR-0014](ADR-0014-read-only-service-surface-and-outbound-endpoint-safety.md) | Phase 4 is a read-only service surface, and outbound endpoints are guarded | Accepted |
 | [ADR-0015](ADR-0015-service-dependencies-are-base-not-an-extra.md) | Service dependencies are base requirements, not an optional extra | Accepted |
 | [ADR-0016](ADR-0016-citation-verifiability-for-extracted-and-remote-sources.md) | Citation verifiability for extracted and remote sources | Accepted |
+| [ADR-0020](ADR-0020-terraform-target-single-host-with-block-storage.md) | The Terraform module targets one AWS host with attached block storage, reachable only through SSM | Accepted |
+| [ADR-0021](ADR-0021-container-exposure-and-filesystem-hardening.md) | In a container the loopback guarantee moves outward, and the read-only claim splits in two | Accepted |
+| [ADR-0022](ADR-0022-observability-dependency-shape-and-span-attribute-allowlist.md) | The OTel API is a base dependency, the SDK is an extra, and span attributes are an allowlist | Accepted |
