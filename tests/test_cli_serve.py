@@ -14,7 +14,6 @@ only thing between an indexed corpus and everyone who can route to the host.
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import logging
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -241,21 +240,29 @@ def test_ipv4_and_ipv6_loopback_are_both_accepted(
 def test_ipv4_mapped_ipv6_loopback_is_accepted(
     index_dir: Path, base_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``::ffff:127.0.0.1`` is loopback, and only unmapping first sees that.
+    """``::ffff:127.0.0.1`` is accepted, whatever the interpreter thinks of it.
 
-    The first assertion is why this test earns its keep:
-    ``IPv6Address.is_loopback`` is equality with ``::1``, so the IPv4-mapped
-    form reports ``False``, and a guard reading that property alone would
-    refuse a genuine loopback bind — sending the operator to
-    ``--allow-remote-access``, which would then warn about an exposure that
-    does not exist and normalize the flag that creates a real one.
+    This test earns its keep because ``IPv6Address.is_loopback``'s answer for
+    the IPv4-mapped form **is not stable across CPython patch releases**. On
+    3.11.9 it is ``False`` (the test is equality with ``::1``); on later patches
+    of 3.11, 3.12 and 3.13 it is ``True``, because the property now consults
+    ``ipv4_mapped``. ADR-0014 decision 10 anticipated exactly this drift for
+    ``.is_private`` and named it as the reason not to depend on the property —
+    it turns out to apply to ``.is_loopback`` too, and decision 10's own
+    parenthetical that ``.is_loopback`` is ``False`` here is therefore true only
+    of older interpreters.
+
+    That is precisely why :mod:`groundkit.service.binding` unmaps explicitly
+    before classifying instead of reading the property: the guard's verdict must
+    not be a function of the interpreter patch version. So this test asserts the
+    GUARD's behaviour and deliberately does **not** assert the stdlib's — an
+    earlier draft did, and it passed locally on 3.11.9 while failing on all
+    three CI versions.
 
     The polarity note in :mod:`groundkit.service.binding` covers the other
     half: :mod:`groundkit.utils.url_safety` unmaps for the opposite reason, to
     *reject* this address on an outbound endpoint.
     """
-    assert ipaddress.IPv6Address("::ffff:127.0.0.1").is_loopback is False
-
     calls = _patch_serve_http(monkeypatch)
     assert cli.main(_argv("serve", index_dir, base_dir, "--host", "::ffff:127.0.0.1")) == 0
     assert calls[0].host == "::ffff:127.0.0.1"

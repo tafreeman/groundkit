@@ -413,6 +413,27 @@ that caused ARP's signature drift (ADR-0001 hazard 4).
   `utils/url_safety.py` does not exist. That is stated plainly in the implementation notes
   rather than implied away.
 
+## Amendment (2026-08-15) — decision 10's `.is_loopback` claim is version-dependent
+
+Decision 10 states that `IPv6Address("::ffff:127.0.0.1").is_loopback` is
+**False**, and uses that to argue a classifier reading the property admits the
+IPv4-mapped spelling. **That is true only of older CPython patch releases.** On
+Python 3.11.9 it is `False`; on the later 3.11, 3.12 and 3.13 patches CI runs it
+is `True`, because the property now consults `ipv4_mapped` — the same migration
+decision 10 already documented for `.is_private`.
+
+**No implementation changes and no hole is opened.** `service/binding.py` and
+`utils/url_safety.py` both unmap explicitly *before* classifying, precisely so
+the verdict is not a function of the interpreter patch version, and both behave
+identically under either stdlib behaviour. Decision 10's *reasoning* — do not
+depend on these properties' treatment of mapped addresses — is strengthened by
+this, not weakened; only its parenthetical statement of fact needs the caveat.
+
+Found the way such things should be: a test asserted the stdlib behaviour
+directly, passed on the developer's 3.11.9, and failed on all three CI versions.
+That assertion has been removed — the test now pins the **guard's** behaviour and
+says why asserting the interpreter's would be pinning something that drifts.
+
 ## Amendment (2026-08-15) — the not-found/bad-request boundary, settled
 
 Decision 9 maps `ConfigurationError` to a 400/`invalid_request`. Decision 3
