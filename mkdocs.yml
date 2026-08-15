@@ -115,6 +115,7 @@ nav:
       - Overview: architecture/index.md
       - The LLM boundary: architecture/llm-boundary.md
       - Phase 3 spec — hybrid retrieval: specs/phase-3-hybrid-retrieval.md
+      - Phase 5 spec — boundary features: specs/phase-5-boundary-features.md
   - API reference:
       - Contracts: reference/contracts.md
       - Configuration: reference/config.md
@@ -139,6 +140,9 @@ nav:
       - "ADR-0014 — Read-only service surface and endpoint safety": adr/ADR-0014-read-only-service-surface-and-outbound-endpoint-safety.md
       - "ADR-0015 — Service dependencies are base": adr/ADR-0015-service-dependencies-are-base-not-an-extra.md
       - "ADR-0016 — Citation verifiability for extracted and remote sources": adr/ADR-0016-citation-verifiability-for-extracted-and-remote-sources.md
+      - "ADR-0017 — Chat seam and redaction boundary": adr/ADR-0017-chat-seam-and-redaction-boundary.md
+      - "ADR-0018 — LLM output is validated, never trusted": adr/ADR-0018-llm-output-is-validated-never-trusted.md
+      - "ADR-0019 — grk answer, and no synthesis on the service surface": adr/ADR-0019-grk-answer-and-no-synthesis-on-the-service-surface.md
   - Project:
       - Security: security.md
       - Known limitations: limitations.md
