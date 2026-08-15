@@ -1,0 +1,35 @@
+# ClusterIP, and the type is the access-control decision (ADR-0021 decision 1).
+#
+# `NodePort` or `LoadBalancer` here would publish an UNAUTHENTICATED,
+# content-bearing surface — document text and absolute source paths over
+# `search`, collection topology over `index_status` and `list_collections` — to
+# whoever can reach the node or the load balancer. Phase 4 ships no
+# authentication of any kind (ADR-0014 decision 1), so there is nothing behind
+# this Service to stop them.
+#
+# Reaching it is:
+#
+#     kubectl -n groundkit port-forward svc/groundkit 8765:8765
+#
+# which the cluster's own RBAC authorises and its audit log records. An Ingress
+# is the same mistake as a LoadBalancer with a hostname attached; if this ever
+# needs to be reachable from outside the cluster, what it needs first is
+# authentication, which is a src/ change and an ADR, not a manifest.
+apiVersion: v1
+kind: Service
+metadata:
+  name: groundkit
+  namespace: groundkit
+  labels:
+    app.kubernetes.io/name: groundkit
+    app.kubernetes.io/component: service
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: groundkit
+    app.kubernetes.io/component: service
+  ports:
+    - name: http
+      port: 8765
+      targetPort: http
+      protocol: TCP

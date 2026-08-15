@@ -1,0 +1,99 @@
+# One-shot ingest. Applied on its own, NOT part of kustomization.yaml.
+#
+#     kubectl apply -f infra/k8s/job-ingest.yaml
+#
+# Out of the kustomize base for a concrete reason rather than for tidiness: a
+# Job's pod template is immutable, so `kubectl apply -k` would succeed the first
+# time and fail on every subsequent apply of the whole base. Delete and re-apply
+# this file to re-run it.
+#
+# This Job exists because `grk serve` will not create an index — `--index-dir`
+# must already exist and the service never creates a collection (ADR-0014
+# decision 3). A freshly provisioned PVC therefore serves an empty index until
+# something writes one, and `list_collections` returning `[]` is not an error,
+# so nothing about a running-but-empty deployment looks wrong. It is.
+#
+# It does NOT solve getting documents onto the volume. `/data/corpus` must
+# already hold them; see infra/README.md for the loader-pod recipe. That gap is
+# real and is stated rather than hidden behind an initContainer that would
+# quietly need network access.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: groundkit-ingest
+  namespace: groundkit
+  labels:
+    app.kubernetes.io/name: groundkit
+    app.kubernetes.io/component: ingest
+spec:
+  backoffLimit: 2
+  # Cleaned up an hour after finishing, so a completed Job does not sit in the
+  # namespace looking like a running one.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: groundkit
+        app.kubernetes.io/component: ingest
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ingest
+          image: ghcr.io/tafreeman/groundkit:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - ingest
+            - /data/corpus
+            - --index-dir=/data/index
+            - --collection=default
+          # No --dense: this Job runs in a namespace with no embedding
+          # endpoint. Adding it without --embed-base-url pointing at a real
+          # Ollama would fail at the first embed call, after the chunking work.
+          #
+          # Two hazards if that changes, both fail-closed and both worth
+          # knowing before editing this list: a BM25-only ingest against a
+          # collection an earlier dense run bound is REFUSED (ADR-0011), and a
+          # dense ingest with a different provider/model/dimension triple than
+          # the manifest records raises IndexIdentityError rather than
+          # re-embedding (ADR-0004).
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data/index
+              subPath: index
+            - name: data
+              mountPath: /data/corpus
+              subPath: corpus
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: home
+              mountPath: /home/groundkit
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: groundkit-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: home
+          emptyDir:
+            sizeLimit: 16Mi

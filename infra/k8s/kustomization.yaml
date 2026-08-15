@@ -1,0 +1,38 @@
+# Steady-state objects only.
+#
+#     kubectl kustomize infra/k8s          # render, offline, gated in CI
+#     kubectl apply -k infra/k8s           # apply, needs a cluster
+#
+# `job-ingest.yaml` and `pod-corpus-loader.yaml` are deliberately NOT listed.
+# Both are one-shots, and both would break a repeated `apply -k`: a Job's pod
+# template is immutable, so the second apply fails, and a long-lived loader pod
+# would hold the ReadWriteOnce claim the Deployment needs. Apply each with
+# `kubectl apply -f` when you want it, and delete it when you are done.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: groundkit
+
+resources:
+  - namespace.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+
+# `labels`, not the deprecated `commonLabels`. The difference is not cosmetic:
+# `commonLabels` also injects into `spec.selector`, and a Deployment's selector
+# is immutable — so adding one later would make the next `apply` fail on an
+# already-deployed object. `includeSelectors: false` is the default here, which
+# is the behaviour that stays safe as this list grows.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: groundkit
+
+# Set before applying. No groundkit image has been published to any registry, so
+# `ghcr.io/tafreeman/groundkit:dev` in deployment.yaml is a placeholder that
+# will not pull. Overriding it here keeps the manifests themselves unedited:
+#
+#     kustomize edit set image ghcr.io/tafreeman/groundkit=myregistry/groundkit:0.1.0
+images:
+  - name: ghcr.io/tafreeman/groundkit
+    newTag: dev

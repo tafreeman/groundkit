@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# groundkit instance bootstrap (Terraform user_data, ADR-0020).
+#
+# Terraform renders this file. In the SOURCE, a doubled dollar escapes the
+# interpolation: $${SHELL_VAR} reaches the instance as a shell variable, while a
+# single-dollar reference is substituted by Terraform before the instance ever
+# boots. Getting that backwards is only caught by `terraform validate` when the
+# name happens not to be a template variable; write $${HOME} as a single dollar
+# and it renders to nothing, silently.
+set -euo pipefail
+
+log() { echo "[groundkit-bootstrap] $*"; }
+
+# -- docker -----------------------------------------------------------------
+log "installing docker"
+dnf install -y docker
+systemctl enable --now docker
+
+# -- data volume ------------------------------------------------------------
+# The attachment names ${data_device_name}, but a Nitro instance presents EBS as
+# NVMe under a different name. The by-id link derived from the volume id is the
+# only identifier that is stable across both, so it is tried first and the
+# attachment name is the fallback for non-Nitro types.
+VOLUME_SUFFIX="$(echo "${data_volume_id}" | tr -d '-')"
+BY_ID="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$${VOLUME_SUFFIX}"
+
+DEVICE=""
+for _ in $(seq 1 60); do
+  if [ -e "$${BY_ID}" ]; then
+    DEVICE="$(readlink -f "$${BY_ID}")"
+    break
+  fi
+  if [ -b "${data_device_name}" ]; then
+    DEVICE="${data_device_name}"
+    break
+  fi
+  sleep 2
+done
+
+if [ -z "$${DEVICE}" ]; then
+  log "FATAL: data volume ${data_volume_id} did not appear within 120s"
+  exit 1
+fi
+log "data volume is $${DEVICE}"
+
+# Format only if there is no filesystem. This script runs again on an instance
+# replacement (user_data_replace_on_change), and the volume it reattaches to
+# holds the corpus — SPEC.md section 7 is explicit that the SQLite store is
+# content-bearing data. An unconditional mkfs would silently destroy it.
+if ! blkid "$${DEVICE}" >/dev/null 2>&1; then
+  log "no filesystem on $${DEVICE}; creating ext4"
+  mkfs -t ext4 -L groundkit "$${DEVICE}"
+else
+  log "existing filesystem on $${DEVICE}; leaving it alone"
+fi
+
+mkdir -p /srv/groundkit
+UUID="$(blkid -s UUID -o value "$${DEVICE}")"
+if ! grep -q "$${UUID}" /etc/fstab; then
+  # `nofail` so a missing volume degrades to a bootable instance an operator can
+  # reach over SSM, rather than one stuck in emergency mode with no way in --
+  # there is no SSH ingress to fall back on (ADR-0020 decision 2).
+  echo "UUID=$${UUID} /srv/groundkit ext4 defaults,nofail 0 2" >> /etc/fstab
+fi
+mount -a
+
+# uid/gid 10001 is the image's fixed non-root identity and part of its public
+# contract (ADR-0021 decision 3). The host has no such user; the numeric owner
+# is what matters to the container.
+mkdir -p /srv/groundkit/index /srv/groundkit/corpus
+chown -R 10001:10001 /srv/groundkit
+
+# -- image ------------------------------------------------------------------
+log "pulling ${container_image}"
+docker pull "${container_image}"
+
+# -- helper: one-shot ingest ------------------------------------------------
+# Run over an SSM session: `sudo groundkit-ingest`. The corpus must already be
+# in /srv/groundkit/corpus; getting it there is the operator's business (aws s3
+# sync, git clone, scp over an SSM session), and this module deliberately does
+# not choose for them.
+cat > /usr/local/bin/groundkit-ingest <<'INGEST'
+#!/usr/bin/env bash
+set -euo pipefail
+exec docker run --rm \
+  --read-only \
+  --tmpfs /tmp:mode=1777,size=256m \
+  --tmpfs /home/groundkit:mode=0700,uid=10001,gid=10001,size=16m \
+  --security-opt no-new-privileges:true \
+  --cap-drop ALL \
+  -v /srv/groundkit/index:/data/index \
+  -v /srv/groundkit/corpus:/data/corpus:ro \
+  IMAGE_PLACEHOLDER \
+  ingest /data/corpus --index-dir=/data/index --collection=COLLECTION_PLACEHOLDER "$@"
+INGEST
+sed -i "s|IMAGE_PLACEHOLDER|${container_image}|; s|COLLECTION_PLACEHOLDER|${collection}|" \
+  /usr/local/bin/groundkit-ingest
+chmod 0755 /usr/local/bin/groundkit-ingest
+
+# -- service ----------------------------------------------------------------
+# A systemd unit rather than `docker run -d`, so the service returns after a
+# reboot and its lifecycle is inspectable with the tools already on the box.
+#
+# `-p 127.0.0.1:${host_port}:8765` is the access control (ADR-0021 decision 1):
+# the security group has no ingress rules, and this publish means even a group
+# that gained one would find nothing listening on a routable address. Session
+# Manager port forwarding connects to localhost ON THE INSTANCE, which is
+# exactly what this exposes.
+cat > /etc/systemd/system/groundkit.service <<UNIT
+[Unit]
+Description=groundkit retrieval service
+After=docker.service srv-groundkit.mount
+Requires=docker.service
+
+[Service]
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f groundkit
+ExecStart=/usr/bin/docker run --rm --name groundkit \\
+  --read-only \\
+  --tmpfs /tmp:mode=1777,size=64m \\
+  --tmpfs /home/groundkit:mode=0700,uid=10001,gid=10001,size=16m \\
+  --security-opt no-new-privileges:true \\
+  --cap-drop ALL \\
+  -p 127.0.0.1:${host_port}:8765 \\
+  -v /srv/groundkit/index:/data/index \\
+  -v /srv/groundkit/corpus:/data/corpus:ro \\
+  -e GROUNDKIT_LOG_FORMAT=json \\
+  ${container_image} \\
+  serve --index-dir=/data/index --base-dir=/data/corpus \\
+  --host=0.0.0.0 --port=8765 --allow-remote-access ${embedding_base_url == "" ? "" : "--dense --embed-provider=ollama --embed-base-url=${embedding_base_url}"}
+ExecStop=/usr/bin/docker stop groundkit
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+
+# `grk serve` refuses an --index-dir that does not exist and never creates one
+# (ADR-0014 decision 3), so the directory above has to be there first -- it is.
+# An EMPTY index, though, serves happily and reports no collections, so a
+# freshly provisioned volume looks healthy and answers nothing. Run
+# `groundkit-ingest` before concluding the deployment works.
+systemctl enable --now groundkit
+log "done"

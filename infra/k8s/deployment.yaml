@@ -1,0 +1,157 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: groundkit
+  namespace: groundkit
+  labels:
+    app.kubernetes.io/name: groundkit
+    app.kubernetes.io/component: service
+spec:
+  # One replica, and not a knob. SPEC.md §4 puts distributed indexing out of
+  # scope: the index is a file-based store on a ReadWriteOnce claim, so a second
+  # replica cannot mount it. Scaling this up does not double throughput, it
+  # leaves a pod Pending.
+  replicas: 1
+  # Recreate, not RollingUpdate, for the same reason: a rolling update wants the
+  # new pod Ready before the old one terminates, and both would have to hold the
+  # RWO claim simultaneously. The rollout would hang on a Multi-Attach error
+  # rather than fail, which is the more confusing outcome. The cost is honest
+  # downtime on every deploy.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: groundkit
+      app.kubernetes.io/component: service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: groundkit
+        app.kubernetes.io/component: service
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        # Must match the image's uid/gid, which ADR-0021 decision 3 makes part
+        # of the image's public contract. `fsGroup` is what makes the PVC
+        # writable by that uid — the image's own chown cannot reach a volume the
+        # CSI driver provisioned.
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: groundkit
+          # No image has been published to any registry. Set this to a real
+          # reference before applying — `kustomization.yaml`'s `images:` block
+          # is the intended place, so this file does not have to be edited.
+          image: ghcr.io/tafreeman/groundkit:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - serve
+            - --index-dir=/data/index
+            - --base-dir=/data/corpus
+            - --host=0.0.0.0
+            - --port=8765
+            - --allow-remote-access
+          # `--host 0.0.0.0 --allow-remote-access` is required inside a
+          # container and is not an exposure decision here (ADR-0021 decision
+          # 1). The exposure decision is the Service: ClusterIP, so nothing
+          # outside the cluster reaches this port without `kubectl
+          # port-forward`, which the cluster's own RBAC authorises.
+          #
+          # `--dense` is absent deliberately. There is no Ollama in this
+          # namespace, and a serve configured for a dense path it cannot reach
+          # would fail at request time rather than at startup. Add it, with the
+          # --embed-* flags, once an embedding endpoint exists.
+          ports:
+            - name: http
+              containerPort: 8765
+              protocol: TCP
+          env:
+            - name: GROUNDKIT_LOG_FORMAT
+              value: json
+            # ADR-0022 decision 2: standard OTel names. Inert until the
+            # instrumentation change installs an SDK; harmless before it. Point
+            # OTEL_EXPORTER_OTLP_ENDPOINT at a collector in this cluster.
+            - name: OTEL_SERVICE_NAME
+              value: groundkit
+            - name: OTEL_TRACES_EXPORTER
+              value: none
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # Read-write, and it cannot be otherwise: WAL sidecars, `CREATE
+            # TABLE IF NOT EXISTS` and the open-time chmod all write on every
+            # open (ADR-0014 decision 4, ADR-0021 decision 2).
+            - name: data
+              mountPath: /data/index
+              subPath: index
+            # Read-only, and this is the half of ADR-0014 decision 4's deferral
+            # that Phase 6 actually discharges: citation resolution re-reads
+            # these files and never writes one, so the kernel enforces it.
+            - name: data
+              mountPath: /data/corpus
+              subPath: corpus
+              readOnly: true
+            # A read-only root filesystem needs its scratch paths named. These
+            # two are the complete list; a third would surface as a permission
+            # error rather than a silent write into a vanishing layer.
+            - name: tmp
+              mountPath: /tmp
+            - name: home
+              mountPath: /home/groundkit
+          # Startup probe first: it holds the liveness probe off until the
+          # process is serving, so a slow start is not read as a hang.
+          startupProbe:
+            httpGet:
+              path: /v1/collections
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /v1/collections
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Deliberately slack. `/v1/collections` lists a directory on the PVC,
+          # so a wedged volume fails this probe — and restarting the pod does
+          # not unwedge a volume, it just adds a restart loop to an already
+          # broken mount. A long period and a high threshold keep this probe
+          # reacting to a stuck process rather than to storage weather. See
+          # docs/specs/phase-6-iac-observability.md §4.2 for why there is no
+          # dedicated health endpoint to point at instead.
+          livenessProbe:
+            httpGet:
+              path: /v1/collections
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              # Memory, not CPU, is the one to watch: `BM25Index.from_store()`
+              # rebuilds postings in memory at every `Retriever.open()`
+              # (ADR-0002), so the working set scales with corpus size rather
+              # than with request rate. An OOMKill here means the corpus
+              # outgrew this limit, not that traffic did.
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: groundkit-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: home
+          emptyDir:
+            sizeLimit: 16Mi

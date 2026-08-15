@@ -62,3 +62,19 @@ Thumbs.db
 
 # Docs build
 site/
+
+# Terraform working state (infra/terraform/**). `.terraform/` is a provider
+# cache, and `.terraform.lock.hcl` belongs to a ROOT module — this repo ships a
+# reusable module, whose consumers own their own lock. Committing one here would
+# pin every consumer to whatever provider version happened to resolve on the
+# machine that ran `init`. `*.tfvars` is ignored because that is where a real
+# deployment's account-specific values land, and `.tfvars.example` is the
+# documented-names counterpart, matching the `.env` / `.env.example` rule above.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+*.tfvars
+!*.tfvars.example

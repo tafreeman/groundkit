@@ -1,0 +1,68 @@
+# A place to `kubectl cp` documents into, and nothing else.
+#
+#     kubectl apply -f infra/k8s/pod-corpus-loader.yaml
+#     kubectl -n groundkit wait --for=condition=Ready pod/groundkit-corpus-loader
+#     kubectl -n groundkit cp ./docs groundkit-corpus-loader:/data/corpus
+#     kubectl -n groundkit delete pod groundkit-corpus-loader
+#
+# Out of kustomization.yaml deliberately: this is a manual, short-lived utility,
+# and a base that created it would leave a sleeping pod holding the RWO claim —
+# which would then block the Deployment from starting on any node but this
+# pod's. Apply it, use it, delete it.
+#
+# It exists because getting documents onto the volume is a genuine gap in these
+# manifests and the honest answer is a recipe rather than an initContainer that
+# would need network access and a source of truth nobody has specified. A real
+# deployment replaces this with whatever it already uses — a git-sync sidecar,
+# an object-storage CSI volume, a build-time layer.
+#
+# Note the mount: `/data/corpus` READ-WRITE, which is exactly what the
+# Deployment refuses to give the serving process (ADR-0021 decision 2). That
+# asymmetry is the design, not an inconsistency — writing the corpus is an
+# operator action, and reading it is all the service is permitted to do.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: groundkit-corpus-loader
+  namespace: groundkit
+  labels:
+    app.kubernetes.io/name: groundkit
+    app.kubernetes.io/component: corpus-loader
+spec:
+  restartPolicy: Never
+  # Bounded so a forgotten loader releases the claim on its own rather than
+  # blocking the Deployment indefinitely.
+  activeDeadlineSeconds: 3600
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: loader
+      # busybox rather than the groundkit image: `kubectl cp` needs `tar` in the
+      # container, which the groundkit image (python:slim, non-root, read-only
+      # root) does not carry and should not gain for this.
+      image: busybox:1.37
+      command: ["sh", "-c", "mkdir -p /data/corpus /data/index && sleep 3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: groundkit-data
