@@ -29,7 +29,7 @@ Both implementations close two ported ARP defects (ADR-0001):
 - **Hazard 5 — unescaped delete predicate.** LanceDB deletes through a SQL
   expression string built by the caller. ADR-0004 decision 6: a document ID
   is validated against a strict identifier pattern (:func:`_validate_document_id`,
-  mirroring ``index/metadata.py``'s ``_validate_collection`` in spirit) before
+  mirroring ``index/metadata.py``'s ``validate_collection_name`` in spirit) before
   it can reach :func:`_build_delete_predicate` — the single function that
   builds that string. Escaping is defence in depth, applied after
   validation, never the primary defence. Verified live against this repo's

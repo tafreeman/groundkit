@@ -21,9 +21,27 @@ classifiers = [
   "Typing :: Typed",
 ]
 # Runtime dependencies land with the phase that needs them (SPEC.md phase plan).
+#
+# FastAPI, uvicorn and the MCP SDK are BASE requirements, not an extra
+# (ADR-0015). The rule that decides it, stated so it decides future cases too:
+# an extra may gate an *option* on a command; it may not gate the *command
+# itself*. `--dense` and `--rerank` are options, so `dense` and `rerank` stay
+# extras below. `serve-mcp` is a command, and it is the command SPEC.md §9
+# names as Phase 4's deliverable -- behind an extra it could only ever raise a
+# ConfigurationError on a default install, which would make SPEC.md §1.2's
+# "real and installable, not a demo" false in the most literal way available.
 dependencies = [
   "pydantic>=2.7,<3",
   "httpx>=0.27,<1",
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.30,<1",
+  # Floor at the release this surface was written and verified against: the
+  # SDK's tool-dispatch and streamable-HTTP APIs moved across 1.x minors, and
+  # `service/mcp_server.py` depends on specifics of both (it registers raw
+  # generated input schemas through the low-level Server, and mounts
+  # StreamableHTTPSessionManager on the FastAPI app). A lower floor would
+  # advertise compatibility nothing checks.
+  "mcp>=1.29,<2",
 ]
 
 [project.urls]
