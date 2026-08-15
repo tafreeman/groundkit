@@ -2,7 +2,7 @@
 
 Honest and current, per repo policy. Updated with each phase.
 
-## Current state (Phase 3 and Phase 4, service surface built)
+## Current state (Phases 3–5: hybrid retrieval, service surface, LLM boundary)
 
 Hybrid retrieval works end-to-end locally, behind opt-in flags: `grk
 ingest --dense` embeds each chunk into a LanceDB vector store alongside the
@@ -363,8 +363,7 @@ per SPEC.md §9:
 - PDF/HTML loaders and URL ingestion (with the SSRF guard) — v1 scope, not
   yet scheduled into a phase; the loader currently reads `.md`/`.markdown`/
   `.txt` only.
-- Synthesis, query rewrite, redaction (Phase 5); IaC and OTel observability
-  (Phase 6); docs site (Phase 7).
+- IaC and OTel observability (Phase 6).
 - BM25 rebuilds in memory at open — O(corpus) startup cost, accepted and
   bounded by ADR-0002's revisit trigger.
 - A UTF-8 BOM is not stripped at load (`utf-8`, not `utf-8-sig`), so a
@@ -457,12 +456,80 @@ per SPEC.md §9:
   `base_url` itself. The threat model is operator misconfiguration, not a
   hostile operator (ADR-0014 Consequences).
 
+## Phase 5 caveats (the LLM boundary)
+
+- **The redaction pass exists and is wired at exactly one boundary: cloud
+  chat egress.** `build_chat` wraps every `openai_compatible` chat provider
+  in `RedactingChat` with no operator opt-out (ADR-0017), constructing a
+  fresh `Redactor` per call — a long-lived one would let `restore()` expand
+  a token from one request into a value captured in another, a
+  cross-request disclosure the mitigation itself would manufacture
+  (regression-tested). The default pattern floor covers structurally
+  recognizable values only: emails, E.164/US phone shapes, IPv4, long
+  secret-shaped tokens. **No person-name pattern ships** — free-text name
+  detection by regex is unreliable enough that shipping one under the label
+  "redacts names" would be a false promise; SPEC.md §2's "names → tokens"
+  is met through *configured* patterns, which is what its own "configurable
+  patterns" clause provides. Two recorded residuals: the **embedding
+  boundary is not redacted** — a deliberate SPEC §2 deviation (ADR-0017
+  decision 5: order-dependent tokens are unstable across ingest/search
+  processes, a vector over redacted text stops describing the stored chunk,
+  and `CollectionManifest` records nothing about redaction, so a mixed
+  collection would pass identity verification); and text that already
+  contains a literal token-shaped substring (`[EMAIL_1]`) is
+  indistinguishable from a real token once redaction runs, so `restore()`
+  corrupts it (tested, documented, unfixed).
+- **The faithfulness judge is advisory and uncalibrated.** Verdicts gate
+  nothing and the exit code never depends on them; malformed or incoherent
+  model output is a `JudgeError`, never coerced. The calibration procedure
+  required before gating could ever be proposed is documented in
+  `evals/judge.py`'s module docstring; no human-labeled verdict set exists
+  yet, and normal CI never runs the judge.
+- **Synthesis quality is unmeasured offline, and nothing re-measures it
+  automatically.** `grk eval --synthesis` runs the planted-marker
+  citation-echo check (SPEC.md §2) against a real chat provider and writes
+  its own artifact (`evals/results/echo-latest.json`); there is
+  deliberately no offline double for it — an echo number from a scripted
+  chat would be noise presented as a measurement. No gated synthesis
+  workflow exists yet (the `eval-gated`/`rerank-gated` posture, but the
+  workflow file itself is not written), so every echo result is a
+  point-in-time local measurement. `EvalReport.synthesis`
+  (`SynthesisReport`) is structure without a producer: `grk eval` does not
+  yet fold judge tallies over the golden corpus into the main artifact.
+- **`grk answer` is CLI-only; synthesis is off the service surface
+  (ADR-0019).** Synthesis is a read, but it adds cost amplification and
+  egress amplification that a loopback bind does not bound. Named
+  consequence: agentic-evalkit can grade groundkit's *retrieval* through
+  the HTTP/MCP `ExecutionTarget` boundary, but not its generative half.
+- **Prompt-injection defense at the synthesis boundary is structural
+  only.** Retrieved content passes through `sanitize_content`
+  (`providers/context_assembly.py`, ported from ARP per ADR-0001) before
+  entering a prompt: delimiter-tag forgery is neutralized, control
+  characters stripped, lines quote-prefixed. Instruction-like phrasing
+  survives verbatim inside the quoting — this raises the bar against naive
+  smuggling and is not a guarantee a model treats the content as inert.
+  The ported `TokenBudgetAssembler`/`frame_content` envelope is available
+  but unwired; only `sanitize_content` is live.
+- **Citation-marker parsing is deliberately naive.** Every `[n]` in a
+  completion counts as a marker, including bracketed numbers inside echoed
+  source text — the distinction is not reliably recoverable from text
+  alone (documented in `providers/synthesis.py`). Redaction tokens cannot
+  collide with markers: the marker regex is digits-only and token
+  categories always carry letters (regression-tested against ADR-0018's
+  recorded hazard).
+- **Query rewrite is reachable only through `grk answer --rewrite` and no
+  eval number measures it.** Enabling it changes retrieval inputs, so its
+  effect on retrieval quality is unquantified; a rewrite failure is a
+  typed error, never a silent fallback to the original query.
+
 ## Phase 2 caveats
 
 - The adversarial category does not test prompt-injection resistance. With
   no LLM in the retrieval path, "injected text must never surface as
-  instructions" is untestable in Phase 2; that arrives with the Phase 5
-  faithfulness judge. What Phase 2 asserts is fixture correctness — that
+  instructions" was untestable in Phase 2. Phase 5 added the structural
+  sanitization pass and the advisory judge described above, but neither
+  turns this category into a resistance test — that remains an unclaimed
+  property. What Phase 2 asserts is fixture correctness — that
   documents referenced by adversarial judgments genuinely contain
   injection-styled text, and that retrieval returns it verbatim like any
   other content. A passing adversarial test is **not** a claim that

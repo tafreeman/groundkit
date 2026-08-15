@@ -214,7 +214,7 @@ alike. Revert the source (not the test), run, restore, run.
 | 2 | Eval harness | golden corpus + metrics engine + BM25 baseline report as reference artifact | done 2026-08-11 |
 | 3 | Hybrid + rerank | dense (LanceDB w/ metadata filtering), RRF, optional cross-encoder (normalized scores); each with eval delta vs baseline | done 2026-08-15 |
 | 4 | Service + MCP | FastAPI + MCP server + CLI; `grk ingest ./docs && grk serve-mcp` connectable from Claude Desktop/Code with documented client config | done 2026-08-15 |
-| 5 | Boundary features | optional query rewrite + cited synthesis; redaction pass (names → tokens, configurable patterns); advisory faithfulness judge | pending |
+| 5 | Boundary features | optional query rewrite + cited synthesis; redaction pass (names → tokens, configurable patterns); advisory faithfulness judge | done 2026-08-15 (redaction covers cloud **chat** egress only — the embedding boundary is a recorded deviation, ADR-0017; no gated synthesis workflow yet) |
 | 6 | IaC + observability | multi-stage non-root Dockerfile; compose (service+Ollama+collector+Jaeger); k8s (deployment, service, PVC, probes); Terraform module for one concrete provider; OTel verified end-to-end in compose | pending |
 | 7 | Docs + release | MkDocs site, README live badges only, MIT, v0.1.0 tag, PyPI publish workflow | machinery done 2026-08-15; **release blocked on Phases 4–6** |
 
@@ -235,9 +235,10 @@ disagrees with `pyproject.toml` — which today still carries `0.1.0.dev0`, so
 the machinery fails closed against exactly this premature release.
 
 The docs site describes only what is built, and states the gaps where they
-fall. When Phases 4–6 land, the docs owed are the service/MCP pages, the IaC
-verification dates, and the row in the LLM-boundary egress inventory that must
-stop saying the redaction pass does not exist.
+fall. Phase 4's service/MCP pages and Phase 5's LLM-boundary update have
+landed — the egress inventory now documents the redaction pass where it
+actually runs (cloud chat, ADR-0017), not the embedding row this paragraph
+originally predicted. Still owed with Phase 6: the IaC verification dates.
 
 ## 10. Definition of done (v1)
 
