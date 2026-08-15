@@ -1,13 +1,14 @@
 """Dense-wiring invariants shared by ingest, retrieval, and evaluation.
 
-Both helpers here enforce an ADR-0004 obligation at a seam, and all three
-callers — :class:`~groundkit.indexer.Indexer`,
-:class:`~groundkit.retrieval.search.Retriever` and
-:func:`~groundkit.evals.runner.run_eval` — need them identically. They live in
-a leaf module rather than in whichever caller happened to need them first,
-precisely so that sharing them creates no dependency between ingest and
-retrieval: this module imports only ``contracts``, ``errors`` and the two
-protocol modules, and nothing it imports imports it back.
+Both helpers here enforce an ADR-0004 obligation at a seam, and every caller —
+:class:`~groundkit.indexer.Indexer`,
+:class:`~groundkit.retrieval.search.Retriever`,
+:func:`~groundkit.evals.runner.run_eval` and, from Phase 4,
+:class:`~groundkit.runtime.CollectionRuntime` — needs them identically. They
+live in a leaf module rather than in whichever caller happened to need them
+first, precisely so that sharing them creates no dependency between ingest and
+retrieval: this module imports only ``contracts``, ``errors`` and the provider
+protocol module, and nothing it imports imports it back.
 
 That neutrality is the point. Each helper previously existed as a per-caller
 copy, and the copies had already begun to diverge in their prose while staying
@@ -23,7 +24,6 @@ from groundkit.contracts import EmbeddingIdentity
 from groundkit.errors import ConfigurationError
 
 if TYPE_CHECKING:
-    from groundkit.index.protocols import VectorStoreProtocol
     from groundkit.providers.protocols import EmbeddingProtocol
 
 
@@ -53,7 +53,7 @@ def identity_of(embedder: EmbeddingProtocol) -> EmbeddingIdentity:
 
 def validate_dense_pair(
     embedder: EmbeddingProtocol | None,
-    vector_store: VectorStoreProtocol | None,
+    vector_store: object | None,
     *,
     subject: str,
     without_store: str,
@@ -71,7 +71,15 @@ def validate_dense_pair(
 
     Args:
         embedder: The embedder half of the pair, or ``None``.
-        vector_store: The vector-store half of the pair, or ``None``.
+        vector_store: The vector-store half of the pair, or ``None``. Typed
+            ``object`` rather than ``VectorStoreProtocol`` because this
+            function only ever tests *presence* — it never touches a member —
+            and because one caller
+            (:class:`~groundkit.runtime.CollectionRuntime`) holds a *factory*
+            for the store rather than the store itself (ADR-0013 decision 6).
+            Narrowing the annotation would push that caller into duplicating
+            the branch structure this function exists to keep in one place,
+            which is the drift it was written to prevent.
         subject: Caller named at the head of the message (e.g. ``"Retriever"``).
         without_store: Consequence clause for an embedder supplied with no
             store. Follows ``"The pair is inseparable: "`` and precedes
