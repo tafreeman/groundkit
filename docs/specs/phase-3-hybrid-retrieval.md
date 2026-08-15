@@ -202,15 +202,51 @@ changeset that leaves the tree green.
   Both remain opt-in: the default install, default commands, and CI need no
   Ollama, and `grk search` still defaults to `bm25` (Q1, below).
 
-### Wave D — optional cross-encoder rerank
+### Wave D — optional cross-encoder rerank (**Landed, except the eval stage**)
 
-- `retrieval/rerank.py` behind `RerankerProtocol`, optional extra.
+- `retrieval/rerank.py` behind `RerankerProtocol`, optional extra. ✅
+  `CrossEncoderReranker` plus two pure functions, `sigmoid` and
+  `rerank_by_logits`; the `rerank` extra carries sentence-transformers and is
+  deliberately **not** mirrored into the dev group.
 - **Hazard 2 regression test:** feed negative logits, assert no
-  `ValidationError` and that ordering is preserved.
+  `ValidationError` and that ordering is preserved. ✅
+  `TestHazard2NegativeLogits` (`tests/test_rerank.py`), shown to fail first
+  against two separate mutations of the source, per SPEC.md §8:
+  - `score=logit` (the literal ARP defect) → 4 failures, all
+    `pydantic ValidationError` on the `ge=0.0` bound.
+  - `score=max(0.0, logit)` (the clamp ADR-0005 rejected) → 3 failures. Note
+    this mutation **passes** the no-`ValidationError` assertion and is caught
+    only by the ordering and tie assertions, which is precisely why those
+    assertions exist: a clamp is contract-legal and corrupt.
 - Unconfigured reranker → typed error, never a silent passthrough (SPEC.md §2
-  fail-closed).
+  fail-closed). ✅ New `RerankerNotConfiguredError`, raised on a missing extra
+  and on any model-load failure. Construction is total; nothing loads until
+  the first non-empty `rerank` call.
 - Heavy deps (torch/sentence-transformers) must stay out of the base install;
-  CI's default job must not pull them.
+  CI's default job must not pull them. ✅ The import is deferred to
+  `_import_cross_encoder`, so `retrieval/rerank.py` is fully importable — and
+  91% covered — in a base install. The real model is proved by
+  `tests/test_rerank_gated.py` behind `RERANK_GATED=1` and
+  `.github/workflows/rerank-gated.yml`, which is the sole proof of this
+  backend and is correspondingly not `continue-on-error`.
+
+**Outstanding, and it is the Phase 3 gate.** SPEC.md §9 requires each Phase 3
+retrieval feature to report an eval delta against the BM25 baseline, and rerank
+does not have one yet: `run_eval` takes no reranker, and `rerank` — though
+already a legal `StageName` — is never appended to a report. Two decisions are
+open and neither should be settled by omission:
+
+1. **Which stage does rerank rerank?** A reranker reorders `RetrievalResult`s,
+   so it is a post-step over some upstream stage rather than a `SearchMode`. The
+   natural default is the best available upstream stage (fusion when a dense
+   pair is present, BM25 otherwise), but that makes the `rerank` row's meaning
+   depend on the run's configuration, which the artifact must then record
+   explicitly or else two reports are silently incomparable.
+2. **Does rerank reach `Retriever.search`?** Wave D deliberately did not wire it
+   in. Doing so adds a fourth mode to a `SearchMode` literal that ADR-0007
+   settled, and a reranked `grk search` would need the extra installed to
+   answer at all — so the fail-closed behaviour of the default path has to be
+   decided before, not after.
 
 ### Wave E — eval deltas (the phase gate) (**Landed**)
 

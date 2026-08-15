@@ -38,8 +38,9 @@ from typing import Any, Protocol, get_type_hints, runtime_checkable
 
 import pytest
 
+from groundkit.index.dense import InMemoryVectorStore, LanceDBVectorStore
 from groundkit.index.metadata import SQLiteMetadataStore
-from groundkit.index.protocols import MetadataStoreProtocol
+from groundkit.index.protocols import MetadataStoreProtocol, VectorStoreProtocol
 from groundkit.ingestion.chunking import RecursiveChunker
 from groundkit.ingestion.loaders import FileLoader
 from groundkit.ingestion.protocols import ChunkerProtocol, LoaderProtocol
@@ -49,6 +50,8 @@ from groundkit.providers.embeddings import (
     OpenAICompatibleEmbedder,
 )
 from groundkit.providers.protocols import EmbeddingProtocol
+from groundkit.retrieval.protocols import RerankerProtocol
+from groundkit.retrieval.rerank import CrossEncoderReranker
 
 # ── The signature-parity helper ────────────────────────────────────────────
 
@@ -314,7 +317,39 @@ class TestMetadataStoreProtocolConformance:
         assert_signature_parity(MetadataStoreProtocol, SQLiteMetadataStore)
 
 
-# VectorStoreProtocol (groundkit/index/protocols.py) and RerankerProtocol
-# (groundkit/retrieval/protocols.py) have no implementations yet — Phase 3
-# stubs. Intentionally not exercised here; add conformance tests once a
-# concrete implementation lands for each.
+# ── VectorStoreProtocol <- InMemoryVectorStore, LanceDBVectorStore ─────────
+
+
+class TestVectorStoreProtocolConformance:
+    """Both dense stores, checked against the seam ADR-0001 hazard 3 shaped.
+
+    The protocol's no-``**kwargs`` ``search`` signature is the half of that
+    hazard fixed by declaration: a misspelled ``metadata_filter`` is a
+    ``TypeError`` at the call site rather than a silently unfiltered result.
+    Parity is what keeps it that way — an implementation free to re-add a
+    catch-all would reopen it while still passing ``isinstance``.
+    """
+
+    def test_in_memory_vector_store_matches_vector_store_protocol(self) -> None:
+        assert_signature_parity(VectorStoreProtocol, InMemoryVectorStore)
+
+    def test_lancedb_vector_store_matches_vector_store_protocol(self) -> None:
+        assert_signature_parity(VectorStoreProtocol, LanceDBVectorStore)
+
+
+# ── RerankerProtocol <- CrossEncoderReranker ───────────────────────────────
+
+
+class TestRerankerProtocolConformance:
+    """The Wave D implementation against the seam ADR-0001 hazard 4 shaped.
+
+    Importing :class:`CrossEncoderReranker` must not require the optional
+    ``rerank`` extra — the heavy import is deferred to model load — so this
+    test runs in the default suite, in a base install, exactly like every
+    other conformance test here. If that laziness ever regressed, collection
+    of this module would fail rather than the failure hiding until someone
+    ran the gated suite.
+    """
+
+    def test_cross_encoder_reranker_matches_reranker_protocol(self) -> None:
+        assert_signature_parity(RerankerProtocol, CrossEncoderReranker)

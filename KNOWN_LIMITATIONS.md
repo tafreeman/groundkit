@@ -2,7 +2,7 @@
 
 Honest and current, per repo policy. Updated with each phase.
 
-## Current state (Phase 3, Wave E)
+## Current state (Phase 3, Wave D — all waves built, eval stage outstanding)
 
 Hybrid retrieval works end-to-end locally, behind opt-in flags: `grk
 ingest --dense` embeds each chunk into a LanceDB vector store alongside the
@@ -196,6 +196,34 @@ per SPEC.md §9:
   `<index-dir>/<collection>.lance`, beside `<collection>.sqlite3`. The
   default install, default commands, and CI need no Ollama and are
   unchanged by any of this.
+- **The cross-encoder reranker exists but nothing calls it, and it has no
+  measured delta.** Wave D built `retrieval/rerank.py` — `CrossEncoderReranker`
+  behind `RerankerProtocol`, with ADR-0001 hazard 2 closed by a sigmoid that
+  is total and monotonic, so no logit however negative can violate
+  `RetrievalResult.score`'s `ge=0.0` bound and the ranking is never altered by
+  the normalization. What does **not** yet exist is any caller:
+  `Retriever.search` has no rerank mode, `run_eval` accepts no reranker, and
+  `grk` exposes no flag. `rerank` is already a legal `StageName`, so a report
+  *could* carry the stage — and none does.
+
+  The consequence to be honest about: **rerank is unmeasured.** Every other
+  Phase 3 retrieval stage reports a signed delta against the BM25 baseline,
+  including when it loses; rerank reports nothing, so no claim that it improves
+  retrieval on this corpus is currently supported by anything in this repo.
+  SPEC.md §9 makes that delta a Phase 3 completion requirement, which is why
+  Phase 3 is not done. The two design decisions blocking it — which upstream
+  stage rerank reorders, and whether it reaches `Retriever.search` at all — are
+  written up in `docs/specs/phase-3-hybrid-retrieval.md` under Wave D.
+
+  Also true of the reranker as built: it needs the optional `rerank` extra
+  (torch, multi-gigabyte), which is deliberately absent from the dev group, so
+  the default suite never loads a model. The pure surface is covered offline;
+  the real model is proved only by `RERANK_GATED=1`, which — like the Ollama
+  eval gate above — is `workflow_dispatch`-only during active development and
+  therefore **re-measures nothing automatically**. Truncation to `top_k`
+  happens after reranking, so a reranker can promote a candidate the upstream
+  stage ranked below the cut only if that candidate was inside the list it was
+  handed; it cannot recover a document the upstream stage never retrieved.
 - **`score_threshold` does not apply to hybrid results.** ADR-0005
   decision 6: an RRF-fused score is a function of result-set size and
   retriever count, not a probability, and thresholding it would silently

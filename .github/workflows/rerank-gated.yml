@@ -1,0 +1,82 @@
+# Real cross-encoder rerank (Wave D's `RERANK_GATED=1` suite).
+#
+# Separate from `ci.yml` on purpose, for the reason Wave D's plan states
+# directly: heavy deps (torch/sentence-transformers) must stay out of the base
+# install, and CI's default job must not pull them. The `rerank` extra is
+# therefore absent from the dev group, and `ci.yml` never installs it.
+#
+# What that leaves unproven is narrow but real. Everything groundkit controls
+# about reranking — the sigmoid, the ordering, the contract re-validation, the
+# fail-closed paths — is pure and covered by `tests/test_rerank.py` in the
+# default job. What only a real model can prove is the *premise*: that an MS
+# MARCO cross-encoder emits raw, unbounded, frequently negative logits, which
+# is what ADR-0001 hazard 2 is about and why the sigmoid exists at all. A stub
+# asserting that premise is not evidence for it.
+#
+# This job is therefore the sole proof of the rerank backend, and nothing here
+# is `continue-on-error` — SPEC.md §3 forbids that for exactly this case.
+name: rerank-gated
+
+# TRIGGERS — deliberately manual-only, matching `eval-gated.yml`.
+#
+# Every run downloads a model and a multi-gigabyte torch wheel. During active
+# development the gated suite is run locally far more often than a cron would
+# add value, and a schedule firing against a moving branch produces a stream of
+# results nobody reads — which is how a gate quietly becomes noise.
+#
+# REVISIT AT END OF DEVELOPMENT (Phase 7, alongside the release checklist):
+# turn on a schedule and re-add the `rerank-gated` PR label trigger, so the
+# real-model path is proven on a cadence once `main` is stable enough for the
+# result to mean something. The label-gating condition below is left in place
+# and inert so that re-enabling is a two-line change to this block.
+#
+#   schedule:
+#     - cron: "30 6 * * 1"         # weekly, Mondays 06:30 UTC
+#   pull_request:
+#     types: [opened, synchronize, reopened, labeled]
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gated-rerank:
+    runs-on: ubuntu-latest
+    # Inert while `on:` is dispatch-only. Kept rather than deleted so that
+    # re-enabling the PR trigger does not also require remembering to re-add
+    # label gating — the half of the change that is easy to miss and expensive
+    # to get wrong: without it, every PR pulls torch.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'rerank-gated')
+    timeout-minutes: 30
+
+    env:
+      RERANK_GATED: "1"
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+
+      # `--extra rerank` is the whole point of this job: it is the one place
+      # the optional extra is installed, and it stays out of `uv sync` for
+      # every other workflow.
+      - run: uv sync --locked --group dev --extra rerank
+
+      - name: Run the gated cross-encoder suite
+        run: uv run pytest tests/test_rerank_gated.py -v
+
+      # A gate that silently skips is indistinguishable from a gate that
+      # passed, which would make this job's green tick meaningless — the exact
+      # failure mode SPEC.md §3 is guarding against. Assert the tests actually
+      # ran.
+      - name: Fail if the gate skipped instead of running
+        run: |
+          uv run pytest tests/test_rerank_gated.py -q --collect-only >/dev/null
+          if uv run pytest tests/test_rerank_gated.py -q 2>&1 | grep -qE '[0-9]+ skipped'; then
+            echo "Gated rerank tests skipped despite RERANK_GATED=1 — the gate did not open." >&2
+            exit 1
+          fi
