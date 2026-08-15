@@ -42,7 +42,9 @@ async def _write(index_dir: Path, collection: str, source: str, doc_id: str, tex
     """
     store = await SQLiteMetadataStore.open(index_dir, collection)
     try:
-        await store.replace_document(source, doc_id, f"hash-{doc_id}", [_chunk(doc_id, doc_id, text)])
+        await store.replace_document(
+            source, doc_id, f"hash-{doc_id}", [_chunk(doc_id, doc_id, text)]
+        )
     finally:
         await store.close()
 
@@ -386,10 +388,11 @@ def test_registry_reuses_one_runtime_per_collection(tmp_path: Path) -> None:
         await _write(tmp_path, "col", "/a.md", "doc-a", "alpha")
         registry = CollectionRegistry(tmp_path)
         try:
-            async with registry.acquire("col") as first:
-                pass
-            async with registry.acquire("col") as second:
-                pass
+            async with registry.acquire("col") as runtime_a:
+                first = await runtime_a.acquire()
+            async with registry.acquire("col") as runtime_b:
+                second = await runtime_b.acquire()
+            assert runtime_a is runtime_b
             assert isinstance(first, AcquiredRetriever)
             assert first is second, "the second acquire rebuilt instead of reusing the cache"
         finally:
@@ -429,10 +432,12 @@ def test_registry_holds_open_rather_than_closing_a_runtime_in_use(tmp_path: Path
             await _write(tmp_path, name, f"/{name}.md", f"doc-{name}", "text")
         registry = CollectionRegistry(tmp_path, max_open_collections=1)
         try:
-            async with registry.acquire("a"):
-                async with registry.acquire("b"):
-                    async with registry.acquire("c"):
-                        assert len(registry._runtimes) == 3
+            async with (
+                registry.acquire("a"),
+                registry.acquire("b"),
+                registry.acquire("c"),
+            ):
+                assert len(registry._runtimes) == 3
         finally:
             await registry.aclose()
 

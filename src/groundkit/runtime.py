@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from typing import TypeAlias
 
     from groundkit.config import RetrievalConfig
+    from groundkit.contracts import Chunk, CollectionManifest
     from groundkit.index.protocols import VectorStoreProtocol
     from groundkit.providers.protocols import EmbeddingProtocol
 
@@ -277,6 +278,56 @@ class CollectionRuntime:
         if not worker.cancelled():
             worker.exception()
 
+    # -- Read-only passthroughs ------------------------------------------
+    #
+    # These exist so a service surface never needs the store handle itself.
+    # The runtime *is* the read-only facade ADR-0014 decision 2 check 4 calls
+    # for: its public API is search-by-acquire plus the reads below, and it
+    # exposes no way to reach upsert_document, add_chunks, replace_document,
+    # delete_document or write_manifest. A wrapper class asserting the same
+    # thing would add a layer whose only job is to re-state a property this
+    # class can hold directly.
+
+    @property
+    def db_path(self) -> Path:
+        """Path to the collection's SQLite file, for diagnostics."""
+        return self._store.db_path
+
+    async def get_chunk(self, chunk_id: str) -> Chunk | None:
+        """Return one chunk by id, or ``None``."""
+        self._require_open()
+        return await self._store.get_chunk(chunk_id)
+
+    async def get_document_sources(self) -> dict[str, str]:
+        """Return ``{document_id: source}`` for every document in the collection."""
+        self._require_open()
+        return await self._store.get_document_sources()
+
+    async def get_manifest(self) -> CollectionManifest | None:
+        """Return the collection's embedding-identity manifest, or ``None``."""
+        self._require_open()
+        return await self._store.get_manifest()
+
+    async def get_generation(self) -> int | None:
+        """Return the collection's staleness marker, or ``None`` if unanswerable."""
+        self._require_open()
+        return await self._store.get_generation()
+
+    async def chunk_count(self) -> int:
+        """Return the number of persisted chunks.
+
+        O(corpus): the store exposes no count, so this materializes the chunk
+        list and measures it. Adding ``COUNT(*)`` to
+        :class:`~groundkit.index.protocols.MetadataStoreProtocol` would be
+        cheaper and is deliberately not done — that protocol is held to exact
+        signature parity by conformance tests, and widening it for a reporting
+        convenience is the trade ADR-0012 decision 3 already refused for
+        ``model_name``. Recorded in ``KNOWN_LIMITATIONS.md`` rather than
+        hidden: this is a status call, not a hot path.
+        """
+        self._require_open()
+        return len(await self._store.get_chunks())
+
     def _require_open(self) -> None:
         if self._closed:
             raise StorageError(
@@ -338,8 +389,19 @@ class CollectionRegistry:
         self._closed = False
 
     @asynccontextmanager
-    async def acquire(self, collection: str) -> AsyncIterator[AcquiredRetriever]:
-        """Yield a current retriever for ``collection``.
+    async def acquire(self, collection: str) -> AsyncIterator[CollectionRuntime]:
+        """Yield the runtime for ``collection``, held open for the block's duration.
+
+        Yields the runtime rather than an :class:`AcquiredRetriever` because a
+        caller usually needs more than a retriever — ``index_status`` wants
+        counts and the manifest, ``fetch_chunk`` wants a chunk and its
+        document's source — and returning only the retriever would push those
+        callers back to the store handle, which is the surface this whole
+        layer exists to keep them away from. Call
+        :meth:`CollectionRuntime.acquire` inside the block for a retriever.
+
+        The refcount is held across the whole block, so eviction cannot close
+        a runtime out from under an in-flight request.
 
         Raises:
             ConfigurationError: The collection name is invalid, or no such
@@ -348,7 +410,7 @@ class CollectionRegistry:
         """
         runtime = await self._checkout(collection)
         try:
-            yield await runtime.acquire()
+            yield runtime
         finally:
             await self._checkin(collection)
 

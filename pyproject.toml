@@ -164,10 +164,33 @@ precision = 2
 #    truth (ADR-0002) and is equally core by that test, which is exactly why the
 #    per-file reasoning above is written down rather than generalized into a
 #    rule. Stated explicitly so the next reader does not reopen it.
+#
+# 3. `runtime.py` is IN, added by ADR-0013 as an EXPLICIT path rather than by
+#    placement. It sits at the package root, so no glob catches it, and that was
+#    the choice: it follows `identity.py`'s placement (a module outside whichever
+#    caller needed it first, so sharing it creates no ingest/retrieval
+#    dependency) while the entry below — not the directory — is what puts it
+#    under the gate. Placing it in `retrieval/` to be caught by the glob would
+#    have bought the same gate at the price of putting a composition root that
+#    imports `index.metadata` inside the retrieval package.
+#
+#    It is gated because it decides whether an answer is computed over CURRENT
+#    data — a stronger retrieval-correctness claim than fusion's ordering, which
+#    the glob already gates. Its hardest code is the single-flight and
+#    cancellation paths, which are unreachable on a non-failing path and
+#    therefore invisible to both coverage and a green suite; a floor is the only
+#    automated pressure on them.
+#
+#    The honest asymmetry: the staleness marker's READ is gated here, while its
+#    BUMP lives in `index/metadata.py`, which item 2 keeps out. The half whose
+#    omission causes silent staleness is ungoverned by this gate, and
+#    `test_metadata_store.py`'s parameterized bump test plus its protocol
+#    classification guard are what stand in for it.
 [tool.groundkit.coverage]
 core_subset = [
   "src/groundkit/retrieval/*",            # search orchestration + citation resolution
   "src/groundkit/ingestion/chunking.py",  # chunking
   "src/groundkit/index/bm25.py",          # lexical scoring
   "src/groundkit/index/dense.py",         # vector scoring (Wave F; see caveats above)
+  "src/groundkit/runtime.py",             # collection lifecycle (ADR-0013; see note 3)
 ]
