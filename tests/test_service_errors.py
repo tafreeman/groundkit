@@ -48,7 +48,7 @@ from groundkit.service.schemas import SearchRequest
 #: derived from ``_MAPPINGS`` on purpose: deriving it would make this test agree
 #: with the table by construction, including when the table is wrong. This is a
 #: second, independent statement of the allow-list.
-_MESSAGE_EXPOSING = frozenset(
+_MESSAGE_EXPOSING: frozenset[type[GroundkitError]] = frozenset(
     {
         RerankerNotConfiguredError,
         IndexIdentityError,
@@ -59,7 +59,7 @@ _MESSAGE_EXPOSING = frozenset(
 
 #: Types whose message must never reach a caller, with why, so a future reader
 #: does not "simplify" one into the allow-list above.
-_MESSAGE_WITHHOLDING = {
+_MESSAGE_WITHHOLDING: dict[type[GroundkitError], str] = {
     ProviderNotConfiguredError: "names the env var and the endpoint it expected",
     EmbeddingError: "may carry a sanitized provider URL or provider response text",
     StorageError: "carries absolute database paths",
@@ -149,16 +149,25 @@ def test_search_request_bounds_are_what_make_the_conflict_mapping_correct() -> N
         SearchRequest(query="ok", top_k=10_000)
 
 
-@pytest.mark.parametrize("exc_type", sorted(_MESSAGE_EXPOSING, key=lambda t: t.__name__))
+#: Sorted for a stable parametrize id order. Hoisted into annotated locals
+#: rather than inlined into the decorators: ``parametrize`` declares its values
+#: as ``Iterable[object]``, and mypy's bidirectional inference would push that
+#: ``object`` back into ``sorted``'s type variable, losing the element type the
+#: key functions below need.
+_EXPOSING_CASES: list[type[GroundkitError]] = sorted(_MESSAGE_EXPOSING, key=lambda t: t.__name__)
+_WITHHOLDING_CASES: list[tuple[type[GroundkitError], str]] = sorted(
+    _MESSAGE_WITHHOLDING.items(), key=lambda kv: kv[0].__name__
+)
+
+
+@pytest.mark.parametrize("exc_type", _EXPOSING_CASES)
 def test_allow_listed_types_return_their_own_message(exc_type: type[GroundkitError]) -> None:
     """The allow-list exposes the message; a caller needs it to act."""
     rendering = map_exception(exc_type("a distinctive marker string"))
     assert rendering.detail == "a distinctive marker string"
 
 
-@pytest.mark.parametrize(
-    ("exc_type", "why"), sorted(_MESSAGE_WITHHOLDING.items(), key=lambda kv: kv[0].__name__)
-)
+@pytest.mark.parametrize(("exc_type", "why"), _WITHHOLDING_CASES)
 def test_withheld_types_return_the_fixed_detail(exc_type: type[GroundkitError], why: str) -> None:
     """Everything outside the allow-list renders the fixed detail.
 
