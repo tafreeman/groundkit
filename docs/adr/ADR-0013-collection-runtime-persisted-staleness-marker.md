@@ -94,10 +94,20 @@ A bump issued as a separate call after the write opens a window in which content
 newer than the marker — a reader then observes "unchanged" over changed data, the
 precise failure this mechanism exists to prevent. The reverse is merely wasteful.
 
-**Unconditional within a mutating method.** No branch decides whether a write "really"
-changed anything: `delete_document` on an absent id bumps, `write_manifest` with a
-matching triple bumps. Over-bumping costs one redundant rebuild; under-bumping serves
-stale results silently and forever.
+**One bump per commit, not one per method call.** Every `_op` that commits durable state
+advances the marker, and no branch inside it decides whether the write "really" changed
+anything — `delete_document` on an absent id deletes zero rows, commits, and advances.
+Over-bumping costs one redundant rebuild; under-bumping serves stale results silently and
+forever, so where the two are traded, bump.
+
+The rule is tied to the **commit** rather than to the method because that is the form
+that can be checked by reading the code instead of trusting each caller to classify its
+own branches. It also settles the one case where the two formulations disagree:
+`write_manifest` re-called with the identity the collection already holds returns before
+any `INSERT` and before any `commit`, so durable state is untouched, a retriever built
+against it is still valid, and it correctly advances nothing. Bumping there would force a
+write on the path every re-ingest of a bound collection takes, in order to invalidate a
+cache nothing invalidated.
 
 **Monotonic and opaque.** The only operation is equality against a previously observed
 value. A counter beats `(doc_count, max_rowid)`, which the most common write defeats —
