@@ -86,6 +86,12 @@ CREATE TABLE IF NOT EXISTS collection_manifest (
     dimensions INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS collection_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    generation INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 #: Fixed identifier stamped into ``PRAGMA application_id`` on every SQLite
@@ -111,32 +117,47 @@ APPLICATION_ID: Final[int] = 0x47524B31  # "GRK1"
 #: 5: pre-1.0, every index is reproducible from ``grk ingest`` in seconds,
 #: so a migration path here would be code written to preserve data that
 #: costs seconds to regenerate).
-SCHEMA_VERSION: Final[int] = 1
+#: Bumped 1 -> 2 by ADR-0013, which added ``collection_state``. The bump is
+#: load-bearing rather than bookkeeping. ``_SCHEMA`` is applied on *every*
+#: open with ``CREATE TABLE IF NOT EXISTS``, so without a version change the
+#: new table would appear in a v1 collection transparently and
+#: :meth:`SQLiteMetadataStore.get_generation` would start answering over it —
+#: after which an older ``grk`` binary, which has no bump logic, could write
+#: to that collection without advancing the counter and a long-lived service
+#: would serve its cached retriever forever. With the bump, such a store is
+#: not schema-current, ``get_generation`` returns ``None``, and the runtime
+#: degrades to rebuilding every request instead of caching a stale index.
+SCHEMA_VERSION: Final[int] = 2
 
 
 class SQLiteMetadataStore:
     """Durable store for documents, chunks, and ingest state, backed by SQLite.
 
     Construct via :meth:`open`, not directly — the constructor takes an
-    already-configured connection and its precomputed manifest capability.
+    already-configured connection and its precomputed schema-currency verdict.
 
     Attributes:
         db_path: Path to the collection's SQLite file, kept for diagnostics.
     """
 
     def __init__(
-        self, connection: sqlite3.Connection, db_path: Path, *, manifest_capable: bool
+        self, connection: sqlite3.Connection, db_path: Path, *, schema_current: bool
     ) -> None:
         self._conn = connection
         self._lock = asyncio.Lock()
         self.db_path = db_path
-        #: True when this store's PRAGMA application_id/user_version carry
-        #: groundkit's ADR-0004 manifest-era stamp (set by :meth:`open`).
-        #: False for a store that predates the manifest (or was never
-        #: created by groundkit); such a store still works for BM25-only
-        #: reads/writes, but :meth:`write_manifest` and :meth:`verify_manifest`
-        #: refuse it via :meth:`_require_manifest_capable`.
-        self._manifest_capable = manifest_capable
+        #: True when this store's PRAGMA application_id/user_version match
+        #: groundkit's current stamp exactly (set by :meth:`open`). False for
+        #: a store written against an older schema, one that predates the
+        #: ADR-0004 stamp entirely, or one groundkit never created.
+        #:
+        #: Named for the schema rather than for the manifest because it now
+        #: gates two unrelated capabilities: :meth:`write_manifest` and
+        #: :meth:`verify_manifest` refuse a non-current store (ADR-0004), and
+        #: :meth:`get_generation` reports "freshness unanswerable" for one
+        #: (ADR-0013). Such a store still works for BM25-only reads and
+        #: writes; it is uncacheable and closed to dense work, not broken.
+        self._schema_current = schema_current
 
     @classmethod
     async def open(cls, index_dir: Path, collection: str) -> SQLiteMetadataStore:
@@ -196,6 +217,18 @@ class SQLiteMetadataStore:
                 conn.execute("PRAGMA journal_mode = WAL")
                 conn.executescript(_SCHEMA)
                 if is_new_file:
+                    # Seed the ADR-0013 generation marker at 0, in the same
+                    # transaction as the schema and the stamps below. A v2
+                    # store therefore always has a row to read: a *missing*
+                    # row is then indistinguishable from a legacy store to
+                    # get_generation(), and both correctly answer "freshness
+                    # unanswerable" rather than a fabricated 0 that would let
+                    # a cache engage over an index it cannot vouch for.
+                    conn.execute(
+                        "INSERT INTO collection_state (id, generation, updated_at) "
+                        "VALUES (1, 0, ?)",
+                        (_now_iso(),),
+                    )
                     # Stamp groundkit's identity as the last statements
                     # before commit (ADR-0004 decision 4): both
                     # PRAGMA writes land in the same transaction as the
@@ -217,20 +250,20 @@ class SQLiteMetadataStore:
             _chmod_best_effort(db_path, 0o600)
             app_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            manifest_capable = app_id == APPLICATION_ID and version == SCHEMA_VERSION
-            return conn, manifest_capable
+            schema_current = app_id == APPLICATION_ID and version == SCHEMA_VERSION
+            return conn, schema_current
 
         try:
-            connection, manifest_capable = await asyncio.to_thread(_connect)
+            connection, schema_current = await asyncio.to_thread(_connect)
         except (OSError, sqlite3.Error) as exc:
             raise StorageError(f"failed to open metadata store at {db_path}") from exc
 
         logger.debug(
-            "opened metadata store (collection=%s, manifest_capable=%s)",
+            "opened metadata store (collection=%s, schema_current=%s)",
             collection,
-            manifest_capable,
+            schema_current,
         )
-        return cls(connection, db_path, manifest_capable=manifest_capable)
+        return cls(connection, db_path, schema_current=schema_current)
 
     async def close(self) -> None:
         """Close the underlying connection."""
@@ -264,6 +297,7 @@ class SQLiteMetadataStore:
                 "VALUES (?, ?, ?, ?)",
                 (document_id, source, content_hash, ingested_at),
             )
+            self._bump_generation()
             self._conn.commit()
 
         await self._run(_op)
@@ -360,6 +394,7 @@ class SQLiteMetadataStore:
                         f"document_id {expected_document_id!r} registered for source {source!r}"
                     )
             self._insert_chunks(chunks)
+            self._bump_generation()
             self._conn.commit()
 
         await self._run(_op)
@@ -412,6 +447,7 @@ class SQLiteMetadataStore:
                         f"document_id {document_id!r} for source {source!r}"
                     )
             self._insert_chunks(chunks)
+            self._bump_generation()
             self._conn.commit()
 
         await self._run(_op)
@@ -481,6 +517,7 @@ class SQLiteMetadataStore:
             count = int(cur.fetchone()[0])
             self._conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
             self._conn.execute("DELETE FROM documents WHERE document_id = ?", (document_id,))
+            self._bump_generation()
             self._conn.commit()
             return count
 
@@ -520,6 +557,7 @@ class SQLiteMetadataStore:
                     "VALUES (1, ?, ?, ?, ?)",
                     (identity.provider, identity.model_name, identity.dimensions, created_at),
                 )
+                self._bump_generation()
                 self._conn.commit()
                 return
             if _manifest_matches(existing, identity):
@@ -582,6 +620,43 @@ class SQLiteMetadataStore:
 
         def _op() -> CollectionManifest | None:
             return self._select_manifest()
+
+        return await self._run(_op)
+
+    async def get_generation(self) -> int | None:
+        """Return the collection's staleness marker, or ``None`` if unanswerable (ADR-0013).
+
+        The marker advances on every commit that changes durable state, and
+        the only operation defined on it is **equality against a previously
+        observed value**. Nothing compares generations for ordering or
+        distance; a caller that has one may ask "is this still the state I
+        built against", and nothing else.
+
+        ``None`` means *freshness cannot be asserted*, never *unchanged*. It
+        is returned for a store that is not schema-current — one predating
+        ADR-0013, or predating ADR-0004's stamp entirely — and for a v2 store
+        whose row is somehow absent. A caller must treat ``None`` as "assume
+        it changed" and rebuild: answering a freshness question that cannot
+        be answered is how a cache ends up serving an index it has no basis
+        to vouch for. This deliberately degrades to reopen-per-request rather
+        than refusing, because nothing is *wrong* on a legacy store — only
+        uncacheable — and SPEC.md §2's fail-closed rule governs wrong
+        answers, not slow ones.
+
+        Returns:
+            The current generation, or ``None`` when freshness is
+            unanswerable.
+
+        Raises:
+            StorageError: On a backend failure.
+        """
+        if not self._schema_current:
+            return None
+
+        def _op() -> int | None:
+            cur = self._conn.execute("SELECT generation FROM collection_state WHERE id = 1")
+            row = cur.fetchone()
+            return None if row is None else int(row[0])
 
         return await self._run(_op)
 
@@ -648,11 +723,44 @@ class SQLiteMetadataStore:
             created_at=created_at,
         )
 
+    def _bump_generation(self) -> None:
+        """Advance the ADR-0013 staleness marker. Call from within an ``_op``, before its commit.
+
+        The bump must land in the **same transaction** as the write it
+        describes, which is why this is a plain statement inside the caller's
+        ``_op`` rather than its own :meth:`_run` call. Issued separately after
+        a write, it would open a window in which content is newer than the
+        marker — and a reader that observes "unchanged" over changed data is
+        exactly the silent staleness the marker exists to prevent. The
+        reverse ordering (marker committed, write rolled back) is merely a
+        wasted rebuild, so atomicity rather than statement order is what
+        makes this safe.
+
+        The invariant is **one bump per commit**, not one per method call:
+        every ``_op`` that commits durable state advances the marker, and a
+        branch that returns without committing (``write_manifest`` re-called
+        with the identity it already holds) changes nothing and correctly
+        does not advance it. Tying the bump to the commit rather than to the
+        method makes that provable by reading the code instead of relying on
+        each caller to classify its own branches.
+
+        The ``ON CONFLICT`` upsert rather than a bare ``UPDATE``: a v2 store
+        is seeded at :meth:`open`, but a store whose row is missing for any
+        reason still advances correctly instead of silently no-op-ing, which
+        an ``UPDATE`` matching zero rows would do without raising.
+        """
+        self._conn.execute(
+            "INSERT INTO collection_state (id, generation, updated_at) VALUES (1, 1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "generation = generation + 1, updated_at = excluded.updated_at",
+            (_now_iso(),),
+        )
+
     def _require_manifest_capable(self, action: str) -> None:
         """Guard dense-identity operations against a store that predates them.
 
         Checked outside :meth:`_run` (like the empty-``chunks`` guard in
-        :meth:`add_chunks`): ``_manifest_capable`` is a plain attribute fixed
+        :meth:`add_chunks`): ``_schema_current`` is a plain attribute fixed
         at :meth:`open` and never touches the connection, so there is
         nothing here that needs the lock.
 
@@ -662,14 +770,16 @@ class SQLiteMetadataStore:
 
         Raises:
             IndexIdentityError: This store's ``PRAGMA application_id``/
-                ``user_version`` do not carry groundkit's manifest-era stamp
-                — either it predates ADR-0004, or it was never created by
-                groundkit at all. Pre-1.0 there is no migration path: every
-                index is reproducible from ``grk ingest`` in seconds, so the
-                remedy is to delete the collection and re-ingest it, not to
-                write code that preserves data this cheap to regenerate.
+                ``user_version`` do not match groundkit's current stamp —
+                it predates ADR-0004, it was written against an older schema
+                (ADR-0013 raised the version to 2), or it was never created
+                by groundkit at all. Pre-1.0 there is no migration path:
+                every index is reproducible from ``grk ingest`` in seconds,
+                so the remedy is to delete the collection and re-ingest it,
+                not to write code that preserves data this cheap to
+                regenerate.
         """
-        if not self._manifest_capable:
+        if not self._schema_current:
             raise IndexIdentityError(
                 f"cannot {action} the embedding-identity manifest for the store at "
                 f"{self.db_path}: it predates the manifest (ADR-0004) or was not "

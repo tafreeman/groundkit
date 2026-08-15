@@ -914,3 +914,311 @@ def test_cancellation_waits_for_the_worker_before_releasing_the_lock(tmp_path: P
             await store.close()
 
     asyncio.run(run())
+
+
+# --------------------------------------------------------------------------
+# ADR-0013: the persisted staleness marker
+# --------------------------------------------------------------------------
+
+#: Every public MetadataStoreProtocol member that commits durable state.
+_MUTATING_MEMBERS = frozenset(
+    {
+        "upsert_document",
+        "add_chunks",
+        "replace_document",
+        "delete_document",
+        "write_manifest",
+    }
+)
+
+#: Every public MetadataStoreProtocol member that does not.
+_READ_ONLY_MEMBERS = frozenset(
+    {
+        "get_document_hash",
+        "get_document_id",
+        "get_document_sources",
+        "get_chunks",
+        "get_chunk",
+        "verify_manifest",
+        "get_manifest",
+        "get_generation",
+    }
+)
+
+
+def _protocol_members(protocol: type) -> frozenset[str]:
+    """Public callable members declared on ``protocol`` itself."""
+    return frozenset(
+        name
+        for name in vars(protocol)
+        if not name.startswith("_") and callable(getattr(protocol, name, None))
+    )
+
+
+def test_metadata_store_protocol_members_are_all_classified() -> None:
+    """Every protocol member is classified mutating or read-only.
+
+    NOT a regression test and must never be reported as one: nothing is
+    being fixed, and it cannot be shown to fail against unfixed code. It is
+    a completeness guard that fails when a *future* member is added without
+    a decision about whether it advances the ADR-0013 marker.
+
+    It carries real weight despite that. The marker's *read* lives in
+    ``runtime.py``, inside the coverage core subset; the marker's *bump*
+    lives here in ``index/metadata.py``, which ``pyproject.toml``
+    deliberately keeps outside it. The half whose omission causes silent
+    staleness is therefore ungoverned by the core gate, and this assertion
+    plus the parameterized bump test below are what stand in for it.
+    """
+    declared = _protocol_members(MetadataStoreProtocol)
+    classified = _MUTATING_MEMBERS | _READ_ONLY_MEMBERS
+    assert declared == classified, (
+        "MetadataStoreProtocol member set changed. Classify each new member as "
+        "mutating (it must call _bump_generation before its commit) or read-only, "
+        "then update _MUTATING_MEMBERS / _READ_ONLY_MEMBERS here."
+    )
+
+
+def test_new_store_seeds_the_generation_at_zero(tmp_path: Path) -> None:
+    """A freshly created store is cacheable immediately, with a real 0."""
+
+    async def run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            assert await store.get_generation() == 0
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("method", sorted(_MUTATING_MEMBERS))
+def test_every_committing_mutation_advances_the_generation(tmp_path: Path, method: str) -> None:
+    """Each mutating method advances the marker. Parameterized so a gap is visible per method.
+
+    Fail-first: removing ``self._bump_generation()`` from any one method's
+    ``_op`` fails that method's parameterization while the others still pass,
+    which is exactly the granularity a reviewer needs.
+    """
+
+    async def run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            # Preconditions each mutation needs, established before the
+            # generation is sampled so setup writes are not what is measured.
+            if method in {"add_chunks", "delete_document"}:
+                await store.upsert_document("/a.md", "doc-1", "h1")
+
+            before = await store.get_generation()
+            assert before is not None
+
+            if method == "upsert_document":
+                await store.upsert_document("/b.md", "doc-2", "h2")
+            elif method == "add_chunks":
+                await store.add_chunks([_make_chunk("c1", "doc-1", "hello")], source="/a.md")
+            elif method == "replace_document":
+                await store.replace_document(
+                    "/c.md", "doc-3", "h3", [_make_chunk("c2", "doc-3", "world")]
+                )
+            elif method == "delete_document":
+                await store.delete_document("doc-1")
+            elif method == "write_manifest":
+                await store.write_manifest(
+                    EmbeddingIdentity(provider="ollama", model_name="m", dimensions=8)
+                )
+            else:  # pragma: no cover - guarded by the classification test
+                raise AssertionError(f"unclassified mutating method {method!r}")
+
+            after = await store.get_generation()
+            assert after is not None
+            assert after > before, f"{method} committed without advancing the marker"
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_delete_of_an_absent_document_still_advances_the_generation(tmp_path: Path) -> None:
+    """Over-bumping is deliberate: no branch decides whether a write 'really' changed anything.
+
+    ``delete_document`` on an id that is not present deletes zero rows and
+    still commits, so it advances. The cost is one redundant rebuild; the
+    cost of the opposite policy is a stale cache served silently, so where
+    the two are traded, bump.
+    """
+
+    async def run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            before = await store.get_generation()
+            assert await store.delete_document("no-such-doc") == 0
+            after = await store.get_generation()
+            assert before is not None and after is not None
+            assert after > before
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_read_only_methods_do_not_advance_the_generation(tmp_path: Path) -> None:
+    """Reads leave the marker alone, so a read-heavy service never invalidates its own cache."""
+
+    async def run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            await store.replace_document("/a.md", "doc-1", "h1", [_make_chunk("c1", "doc-1", "hi")])
+            before = await store.get_generation()
+
+            await store.get_document_hash("/a.md")
+            await store.get_document_id("/a.md")
+            await store.get_document_sources()
+            await store.get_chunks()
+            await store.get_chunk("c1")
+            await store.get_manifest()
+            await store.get_generation()
+
+            assert await store.get_generation() == before
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_generation_bump_is_atomic_with_the_write(tmp_path: Path) -> None:
+    """A rolled-back write leaves the marker where it was.
+
+    The bump is a statement inside the caller's ``_op``, before its commit,
+    so a failure anywhere in that op rolls both back together. Issued as its
+    own operation instead, the marker would advance while the content did
+    not — and a reader would then observe "changed" over unchanged data
+    (wasteful) or, with the opposite ordering, "unchanged" over changed data
+    (silent staleness, the failure the marker exists to prevent).
+
+    ``replace_document`` is driven to raise *after* its document INSERT by a
+    chunk whose ``document_id`` does not match, which is a real failure path
+    rather than a patched one.
+    """
+
+    async def run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            before = await store.get_generation()
+            assert before is not None
+
+            with pytest.raises(StorageError, match="does not match"):
+                await store.replace_document(
+                    "/a.md", "doc-1", "h1", [_make_chunk("c1", "WRONG-DOC", "hi")]
+                )
+
+            # Neither half landed.
+            assert await store.get_generation() == before
+            assert await store.get_document_sources() == {}
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_rewriting_the_same_manifest_does_not_advance_the_generation(tmp_path: Path) -> None:
+    """The no-op branch of ``write_manifest`` commits nothing, so it advances nothing.
+
+    The invariant is one bump per *commit*, not one per method call.
+    Re-ingesting into an already-bound collection re-calls ``write_manifest``
+    with the identity it already holds; that branch returns before any INSERT
+    and before any commit, so durable state is untouched and a cached
+    retriever built against it is still valid. Bumping here would force a
+    write on a path taken by every re-ingest of a bound collection, to
+    invalidate a cache that nothing invalidated.
+    """
+
+    async def run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            identity = EmbeddingIdentity(provider="ollama", model_name="m", dimensions=8)
+            await store.write_manifest(identity)
+            after_first = await store.get_generation()
+
+            await store.write_manifest(identity)  # same triple: a no-op
+            assert await store.get_generation() == after_first
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_legacy_store_reports_an_unanswerable_generation(tmp_path: Path) -> None:
+    """A pre-ADR-0004 store returns None, not 0 — freshness is unanswerable, not unchanged.
+
+    Returning 0 would be the dangerous failure: a caller comparing 0 == 0
+    across two requests would conclude "unchanged" and serve a cached index
+    over a store it has no basis to vouch for. None forces the caller to
+    rebuild every time — correct and slow — which is the whole point of
+    distinguishing the two values.
+    """
+    _write_legacy_schema(tmp_path, "legacy")
+
+    async def run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "legacy")
+        try:
+            assert await store.get_generation() is None
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_store_stamped_with_an_older_schema_version_reports_unanswerable(tmp_path: Path) -> None:
+    """A v1-stamped store is refused the cache, which is what makes the version bump load-bearing.
+
+    ``_SCHEMA`` is applied on every open with ``CREATE TABLE IF NOT EXISTS``,
+    so ``collection_state`` appears in an older collection regardless. Without
+    the ``SCHEMA_VERSION`` bump the marker would therefore start answering
+    over it, and an older ``grk`` binary with no bump logic could then write
+    to that collection without advancing the counter — a long-lived service
+    would serve its cached retriever forever. The bump is what turns that
+    into "uncacheable" instead of "silently stale".
+    """
+
+    async def run_setup() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        await store.close()
+
+    asyncio.run(run_setup())
+
+    # Roll the stamp back to the pre-ADR-0013 version, leaving everything else.
+    conn = sqlite3.connect(str(tmp_path / "col.sqlite3"))
+    try:
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    async def run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            assert await store.get_generation() is None
+            # The collection_state row is still physically present — it is the
+            # version stamp, not a missing table, that withholds the answer.
+            cur = store._conn.execute("SELECT generation FROM collection_state WHERE id = 1")
+            assert cur.fetchone() is not None
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_schema_version_is_current(tmp_path: Path) -> None:
+    """A store this build creates is stamped with the version this build expects."""
+
+    async def run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            version = int(store._conn.execute("PRAGMA user_version").fetchone()[0])
+            app_id = int(store._conn.execute("PRAGMA application_id").fetchone()[0])
+            assert version == SCHEMA_VERSION
+            assert app_id == APPLICATION_ID
+        finally:
+            await store.close()
+
+    asyncio.run(run())
