@@ -14,7 +14,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from groundkit.errors import ConfigurationError
 
 #: Default local Ollama endpoint — loopback by design (SPEC.md §7: the one
 #: named exception to the SSRF guard).
@@ -77,6 +79,70 @@ class EmbeddingConfig(BaseModel):
     batch_size: int = Field(default=32, gt=0)
     max_concurrent: int = Field(default=4, gt=0)
     timeout_seconds: float = Field(default=30.0, gt=0)
+
+
+def resolve_embedding_config(
+    *,
+    provider: Literal["ollama", "openai_compatible", "inmemory"] | None,
+    model_name: str | None,
+    dimensions: int | None,
+    base_url: str | None,
+) -> EmbeddingConfig:
+    """Build an :class:`EmbeddingConfig`, defaulting any ``None`` field.
+
+    Each parameter is typed as the corresponding :class:`EmbeddingConfig`
+    field's own type — ``provider`` is the same ``Literal["ollama",
+    "openai_compatible", "inmemory"] | None`` that
+    :attr:`EmbeddingConfig.provider` uses, not ``str | None`` — rather than
+    a heterogeneous ``dict[str, ...]`` splat, which cannot type-check
+    cleanly against :class:`EmbeddingConfig`'s typed fields under ``mypy
+    --strict``.
+
+    A caller that already holds typed values gets full checking at this
+    boundary. A caller holding an *untyped* value can still pass it straight
+    through with no ``cast``: ``argparse.Namespace`` attributes are typed
+    ``Any``, and ``Any`` is assignable to any parameter type, so the
+    permissiveness that makes passthrough type-check lives at the *call
+    site*, not here. ``groundkit.cli._resolve_embedding_config`` is exactly
+    that call site — it unpacks a parsed ``args.embed_*`` namespace and
+    passes the attributes straight into these keyword parameters. Pydantic
+    still validates the ``provider`` literal at construction below (argparse's
+    own ``choices`` already constrains it on that call path, so this is
+    defense in depth, not the only check).
+
+    Defaults come from a fresh :class:`EmbeddingConfig` — one source of
+    truth, never a second copy of its field defaults.
+
+    Pydantic's own field invariants (``dimensions`` must be ``> 0``, and any
+    other bound :class:`EmbeddingConfig` grows later) are enforced here and
+    nowhere else on this path, so the ``ValidationError`` they raise is
+    translated into a :class:`~groundkit.errors.ConfigurationError`.
+    Untranslated it is not a :class:`~groundkit.errors.GroundkitError`, so
+    ``cli.main``'s handler never sees it and ``grk ingest --dense
+    --embed-dimensions 0`` exits on a pydantic traceback instead of the
+    one-line ``error:`` message every other bad flag produces. Translating
+    at this single construction site rather than re-checking each bound at
+    every caller keeps :class:`EmbeddingConfig` the only place a bound is
+    stated.
+
+    Raises:
+        ConfigurationError: A supplied value violates an
+            :class:`EmbeddingConfig` invariant.
+    """
+    defaults = EmbeddingConfig()
+    try:
+        return EmbeddingConfig(
+            provider=provider if provider is not None else defaults.provider,
+            model_name=model_name if model_name is not None else defaults.model_name,
+            dimensions=dimensions if dimensions is not None else defaults.dimensions,
+            base_url=base_url if base_url is not None else defaults.base_url,
+        )
+    except ValidationError as exc:
+        details = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+            for error in exc.errors()
+        )
+        raise ConfigurationError(f"invalid embedding configuration ({details})") from exc
 
 
 class IndexConfig(BaseModel):

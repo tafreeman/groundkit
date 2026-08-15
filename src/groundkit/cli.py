@@ -28,10 +28,8 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pydantic import ValidationError
-
 from groundkit import __version__
-from groundkit.config import EmbeddingConfig, RetrievalConfig
+from groundkit.config import EmbeddingConfig, RetrievalConfig, resolve_embedding_config
 from groundkit.errors import ConfigurationError, EvalError, GroundkitError
 from groundkit.evals.delta import StageDelta, derive_rerank_attribution, derive_stage_deltas
 from groundkit.evals.runner import MIN_EVAL_TOP_K, run_eval, write_report
@@ -226,50 +224,25 @@ def _embed_flags_supplied(args: argparse.Namespace) -> bool:
 
 
 def _resolve_embedding_config(args: argparse.Namespace) -> EmbeddingConfig:
-    """Build an :class:`EmbeddingConfig` from ``--embed-*`` flags, unsupplied ones defaulted.
+    """Unpack ``--embed-*`` flags from ``args`` and delegate to the promoted resolver.
 
-    Built via explicit keyword construction rather than a ``dict[str, ...]``
-    splat: a heterogeneous override dict (``provider`` is a ``Literal``,
-    ``dimensions`` an ``int``, the rest ``str``) cannot type-check cleanly
-    against ``EmbeddingConfig``'s typed fields under ``mypy --strict``.
-    ``argparse.Namespace`` attributes are typed ``Any``, so passing them
-    straight through here type-checks without a cast, and pydantic still
-    validates the ``provider`` literal at construction (argparse's ``choices``
-    already constrains it, so this is defense in depth, not the only check).
-    Defaults come from a fresh :class:`EmbeddingConfig` — one source of truth,
-    not a second copy of its field defaults.
-
-    Pydantic's own field invariants (``dimensions`` must be ``> 0``, and any
-    other bound :class:`EmbeddingConfig` grows later) are enforced here and
-    nowhere else on this path, so the ``ValidationError`` they raise is
-    translated into a :class:`~groundkit.errors.ConfigurationError`.
-    Untranslated it is not a ``GroundkitError``, so ``main``'s handler does
-    not see it and ``grk ingest --dense --embed-dimensions 0`` exits on a
-    pydantic traceback rather than the one-line ``error:`` message every
-    other bad flag produces. Translating at this single construction site
-    rather than re-checking each bound in argparse keeps
-    :class:`EmbeddingConfig` the only place a bound is stated.
+    See :func:`groundkit.config.resolve_embedding_config` for the defaulting
+    rule, the ``ValidationError`` -> ``ConfigurationError`` translation, and
+    why passing ``args.embed_*`` straight through here type-checks under
+    ``mypy --strict`` with no ``cast``: ``argparse.Namespace`` attributes are
+    typed ``Any``, which is assignable to that function's typed keyword
+    parameters.
 
     Raises:
         ConfigurationError: A supplied ``--embed-*`` value violates an
-            :class:`EmbeddingConfig` invariant.
+            :class:`~groundkit.config.EmbeddingConfig` invariant.
     """
-    defaults = EmbeddingConfig()
-    try:
-        return EmbeddingConfig(
-            provider=args.embed_provider if args.embed_provider is not None else defaults.provider,
-            model_name=args.embed_model if args.embed_model is not None else defaults.model_name,
-            dimensions=(
-                args.embed_dimensions if args.embed_dimensions is not None else defaults.dimensions
-            ),
-            base_url=args.embed_base_url if args.embed_base_url is not None else defaults.base_url,
-        )
-    except ValidationError as exc:
-        details = "; ".join(
-            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
-            for error in exc.errors()
-        )
-        raise ConfigurationError(f"invalid embedding configuration ({details})") from exc
+    return resolve_embedding_config(
+        provider=args.embed_provider,
+        model_name=args.embed_model,
+        dimensions=args.embed_dimensions,
+        base_url=args.embed_base_url,
+    )
 
 
 async def _open_dense_deps(
