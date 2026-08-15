@@ -110,6 +110,23 @@ class MetadataStoreProtocol(Protocol):
         """Return the collection's embedding-identity manifest, or None if unset."""
         ...
 
+    async def get_generation(self) -> int | None:
+        """Return the collection's staleness marker, or ``None`` if unanswerable.
+
+        The marker advances on every commit that changes durable state
+        (ADR-0013). The only operation defined on it is **equality against a
+        previously observed value** — a caller may ask "is this still the
+        state I built against", never how far apart two values are.
+
+        ``None`` means *freshness cannot be asserted*, never *unchanged*. A
+        caller that receives it must assume the collection changed and
+        rebuild whatever it derived from the store. Treating ``None`` as
+        "unchanged" is the silent-staleness failure this member exists to
+        prevent, which is why the two are different values rather than a
+        default.
+        """
+        ...
+
 
 @runtime_checkable
 class VectorStoreProtocol(Protocol):

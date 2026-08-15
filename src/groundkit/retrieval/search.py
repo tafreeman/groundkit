@@ -34,6 +34,21 @@ logger = logging.getLogger(__name__)
 #: Upper bound on a caller-supplied top_k (ported from ARP's tool validation).
 MAX_TOP_K: int = 50
 
+#: Upper bound on a caller-supplied query, in characters. Unlike
+#: :data:`MAX_TOP_K` this has no ARP ancestor: the CLI is bounded by whatever a
+#: shell will pass, so nothing needed it until Phase 4 put a network surface in
+#: front of retrieval (ADR-0014). It lives here, beside the bound it sits next
+#: to, because a threshold belongs in one named place rather than inline at each
+#: boundary that enforces it (SPEC.md §5.2) — and because the service is not the
+#: only future caller that will need it.
+#:
+#: Not enforced by :meth:`Retriever.search` itself: the retriever's contract is
+#: that an empty query is a :class:`~groundkit.errors.RetrievalError`, and
+#: widening it to police length would change an existing typed behaviour that
+#: ADR-0014's error mapping depends on. Callers at a trust boundary bound the
+#: input before it reaches retrieval.
+MAX_QUERY_LEN: int = 4096
+
 #: Search modes accepted by :meth:`Retriever.search`.
 SearchMode = Literal["bm25", "dense", "hybrid"]
 

@@ -171,6 +171,11 @@ class TestRetriever:
             async def get_manifest(self) -> CollectionManifest | None:
                 return None
 
+            async def get_generation(self) -> int | None:
+                # None means "freshness unanswerable" (ADR-0013), which is the
+                # honest answer for a hand-built fake with no durable state.
+                return None
+
         store = OrphanStore()
         assert isinstance(store, MetadataStoreProtocol)
 

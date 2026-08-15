@@ -10,22 +10,25 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Final
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
 from pydantic import ValidationError
 
 from groundkit.config import EmbeddingConfig
-from groundkit.errors import EmbeddingError, ProviderNotConfiguredError
+from groundkit.errors import ConfigurationError, EmbeddingError, ProviderNotConfiguredError
 from groundkit.providers.embeddings import (
     InMemoryEmbedder,
     OllamaEmbedder,
     OpenAICompatibleEmbedder,
+    _sanitize_url,
     build_embedder,
 )
 from groundkit.providers.protocols import EmbeddingProtocol
+from groundkit.utils import url_safety
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -33,6 +36,45 @@ Handler = Callable[[httpx.Request], httpx.Response]
 def _client(handler: Handler) -> httpx.AsyncClient:
     """Build an httpx.AsyncClient wired to a MockTransport — no network."""
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+#: A host that is not shaped like an address literal, so
+#: ``ensure_safe_endpoint`` (ADR-0014 decision 10) sends it through DNS
+#: resolution rather than classifying it directly. Reused across every
+#: OpenAICompatibleEmbedder test that needs to actually send a request: that
+#: provider carries no loopback/private allowance (only OllamaEmbedder does),
+#: so the previous default of pointing it at DEFAULT_OLLAMA_BASE_URL
+#: (127.0.0.1) now fails closed at request time — that is the guard working,
+#: not a regression, and every such test is re-pointed here instead.
+_PUBLIC_HOST: Final[str] = "embed-proxy.example.com"
+_PUBLIC_BASE_URL: Final[str] = f"https://{_PUBLIC_HOST}"
+
+#: A real, globally-routable address (example.com's long-standing IP) — used
+#: only as a stand-in DNS answer, never actually contacted.
+_PUBLIC_ADDRESS: Final[str] = "93.184.216.34"
+
+
+async def _resolve_to_public_address(host: str) -> Sequence[str]:
+    """Fake resolver: answers every lookup with a public address.
+
+    Injected by replacing ``url_safety._default_resolver`` wholesale via
+    ``monkeypatch`` — ``OpenAICompatibleEmbedder``'s per-request call to
+    ``ensure_safe_endpoint`` does not expose a resolver parameter of its own
+    (only ``url_safety``'s functions do), so patching the module-level
+    default is the injection seam at this layer, the same way
+    ``monkeypatch.setenv`` is already used for the API key.
+    """
+    assert host == _PUBLIC_HOST
+    return [_PUBLIC_ADDRESS]
+
+
+def _public_openai_config(monkeypatch: pytest.MonkeyPatch, **kwargs: object) -> EmbeddingConfig:
+    """Build an ``openai_compatible`` EmbeddingConfig pointed at a
+    public-looking host, with the resolver faked so the endpoint-safety
+    guard can run without touching the network. See ``_PUBLIC_BASE_URL``.
+    """
+    monkeypatch.setattr(url_safety, "_default_resolver", _resolve_to_public_address)
+    return EmbeddingConfig(provider="openai_compatible", base_url=_PUBLIC_BASE_URL, **kwargs)  # type: ignore[arg-type]
 
 
 # ── InMemoryEmbedder ──────────────────────────────────────────────────────
@@ -232,7 +274,7 @@ class TestOpenAICompatibleEmbedder:
             seen_headers.append(request.headers.get("authorization"))
             return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.1, 0.2]}]})
 
-        config = EmbeddingConfig(provider="openai_compatible", dimensions=2)
+        config = _public_openai_config(monkeypatch, dimensions=2)
         embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
 
         asyncio.run(embedder.embed(["x"]))
@@ -274,9 +316,7 @@ class TestOpenAICompatibleEmbedder:
             assert request.headers.get("authorization") == "Bearer sk-custom"
             return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.1, 0.2]}]})
 
-        config = EmbeddingConfig(
-            provider="openai_compatible", dimensions=2, api_key_env="CUSTOM_KEY_VAR"
-        )
+        config = _public_openai_config(monkeypatch, dimensions=2, api_key_env="CUSTOM_KEY_VAR")
         embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
         asyncio.run(embedder.embed(["x"]))
 
@@ -294,7 +334,7 @@ class TestOpenAICompatibleEmbedder:
                 },
             )
 
-        config = EmbeddingConfig(provider="openai_compatible", dimensions=2)
+        config = _public_openai_config(monkeypatch, dimensions=2)
         embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
 
         result = asyncio.run(embedder.embed(["first", "second"]))
@@ -307,7 +347,7 @@ class TestOpenAICompatibleEmbedder:
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"data": [{"index": 0, "embedding": [1.0, 2.0, 3.0]}]})
 
-        config = EmbeddingConfig(provider="openai_compatible", dimensions=2)
+        config = _public_openai_config(monkeypatch, dimensions=2)
         embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
 
         with pytest.raises(EmbeddingError, match="dimension"):
@@ -319,7 +359,7 @@ class TestOpenAICompatibleEmbedder:
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.1, 0.2]}]})
 
-        config = EmbeddingConfig(provider="openai_compatible", dimensions=2)
+        config = _public_openai_config(monkeypatch, dimensions=2)
         embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
 
         with pytest.raises(EmbeddingError, match="2 input texts"):
@@ -346,7 +386,7 @@ class TestOpenAICompatibleEmbedder:
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=response_body)
 
-        config = EmbeddingConfig(provider="openai_compatible", dimensions=2)
+        config = _public_openai_config(monkeypatch, dimensions=2)
         embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
 
         with pytest.raises(EmbeddingError):
@@ -366,7 +406,7 @@ class TestOpenAICompatibleEmbedder:
                 },
             )
 
-        config = EmbeddingConfig(provider="openai_compatible", dimensions=2)
+        config = _public_openai_config(monkeypatch, dimensions=2)
         embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
 
         with pytest.raises(EmbeddingError, match="indices"):
@@ -385,7 +425,7 @@ class TestOpenAICompatibleEmbedder:
         def handler(_request: httpx.Request) -> httpx.Response:
             raise RuntimeError(f"upstream rejected credential {api_key}")
 
-        config = EmbeddingConfig(provider="openai_compatible", dimensions=2)
+        config = _public_openai_config(monkeypatch, dimensions=2)
         embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
 
         with pytest.raises(EmbeddingError) as excinfo:
@@ -414,84 +454,241 @@ class TestOpenAICompatibleEmbedder:
         # the key is ever resolved.
         assert asyncio.run(embedder.embed([])) == []
 
-    def test_configured_secret_embedded_in_base_url_query_is_scrubbed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """HIGH 1: EmbeddingConfig.base_url is free-form operator-controlled
-        str; several OpenAI-compatible/proxy endpoints carry the credential
-        in the query string (Azure-style ``?api-key=...``). The URL must be
-        scrubbed before it reaches the raised EmbeddingError, exactly like
-        the exception message already is (ADR-0001 hazard 6).
-        """
+
+# ── _sanitize_url (credential scrubbing in URLs) ───────────────────────────
+#
+# Tested directly against the pure function rather than through a full
+# OpenAICompatibleEmbedder round trip: ADR-0014 decision 10's
+# validate_endpoint_shape now rejects any base_url carrying a query string,
+# fragment, or userinfo at CONSTRUCTION time (a query/fragment attaches to
+# every request once concatenated onto base_url; userinfo has no business in
+# operator configuration at all). The three query-string-redaction tests
+# that used to exercise this through OpenAICompatibleEmbedder(base_url=...)
+# no longer can — that base_url shape is now illegal — so they are rewritten
+# here as direct calls. This is forced by decision 10's shape guard, the same
+# way the OpenAICompatibleEmbedder loopback re-pointing above is forced by
+# decision 10's address guard.
+
+
+class TestSanitizeUrl:
+    def test_query_values_are_redacted(self) -> None:
         api_key = "sk-super-secret-value"
-        monkeypatch.setenv("GROUNDKIT_OPENAI_API_KEY", api_key)
+        url = f"https://embed-proxy.example.com/openai-proxy?api-key={api_key}"
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            raise RuntimeError("upstream rejected the request")
+        sanitized = _sanitize_url(url, api_key)
 
-        config = EmbeddingConfig(
-            provider="openai_compatible",
-            dimensions=2,
-            base_url=f"https://embed-proxy.example.com/openai-proxy?api-key={api_key}",
-        )
-        embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
+        assert api_key not in sanitized
 
-        with pytest.raises(EmbeddingError) as excinfo:
-            asyncio.run(embedder.embed(["x"]))
-
-        assert api_key not in str(excinfo.value)
-
-    def test_unrelated_query_string_credential_is_also_redacted(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_unrelated_query_credential_is_redacted_generically(self) -> None:
         """Proves generic query redaction, not only exact-secret replacement:
         a token embedded in base_url that is NOT the configured api_key must
         still be redacted, since base_url is free-form and groundkit cannot
-        know every credential shape a proxy might embed there.
-        """
-        monkeypatch.setenv("GROUNDKIT_OPENAI_API_KEY", "sk-bearer-value")
+        know every credential shape a proxy might embed there."""
         leaked_token = "different-leaked-token-999"  # noqa: S105 - test fixture, not a real secret
+        url = f"https://embed-proxy.example.com/openai-proxy?key={leaked_token}"
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            raise RuntimeError("upstream rejected the request")
+        sanitized = _sanitize_url(url, "sk-bearer-value")
 
+        assert leaked_token not in sanitized
+
+    def test_scheme_host_and_path_survive_redaction(self) -> None:
+        """Redaction must not destroy the operator's ability to tell which
+        endpoint failed — only the query-string VALUES (and userinfo) are
+        sensitive."""
+        api_key = "sk-super-secret-value"
+        url = f"https://embed-proxy.example.com/openai-proxy?api-key={api_key}"
+
+        sanitized = _sanitize_url(url, api_key)
+
+        assert "https://embed-proxy.example.com" in sanitized
+        assert "/openai-proxy" in sanitized
+        assert api_key not in sanitized
+
+    def test_userinfo_is_redacted_not_just_query_values(self) -> None:
+        """GENUINE REVERT (ADR-0014 fact 1 / ADR-0001 hazard 6).
+
+        ``_sanitize_url`` used to rebuild via
+        ``urlunsplit((scheme, parsed.netloc, path, ...))``, and ``netloc`` is
+        the *raw* authority component — redacting the query does nothing to
+        it. Run directly against that unfixed version with this exact input,
+        it produced
+        ``https://user:hunter2@api.example.com/v1/embeddings?api-key=***``:
+        the query credential redacted, the password verbatim. Reverting the
+        fix and rerunning this test reproduces exactly that failure (see the
+        accompanying report for the observed output in both directions).
+        """
+        url = "https://user:hunter2@api.example.com/v1/embeddings?api-key=sk-live-123"
+
+        sanitized = _sanitize_url(url, None)
+
+        assert "hunter2" not in sanitized
+        assert "user:hunter2" not in sanitized
+        resanitized = urlsplit(sanitized)
+        # The rebuilt netloc still carries a redaction placeholder before the
+        # "@" (so it stays a syntactically valid authority component), but
+        # neither the username nor the password may be the real credential.
+        assert resanitized.username != "user"
+        assert resanitized.password != "hunter2"  # noqa: S105 - asserting NOT equal to a secret
+        # Scheme/host/path still survive, same as the query-only case above.
+        assert resanitized.hostname == "api.example.com"
+        assert resanitized.path == "/v1/embeddings"
+
+    def test_userinfo_and_query_secret_are_both_redacted_together(self) -> None:
+        api_key = "sk-live-123"
+        url = f"https://user:hunter2@api.example.com/v1/embeddings?api-key={api_key}"
+
+        sanitized = _sanitize_url(url, api_key)
+
+        assert "hunter2" not in sanitized
+        assert api_key not in sanitized
+
+    def test_ipv6_host_keeps_its_brackets_after_redaction(self) -> None:
+        """The netloc is rebuilt from ``hostname``/``port`` rather than
+        reused verbatim (that rebuild is what closes the userinfo leak
+        above), so an IPv6 literal's brackets — stripped by
+        ``urlsplit().hostname`` — must be put back or the result is not a
+        valid authority component."""
+        url = "https://user:pw@[::1]:8080/v1/embeddings?api-key=secret"
+
+        sanitized = _sanitize_url(url, None)
+
+        assert "pw" not in sanitized
+        parsed = urlsplit(sanitized)
+        assert parsed.hostname == "::1"
+        assert parsed.port == 8080
+
+
+# ── outbound endpoint safety (ADR-0014 decision 10) ────────────────────────
+
+
+class TestEndpointShapeValidationAtConstruction:
+    """NEW SURFACE: validate_endpoint_shape did not exist before this change,
+    so there is no unfixed version to revert here — the address-safety call
+    site (below) is where this ADR's genuine-revert obligation lives."""
+
+    def test_userinfo_in_base_url_is_rejected_at_construction(self) -> None:
+        config = EmbeddingConfig(provider="ollama", base_url="http://user:hunter2@127.0.0.1:11434")
+        with pytest.raises(ConfigurationError, match="userinfo"):
+            OllamaEmbedder(config)
+
+    def test_query_string_in_base_url_is_rejected_at_construction(self) -> None:
         config = EmbeddingConfig(
-            provider="openai_compatible",
-            dimensions=2,
-            base_url=f"https://embed-proxy.example.com/openai-proxy?key={leaked_token}",
+            provider="openai_compatible", base_url="https://api.example.com/v1?x=1"
         )
-        embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
+        with pytest.raises(ConfigurationError, match="query"):
+            OpenAICompatibleEmbedder(config)
 
-        with pytest.raises(EmbeddingError) as excinfo:
-            asyncio.run(embedder.embed(["x"]))
+    def test_bad_scheme_in_base_url_is_rejected_at_construction(self) -> None:
+        config = EmbeddingConfig(provider="ollama", base_url="ftp://127.0.0.1:11434")
+        with pytest.raises(ConfigurationError, match="scheme"):
+            OllamaEmbedder(config)
 
-        assert leaked_token not in str(excinfo.value)
+    def test_shape_rejection_applies_identically_to_ollama_and_openai_compatible(self) -> None:
+        """The shape check is not part of the Ollama private-endpoint
+        allowance — ADR-0014 decision 10 is explicit that the allowance
+        "does not relax the shape check". Same bad base_url, same rejection,
+        regardless of which provider it is constructed for."""
+        bad_url = "http://user:pw@127.0.0.1:11434"
+        with pytest.raises(ConfigurationError, match="userinfo"):
+            OllamaEmbedder(EmbeddingConfig(provider="ollama", base_url=bad_url))
+        with pytest.raises(ConfigurationError, match="userinfo"):
+            OpenAICompatibleEmbedder(
+                EmbeddingConfig(provider="openai_compatible", base_url=bad_url)
+            )
 
-    def test_scrubbed_url_keeps_scheme_host_and_path_for_debuggability(
+    def test_valid_shape_construction_still_succeeds(self) -> None:
+        """The guard must not reject ordinary, legitimate configuration —
+        the default Ollama endpoint construction must keep working."""
+        OllamaEmbedder(EmbeddingConfig(provider="ollama"))
+
+
+class TestEnsureSafeEndpointCallSite:
+    """GENUINE REVERT: removing the ``await ensure_safe_endpoint(...)`` line
+    from a ``_request_batch`` method (not touching url_safety.py at all) was
+    verified to make the corresponding test below fail, and restoring it
+    verified the test passes again — see the accompanying report for the
+    observed output in both directions. Each test asserts both that the call
+    raises *and* that zero requests reached the mock transport, proving the
+    refusal happens before the socket, not merely that the response was
+    later discarded.
+    """
+
+    def test_openai_compatible_refuses_the_default_loopback_endpoint(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Redaction must not destroy the operator's ability to tell which
-        endpoint failed — only the query-string VALUES are sensitive."""
-        api_key = "sk-super-secret-value"
-        monkeypatch.setenv("GROUNDKIT_OPENAI_API_KEY", api_key)
+        """OpenAICompatibleEmbedder carries no private-endpoint allowance, so
+        even the library's own default ``base_url`` (loopback, meant for
+        Ollama) must be refused for this provider once a request is
+        attempted."""
+        monkeypatch.setenv("GROUNDKIT_OPENAI_API_KEY", "sk-test")
+        requests: list[httpx.Request] = []
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            raise RuntimeError("upstream rejected the request")
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.1, 0.2]}]})
 
-        config = EmbeddingConfig(
-            provider="openai_compatible",
-            dimensions=2,
-            base_url=f"https://embed-proxy.example.com/openai-proxy?api-key={api_key}",
-        )
+        config = EmbeddingConfig(provider="openai_compatible", dimensions=2)
         embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
 
-        with pytest.raises(EmbeddingError) as excinfo:
+        with pytest.raises(ConfigurationError, match="loopback"):
             asyncio.run(embedder.embed(["x"]))
 
-        message = str(excinfo.value)
-        assert "https://embed-proxy.example.com" in message
-        assert "/openai-proxy" in message
-        assert api_key not in message
+        assert requests == []
+
+    def test_ollama_still_refuses_link_local_despite_its_allowance(self) -> None:
+        """OllamaEmbedder's allowance is scoped to loopback/private only
+        (ADR-0014 decision 10) — a link-local literal such as the common
+        cloud metadata address must still be refused for it."""
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"embeddings": [[0.1, 0.2]]})
+
+        config = EmbeddingConfig(
+            provider="ollama", dimensions=2, base_url="http://169.254.169.254:11434"
+        )
+        embedder = OllamaEmbedder(config, client=_client(handler))
+
+        with pytest.raises(ConfigurationError, match="link_local"):
+            asyncio.run(embedder.embed(["x"]))
+
+        assert requests == []
+
+
+class TestOllamaPrivateEndpointAllowance:
+    """NEW SURFACE: proves the ``_allow_private_endpoint`` wiring actually
+    reaches ``ensure_safe_endpoint`` end-to-end through a real embedder, not
+    just at the ``url_safety`` unit-test level."""
+
+    def test_default_loopback_endpoint_still_succeeds(self) -> None:
+        """Every other OllamaEmbedder test in this file already exercises
+        the default (loopback) base_url end to end; this test names that
+        property explicitly as a regression guard against the allowance
+        being narrowed to something that excludes 127.0.0.1 itself."""
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"embeddings": [[0.1, 0.2]]})
+
+        config = EmbeddingConfig(provider="ollama", dimensions=2)
+        embedder = OllamaEmbedder(config, client=_client(handler))
+
+        assert asyncio.run(embedder.embed(["x"])) == [[0.1, 0.2]]
+
+    def test_rfc1918_bridge_network_endpoint_succeeds(self) -> None:
+        """SPEC.md §9's Phase 6 compose topology reaches Ollama at a
+        bridge-network address, not just at loopback — the reason the
+        allowance is named for private endpoints generally."""
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"embeddings": [[0.1, 0.2]]})
+
+        config = EmbeddingConfig(
+            provider="ollama", dimensions=2, base_url="http://172.17.0.5:11434"
+        )
+        embedder = OllamaEmbedder(config, client=_client(handler))
+
+        assert asyncio.run(embedder.embed(["x"])) == [[0.1, 0.2]]
 
 
 # ── vector value validation (shared by both HTTP parsers) ─────────────────
@@ -557,7 +754,7 @@ class TestVectorValuesAreValidatedNotCoerced:
                 headers={"content-type": "application/json"},
             )
 
-        config = EmbeddingConfig(provider="openai_compatible", dimensions=2)
+        config = _public_openai_config(monkeypatch, dimensions=2)
         embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
 
         with pytest.raises(EmbeddingError, match=r"non-finite|non-numeric"):
@@ -584,7 +781,7 @@ class TestVectorValuesAreValidatedNotCoerced:
                 },
             )
 
-        config = EmbeddingConfig(provider="openai_compatible", dimensions=2)
+        config = _public_openai_config(monkeypatch, dimensions=2)
         embedder = OpenAICompatibleEmbedder(config, client=_client(handler))
 
         with pytest.raises(EmbeddingError, match="integer 'index'"):

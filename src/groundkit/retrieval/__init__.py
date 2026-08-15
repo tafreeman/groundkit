@@ -6,9 +6,10 @@ from __future__ import annotations
 from groundkit.retrieval.citations import resolve_citation, verify_citation
 from groundkit.retrieval.fusion import reciprocal_rank_fusion
 from groundkit.retrieval.protocols import RerankerProtocol
-from groundkit.retrieval.search import MAX_TOP_K, Retriever
+from groundkit.retrieval.search import MAX_QUERY_LEN, MAX_TOP_K, Retriever
 
 __all__ = [
+    "MAX_QUERY_LEN",
     "MAX_TOP_K",
     "RerankerProtocol",
     "Retriever",
