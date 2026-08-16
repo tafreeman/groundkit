@@ -1,0 +1,62 @@
+# Build context exclusions for infra/docker/Dockerfile.
+#
+# At the repo root rather than beside the Dockerfile, because Docker resolves
+# `.dockerignore` from the build CONTEXT root and the context is the project
+# (the image needs pyproject.toml, uv.lock and src/). BuildKit's
+# `<dockerfile>.dockerignore` convention would also work and is deliberately not
+# used: it is obscure enough that a reader would not think to look for it.
+#
+# This file is about context size and about not shipping local state into a
+# layer. It is NOT a secret boundary — .gitignore keeps `.env` out of the repo,
+# gitleaks gates the commit, and neither depends on this file.
+
+.git/
+.github/
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.codex-artifacts/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+site/
+
+# Local index state. WAL means a store is three files, and none of them belongs
+# in a build context (ADR-0002).
+.groundkit/
+*.lance/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Generated eval artifacts; reproducible from a run, never baked into an image.
+evals/results/
+
+# Coverage output
+.coverage
+coverage.xml
+htmlcov/
+
+# Secrets and local machine config. Belt and braces: none of these is tracked.
+.env
+.env.*
+!.env.example
+.mcp.json
+CLAUDE.md
+
+# Editors / OS
+.idea/
+.vscode/
+.vs/
+*.swp
+Thumbs.db
+.DS_Store
+~$*
+
+# Office documents dropped in the working copy. Not repo content.
+*.docx
+*.xlsx
+*.pptx
