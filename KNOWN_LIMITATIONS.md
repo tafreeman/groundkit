@@ -458,16 +458,19 @@ per SPEC.md §9:
   `base_url` itself. The threat model is operator misconfiguration, not a
   hostile operator (ADR-0014 Consequences).
 
-## Phase 6 — IaC and OTel instrumentation landed; traces verified, most IaC paths not
+## Phase 6 — IaC and OTel instrumentation landed; traces and the Terraform path verified, compose and k8s not
 
 Phase 6 lands in two changes (`docs/specs/phase-6-iac-observability.md` §3). The
 first is `infra/` plus its ADRs and docs and **changed nothing under `src/`**;
 the second adds the OpenTelemetry instrumentation and the JSON log formatter.
-Both have landed, and on 2026-08-16 a real groundkit span was observed in Jaeger.
-What remains is narrower than it was and is listed below: the trace verification
-covered two of the three span sites and did not use the compose service or its
-loopback publish, and most other IaC paths are still unrun. `infra/README.md` is
-the status board and records the exact scope of what was executed.
+Both have landed. On 2026-08-16 a real groundkit span was observed in Jaeger,
+and later the same day a real `terraform apply` against a live AWS account
+provisioned the instance, ingested a document, and served a real search over
+an SSM tunnel. What remains is narrower than it was and is listed below: the
+trace verification covered two of the three span sites and did not use the
+compose service or its loopback publish, and the compose and Kubernetes IaC
+paths are still unrun. `infra/README.md` is the status board and records the
+exact scope of what was executed.
 
 - **A groundkit span has now been observed in Jaeger (2026-08-16), for `ingest`
   and `retrieve` — not for `synthesize`.** `src/groundkit/telemetry.py` is the
@@ -686,29 +689,50 @@ the status board and records the exact scope of what was executed.
   deployment that is not a single user's local machine, and ADR-0020 decision 4
   settles exactly one of them. It is also a single instance: every AMI or
   instance-type change is downtime.
-- **Most IaC paths are not yet verified, and `infra/README.md` is the status
-  board.** SPEC.md §1.4 requires each path be verified with the date recorded
-  and SPEC.md §2 forbids recording a date no run produced, so some rows are
-  empty. The machine this tree was written on had a Docker CLI with **no running
-  daemon**, a `kubectl` with **no cluster context**, and no cloud credential —
-  nothing was built, pulled, applied or planned there. What *was* executed and
-  observed: the compose file parses and interpolates, the Kubernetes base
+- **The Terraform path has now been proved against a real AWS account
+  (2026-08-16); compose and Kubernetes have not.** SPEC.md §1.4 requires each
+  path be verified with the date recorded and SPEC.md §2 forbids recording a
+  date no run produced, so some rows are still empty. The machine this tree
+  was originally written on had a Docker CLI with **no running daemon**, a
+  `kubectl` with **no cluster context**, and no cloud credential — nothing was
+  built, pulled, applied or planned there. What *was* executed and observed at
+  that point: the compose file parses and interpolates, the Kubernetes base
   renders and every manifest parses, the Terraform module passes `fmt -check`
   and `validate` against AWS provider 5.100.0 and 6.60.0, and the user-data
   template renders to a script that passes `bash -n`. The `infra` CI job covers
   what that machine could not — on this change's first run the image built, ran
   as uid 10001 under a read-only root, and all six pinned third-party tags
   resolved — and it gates all of that on every pull request from now on. It also
-  now evaluates the two things this module *derives* from string inputs, rather
+  evaluates the two things this module *derives* from string inputs, rather
   than only proving they parse: the ECR-registry match that decides an IAM
   attachment and a `docker login`, and the egress rule the embedding endpoint
-  needs. Both are checked with `terraform console`, which resolves locals and
-  `templatefile()` without a provider credential. What remains unrun: no
-  container has served a request, no manifest has reached a cluster, no
-  precondition has been evaluated, and `terraform validate` makes no API call,
-  so a missing IAM permission or an AMI filter matching nothing is invisible to
-  it. A real `compose up`, a cluster apply and a Terraform apply are the
-  operator's to run.
+  needs, both checked with `terraform console`, which resolves locals and
+  `templatefile()` without a provider credential.
+
+  A later session had a real AWS account available and closed the last
+  Terraform row: `terraform plan` against a real personal-sandbox account in
+  `us-east-1` produced 9 resources to add with a real AMI resolved and the
+  ECR-detection logic correctly matched a real private-ECR image reference;
+  `terraform apply` created them; bootstrap installed docker, authenticated to
+  the private ECR repo and pulled the image, and mounted the data volume via
+  the retrying storage-prep unit; `groundkit-ingest` indexed a planted
+  document; and a real `POST /v1/search` over an SSM port-forward tunnel
+  returned the correct citation-bearing result. `terraform destroy` ran in the
+  same session. One finding worth naming here rather than only in
+  `infra/README.md`: the account's default VPC ships as all-public with no NAT
+  gateway, which does not satisfy this module's "private subnet with NAT"
+  network prerequisite — `associate_public_ip_address` is pinned `false`
+  unconditionally, so a public-subnet-with-no-NAT deployment would apply
+  cleanly and then fail bootstrap's `dnf install` under `set -e`. A NAT
+  gateway and a dedicated route table had to be created outside the module as
+  a prerequisite, which is a real operational cost of this module's documented
+  network requirement, not a defect it introduced. Full scope — what this run
+  did and did not exercise (BM25-only, no SSM VPC endpoints, one account, one
+  region) — is in `infra/README.md`.
+
+  What remains unrun: no container has served a request over compose's
+  loopback publish, and no manifest has reached a Kubernetes cluster. A real
+  `compose up` and a cluster `apply -k` are the operator's to run.
 
 ## Phase 5 caveats (the LLM boundary)
 

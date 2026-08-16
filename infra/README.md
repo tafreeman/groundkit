@@ -200,12 +200,15 @@ that job exists rather than being a formality.
 | terraform | ECR, egress and instance-architecture inputs classify correctly | **passed 2026-08-16** |
 | compose | the one-shots gate on Ollama's healthcheck, `serve` deliberately does not | **passed 2026-08-16** |
 | terraform | the security-group preconditions actually reject | **passed 2026-08-16** — `terraform test` with `mock_provider`, 5 runs, no credentials and no API call |
-| terraform | `plan` / `apply` against a real account | **not yet run** |
+| terraform | `plan` / `apply` against a real account | **passed 2026-08-16** — real AWS account, `us-east-1`, single-node personal sandbox; see the note below for exact scope |
 
 What the passing rows do **not** cover, so a full column of green is not read as
 more than it is: no manifest has reached a cluster, and `terraform validate`
 makes no API call — a missing IAM permission, an instance type unavailable in
-the region, or an AMI filter matching nothing are all invisible to it.
+the region, or an AMI filter matching nothing are all invisible to it. The
+`plan` / `apply` row below is the exception: it is the one row that did make
+real API calls, in one specific region and account, and its own scope note
+says exactly what that does and does not settle.
 
 **Scope of the 2026-08-16 trace verification, stated because the row above is
 narrower than it looks.** The collector and Jaeger were started with
@@ -237,6 +240,54 @@ variables are read by `opentelemetry.sdk._configuration` under the
 warning anywhere. `telemetry.configure_tracing()` is the fix, and
 `tests/test_telemetry.py::TestConfigureTracing` is the regression test. Nothing
 short of running the stack would have caught it.
+
+**Scope of the 2026-08-16 `plan`/`apply` verification.** Ran against a real AWS
+account (single personal free-tier sandbox, not a production or shared
+account), region `us-east-1`, the account's default VPC.
+
+The default VPC's six subnets are all public (`MapPublicIpOnLaunch: true`, a
+route table with only an internet-gateway route) and the account had no NAT
+gateway anywhere in the region. That matters because of the "Network
+prerequisite" section above: the module pins `associate_public_ip_address =
+false` unconditionally, so an instance launched into any of those subnets
+as-is would get no public IP and no usable route out through the IGW —
+`dnf install -y docker` would fail under `set -e` during bootstrap, the exact
+"healthy instance, no service" trap this file already warns about. A NAT
+gateway, a new route table (`0.0.0.0/0` → NAT), and its association with one
+subnet were created **as a prerequisite outside the module** before `plan`,
+and destroyed afterward along with everything else — the module itself does
+not build a NAT gateway (ADR-0020 decision 3) and this run did not change
+that.
+
+`container_image` was a real private ECR reference
+(`<account>.dkr.ecr.us-east-1.amazonaws.com/groundkit:phase6-verify`), pushed
+from the locally-built `groundkit:local` image for this run. `plan` showed 9
+resources to add, 0 to change, 0 to destroy, with a real AMI resolved
+(`al2023-ami-2023.*-x86_64` in `us-east-1`) and the ECR-detection logic
+correctly matching the image reference and attaching
+`AmazonEC2ContainerRegistryReadOnly`. `apply` created all 9 cleanly. On the
+instance: bootstrap installed docker, authenticated to the private ECR
+registry and pulled the image, formatted and mounted the data volume via the
+retrying `groundkit-storage.service` unit, and `groundkit.service` came up
+healthy — proving the ECR pull path and the storage-prep unit for real, not
+just at `bash -n`/`terraform console`. A document was placed under
+`/srv/groundkit/corpus`, `groundkit-ingest` was run, and `groundkit` was
+restarted; a real SSM port-forward session was then opened from the
+operator's own machine and a real `POST /v1/search` over that tunnel returned
+a correct, citation-bearing result for a planted marker token — that, not the
+successful `apply`, is what actually closes this row. `terraform destroy` ran
+in the same session; the ECR repository, NAT gateway, route table and Elastic
+IP (none of them terraform-managed) were deleted immediately afterward.
+
+What this run did **not** cover: the dense/hybrid path (`embedding_base_url`
+stayed unset, so the derived-egress-rule branch was exercised only by the
+existing `terraform console` checks, never against a real security group);
+`create_ssm_vpc_endpoints` (stayed `false` — this account had NAT-based
+egress, so the SSM-interface-endpoint resources were never applied for real);
+and any partition other than the commercial one (GovCloud/China ECR-host and
+managed-policy-ARN matching remain `terraform console`-only, as before). It
+is also a single run against a single account and region — the same caveat
+the k8s single-node row already carries.
 
 Update the rows, with the date, when you run one. Do not update a row you did
 not run.

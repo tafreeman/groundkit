@@ -234,8 +234,8 @@ instance runs out of memory, the corpus outgrew it — not the traffic.
 | Egress derivation classifies sixteen `embedding_base_url` forms, including an IPv6 host flagged at every port | **passed 2026-08-16** |
 | The input validations reject what they claim to — Graviton types, shell metacharacters, bad ports, query/fragment/userinfo | **passed 2026-08-16** |
 | The three security-group **preconditions** actually reject | **not yet run** — needs a plan |
-| `terraform plan` against a real account | **not yet run** |
-| `terraform apply`, SSM session, a search over the tunnel | **not yet run** |
+| `terraform plan` against a real account | **passed 2026-08-16** — `us-east-1`, a real personal sandbox account; 9 resources to add, 0 to change/destroy, real AMI resolved, ECR detection matched a real private-ECR reference |
+| `terraform apply`, SSM session, a search over the tunnel | **passed 2026-08-16** — instance booted, bootstrap pulled the image from the private ECR repo and mounted the data volume, `groundkit-ingest` indexed a planted document, and a real `POST /v1/search` over an SSM port-forward tunnel returned the correct citation-bearing result. Full scope (NAT gateway prerequisite, what was and wasn't exercised) recorded in `infra/README.md`'s verification status section — read it before assuming more than this run tested. |
 
 `validate` proves the configuration is well-formed and satisfies the provider's
 schema. It does **not** prove the module applies: it makes no API calls, so an
