@@ -1,0 +1,35 @@
+# One claim, two mounts, two different access modes.
+#
+# `ReadWriteOnce` is not a conservative default here, it is a requirement of the
+# storage engine: ADR-0002 makes SQLite in WAL mode the durable truth, and WAL
+# coordinates readers and writers through a memory-mapped `-shm` sidecar that is
+# not reliable over a network filesystem. A ReadWriteMany claim backed by NFS
+# would appear to work and would corrupt quietly — the same argument that
+# decided the Terraform target in ADR-0020 decision 1.
+#
+# RWO is also what forces `strategy: Recreate` on the Deployment: a rolling
+# update would need two pods holding this claim at once, which the access mode
+# forbids, so the rollout would hang rather than fail.
+#
+# `storageClassName` is deliberately UNSET, so the cluster's default class is
+# used. Set it — with kustomize, or by editing this file — to a block-backed
+# class. Not naming one here avoids inventing a class name that exists on no
+# cluster; leaving it unset on a cluster whose default is NFS-backed is the
+# failure mode above, and there is no way for a manifest to detect that.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: groundkit-data
+  namespace: groundkit
+  labels:
+    app.kubernetes.io/name: groundkit
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # Sized for a modest corpus. SPEC.md §7: the SQLite store holds document
+      # TEXT, not just an index, so this grows with the corpus rather than with
+      # a fixed metadata overhead.
+      storage: 10Gi

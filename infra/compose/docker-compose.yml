@@ -1,0 +1,207 @@
+# groundkit local stack: service + Ollama + OTel collector + Jaeger.
+# SPEC.md §9 Phase 6; ADR-0021 (exposure and hardening), ADR-0022 (telemetry).
+#
+#     docker compose -f infra/compose/docker-compose.yml up -d
+#
+# Zero credentials. Every published port is bound to the HOST's loopback
+# interface, which is what re-establishes ADR-0014 decision 7's guarantee after
+# ADR-0021 decision 1 moves it out of the process. Ollama and the collector
+# publish nothing at all — they are reachable only from this stack's network.
+#
+# READ THIS BEFORE LOOKING FOR TRACES: the collector and Jaeger are wired and
+# running, and until the instrumentation change lands (Phase 6's second change —
+# see docs/specs/phase-6-iac-observability.md §3) groundkit emits no spans, so
+# the Jaeger UI will show none. The collector→Jaeger leg can be proved on its
+# own with a synthetic OTLP payload; §6.2 of the phase spec has the procedure.
+#
+# Image tags are pinned. None was pulled while this file was written — no
+# container runtime was available — so CI resolves each one with
+# `docker manifest inspect` rather than leaving the pins as an untested claim.
+
+name: groundkit
+
+services:
+  # ---------------------------------------------------------------- service
+  groundkit:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    image: groundkit:local
+    command:
+      - serve
+      - --index-dir=/data/index
+      - --base-dir=/data/corpus
+      - --host=0.0.0.0
+      - --port=8765
+      - --allow-remote-access
+      - --dense
+      - --embed-provider=ollama
+      - --embed-base-url=http://ollama:11434
+      - --embed-model=${GROUNDKIT_EMBED_MODEL:-nomic-embed-text}
+    # `http://ollama:11434` resolves to an RFC1918 bridge address, not to
+    # loopback. It is reachable because OllamaEmbedder sets
+    # `_allow_private_endpoint = True` (ADR-0014 decision 10) — a class
+    # attribute scoped to that one provider, not a relaxation of the SSRF guard.
+    # An OpenAI-compatible provider pointed at a private address would still be
+    # refused.
+    environment:
+      # ADR-0022 decision 2: standard OTel names, read by the SDK. Inert until
+      # the instrumentation change installs one; harmless before it.
+      OTEL_SERVICE_NAME: groundkit
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      GROUNDKIT_LOG_FORMAT: json
+    ports:
+      # HOST loopback only. `8765:8765` would publish an unauthenticated,
+      # content-bearing surface on every interface of this machine.
+      - "127.0.0.1:${GROUNDKIT_HOST_PORT:-8765}:8765"
+    volumes:
+      - groundkit-index:/data/index
+      # Read-only, and that is the point (ADR-0021 decision 2): citation
+      # resolution re-reads these files and never writes one, so the kernel can
+      # enforce what ADR-0014 decision 4 could only scope in Python.
+      - ${GROUNDKIT_CORPUS_DIR:-../../docs}:/data/corpus:ro
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+      - /home/groundkit:mode=0700,uid=10001,gid=10001,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # `service_started`, deliberately, and NOT the `service_healthy` the two
+    # one-shots below use. The asymmetry is the point: those dial the embedding
+    # endpoint the instant they start, while `grk serve` does not touch it until
+    # a dense or hybrid request arrives — so gating on Ollama's healthcheck here
+    # would buy nothing and delay every `compose up` by the daemon's start time.
+    depends_on:
+      ollama:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ ollama
+  # No published port: the embedding endpoint is an internal detail of this
+  # stack. `ollama pull` is run through the `setup` profile below rather than by
+  # reaching the daemon from the host.
+  ollama:
+    image: ollama/ollama:0.5.4
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+    # `service_started` on the dependents below means "the container is
+    # running", which for a server is not the same as "the listener accepts
+    # connections". The documented cold-start sequence is
+    # `--profile setup run --rm ollama-pull`, which starts this service and
+    # immediately dials http://ollama:11434 — so without a healthcheck to gate
+    # on, the very first command in infra/README.md races the daemon and fails
+    # with a connection error on a slow or cold host.
+    #
+    # `ollama list` rather than curl or wget: it is the image's own binary and
+    # certain to be present, and with OLLAMA_HOST unset inside this container
+    # it talks to 127.0.0.1:11434 — which is precisely the listener the
+    # dependents need. `start_period` covers first-boot without counting
+    # against `retries`.
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # -------------------------------------------------------------- collector
+  # Core distribution, not contrib: every component used here (otlp receiver,
+  # memory_limiter/batch processors, otlp and debug exporters) is in core, and
+  # core cannot accidentally grow a dependency on a contrib-only component.
+  otel-collector:
+    image: otel/opentelemetry-collector:0.115.0
+    command: ["--config=/etc/otel/collector.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otel/collector.yaml:ro
+    depends_on:
+      jaeger:
+        condition: service_started
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------- jaeger
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      # In-memory storage: this stack is for local development and a restart
+      # losing its traces is correct here. A deployment that wants trace
+      # retention wants a real backend, which is a different decision.
+      SPAN_STORAGE_TYPE: memory
+    ports:
+      - "127.0.0.1:${JAEGER_UI_PORT:-16686}:16686"
+    restart: unless-stopped
+
+  # ------------------------------------------------------- one-shot: ingest
+  # `docker compose --profile ingest run --rm ingest`
+  #
+  # A profile, so `up` never starts it. The flags are here rather than in the
+  # README because getting them wrong is silent: an ingest without --dense
+  # against a manifest-bound collection is refused (ADR-0011), and one with a
+  # different --embed-model corrupts the semantic space the manifest binds
+  # (ADR-0004).
+  ingest:
+    profiles: ["ingest"]
+    image: groundkit:local
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    command:
+      - ingest
+      - /data/corpus
+      - --index-dir=/data/index
+      - --collection=${GROUNDKIT_COLLECTION:-default}
+      - --dense
+      - --embed-provider=ollama
+      - --embed-base-url=http://ollama:11434
+      - --embed-model=${GROUNDKIT_EMBED_MODEL:-nomic-embed-text}
+    volumes:
+      - groundkit-index:/data/index
+      - ${GROUNDKIT_CORPUS_DIR:-../../docs}:/data/corpus:ro
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+      - /home/groundkit:mode=0700,uid=10001,gid=10001,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      ollama:
+        # Same reason as ollama-pull: this ingest embeds every chunk against
+        # that endpoint, and a connection error partway through a --dense run
+        # leaves a collection whose manifest is bound but whose vectors are
+        # incomplete.
+        condition: service_healthy
+
+  # -------------------------------------------------- one-shot: pull a model
+  # `docker compose --profile setup run --rm ollama-pull`
+  #
+  # Run once. Afterwards the model lives in the `ollama-models` volume and the
+  # stack needs no network for embeddings. Pre-seeding that volume is how this
+  # stack is made air-gap friendly (see infra/README.md).
+  ollama-pull:
+    profiles: ["setup"]
+    image: ollama/ollama:0.5.4
+    entrypoint: ["ollama"]
+    command: ["pull", "${GROUNDKIT_EMBED_MODEL:-nomic-embed-text}"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    depends_on:
+      ollama:
+        # Not service_started: this is the first command infra/README.md gives,
+        # and it dials the daemon the instant the container exists.
+        condition: service_healthy
+
+volumes:
+  # The index is the only durable state this stack owns. `docker compose down
+  # -v` deletes it, and with it every ingested document's text — SPEC.md §7 is
+  # explicit that the SQLite store is content-bearing data, not just an index.
+  groundkit-index:
+  ollama-models:

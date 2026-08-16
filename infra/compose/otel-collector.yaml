@@ -1,0 +1,53 @@
+# OpenTelemetry Collector config for the local compose stack.
+# Core distribution only — every component here ships in
+# `otel/opentelemetry-collector`, so this file cannot drift onto a contrib-only
+# component without the image changing too.
+
+receivers:
+  otlp:
+    protocols:
+      # 0.0.0.0 inside the container, reachable only from the compose network:
+      # the collector publishes no host port. The same reasoning ADR-0021
+      # decision 1 applies to the service applies here.
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # memory_limiter must be FIRST in every pipeline that uses it. Placed anywhere
+  # else it can only shed load that has already been admitted and buffered,
+  # which is the situation it exists to prevent.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      # Plaintext on a private compose network between two containers that
+      # publish no host port. A local stack that required certificate material
+      # would be a stack nobody runs.
+      insecure: true
+  # Kept in the pipeline deliberately. Before the instrumentation change lands
+  # this is the cheapest way to answer "did anything arrive at all?" — a
+  # `docker compose logs otel-collector` shows received spans without the Jaeger
+  # UI being involved, which separates a receive problem from an export one.
+  debug:
+    verbosity: normal
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/jaeger, debug]

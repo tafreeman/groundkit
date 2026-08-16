@@ -1,0 +1,60 @@
+# Steady-state objects only.
+#
+#     kubectl kustomize infra/k8s          # render, offline, gated in CI
+#     kubectl apply -k infra/k8s           # apply, needs a cluster
+#
+# The two one-shots are deliberately NOT listed. Both would break a repeated
+# `apply -k`: a Job's pod template is immutable, so the second apply fails, and
+# a long-lived loader pod would hold the ReadWriteOnce claim the Deployment
+# needs. `ingest/` has its own kustomization so the image override below reaches
+# it too; `pod-corpus-loader.yaml` needs no override — it runs busybox — so it
+# stays a plain `kubectl apply -f`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: groundkit
+
+# Declaration order is the applied order, and that is not the default. Kustomize's
+# legacy sort reorders by kind and has no entry for NetworkPolicy, so it sorted
+# to the very END -- after the Deployment. The comment below claimed an ordering
+# the renderer was actively reversing: on a first apply to a shared cluster the
+# Deployment controller could create a reachable pod before the deny policy was
+# submitted, which is a window in which this unauthenticated, content-bearing
+# service is dialable from every pod in the cluster. `fifo` is what makes the
+# next four lines mean what they say. Check it with `kubectl kustomize infra/k8s`:
+# NetworkPolicy must appear before Deployment.
+sortOptions:
+  order: fifo
+
+resources:
+  - namespace.yaml
+  # Before the workload, so the deny lands with the namespace rather than after
+  # a window in which the service is reachable from every pod in the cluster.
+  - networkpolicy.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+
+# `labels`, not the deprecated `commonLabels`. The difference is not cosmetic:
+# `commonLabels` also injects into `spec.selector`, and a Deployment's selector
+# is immutable — so adding one later would make the next `apply` fail on an
+# already-deployed object. `includeSelectors: false` is the default here, which
+# is the behaviour that stays safe as this list grows.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: groundkit
+
+# Set before applying. No groundkit image has been published to any registry, so
+# `ghcr.io/tafreeman/groundkit:dev` in deployment.yaml is a placeholder that
+# will not pull. Overriding it here keeps the manifests themselves unedited:
+#
+#     kustomize edit set image ghcr.io/tafreeman/groundkit=myregistry/groundkit:0.1.0
+#
+# **Set it in `ingest/kustomization.yaml` too.** A transformer reaches only the
+# resources of the kustomization declaring it, so a value set here alone leaves
+# the ingest Job on the unpublished placeholder — and if the two are set to
+# different builds, an ingest and the serve reading it disagree about the code
+# that produced the index.
+images:
+  - name: ghcr.io/tafreeman/groundkit
+    newTag: dev

@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# groundkit instance bootstrap (Terraform user_data, ADR-0020).
+#
+# Terraform renders this file. In the SOURCE, a doubled dollar escapes the
+# interpolation: $${SHELL_VAR} reaches the instance as a shell variable, while a
+# single-dollar reference is substituted by Terraform before the instance ever
+# boots. Getting that backwards is only caught by `terraform validate` when the
+# name happens not to be a template variable; write $${HOME} as a single dollar
+# and it renders to nothing, silently.
+set -euo pipefail
+
+log() { echo "[groundkit-bootstrap] $*"; }
+
+# -- docker -----------------------------------------------------------------
+log "installing docker"
+dnf install -y docker
+systemctl enable --now docker
+
+# -- data volume ------------------------------------------------------------
+# Storage preparation is a SEPARATE, RETRYING unit rather than inline bootstrap,
+# and the reason is a race this script cannot win on its own.
+#
+# `aws_volume_attachment` cannot be requested until the instance resource has
+# completed, but cloud-init is already running by then. When the attachment is
+# slow, inline code gets one bounded wait and then `set -e` ends provisioning
+# permanently -- while Terraform goes on to attach the volume and report a
+# successful apply. The result is the failure mode this module keeps producing:
+# an apparently applied deployment with no service on it, and nothing that will
+# ever retry.
+#
+# As a `oneshot` with `Restart=on-failure` it simply keeps trying, so a late
+# attachment resolves itself. On success it starts the service, because a
+# dependency that failed and later succeeded does not pull its dependents up on
+# its own.
+cat > /usr/local/sbin/groundkit-prepare-storage <<'PREPARE'
+#!/usr/bin/env bash
+set -euo pipefail
+log() { echo "[groundkit-storage] $*"; }
+
+# Three names for one volume, because the guest's name for it depends on the
+# hypervisor. A Nitro instance presents EBS as NVMe; a Xen instance renames the
+# requested /dev/sdX to /dev/xvdX. The by-id link derived from the volume id is
+# the only identifier stable across both, so it is tried first -- but on Xen it
+# does not exist at all, and the requested name does not either, which is why
+# the xvd form is checked rather than assumed equivalent.
+VOLUME_SUFFIX="$(echo "${data_volume_id}" | tr -d '-')"
+BY_ID="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$${VOLUME_SUFFIX}"
+REQUESTED="${data_device_name}"
+XEN="${replace(data_device_name, "/dev/sd", "/dev/xvd")}"
+
+DEVICE=""
+if [ -e "$${BY_ID}" ]; then
+  DEVICE="$(readlink -f "$${BY_ID}")"
+elif [ -b "$${REQUESTED}" ]; then
+  DEVICE="$${REQUESTED}"
+elif [ -b "$${XEN}" ]; then
+  DEVICE="$${XEN}"
+fi
+
+if [ -z "$${DEVICE}" ]; then
+  # Not fatal in the permanent sense any more: systemd restarts this unit.
+  log "data volume ${data_volume_id} not present yet (tried $${BY_ID}, $${REQUESTED}, $${XEN})"
+  exit 1
+fi
+log "data volume is $${DEVICE}"
+
+# Format only if there is no filesystem. This runs again on an instance
+# replacement (user_data_replace_on_change) and on every retry, and the volume
+# it reattaches to holds the corpus -- SPEC.md section 7 is explicit that the
+# SQLite store is content-bearing data. An unconditional mkfs would silently
+# destroy it.
+if ! blkid "$${DEVICE}" >/dev/null 2>&1; then
+  log "no filesystem on $${DEVICE}; creating ext4"
+  mkfs -t ext4 -L groundkit "$${DEVICE}"
+else
+  log "existing filesystem on $${DEVICE}; leaving it alone"
+fi
+
+mkdir -p /srv/groundkit
+UUID="$(blkid -s UUID -o value "$${DEVICE}")"
+if ! grep -q "$${UUID}" /etc/fstab; then
+  # `nofail` so a missing volume degrades to a bootable instance an operator can
+  # reach over SSM, rather than one stuck in emergency mode with no way in --
+  # there is no SSH ingress to fall back on (ADR-0020 decision 2).
+  echo "UUID=$${UUID} /srv/groundkit ext4 defaults,nofail 0 2" >> /etc/fstab
+fi
+systemctl daemon-reload
+mount -a
+
+# `nofail` above buys a bootable instance and costs a guarantee: the mount can
+# fail and everything after it still runs. What follows is `mkdir -p` on paths
+# under the mountpoint, so an unmounted /srv/groundkit gets those directories on
+# the ROOT disk, the container binds them, and the deployment looks healthy
+# while serving an empty index from the wrong device -- and an ingest into it is
+# hidden the moment the volume comes back. Checked here rather than assumed.
+if ! mountpoint -q /srv/groundkit; then
+  log "$${DEVICE} did not mount at /srv/groundkit"
+  exit 1
+fi
+
+# uid/gid 10001 is the image's fixed non-root identity and part of its public
+# contract (ADR-0021 decision 3). The host has no such user; the numeric owner
+# is what matters to the container.
+mkdir -p /srv/groundkit/index /srv/groundkit/corpus
+chown -R 10001:10001 /srv/groundkit
+log "storage ready"
+PREPARE
+chmod 0755 /usr/local/sbin/groundkit-prepare-storage
+
+cat > /etc/systemd/system/groundkit-storage.service <<'UNIT'
+[Unit]
+Description=groundkit data volume preparation
+After=cloud-init.service
+Before=groundkit.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/groundkit-prepare-storage
+# The late-attachment case. `Restart=on-failure` is permitted with oneshot and
+# is the whole point: a volume that appears after cloud-init has given up is
+# picked up on the next attempt instead of never.
+Restart=on-failure
+RestartSec=15
+# A dependency that failed and later succeeded does not start its dependents,
+# so success says so explicitly.
+ExecStartPost=/usr/bin/systemctl start --no-block groundkit.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# -- image ------------------------------------------------------------------
+# A private ECR pull needs a docker login; the instance role carries
+# AmazonEC2ContainerRegistryReadOnly only when the configured image is an ECR
+# reference, and this block is rendered empty otherwise. Without it, the
+# README's own example image fails to pull and `set -e` ends bootstrap before
+# the service is written - a failure whose symptom is a healthy-looking instance
+# serving nothing.
+%{ if ecr_registry != "" ~}
+log "authenticating to ${ecr_registry}"
+aws ecr get-login-password --region ${ecr_region} \
+  | docker login --username AWS --password-stdin ${ecr_registry}
+%{ endif ~}
+log "pulling ${container_image}"
+docker pull "${container_image}"
+
+# -- helper: one-shot ingest ------------------------------------------------
+# Run over an SSM session: `sudo groundkit-ingest`. The corpus must already be
+# in /srv/groundkit/corpus; getting it there is the operator's business (aws s3
+# sync, git clone, scp over an SSM session), and this module deliberately does
+# not choose for them.
+#
+# The embedding arguments MUST match the service unit below. They are rendered
+# from the same input for that reason: a helper that ingested BM25-only while
+# the service served --dense produced a collection with no vectors and no
+# embedding-identity manifest, so every dense or hybrid request against it was
+# refused (ADR-0008) on a deployment that was configured for them. The failure
+# named an index inconsistency, three steps away from the ingest that caused it.
+#
+# Written by TERRAFORM interpolation, not by a `sed` pass over placeholders,
+# which is what this did. `sed` gives its replacement text its own syntax: an
+# unescaped `&` means "the whole match", `|` was the delimiter, and a backslash
+# escapes. So an `embedding_base_url` containing `&` -- an Ollama-compatible
+# proxy rooted at a path with a query string is enough -- silently rewrote
+# itself to the literal string `EMBED_PLACEHOLDER` inside the helper while the
+# systemd unit below, built by plain interpolation, kept the real URL. That is
+# the round-one failure through a different door: the helper and the service
+# disagreeing about the endpoint, and the resulting collection refused under
+# ADR-0008 with an error naming an index inconsistency.
+#
+# No placeholders and no `sed` closes the class rather than escaping one
+# character of it. Interpolation happens when Terraform renders this file, so
+# the QUOTED heredoc below is still correct and still necessary -- it stops the
+# instance's shell from touching `$@` when the file is written. Terraform sees
+# `$@` as literal text and leaves it alone; only `$${...}` needs escaping here.
+#
+# The values are single-quoted in the generated script so its own shell treats
+# them as literal at run time. `collection`, `container_image` and
+# `embedding_base_url` are validated in variables.tf against character classes
+# that exclude a single quote, so that quoting cannot be broken out of.
+#
+# Note the helper and the systemd unit below escape DIFFERENTLY for the same
+# input, which is the one asymmetry between them and is deliberate. `%` is legal
+# in a URL (percent-encoding) and ordinary to a shell, but systemd reads `%` in
+# `ExecStart` as the start of a unit specifier — `%20` is not "space", it is an
+# invalid specifier, and `systemctl enable --now` refuses the unit outright. So
+# the unit doubles it to `%%` and the helper does not. They still carry the same
+# URL; only one of them has to say so in systemd's escaping.
+cat > /usr/local/bin/groundkit-ingest <<'INGEST'
+#!/usr/bin/env bash
+set -euo pipefail
+exec docker run --rm \
+  --read-only \
+  --tmpfs /tmp:mode=1777,size=256m \
+  --tmpfs /home/groundkit:mode=0700,uid=10001,gid=10001,size=16m \
+  --security-opt no-new-privileges:true \
+  --cap-drop ALL \
+  -v /srv/groundkit/index:/data/index \
+  -v /srv/groundkit/corpus:/data/corpus:ro \
+  '${container_image}' \
+  ingest /data/corpus --index-dir=/data/index --collection='${collection}' ${embedding_base_url == "" ? "" : "--dense --embed-provider=ollama --embed-base-url='${embedding_base_url}'"} "$@"
+INGEST
+chmod 0755 /usr/local/bin/groundkit-ingest
+
+# -- service ----------------------------------------------------------------
+# A systemd unit rather than `docker run -d`, so the service returns after a
+# reboot and its lifecycle is inspectable with the tools already on the box.
+#
+# `-p 127.0.0.1:${host_port}:8765` is the access control (ADR-0021 decision 1):
+# the security group has no ingress rules, and this publish means even a group
+# that gained one would find nothing listening on a routable address. Session
+# Manager port forwarding connects to localhost ON THE INSTANCE, which is
+# exactly what this exposes.
+#
+# `RequiresMountsFor` and not `After=srv-groundkit.mount`, which is what this
+# unit had: After is ordering ALONE. Paired with the fstab entry's `nofail`, a
+# reboot on which the EBS volume does not attach started this service anyway,
+# docker created /srv/groundkit/index and /srv/groundkit/corpus on the root
+# disk, and the result passed every probe -- an empty corpus, served
+# confidently, with any ingest run against it silently shadowed once the volume
+# returned. RequiresMountsFor pulls in the mount unit AND requires it, so that
+# reboot now leaves the service failed with the mount named in `systemctl
+# status`. The instance still boots and SSM still works, which is what `nofail`
+# is for and is why it stays.
+cat > /etc/systemd/system/groundkit.service <<UNIT
+[Unit]
+Description=groundkit retrieval service
+After=docker.service groundkit-storage.service
+Requires=docker.service groundkit-storage.service
+RequiresMountsFor=/srv/groundkit
+
+[Service]
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f groundkit
+ExecStart=/usr/bin/docker run --rm --name groundkit \\
+  --read-only \\
+  --tmpfs /tmp:mode=1777,size=64m \\
+  --tmpfs /home/groundkit:mode=0700,uid=10001,gid=10001,size=16m \\
+  --security-opt no-new-privileges:true \\
+  --cap-drop ALL \\
+  -p 127.0.0.1:${host_port}:8765 \\
+  -v /srv/groundkit/index:/data/index \\
+  -v /srv/groundkit/corpus:/data/corpus:ro \\
+  -e GROUNDKIT_LOG_FORMAT=json \\
+  ${container_image} \\
+  serve --index-dir=/data/index --base-dir=/data/corpus \\
+  --host=0.0.0.0 --port=8765 --allow-remote-access ${embedding_base_url == "" ? "" : "--dense --embed-provider=ollama --embed-base-url=${replace(embedding_base_url, "%", "%%")}"}
+ExecStop=/usr/bin/docker stop groundkit
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+
+# `grk serve` refuses an --index-dir that does not exist and never creates one
+# (ADR-0014 decision 3), so /srv/groundkit/index has to be there first — which
+# is groundkit-storage.service's job, and why this unit Requires it.
+# An EMPTY index, though, serves happily and reports no collections, so a
+# freshly provisioned volume looks healthy and answers nothing. Run
+# `groundkit-ingest` before concluding the deployment works.
+#
+# `enable` without `--now` for the service, then start the STORAGE unit: its
+# ExecStartPost starts this one once the volume is genuinely ready. Starting
+# both here would race, and `enable --now groundkit` on an instance whose volume
+# has not attached yet would fail under `set -e` and end bootstrap — which is
+# the permanent failure the retrying unit exists to remove, reintroduced at the
+# last line.
+systemctl enable groundkit
+systemctl enable groundkit-storage
+systemctl start --no-block groundkit-storage
+log "done"

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: groundkit
+  labels:
+    app.kubernetes.io/name: groundkit
+    # Pod Security Admission at `restricted`, enforced rather than audited.
+    # The workload already satisfies it — non-root with a fixed uid, all
+    # capabilities dropped, no privilege escalation, RuntimeDefault seccomp
+    # (ADR-0021 decision 3) — so the label costs nothing today and refuses a
+    # future pod that quietly stops satisfying it.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

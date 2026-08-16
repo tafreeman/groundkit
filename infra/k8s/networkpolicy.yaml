@@ -1,0 +1,45 @@
+# Default-deny ingress for the whole namespace.
+#
+# `ClusterIP` on the Service (ADR-0021 decision 1) closes *external*
+# publication and nothing else: every pod in every namespace, and the nodes
+# themselves, can still reach a `ClusterIP` directly. For a surface with no
+# authentication of any kind (ADR-0014 decision 1) that is not an access
+# boundary — it is a smaller blast radius. This object is what actually closes
+# in-cluster reachability, and it exists because the Service alone was claimed
+# to do a job it cannot.
+#
+# An empty `podSelector` selects every pod in the namespace; `policyTypes:
+# [Ingress]` with **no** `ingress` rules denies all inbound connections. Egress
+# is deliberately untouched: the pod may need to reach an embedding endpoint,
+# and an egress policy that silently broke that would be a different outage
+# with a much less obvious cause.
+#
+# Two things this cannot do, both worth knowing before treating it as a
+# guarantee:
+#
+#   1. **A NetworkPolicy is inert on a cluster whose CNI does not enforce
+#      them.** The API server accepts the object either way and reports nothing
+#      — there is no status field, no event, and no warning. On a cluster
+#      without an enforcing CNI, `kubectl get networkpolicy` shows this object
+#      and every pod can still reach the service. Confirm enforcement against
+#      the cluster rather than against this file.
+#   2. **It may break `kubectl port-forward`.** Port-forward is a kubelet →
+#      pod connection originating on the node, not from another pod. Most CNIs
+#      permit node-to-pod traffic regardless of policy (kubelet health probes
+#      would otherwise fail), which is why the probes in deployment.yaml are
+#      unaffected — but that is a CNI behaviour, not a Kubernetes guarantee. If
+#      port-forward stops working after applying this, that is the cause, and
+#      the fix is a narrow allow-from-node rule for the cluster in question,
+#      not deleting this policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: groundkit-default-deny-ingress
+  namespace: groundkit
+  labels:
+    app.kubernetes.io/name: groundkit
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
