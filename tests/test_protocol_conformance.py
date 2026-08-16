@@ -38,6 +38,7 @@ from typing import Any, Protocol, get_type_hints, runtime_checkable
 
 import pytest
 
+from groundkit.extraction import ExtractorProtocol, HtmlExtractor, PdfExtractor
 from groundkit.index.dense import InMemoryVectorStore, LanceDBVectorStore
 from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.index.protocols import MetadataStoreProtocol, VectorStoreProtocol
@@ -359,6 +360,27 @@ class TestRerankerProtocolConformance:
 
     def test_cross_encoder_reranker_matches_reranker_protocol(self) -> None:
         assert_signature_parity(RerankerProtocol, CrossEncoderReranker)
+
+
+# ── ChatProtocol <- OllamaChat, OpenAICompatChat, ScriptedChatProvider, RedactingChat ──
+
+
+class TestExtractorProtocolConformance:
+    """``ExtractorProtocol`` <- ``PdfExtractor``, ``HtmlExtractor`` (Wave 3).
+
+    Worth the parity check rather than ``isinstance`` for a reason specific to
+    this seam: ADR-0016 decision 2 rests on the *same* extractor object being
+    used at ingest and at citation-resolution time, so a drift between the two
+    implementations -- one growing a keyword argument the other lacks, or
+    ``identity`` becoming a method on one and staying a property on the other
+    -- would break re-extraction in exactly the way ``isinstance`` cannot see.
+    """
+
+    def test_pdf_extractor_matches_extractor_protocol(self) -> None:
+        assert_signature_parity(ExtractorProtocol, PdfExtractor)
+
+    def test_html_extractor_matches_extractor_protocol(self) -> None:
+        assert_signature_parity(ExtractorProtocol, HtmlExtractor)
 
 
 # ── ChatProtocol <- OllamaChat, OpenAICompatChat, ScriptedChatProvider, RedactingChat ──
