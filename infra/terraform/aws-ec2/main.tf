@@ -307,9 +307,25 @@ resource "aws_volume_attachment" "data" {
 # -- Compute ----------------------------------------------------------------
 
 resource "aws_instance" "this" {
-  ami                    = data.aws_ami.al2023.id
-  instance_type          = var.instance_type
-  subnet_id              = var.subnet_id
+  ami           = data.aws_ami.al2023.id
+  instance_type = var.instance_type
+  subnet_id     = var.subnet_id
+
+  # Explicitly false, because unset does not mean "no". Unset inherits the
+  # subnet's `MapPublicIpOnLaunch`, so dropping this module into a public
+  # subnet handed the instance a public IPv4 — while `outputs.tf` told the
+  # operator "no public address, no ingress rule, no SSH". The security group
+  # and the loopback publish still keep the service unreachable, so this is not
+  # an exposure of the corpus; it is an unnecessary public surface on the host,
+  # a billed IPv4, and a claim the resources did not back.
+  #
+  # It also makes the documented shape a requirement rather than a preference:
+  # with no public IP there is no route out through an internet gateway, so the
+  # subnet must provide egress itself. That is the private-subnet-with-NAT shape
+  # this module already asks for, and bootstrap fails at `dnf install` without
+  # it either way.
+  associate_public_ip_address = false
+
   vpc_security_group_ids = [aws_security_group.instance.id]
   iam_instance_profile   = aws_iam_instance_profile.this.name
   ebs_optimized          = true

@@ -22,6 +22,13 @@ The instance needs **outbound HTTPS during bootstrap**: it installs docker from
 Amazon Linux's CDN and pulls the container image. A private subnet therefore
 wants a NAT gateway.
 
+The subnet must supply that egress itself, because the instance takes **no
+public IPv4**. `associate_public_ip_address` is pinned `false` rather than left
+to inherit the subnet's `MapPublicIpOnLaunch` — otherwise a public subnet gave
+the host a public address while this module's own outputs said "no public
+address, no ingress rule, no SSH". So a public subnet is not the shape here:
+with no public IP there is no route out through an internet gateway.
+
 `create_ssm_vpc_endpoints` is **not** a substitute. It creates the endpoints in
 `ssm_vpc_endpoint_services` — by default `ssm` and `ssmmessages` — which carry
 the Session Manager control channel and nothing else; neither the package
