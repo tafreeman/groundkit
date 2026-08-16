@@ -205,7 +205,8 @@ that job exists rather than being a formality.
 | Dockerfile | `docker build` | **passed 2026-08-15** *(CI)* |
 | Dockerfile | container runs as uid 10001; CLI works; starts under `--read-only` with only the two named scratch mounts | **passed 2026-08-15** *(CI)* |
 | compose | `docker compose config` parses and interpolates | **passed 2026-08-15** |
-| compose | `up`, ingest, a real search over the loopback publish | **not yet run** — the 2026-08-16 trace run reached the collector over the compose network with `docker run`, never through the `groundkit` service's host publish; bringing that service up also needs the Ollama model pulled, since its command is `--dense`. The LAN bind check (ADR-0021 decision 1's actual claim) needs a second host and is the half most likely to be skipped |
+| compose | `up`, ingest, a real search over the loopback publish | **passed 2026-08-16** — the documented cold-start sequence in full: `--profile setup run --rm ollama-pull`, `--profile ingest run --rm ingest` (43 files, 1299 chunks, 1299 vectors via Ollama), `up -d`, then `GET /v1/collections` → `["default"]` and `POST /v1/search` → 200 with a citation-bearing result, both over `127.0.0.1:8765` |
+| compose | published ports are loopback-only | **passed 2026-08-16, host-side only** — a differential through this host's own LAN interface address, not loopback: `10.0.0.16:8766` (a control container published `0.0.0.0`) returned 200 while `10.0.0.16:8765` (the `groundkit` service, published `127.0.0.1`) was actively refused, with `Get-NetTCPConnection` showing `0.0.0.0` and `127.0.0.1` respectively. **The from-another-host leg was attempted and did NOT complete** — see the scope note below |
 | compose | collector→Jaeger leg, proved on its own with a synthetic OTLP/HTTP payload | **passed 2026-08-16** |
 | compose | a groundkit span visible in Jaeger, carrying no query text | **passed 2026-08-16** — `ingest` and `retrieve` spans observed; see the note below for what this run did and did not cover |
 | k8s | `kubectl kustomize` renders; every manifest parses as YAML | **passed 2026-08-15** |
@@ -224,6 +225,34 @@ the region, or an AMI filter matching nothing are all invisible to it. The
 `plan` / `apply` row below is the exception: it is the one row that did make
 real API calls, in one specific region and account, and its own scope note
 says exactly what that does and does not settle.
+
+**Scope of the 2026-08-16 loopback-publish check, because "passed, host-side
+only" is a real qualifier and not a hedge.** ADR-0021 decision 1's claim is
+that containerising groundkit does not publish it beyond loopback. What was
+demonstrated: a control container published on `0.0.0.0:8766` answered on
+`10.0.0.16:8766` (this host's LAN interface address, not `127.0.0.1`), while
+the `groundkit` service published on `127.0.0.1:8765` was actively refused on
+`10.0.0.16:8765` in the same minute. Two ports, one host, the same Docker
+publish mechanism, differing only in bind address — and the refusal is the
+kernel declining a connection to an address nothing is bound to, which is the
+same path a remote packet meets at its destination.
+
+What that does **not** cover, and why the row says host-side only: the packets
+never crossed the network, so firewall rules, routing and AP behaviour were
+not exercised. A genuine from-another-host check was attempted the same day
+from a phone and **could not complete** — that phone could not reach the
+`0.0.0.0` control port either, though this host reaches it fine over the same
+address, which places the fault in the wireless network rather than in
+anything here. The Wi-Fi is a `-Guest` SSID with client isolation, so no device
+on it can reach this machine at all. Closing the remaining leg needs a wired
+host, or a device on the non-guest network. Recorded rather than quietly
+counted as done, because "the check passed" and "the check could not run" are
+opposite claims and a green row must not blur them.
+
+Groundkit's own access log corroborates the negative independently: across the
+whole session it recorded requests from `127.0.0.1` and from Docker's bridge
+gateway `172.18.0.1` (the healthcheck) and **from no `10.0.0.0/24` address at
+all**.
 
 **Scope of the 2026-08-16 trace verification, stated because the row above is
 narrower than it looks.** The collector and Jaeger were started with

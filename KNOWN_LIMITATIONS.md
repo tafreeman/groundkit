@@ -458,7 +458,7 @@ per SPEC.md §9:
   `base_url` itself. The threat model is operator misconfiguration, not a
   hostile operator (ADR-0014 Consequences).
 
-## Phase 6 — IaC and OTel instrumentation landed; traces and the Terraform path verified, compose and k8s not
+## Phase 6 — IaC and OTel instrumentation landed; traces, Terraform and compose verified, k8s not
 
 Phase 6 lands in two changes (`docs/specs/phase-6-iac-observability.md` §3). The
 first is `infra/` plus its ADRs and docs and **changed nothing under `src/`**;
@@ -466,11 +466,31 @@ the second adds the OpenTelemetry instrumentation and the JSON log formatter.
 Both have landed. On 2026-08-16 a real groundkit span was observed in Jaeger,
 and later the same day a real `terraform apply` against a live AWS account
 provisioned the instance, ingested a document, and served a real search over
-an SSM tunnel. What remains is narrower than it was and is listed below: the
-trace verification covered two of the three span sites and did not use the
-compose service or its loopback publish, and the compose and Kubernetes IaC
-paths are still unrun. `infra/README.md` is the status board and records the
-exact scope of what was executed.
+an SSM tunnel, and the full documented compose cold-start ran end to end. What
+remains is narrower than it was and is listed below: the trace verification
+covered two of the three span sites, one half of the compose bind check could
+not be run at all, and the Kubernetes path is still entirely unrun.
+`infra/README.md` is the status board and records the exact scope of what was
+executed.
+
+- **The compose stack's loopback-only binding is verified host-side only, and
+  the other half could not be run.** The documented cold-start sequence
+  completed on 2026-08-16 — model pull, the ingest one-shot (43 files, 1299
+  chunks, 1299 vectors through Ollama), `up -d`, and a citation-bearing
+  `POST /v1/search` over `127.0.0.1:8765`. The binding itself was demonstrated
+  by a differential through this host's own LAN interface address: a control
+  container published on `0.0.0.0` answered on `10.0.0.16:8766` while the
+  service published on `127.0.0.1` was refused on `10.0.0.16:8765`, with the
+  host listener table showing the two bind addresses. **What was not done is
+  the check ADR-0021 decision 1 actually names — a connection attempt from a
+  different host.** It was attempted from a phone and could not complete: that
+  device could not reach the `0.0.0.0` control port either, while this host
+  reaches it fine, which places the fault in the network rather than in
+  anything here. The only Wi-Fi available is a guest SSID with client
+  isolation, so no device on it can reach this machine. Closing it needs a
+  wired host or the non-guest network. Kept as a distinct gap because "the
+  bind is correct, demonstrated locally" and "no external host was ever
+  refused" are different claims, and only the first is currently true.
 
 - **A groundkit span has now been observed in Jaeger (2026-08-16), for `ingest`
   and `retrieve` — not for `synthesize`.** `src/groundkit/telemetry.py` is the

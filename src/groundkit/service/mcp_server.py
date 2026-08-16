@@ -62,6 +62,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import time
 from typing import TYPE_CHECKING, Any, Final
 from uuid import uuid4
 
@@ -78,7 +79,7 @@ from groundkit.service.errors import (
     map_exception,
     unexpected_error_rendering,
 )
-from groundkit.service.tools import TOOLS
+from groundkit.service.tools import TOOLS, result_count
 
 if TYPE_CHECKING:
     from groundkit.service.errors import ErrorRendering
@@ -287,12 +288,30 @@ async def _dispatch(
             )
             return _error_result(rendering, request_id)
 
+    started = time.perf_counter()
     result = await spec.handler(ctx, request)
+    latency_ms = (time.perf_counter() - started) * 1000.0
+    # For a successful MCP call this line is the ONLY access record — there is
+    # no equivalent of the REST surface's separate access log — so it owes the
+    # same fields SPEC.md §3 names: request id, latency, result count, and (on
+    # the failure paths below) the typed failure code. `result_count` is
+    # imported from `service/tools.py` rather than reimplemented here so the
+    # two transports cannot drift into disagreeing about what a result is.
+    # Neither the query nor any retrieved content appears: same rule as the
+    # REST access line (ADR-0014 decision 9).
     logger.info(
-        "mcp tool=%s request_id=%s ok",
+        "mcp tool=%s request_id=%s ok latency_ms=%.2f results=%d",
         name,
         request_id,
-        extra={"tool": name, "request_id": request_id, "status": "ok"},
+        latency_ms,
+        result_count(result),
+        extra={
+            "tool": name,
+            "request_id": request_id,
+            "status": "ok",
+            "latency_ms": latency_ms,
+            "results": result_count(result),
+        },
     )
     return _success_result(result)
 
@@ -331,14 +350,27 @@ def build_mcp_server(ctx: ServiceContext) -> Server[Any, Any]:
         try:
             return await _dispatch(ctx, name, arguments, request_id)
         except GroundkitError as exc:
+            # Mapped BEFORE logging, not inline in the return below, so the log
+            # record carries the same typed `kind` the caller receives. Without
+            # it a collector sees only status="failed" and cannot tell a
+            # storage fault from a retrieval one from an index inconsistency —
+            # the precondition-refusal path above already logs `failure_kind`,
+            # and this being the odd one out was the inconsistency.
+            rendering = map_exception(exc)
             logger.error(
-                "mcp tool=%s request_id=%s failed",
+                "mcp tool=%s request_id=%s failed kind=%s",
                 name,
                 request_id,
+                rendering.kind,
                 exc_info=exc,
-                extra={"tool": name, "request_id": request_id, "status": "failed"},
+                extra={
+                    "tool": name,
+                    "request_id": request_id,
+                    "status": "failed",
+                    "failure_kind": rendering.kind,
+                },
             )
-            return _error_result(map_exception(exc), request_id)
+            return _error_result(rendering, request_id)
         except Exception as exc:
             logger.error(
                 "mcp tool=%s request_id=%s failed unexpectedly",
