@@ -233,7 +233,7 @@ instance runs out of memory, the corpus outgrew it — not the traffic.
 | ECR detection matches private ECR in the commercial, GovCloud and China partitions, and not ghcr/Docker Hub/`public.ecr.aws` | **passed 2026-08-16** |
 | Egress derivation classifies sixteen `embedding_base_url` forms, including an IPv6 host flagged at every port | **passed 2026-08-16** |
 | The input validations reject what they claim to — Graviton types, shell metacharacters, bad ports, query/fragment/userinfo | **passed 2026-08-16** |
-| The three security-group **preconditions** actually reject | **not yet run** — needs a plan |
+| The security-group **preconditions** actually reject | **passed 2026-08-16** — `terraform test` with `mock_provider`, 5 runs, no credentials and no API call. Preconditions evaluate at plan time and `terraform test` runs a plan, so mocks reach them; `tests/security_group_preconditions.tftest.hcl` |
 | `terraform plan` against a real account | **passed 2026-08-16** — `us-east-1`, a real personal sandbox account; 9 resources to add, 0 to change/destroy, real AMI resolved, ECR detection matched a real private-ECR reference |
 | `terraform apply`, SSM session, a search over the tunnel | **passed 2026-08-16** — instance booted, bootstrap pulled the image from the private ECR repo and mounted the data volume, `groundkit-ingest` indexed a planted document, and a real `POST /v1/search` over an SSM port-forward tunnel returned the correct citation-bearing result. Full scope (NAT gateway prerequisite, what was and wasn't exercised) recorded in `infra/README.md`'s verification status section — read it before assuming more than this run tested. |
 
@@ -241,11 +241,12 @@ instance runs out of memory, the corpus outgrew it — not the traffic.
 schema. It does **not** prove the module applies: it makes no API calls, so an
 IAM permission that is missing, an instance type unavailable in the region, or
 an AMI filter that matches nothing are all invisible to it. The last three rows
-are what would close that, and none has been run — see
-`docs/specs/phase-6-iac-observability.md` §6 for the environment that made the
-difference.
+are what closed that, and **all three have now been run** — the preconditions
+under `terraform test` with mocked providers, and the `plan` and `apply` against
+a real account on 2026-08-16. See `docs/specs/phase-6-iac-observability.md` §6
+for the environment, and `infra/README.md` for the apply's full scope.
 
-Everything above the "not yet run" rows was executed locally on 2026-08-16 with
+Everything above those last three rows was executed locally on 2026-08-16 with
 `terraform console`, which resolves locals, variable validations and
 `templatefile()` without configuring a provider — so it needs no credential.
 **None of it is gated.** These are point-in-time local runs, not a check that
@@ -254,8 +255,24 @@ derivations exists and is parked on `chore/infra-ci-checks-parked` rather than
 shipped here: it re-tests Terraform's own validation engine more than it tests
 this module, and it is not where the module's real risk lies.
 
-That risk is the last three rows. `validate` and `console` make no API call, and
-a `precondition` is reachable by neither — so a missing IAM permission, an
-instance type unavailable in the region, an AMI filter matching nothing, and
-every precondition here are all still unproven. A mocked test suite would not
-change that; a `plan` against an account would.
+That risk was the last three rows, and they are now closed — but by two
+different instruments, and conflating them would overstate what either proves.
+
+`validate` and `console` make no API call, and a `precondition` is reachable by
+neither. **`terraform test` with `mock_provider` does reach them**, because
+preconditions evaluate at plan time and `terraform test` runs a plan: that is
+what closed the precondition row, with no credential and no API call. Recorded
+carefully, because a mocked suite was previously declined for this module and
+**that reasoning still stands** — mocks cannot catch a missing IAM permission,
+an instance type unavailable in the region, or an AMI filter matching nothing.
+The decline answered "can mocks substitute for a real apply?" (no). The suite
+answers the narrower "can mocks close the never-executed-precondition row?"
+(yes). Both remain true.
+
+The three failure modes mocks cannot see are exactly what the `plan` and
+`apply` rows closed on 2026-08-16, against a real account. One finding from
+writing the suite is worth keeping: **precondition 2 is unreachable through the
+variable path.** `variables.tf`'s URL validation regex is a strict superset of
+the prefix `local.embed_scheme` derives from, so any value clearing validation
+necessarily yields a non-empty scheme. It is defensive-only, and the suite
+documents that rather than pretending to exercise it.
