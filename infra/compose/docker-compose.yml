@@ -70,6 +70,11 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # `service_started`, deliberately, and NOT the `service_healthy` the two
+    # one-shots below use. The asymmetry is the point: those dial the embedding
+    # endpoint the instant they start, while `grk serve` does not touch it until
+    # a dense or hybrid request arrives — so gating on Ollama's healthcheck here
+    # would buy nothing and delay every `compose up` by the daemon's start time.
     depends_on:
       ollama:
         condition: service_started
@@ -86,6 +91,25 @@ services:
     volumes:
       - ollama-models:/root/.ollama
     restart: unless-stopped
+    # `service_started` on the dependents below means "the container is
+    # running", which for a server is not the same as "the listener accepts
+    # connections". The documented cold-start sequence is
+    # `--profile setup run --rm ollama-pull`, which starts this service and
+    # immediately dials http://ollama:11434 — so without a healthcheck to gate
+    # on, the very first command in infra/README.md races the daemon and fails
+    # with a connection error on a slow or cold host.
+    #
+    # `ollama list` rather than curl or wget: it is the image's own binary and
+    # certain to be present, and with OLLAMA_HOST unset inside this container
+    # it talks to 127.0.0.1:11434 — which is precisely the listener the
+    # dependents need. `start_period` covers first-boot without counting
+    # against `retries`.
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
 
   # -------------------------------------------------------------- collector
   # Core distribution, not contrib: every component used here (otlp receiver,
@@ -150,7 +174,11 @@ services:
       - ALL
     depends_on:
       ollama:
-        condition: service_started
+        # Same reason as ollama-pull: this ingest embeds every chunk against
+        # that endpoint, and a connection error partway through a --dense run
+        # leaves a collection whose manifest is bound but whose vectors are
+        # incomplete.
+        condition: service_healthy
 
   # -------------------------------------------------- one-shot: pull a model
   # `docker compose --profile setup run --rm ollama-pull`
@@ -167,7 +195,9 @@ services:
       OLLAMA_HOST: http://ollama:11434
     depends_on:
       ollama:
-        condition: service_started
+        # Not service_started: this is the first command infra/README.md gives,
+        # and it dials the daemon the instant the container exists.
+        condition: service_healthy
 
 volumes:
   # The index is the only durable state this stack owns. `docker compose down

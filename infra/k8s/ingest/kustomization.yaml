@@ -1,6 +1,11 @@
 # The ingest Job, in its own kustomization rather than the base.
 #
+#     kubectl -n groundkit delete job/groundkit-ingest --ignore-not-found
 #     kubectl apply -k infra/k8s/ingest
+#
+# The delete is load-bearing: a Job's pod template is immutable, so applying
+# over a completed one creates no pod and a following `wait --for=complete`
+# returns on the previous run. See `job.yaml`.
 #
 # **Its own kustomization, not a loose `kubectl apply -f`, because the image
 # override has to reach it.** A kustomize `images:` transformer rewrites only

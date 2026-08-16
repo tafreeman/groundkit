@@ -1,9 +1,18 @@
 # One-shot ingest. Applied through its own kustomization, NOT the base.
 #
 #     kubectl -n groundkit scale deploy/groundkit --replicas=0   # release the claim
+#     kubectl -n groundkit delete job/groundkit-ingest --ignore-not-found
 #     kubectl apply -k infra/k8s/ingest
 #     kubectl -n groundkit wait --for=condition=complete job/groundkit-ingest --timeout=10m
 #     kubectl -n groundkit scale deploy/groundkit --replicas=1   # reopen the retriever
+#
+# The delete is part of the sequence, not a cleanup step. A Job's pod template
+# is immutable, so `apply` over an existing one is accepted and creates no pod;
+# inside the `ttlSecondsAfterFinished` window below, the `wait` that follows
+# then succeeds immediately against the PREVIOUS run's completion. Re-ingesting
+# after copying new documents, or retrying a failed ingest, therefore reports
+# success having done nothing at all. `--ignore-not-found` keeps the line
+# idempotent on the first run.
 #
 # Both scale steps are load-bearing. The PVC is ReadWriteOnce, so on a
 # multi-node cluster this Job cannot attach a volume the running Deployment

@@ -14,6 +14,18 @@ kind: Kustomization
 
 namespace: groundkit
 
+# Declaration order is the applied order, and that is not the default. Kustomize's
+# legacy sort reorders by kind and has no entry for NetworkPolicy, so it sorted
+# to the very END -- after the Deployment. The comment below claimed an ordering
+# the renderer was actively reversing: on a first apply to a shared cluster the
+# Deployment controller could create a reachable pod before the deny policy was
+# submitted, which is a window in which this unauthenticated, content-bearing
+# service is dialable from every pod in the cluster. `fifo` is what makes the
+# next four lines mean what they say. Check it with `kubectl kustomize infra/k8s`:
+# NetworkPolicy must appear before Deployment.
+sortOptions:
+  order: fifo
+
 resources:
   - namespace.yaml
   # Before the workload, so the deny lands with the namespace rather than after
