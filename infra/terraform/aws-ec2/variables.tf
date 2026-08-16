@@ -21,10 +21,15 @@ variable "vpc_id" {
 
 variable "subnet_id" {
   description = <<-EOT
-    Subnet for the instance. Must be in var.vpc_id. A private subnet is the
-    intended shape; set create_ssm_vpc_endpoints if it has no NAT gateway, or
-    Session Manager cannot reach the instance and there is then no way in at all
-    (ADR-0020 decision 2 opens no ingress).
+    Subnet for the instance. Must be in var.vpc_id. A private subnet with a NAT
+    gateway is the intended shape: the instance needs outbound HTTPS during
+    bootstrap for the docker package and the container image, and the SSM agent
+    needs to reach Systems Manager or there is no way in at all (ADR-0020
+    decision 2 opens no ingress).
+
+    With no NAT, set create_ssm_vpc_endpoints for the SSM control channel — but
+    read that variable's description first, because it does not make bootstrap
+    work on its own.
   EOT
   type        = string
 }
@@ -108,9 +113,18 @@ variable "host_port" {
 
 variable "create_ssm_vpc_endpoints" {
   description = <<-EOT
-    Create the ssm/ssmmessages/ec2messages interface endpoints so the SSM agent
-    reaches the service without a NAT or internet gateway. Off by default so an
-    account that already has them, or already has NAT, does not pay twice.
+    Create the ssm/ssmmessages/ec2messages interface endpoints, so the SSM agent
+    reaches Systems Manager without traversing a NAT or internet gateway. Off by
+    default so an account that already has them, or already has NAT, does not
+    pay twice.
+
+    This covers the SSM CONTROL CHANNEL ONLY. It does not make a subnet with no
+    egress work: bootstrap runs `dnf install -y docker` against Amazon Linux's
+    CDN and then pulls the container image, and neither is reachable through
+    these three endpoints. Setting this on a subnet with no other egress leaves
+    an instance you can open a session to and a service that was never
+    installed. See the module README for what a genuinely egress-free
+    deployment would take.
   EOT
   type        = bool
   default     = false

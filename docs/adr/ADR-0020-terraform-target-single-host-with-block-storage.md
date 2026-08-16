@@ -48,6 +48,20 @@ bounded by the operator's own machine.
 
 ## Decision
 
+### 0. Amendments after review
+
+Two claims in the first draft of this record were wrong in the same way — each described
+a capability the resources did not actually provide — and are corrected in place above
+rather than left for a reader to trip over:
+
+- `create_ssm_vpc_endpoints` was described as making a NAT-free subnet work. It covers
+  the SSM control channel only; bootstrap still needs egress. See decision 3.
+- The instance role carried `AmazonSSMManagedInstanceCore` alone while this module's own
+  README documented a private ECR image, which cannot be pulled without a login. The
+  module now detects an ECR reference in `container_image`, attaches
+  `AmazonEC2ContainerRegistryReadOnly` only in that case, and authenticates in
+  bootstrap. See decision 6.
+
 ### 1. The provider is AWS, and the shape is one EC2 instance with an attached EBS volume
 
 `infra/terraform/aws-ec2/` provisions a single instance, one encrypted `gp3` EBS volume
@@ -89,9 +103,20 @@ outbound connection, because the embedding endpoint is an input (decision 5) rat
 a default reaching out to the internet.
 
 `create_ssm_vpc_endpoints` (default `false`) creates the three interface endpoints —
-`ssm`, `ssmmessages`, `ec2messages` — that let the agent reach the service without a NAT
-gateway or an internet gateway. It defaults off because an account that already has them,
-or already has NAT, would otherwise pay twice.
+`ssm`, `ssmmessages`, `ec2messages` — that let the **agent** reach Systems Manager
+without a NAT gateway or an internet gateway. It defaults off because an account that
+already has them, or already has NAT, would otherwise pay twice.
+
+**It does not make a subnet with no egress work, and this record originally implied it
+did.** Bootstrap installs docker from Amazon Linux's CDN and pulls a container image;
+neither is reachable through those three endpoints, so `set -e` ends provisioning before
+the service is installed and the operator is left with an instance they can open a
+session to and no service running on it. The intended shape is therefore a private
+subnet **with NAT**. A genuinely egress-free deployment is possible and is not built:
+it needs an AMI with docker and the image already baked in, or the `ecr.api`/`ecr.dkr`
+interface endpoints plus the `s3` gateway endpoint for layer storage *and* a
+VPC-reachable package mirror. Recorded as a design rather than discovered as a failed
+`terraform apply`.
 
 IMDSv2 is required (`http_tokens = "required"`). The instance metadata endpoint is
 link-local, which `utils/url_safety.py` refuses for outbound provider endpoints even when
@@ -124,6 +149,31 @@ what the deployment can do — or a GPU instance class an order of magnitude mor
 expensive, which is a cost decision the module has no business making silently. The
 compose stack, which runs on a machine the operator already owns, is where the local
 Ollama topology lives.
+
+Whatever this variable is set to, the **`groundkit-ingest` helper the bootstrap writes
+takes the same setting.** That is not symmetry for its own sake: an ingest without
+`--dense` against a deployment serving `--dense` produces a collection with no vectors
+and no embedding-identity manifest, so every dense and hybrid request is refused
+(ADR-0008) — on a deployment explicitly configured for them, with an error naming an
+index inconsistency rather than the ingest three steps upstream. The two are rendered
+from one input for that reason.
+
+### 6. The role grants ECR pull only when the image is an ECR reference
+
+`container_image` is matched against the ECR host pattern. When it matches,
+`AmazonEC2ContainerRegistryReadOnly` is attached and bootstrap runs
+`aws ecr get-login-password | docker login` against that registry and region; when it
+does not, neither happens and the role keeps SSM alone.
+
+Detected rather than asked for, because the alternative is a flag whose omission breaks
+the module's own documented example silently — an unauthenticated pull of a private ECR
+image fails under `set -e` before the systemd unit is written, which presents as an
+instance that came up healthy and serves nothing. Detection also keeps the grant narrow:
+a deployment pulling from a public registry never receives ECR permissions at all.
+
+The registry and region come from the image reference rather than from
+`data.aws_region`, so a cross-region pull is expressed by writing the cross-region
+reference and needs no second variable.
 
 ## Alternatives considered
 

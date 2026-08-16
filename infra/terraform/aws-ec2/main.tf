@@ -26,6 +26,17 @@ locals {
   # device instead, so the bootstrap script resolves it by volume id under
   # /dev/disk/by-id rather than trusting this name.
   data_device_name = "/dev/sdf"
+
+  # Whether `container_image` names a private ECR registry, and if so which one.
+  # Detected rather than asked for: the module's own README documents an ECR
+  # reference as the usual case, and an unauthenticated `docker pull` of one
+  # fails under `set -e` before the service is ever written — so a flag the
+  # operator had to remember would be a flag whose omission silently breaks the
+  # documented path. Deriving it also keeps the IAM grant below narrow: the ECR
+  # policy attaches only when there is genuinely an ECR image to pull.
+  ecr_match    = regexall("^([0-9]{12}\\.dkr\\.ecr\\.([a-z0-9-]+)\\.amazonaws\\.com)/", var.container_image)
+  ecr_registry = length(local.ecr_match) > 0 ? local.ecr_match[0][0] : ""
+  ecr_region   = length(local.ecr_match) > 0 ? local.ecr_match[0][1] : ""
 }
 
 data "aws_subnet" "this" {
@@ -84,6 +95,17 @@ resource "aws_iam_role" "this" {
 resource "aws_iam_role_policy_attachment" "ssm" {
   role       = aws_iam_role.this.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# Pull-only, and attached only when `container_image` is an ECR reference. The
+# managed read-only policy rather than a hand-written one, for the same reason
+# as the SSM attachment above: it is the documented minimum and it tracks the
+# service. It grants no push and no repository administration.
+resource "aws_iam_role_policy_attachment" "ecr_pull" {
+  count = local.ecr_registry == "" ? 0 : 1
+
+  role       = aws_iam_role.this.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
 
 resource "aws_iam_instance_profile" "this" {
@@ -190,7 +212,18 @@ resource "aws_instance" "this" {
     embedding_base_url = var.embedding_base_url
     data_volume_id     = aws_ebs_volume.data.id
     data_device_name   = local.data_device_name
+    ecr_registry       = local.ecr_registry
+    ecr_region         = local.ecr_region
   })
+
+  # The instance profile has to exist before the instance boots, or the
+  # bootstrap's `aws ecr get-login-password` runs with no credentials. Terraform
+  # infers the profile dependency from the attribute reference above but not the
+  # policy attachments hanging off the role, so they are named explicitly.
+  depends_on = [
+    aws_iam_role_policy_attachment.ssm,
+    aws_iam_role_policy_attachment.ecr_pull,
+  ]
 }
 
 # -- Optional: reach SSM from a subnet with no NAT --------------------------

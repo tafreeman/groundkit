@@ -8,13 +8,42 @@ this file is the operating manual.
 ## What it creates
 
 One EC2 instance running the groundkit container, one encrypted EBS data volume
-with its own lifecycle, an instance profile whose only policy is
-`AmazonSSMManagedInstanceCore`, and a security group with **no ingress rules at
-all**. Optionally, three SSM interface endpoints so a subnet with no NAT still
-works.
+with its own lifecycle, an instance profile carrying
+`AmazonSSMManagedInstanceCore` (plus `AmazonEC2ContainerRegistryReadOnly` **only
+when `container_image` is a private ECR reference**), and a security group with
+**no ingress rules at all**. Optionally, three SSM interface endpoints.
 
 It does **not** create a VPC, a subnet, a NAT gateway, a DNS record, a load
 balancer, a backup schedule, or an Ollama.
+
+## Network prerequisite, before you plan
+
+The instance needs **outbound HTTPS during bootstrap**: it installs docker from
+Amazon Linux's CDN and pulls the container image. A private subnet therefore
+wants a NAT gateway.
+
+`create_ssm_vpc_endpoints` is **not** a substitute. It creates the
+`ssm`/`ssmmessages`/`ec2messages` endpoints, which carry the Session Manager
+control channel and nothing else; neither the package repository nor a container
+registry is reachable through them. Set it on an otherwise egress-free subnet
+and you get an instance you can open a session to, running no service, because
+`set -e` ended bootstrap at `dnf install`. A genuinely egress-free deployment
+needs an AMI with docker and the image baked in, or `ecr.api` + `ecr.dkr`
+interface endpoints plus the `s3` gateway endpoint *and* a VPC-reachable package
+mirror — none of which this module builds.
+
+## Private ECR images work, and that is not automatic
+
+The `container_image` reference is matched against the private-ECR host pattern
+(`<account>.dkr.ecr.<region>.amazonaws.com/…`). When it matches, the role gains
+`AmazonEC2ContainerRegistryReadOnly` and bootstrap runs `aws ecr
+get-login-password | docker login` against that registry and region. When it
+does not — `ghcr.io`, Docker Hub, `public.ecr.aws`, all of which pull
+anonymously — neither happens and the role keeps SSM alone.
+
+Detected rather than flagged because the failure it prevents is silent: an
+unauthenticated pull of a private image fails under `set -e` before the systemd
+unit is written, so the instance comes up healthy and serves nothing.
 
 ## The access model, before anything else
 
@@ -58,7 +87,8 @@ module "groundkit" {
   # can pull from.
   container_image = "123456789012.dkr.ecr.eu-west-1.amazonaws.com/groundkit:0.1.0"
 
-  # Set only if the subnet has no NAT gateway.
+  # SSM control channel only — read "Network prerequisite" above before
+  # assuming this replaces a NAT gateway. It does not.
   create_ssm_vpc_endpoints = true
 }
 ```
@@ -69,6 +99,14 @@ Then, over an SSM session, put documents in `/srv/groundkit/corpus` and run:
 sudo groundkit-ingest          # written by the bootstrap script
 sudo systemctl restart groundkit
 ```
+
+`groundkit-ingest` is rendered with the **same** embedding arguments as the
+service unit, from the same `embedding_base_url` input. That matters: a
+BM25-only ingest feeding a `--dense` service produces a collection with no
+vectors and no embedding-identity manifest, so every dense and hybrid request is
+refused ([ADR-0008](../../../docs/adr/ADR-0008-dense-search-requires-a-dense-collection.md))
+with an error naming an index inconsistency rather than the ingest that caused
+it.
 
 The restart is not optional and the reason is a real property of the software: a
 `Retriever` is a snapshot of the store as of `open()` and never refreshes, so a
@@ -95,7 +133,7 @@ nothing. Ingest before concluding the deployment works.
 | `collection` | string | `default` | Used by the `groundkit-ingest` helper. |
 | `embedding_base_url` | string | `""` | Empty runs the BM25-only path. |
 | `host_port` | number | `8765` | Loopback publish and SSM forward target. |
-| `create_ssm_vpc_endpoints` | bool | `false` | For a subnet with no NAT. |
+| `create_ssm_vpc_endpoints` | bool | `false` | SSM control channel only; not a NAT replacement. |
 | `tags` | map(string) | `{}` | Merged onto everything. |
 
 Sizing note: `BM25Index.from_store()` rebuilds postings **in memory at every
@@ -128,11 +166,13 @@ instance runs out of memory, the corpus outgrew it — not the traffic.
 
 | Check | Status |
 |---|---|
-| `terraform fmt -check -recursive` | **passed 2026-08-15** |
-| `terraform validate`, AWS provider 6.60.0 | **passed 2026-08-15** |
+| `terraform fmt -check -recursive` | **passed 2026-08-16** |
+| `terraform validate`, AWS provider 6.60.0 | **passed 2026-08-16** |
 | `terraform validate`, AWS provider 5.100.0 (the declared floor's major) | **passed 2026-08-15** |
-| `bootstrap.sh.tftpl` renders, and the rendered script passes `bash -n` | **passed 2026-08-15** |
+| `bootstrap.sh.tftpl` renders for both the ECR/dense and public/BM25 cases; both pass `bash -n` | **passed 2026-08-16** |
 | Rendered systemd unit emits single-backslash continuations | **passed 2026-08-15** |
+| Rendered `groundkit-ingest` carries the service's embedding arguments | **passed 2026-08-16** |
+| ECR detection matches private ECR (incl. GovCloud) and not ghcr/Docker Hub/`public.ecr.aws` | **passed 2026-08-16** |
 | `terraform plan` against a real account | **not yet run** |
 | `terraform apply`, SSM session, a search over the tunnel | **not yet run** |
 

@@ -71,6 +71,17 @@ mkdir -p /srv/groundkit/index /srv/groundkit/corpus
 chown -R 10001:10001 /srv/groundkit
 
 # -- image ------------------------------------------------------------------
+# A private ECR pull needs a docker login; the instance role carries
+# AmazonEC2ContainerRegistryReadOnly only when the configured image is an ECR
+# reference, and this block is rendered empty otherwise. Without it, the
+# README's own example image fails to pull and `set -e` ends bootstrap before
+# the service is written - a failure whose symptom is a healthy-looking instance
+# serving nothing.
+%{ if ecr_registry != "" ~}
+log "authenticating to ${ecr_registry}"
+aws ecr get-login-password --region ${ecr_region} \
+  | docker login --username AWS --password-stdin ${ecr_registry}
+%{ endif ~}
 log "pulling ${container_image}"
 docker pull "${container_image}"
 
@@ -79,6 +90,13 @@ docker pull "${container_image}"
 # in /srv/groundkit/corpus; getting it there is the operator's business (aws s3
 # sync, git clone, scp over an SSM session), and this module deliberately does
 # not choose for them.
+#
+# The embedding arguments MUST match the service unit below. They are rendered
+# from the same input for that reason: a helper that ingested BM25-only while
+# the service served --dense produced a collection with no vectors and no
+# embedding-identity manifest, so every dense or hybrid request against it was
+# refused (ADR-0008) on a deployment that was configured for them. The failure
+# named an index inconsistency, three steps away from the ingest that caused it.
 cat > /usr/local/bin/groundkit-ingest <<'INGEST'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -91,9 +109,9 @@ exec docker run --rm \
   -v /srv/groundkit/index:/data/index \
   -v /srv/groundkit/corpus:/data/corpus:ro \
   IMAGE_PLACEHOLDER \
-  ingest /data/corpus --index-dir=/data/index --collection=COLLECTION_PLACEHOLDER "$@"
+  ingest /data/corpus --index-dir=/data/index --collection=COLLECTION_PLACEHOLDER EMBED_PLACEHOLDER "$@"
 INGEST
-sed -i "s|IMAGE_PLACEHOLDER|${container_image}|; s|COLLECTION_PLACEHOLDER|${collection}|" \
+sed -i "s|IMAGE_PLACEHOLDER|${container_image}|; s|COLLECTION_PLACEHOLDER|${collection}|; s|EMBED_PLACEHOLDER|${embedding_base_url == "" ? "" : "--dense --embed-provider=ollama --embed-base-url=${embedding_base_url}"}|" \
   /usr/local/bin/groundkit-ingest
 chmod 0755 /usr/local/bin/groundkit-ingest
 
