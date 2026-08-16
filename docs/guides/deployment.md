@@ -134,6 +134,13 @@ kustomize `images:` transformer rewrites only its own kustomization's resources:
 applied loose, the Job kept the unpublished placeholder image and the documented
 workflow ended in `ImagePullBackOff`. Set the image in both places.
 
+**Delete the ingest Job before re-applying it.** A Job's pod template is
+immutable, so `apply` over a completed one is accepted, creates no pod, and
+leaves a following `wait --for=condition=complete` to return immediately on the
+previous run's completion. Inside the hour before `ttlSecondsAfterFinished`
+collects it, re-ingesting after copying new documents therefore reports success
+having done nothing.
+
 **Scale the Deployment to zero before running either one-shot.** One RWO claim
 admits one pod; on a multi-node cluster the one-shot otherwise sits Pending on a
 multi-attach error. Scaling back up afterwards is not just restoring service —
@@ -153,19 +160,43 @@ not reliable over a network filesystem, which disqualifies every
 serverless-container-plus-managed-filesystem answer before compute is even
 considered.
 
-Two operational facts that are easy to get wrong and fail silently:
+Five operational facts that are easy to get wrong and fail silently. They share
+a shape worth naming: each one applies, boots and passes a probe, then fails at a
+distance from its cause.
 
 - **The instance needs outbound HTTPS during bootstrap** — it installs docker
   and pulls the image — so a private subnet wants a NAT gateway.
   `create_ssm_vpc_endpoints` carries the Session Manager control channel only;
   on an otherwise egress-free subnet it yields an instance you can open a
   session to and no service running on it.
+- **The dense path needs its own egress rule, and the module derives one.**
+  Ollama listens on 11434 and the standing egress rule is 443, so
+  `embedding_base_url` also produces an egress rule scoped to that endpoint. A
+  DNS-name host on a non-443 port cannot be resolved to a CIDR at plan time and
+  needs `embedding_egress_cidr`; an IPv6 endpoint is refused at any port, since
+  every rule the module writes is `cidr_ipv4` and "443 is already covered" is
+  true of IPv4 alone. Both fail at `plan` with the reason, which is the whole
+  point — the alternative is an embed call that times out on a deployment that
+  applied cleanly.
+- **The deployment is x86_64 in two places, so `instance_type` is validated.**
+  The AMI filter selects an x86_64 image and the container image is built for a
+  single architecture, so a Graviton type is refused at `plan` rather than by
+  EC2 at launch. Supporting arm64 is a multi-architecture image build, not a
+  different value for that variable.
 - **A private ECR image is detected and authenticated.** When
-  `container_image` matches the private-ECR host pattern, the role gains
-  `AmazonEC2ContainerRegistryReadOnly` and bootstrap performs a `docker login`;
-  otherwise neither happens. Detected rather than flagged because an
-  unauthenticated pull of a private image ends bootstrap before the service unit
-  is written, and the instance then looks healthy while serving nothing.
+  `container_image` matches the private-ECR host pattern (including
+  `.amazonaws.com.cn`), the role gains `AmazonEC2ContainerRegistryReadOnly` and
+  bootstrap performs a `docker login`; otherwise neither happens. Detected
+  rather than flagged because an unauthenticated pull of a private image ends
+  bootstrap before the service unit is written, and the instance then looks
+  healthy while serving nothing.
+- **The service requires its data mount, not merely ordering after it.** The
+  fstab entry uses `nofail` on purpose — there is no SSH ingress, so an instance
+  stuck in emergency mode is unreachable — which means a reboot without the EBS
+  volume still boots. `RequiresMountsFor=/srv/groundkit` on the unit is what
+  stops docker from creating the bind-mount paths on the root disk and serving
+  an empty index that looks healthy, with any ingest into it shadowed the moment
+  the volume returns.
 
 The module creates **no** backup schedule. `prevent_destroy` on the data volume
 means it survives instance replacement and nothing more, and SPEC.md §7 is

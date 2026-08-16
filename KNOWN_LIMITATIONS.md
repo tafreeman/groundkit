@@ -473,14 +473,20 @@ Everything below describes the state between the two.
   deployment guide both say so where a reader would otherwise conclude the
   opposite. The collector→Jaeger leg is provable on its own with a synthetic
   OTLP payload in the meantime.
-- **`synthesize` spans are deferred past Phase 6 entirely, not just past its
-  first change.** Query rewrite and cited synthesis are Phase 5 and are being
-  built concurrently; instrumenting a module that does not exist is not
-  possible, and guessing at a seam still under construction is worse than
-  waiting. SPEC.md §3's three-site list will therefore be satisfied two-thirds
-  when Phase 6 completes, and closing the third is an obligation on whichever
-  change lands synthesis — in the same sense that ADR-0001's hazard list is an
-  obligation on the phase that ports each defect.
+- **All three of SPEC.md §3's span sites are Phase 6's to instrument, `synthesize`
+  included — this entry used to defer it and no longer does.** The deferral was
+  written while Phase 5 was under construction alongside this phase, when
+  `providers/synthesis.py` genuinely did not exist. Phase 5 then landed (SPEC.md
+  §9: done 2026-08-15) and this branch merged `main`, so the seam —
+  `async Synthesizer.synthesize(query, results)` — is present in this tree and
+  settled. The premise expired without the text changing; had it stayed, Phase 6
+  would have closed at two-thirds of a SPEC.md §3 requirement by following its
+  own documentation (ADR-0022 decision 5).
+
+  The residual worth knowing is not a missing span but a sharper allowlist
+  obligation: a synthesis span sits closer to prompt text, completion text and
+  citation spans than any other site, and none of those may become a span
+  attribute. Model identity, result count, latency and a typed failure code may.
 - **The read-only-mount deferral is discharged in part, and the part is worth
   stating precisely.** The "read-only does not mean the process writes no bytes"
   entry above deferred filesystem-level enforcement to this phase. What that
@@ -526,20 +532,71 @@ Everything below describes the state between the two.
   behaviour rather than a Kubernetes guarantee. compose and the Terraform
   module rest on a kernel-level socket bind instead and are contingent on
   nothing.
+- **The base kustomization pins `sortOptions: order: fifo`, and that is
+  load-bearing.** Kustomize's legacy sort reorders by kind and has no entry for
+  `NetworkPolicy`, so it rendered *after* the Deployment — meaning a first
+  `apply -k` to a shared cluster could have the Deployment controller create a
+  reachable pod before the default-deny policy was submitted. For an
+  unauthenticated, content-bearing service that window is the whole exposure.
+  FIFO makes declaration order the applied order. Verified by rendering:
+  `kubectl kustomize infra/k8s` now emits `NetworkPolicy` second, ahead of
+  `Deployment`. Not gated — a render-order assertion is parked on
+  `chore/infra-ci-checks-parked`.
 - **The Kubernetes manifests do not solve getting documents onto the volume.**
   `pod-corpus-loader.yaml` is a `kubectl cp` target and a recipe, not a
   mechanism. A real deployment substitutes whatever it already uses.
-- **Two Kubernetes sequencing rules are not enforceable by a manifest.** The
+- **Three Kubernetes sequencing rules are not enforceable by a manifest.** The
   `ReadWriteOnce` claim admits one pod, so the Deployment must be scaled to zero
   before either one-shot runs, or they sit Pending on a multi-attach error — on
   a multi-node cluster only, which means the wrong order passes on a laptop
-  cluster and stalls in production. And the image must be set in **both**
+  cluster and stalls in production. The image must be set in **both**
   `k8s/kustomization.yaml` and `k8s/ingest/kustomization.yaml`, because a
   kustomize `images:` transformer reaches only its own kustomization's
   resources; setting one leaves the other on the unpublished placeholder, and
   setting them differently has an ingest and the serve reading it disagree about
-  the code that built the index. Both are documented in `infra/README.md` and in
-  the manifests themselves; neither is checked by anything.
+  the code that built the index. And the ingest Job must be **deleted before it
+  is re-applied**: a Job's pod template is immutable, so `apply` over a
+  completed one is accepted, creates no pod, and leaves a following
+  `wait --for=condition=complete` to return immediately against the *previous*
+  run — so within the hour before `ttlSecondsAfterFinished` collects it,
+  re-ingesting after copying new documents reports success having done nothing.
+  All three are documented in `infra/README.md` and in the manifests themselves;
+  none is checked by anything.
+- **`create_ssm_vpc_endpoints` creates `ssm` and `ssmmessages` only.**
+  `ec2messages` is the legacy channel — the SSM agent on the pinned AL2023 image
+  uses the other two — and it is not offered in every region. That is more than
+  a tidiness point: `data.aws_vpc_endpoint_service` errors on a service its
+  region does not offer, and a failing data source fails the entire `plan`, so
+  an optional endpoint nothing used could break the whole module. Add it back
+  through `ssm_vpc_endpoint_services` if you run an older agent, in a region you
+  have confirmed offers it.
+- **`embedding_base_url` is escaped differently for the systemd unit than for
+  the ingest helper, and that asymmetry is deliberate.** systemd reads `%` in
+  `ExecStart` as the start of a unit specifier, so `%20` is not a space but an
+  invalid specifier and `systemctl enable --now` refuses the whole unit —
+  ending bootstrap with no service. The unit therefore doubles `%` to `%%` and
+  the helper does not, because a shell has no such rule and doubling it there
+  would pass a different URL to the ingest. Both still carry the same URL; only
+  one has to say so in systemd's escaping. An explicit port is separately
+  validated to 1-65535, since port 0 otherwise produces a real egress rule
+  permitting nothing usable.
+- **The Terraform module's data volume is prepared by a retrying unit, because
+  the attachment can arrive after cloud-init has finished.**
+  `aws_volume_attachment` cannot be requested until the instance resource
+  completes, by which time cloud-init is already running. A slow attach used to
+  exhaust a bounded inline wait and end provisioning permanently, while
+  Terraform went on to attach the volume and report a clean apply — an
+  apparently applied deployment with no service and nothing that would retry.
+  Storage prep is now `groundkit-storage.service`, a `oneshot` with
+  `Restart=on-failure` that starts `groundkit.service` on success. It also
+  resolves the volume under three names, since a Xen instance renames the
+  requested `/dev/sdf` to `/dev/xvdf` and has neither the NVMe by-id link nor
+  the requested name.
+- **`data_volume_type` accepts only `gp3` and `gp2`, which is narrower than
+  "any block device type".** `io1`/`io2` require an `iops` argument this module
+  does not set and `st1`/`sc1` have a 125 GiB minimum the 20 GiB default
+  violates, so both fail at apply for a value the docs used to invite.
+  Supporting them means exposing and validating type-dependent size and IOPS.
 - **The Terraform module needs outbound HTTPS at boot, so a private subnet needs
   NAT.** Bootstrap installs docker from Amazon Linux's CDN and pulls the
   container image. `create_ssm_vpc_endpoints` carries the Session Manager
@@ -549,6 +606,42 @@ Everything below describes the state between the two.
   deployment needs a prebaked AMI, or `ecr.api`/`ecr.dkr` interface endpoints
   plus the `s3` gateway endpoint *and* a VPC-reachable package mirror — none of
   which this module builds (ADR-0020 decision 3).
+- **The Terraform module's embedding egress is derived, and two forms of
+  endpoint it cannot derive fail at `plan` rather than being supported.** The
+  standing egress rule is TCP 443; `embedding_base_url` adds a rule for its own
+  port when that is not 443, which is the documented case, since Ollama listens
+  on 11434. A host given as a **DNS name** cannot be turned into a CIDR at plan
+  time and needs `embedding_egress_cidr` supplied alongside it. An **IPv6**
+  endpoint is not supported at any port: the module writes `cidr_ipv4` rules
+  only, the standing HTTPS rule included, so "443 is already covered" is a
+  statement about IPv4 and nothing else. Both refuse loudly, which is the
+  intended trade — the alternative is an embed call that times out at the
+  security group on a deployment that applied cleanly.
+- **Three Terraform inputs are constrained to character classes because they are
+  written into files on the instance.** `container_image` and
+  `embedding_base_url` reach both the generated ingest helper and the systemd
+  unit; `collection` reaches the helper. They are single-quoted there, and the
+  classes — which exclude the single quote, `$`, backticks, backslashes and
+  whitespace — are what make that quoting a property rather than a convention.
+  `collection` mirrors `index/metadata.py`'s own pattern and `.`/`..` rejection,
+  so a name groundkit would refuse cannot reach an instance. A legitimate value
+  outside those classes is rejected at `plan`; `&` is deliberately still allowed.
+- **The Terraform deployment is x86_64 and `instance_type` is validated against
+  it.** The AMI filter selects `al2023-ami-2023.*-x86_64` and the container image
+  is built by a plain `docker build` on an amd64 runner, so it carries one
+  manifest. A Graviton instance type is refused at `plan` rather than by EC2 at
+  launch, and arm64 support is a multi-architecture image build rather than a
+  different value for that variable. A Graviton family the pattern does not
+  recognise falls through to EC2's own launch rejection, which is loud.
+
+  The conditions that produce those refusals are resource `precondition`
+  blocks, and **they have never executed.** `terraform validate` does not
+  evaluate a precondition and `terraform console` cannot reach one, so nothing
+  offline can. CI checks the state they reject rather than the rejection
+  itself — see `infra/terraform/aws-ec2/README.md`'s status table, where that
+  row is deliberately separate from the rows CI earned. The `instance_type`
+  refusal is a variable `validation` instead, which *is* reachable offline and
+  is checked directly.
 - **No groundkit image is published to any registry**, so the image reference in
   `deployment.yaml` is a placeholder that will not pull, and the Terraform
   module's `container_image` has no default.
@@ -571,11 +664,17 @@ Everything below describes the state between the two.
   template renders to a script that passes `bash -n`. The `infra` CI job covers
   what that machine could not — on this change's first run the image built, ran
   as uid 10001 under a read-only root, and all six pinned third-party tags
-  resolved — and it gates all of that on every pull request from now on. What
-  remains unrun: no container has served a request, no manifest has reached a
-  cluster, and `terraform validate` makes no API call, so a missing IAM
-  permission or an AMI filter matching nothing is invisible to it. A real
-  `compose up`, a cluster apply and a Terraform apply are the operator's to run.
+  resolved — and it gates all of that on every pull request from now on. It also
+  now evaluates the two things this module *derives* from string inputs, rather
+  than only proving they parse: the ECR-registry match that decides an IAM
+  attachment and a `docker login`, and the egress rule the embedding endpoint
+  needs. Both are checked with `terraform console`, which resolves locals and
+  `templatefile()` without a provider credential. What remains unrun: no
+  container has served a request, no manifest has reached a cluster, no
+  precondition has been evaluated, and `terraform validate` makes no API call,
+  so a missing IAM permission or an AMI filter matching nothing is invisible to
+  it. A real `compose up`, a cluster apply and a Terraform apply are the
+  operator's to run.
 
 ## Phase 5 caveats (the LLM boundary)
 

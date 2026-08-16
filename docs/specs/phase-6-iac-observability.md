@@ -45,9 +45,10 @@ Two things are **not** seated:
    create has to be created by something).
 4. A Terraform module for one concrete provider, with the provider choice
    recorded in an ADR before the module was written.
-5. OTel spans on `ingest` and `retrieve`, structured JSON logs carrying request
-   id, latency, result counts and typed failure codes, and neither carrying
-   document content or query text.
+5. OTel spans on `ingest`, `retrieve` **and `synthesize`** — all three of
+   SPEC.md §3's sites — structured JSON logs carrying request id, latency,
+   result counts and typed failure codes, and neither carrying document content
+   or query text.
 6. Every IaC path either **verified with the date recorded**, or explicitly
    marked **not yet verified** with the reason. SPEC.md §1.4 requires the first;
    SPEC.md §2 forbids inventing it, and §8's regression-test rule is the same
@@ -68,9 +69,18 @@ deployment guide, nav, and the CI job that gates the infra. **Nothing under
 touch.
 
 **Change 2 — instrumentation.** The `opentelemetry-api` base dependency, the
-`otel` extra, the tracer helper, spans on `Indexer.run` and `Retriever.search`,
-the JSON log formatter, the image gaining `--extra otel`, and the compose
-stack's first real trace. Rebased on `origin/main` immediately before it opens,
+`otel` extra, the tracer helper, spans on `Indexer.run`, `Retriever.search` and
+`Synthesizer.synthesize`, the JSON log formatter, the image gaining
+`--extra otel`, and the compose stack's first real trace.
+
+The third span site was originally deferred out of this phase, on the grounds
+that Phase 5 had not built it yet. It has: Phase 5 is done (SPEC.md §9) and this
+branch merged `main`, so `providers/synthesis.py` is in the tree. ADR-0022
+decision 5 withdraws the deferral, and change 2 owes all three sites — the
+synthesis span most carefully, since it is the one sitting next to prompt text,
+completion text and citation spans, none of which may become an attribute.
+
+Rebased on `origin/main` immediately before it opens,
 so Phase 5's landed work is integrated over rather than around.
 
 The cost of the split, stated so it is not mistaken for an oversight: **after
@@ -206,8 +216,8 @@ base rather than against the branch.
 
 Change 2 adds, under `src/`: `groundkit/telemetry.py` (tracer accessor and the
 typed-keyword attribute helper ADR-0022 decision 3 requires), a
-`logging.Formatter` subclass, spans in `indexer.py` and `retrieval/search.py`,
-and `--extra otel` in the image build.
+`logging.Formatter` subclass, spans in `indexer.py`, `retrieval/search.py` and
+`providers/synthesis.py`, and `--extra otel` in the image build.
 
 ## 6. Verification — what was executed, and what was not
 
@@ -261,9 +271,23 @@ only next to a row someone has actually run.
    That needs a cluster.
 5. **Terraform.** `terraform fmt -check` and `terraform init -backend=false &&
    terraform validate` are gated in CI and prove the module is well-formed and
-   its provider schema is satisfied. They do **not** prove it applies. A real
-   verification is an apply into a throwaway account, an SSM port-forward
-   session, and a search over the tunnel.
+   its provider schema is satisfied. They do **not** prove it applies.
+
+   What the module *derives* from its string inputs — the ECR-registry match
+   that decides an IAM attachment and a `docker login`, the egress rule the
+   embedding endpoint needs, and the rendered `bootstrap.sh.tftpl` — is checked
+   with `terraform console`, which resolves locals, variable validations and
+   `templatefile()` without configuring a provider. Those runs are local and
+   dated in `infra/terraform/aws-ec2/README.md`; they are **not gated**. A CI
+   job for them is parked on `chore/infra-ci-checks-parked` and was cut from
+   this change on purpose: it re-tests Terraform's own validation engine more
+   than it tests this module.
+
+   Nothing offline reaches a `precondition` — `validate` does not evaluate one
+   and `console` cannot — so every precondition in the module is unexecuted.
+   That, not the missing gate, is the module's real exposure, and only a real
+   verification closes it: an apply into a throwaway account, an SSM
+   port-forward session, and a search over the tunnel.
 
 CI gates 1, 4 (render only) and 5 on every pull request, so those three cannot
 rot silently. 2 and 3 need a running daemon and are the operator's to run.

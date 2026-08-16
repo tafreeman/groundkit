@@ -50,9 +50,12 @@ bounded by the operator's own machine.
 
 ### 0. Amendments after review
 
-Two claims in the first draft of this record were wrong in the same way — each described
-a capability the resources did not actually provide — and are corrected in place above
-rather than left for a reader to trip over:
+Every claim corrected here was wrong in one way: it described a capability the resources
+did not actually provide. They are corrected in place above rather than left for a reader
+to trip over. Note the shape of the class — each one applied, booted and passed a probe,
+and failed later at a distance from its cause.
+
+Round one:
 
 - `create_ssm_vpc_endpoints` was described as making a NAT-free subnet work. It covers
   the SSM control channel only; bootstrap still needs egress. See decision 3.
@@ -61,6 +64,56 @@ rather than left for a reader to trip over:
   module now detects an ECR reference in `container_image`, attaches
   `AmazonEC2ContainerRegistryReadOnly` only in that case, and authenticates in
   bootstrap. See decision 6.
+
+Round two, on the fixes themselves — two of the three are defects the round-one fixes
+introduced or made reachable, which is the argument for reviewing a fix as a change
+rather than as a correction:
+
+- **Egress was 443-only while the module rendered `--dense` into both the service unit
+  and the ingest helper.** Round one made the helper agree with the service; both then
+  agreed on an endpoint the security group blocked. See decision 3.
+- **Managed-policy ARNs were hardcoded to the `aws` partition, and the ECR host matcher
+  stopped at `.amazonaws.com`.** Both are inert in the commercial partition and both fail
+  in GovCloud or China — the ARN at role creation, the matcher by silently skipping the
+  login it exists to perform. The ECR matcher is round one's own code. See decision 6.
+- **The service unit ordered itself after the data mount without requiring it.** With
+  `nofail` in fstab — which decision 2 requires, since there is no SSH to fall back on —
+  a reboot where the volume does not attach started the service anyway and let docker
+  create the bind-mount paths on the root disk. `RequiresMountsFor=/srv/groundkit` now
+  makes the dependency real, and bootstrap verifies the mount before creating anything
+  under it. The instance still boots and SSM still works; only the service fails, with
+  the mount named in `systemctl status`.
+
+Round three, both findings against round two's own fixes. The pattern has now repeated
+three times and is worth stating as a rule rather than an observation: **a fix is a
+change and inherits the full review a change gets.** Round one's ECR matcher carried the
+partition defect; round two's egress fix carried the IPv6 defect.
+
+- **The IPv6 rejection was derived from the port.** It rode on the same "does this need a
+  rule?" flag as the CIDR check, and that flag is false at 443 — so an HTTPS IPv6 literal
+  skipped the rejection entirely and applied onto a security group with no IPv6 egress at
+  all. Now independent of port. See decision 3.
+- **`instance_type` was an unrestricted string over a single-architecture deployment.**
+  The AMI filter selects `x86_64` and the container image is built by a plain
+  `docker build` on an amd64 runner, so a Graviton type produced a module that cannot
+  apply. Refused at the input rather than accommodated by selecting an arm64 AMI, because
+  the *image* is the binding constraint: an arm64 host would boot, pass its SSM check and
+  then fail to pull, moving a loud EC2 launch rejection into a silent bootstrap failure.
+  See decision 7.
+- **The ingest helper was written by a `sed` pass over placeholders, and `sed` gives its
+  replacement text its own syntax.** An unescaped `&` there means "the whole match", so an
+  `embedding_base_url` carrying a query string wrote the literal token
+  `EMBED_PLACEHOLDER` into the helper while the systemd unit, built by ordinary
+  interpolation, kept the real URL. That is round one's defect through a different door —
+  the helper and the service disagreeing about the endpoint, ending in an ADR-0008
+  refusal that names an index inconsistency rather than its cause. The placeholders and
+  the `sed` pass are gone: the helper is interpolated like everything else, which removes
+  the escaping question instead of answering it. See decision 8.
+- **`create_ssm_vpc_endpoints` hardcoded `ec2messages` into a strict data source.** A
+  service name a region does not offer is an error, and a failing data source fails the
+  whole plan — so an optional endpoint the AL2023 agent does not even use could take the
+  module down. Now `ssm_vpc_endpoint_services`, defaulting to the two that agent uses.
+  See decision 3.
 
 ### 1. The provider is AWS, and the shape is one EC2 instance with an attached EBS volume
 
@@ -95,17 +148,55 @@ This is the decision that makes the module honest. A module with a
 publish an unauthenticated corpus, and the variable's existence would read as
 endorsement. There is no such variable, and adding one is a change to this record.
 
-### 3. Egress is restricted to HTTPS, and a private subnet is supported without NAT
+### 3. Egress is HTTPS plus the configured embedding endpoint, and a private subnet wants NAT
 
-The security group's only egress rule is TCP 443. That is what SSM, container registry
-pulls and package installation need; nothing else in the deployed system makes an
-outbound connection, because the embedding endpoint is an input (decision 5) rather than
-a default reaching out to the internet.
+The standing egress rule is TCP 443 to `0.0.0.0/0`. That is what SSM, container registry
+pulls and package installation need.
 
-`create_ssm_vpc_endpoints` (default `false`) creates the three interface endpoints —
-`ssm`, `ssmmessages`, `ec2messages` — that let the **agent** reach Systems Manager
-without a NAT gateway or an internet gateway. It defaults off because an account that
-already has them, or already has NAT, would otherwise pay twice.
+It is **not** all the deployed system needs, which this record originally got wrong by
+reasoning from the wrong half of decision 5. The embedding endpoint being an input rather
+than a default means the module does not reach out to the internet on its own — it does
+not mean nothing is reached. When `embedding_base_url` is set, the instance dials it on
+every ingest and every dense or hybrid request, and Ollama's default port is 11434. A
+443-only group let that configuration plan, apply and boot, and then time out at the
+security group on the first embed call, with the service's own logs showing an
+unreachable endpoint rather than a rule that forbade it.
+
+The rule is therefore derived from the URL — host and port parsed out, one additional
+egress rule when the port is not 443, scoped to that endpoint rather than widening the
+standing rule. Derived rather than configured because a separate `embedding_port` input
+is a second thing that has to agree with the first. Two cases cannot be derived and both
+fail at `plan` with the reason named: a DNS-name host (nothing here resolves it, so
+`embedding_egress_cidr` supplies the CIDR) and an IPv6 endpoint (this module writes
+`cidr_ipv4` rules only). Failing at plan is the point — the alternative is a timeout on a
+deployment that applied cleanly.
+
+**The IPv6 rejection is independent of the port, and briefly was not.** The first version
+of it rode on the same "does this need a rule?" flag as the CIDR check, which is false at
+port 443 because the standing rule covers that port. That reasoning is only true for
+IPv4. An `https://[2001:db8::10]` endpoint therefore skipped the rejection, created no
+rule, and applied cleanly onto a security group whose every rule — the standing one
+included — is `cidr_ipv4`. An address family is not a function of a port, and deriving
+one from the other reintroduced precisely the silent timeout this decision exists to
+remove.
+
+This is also the one outbound destination that carries query text, so it gets its own
+rule and its own description rather than being absorbed into a broader one.
+
+`create_ssm_vpc_endpoints` (default `false`) creates the interface endpoints that let the
+**agent** reach Systems Manager without a NAT gateway or an internet gateway. It defaults
+off because an account that already has them, or already has NAT, would otherwise pay
+twice.
+
+Which endpoints is `ssm_vpc_endpoint_services`, defaulting to `ssm` and `ssmmessages`,
+and it was a hardcoded three including `ec2messages`. Two facts make that the wrong
+default. `ec2messages` is the legacy channel — the SSM agent shipped on the AL2023 image
+this module pins uses `ssm` and `ssmmessages` — and it is not offered in every region.
+The second fact is the one with teeth: `data.aws_vpc_endpoint_service` errors on a
+service the region does not offer, and a failing data source fails **the entire plan**,
+not the one endpoint. So an optional convenience could take the whole module down over an
+endpoint the deployment had no use for. An operator running an older agent adds it back
+through the variable, in a region they have confirmed offers it.
 
 **It does not make a subnet with no egress work, and this record originally implied it
 did.** Bootstrap installs docker from Amazon Linux's CDN and pulls a container image;
@@ -174,6 +265,73 @@ a deployment pulling from a public registry never receives ECR permissions at al
 The registry and region come from the image reference rather than from
 `data.aws_region`, so a cross-region pull is expressed by writing the cross-region
 reference and needs no second variable.
+
+**The matcher and the policy ARNs are partition-aware, and were not.** A private ECR
+registry in `cn-north-1` or `cn-northwest-1` is `<account>.dkr.ecr.<region>.amazonaws.com.cn`,
+which a matcher ending at `.amazonaws.com` does not match — so in the one partition where
+an operator is least able to shrug it off, the module skipped both the policy attachment
+and the `docker login`, and the pull failed exactly the way this decision exists to
+prevent. The AWS-managed policy ARNs had the partition hardcoded as `aws` for the same
+reason: nothing in the commercial partition can tell. Both now derive from
+`data.aws_partition.current`, which is the same reasoning that already sent the VPC
+endpoint service names through a data source rather than string interpolation.
+
+What this does **not** claim: that the module has been applied in GovCloud or China. It
+has not been applied anywhere — see `infra/README.md`'s status table. These two fixes
+remove two known-wrong strings; they are not a statement that the remaining ones are
+right, and the EC2 service principal in the assume-role policy is the next thing a reader
+should check before trying it.
+
+### 7. The deployment is x86_64, and `instance_type` is validated rather than accommodated
+
+The AMI data source filters `al2023-ami-2023.*-x86_64`. `instance_type` was an
+unrestricted string, so an ARM family — `t4g.small`, say — produced a module that could
+not apply: EC2 rejects a launch whose instance architecture and image architecture
+disagree.
+
+The interesting part is which of the two knobs to turn. Selecting the AMI architecture
+*from* the instance type is the more capable answer and is the wrong one here, because the
+AMI is not the binding constraint. `infra/docker/Dockerfile` is built by CI with a plain
+`docker build` on an amd64 runner, so the image has a single manifest. An arm64 instance
+with a correctly-matched arm64 AMI would launch, boot, register with SSM, and then fail at
+`docker pull` inside bootstrap under `set -e` — which is this module's signature failure:
+an instance that looks healthy and serves nothing. Deriving the AMI would have converted a
+loud, immediate, well-worded EC2 error into a silent one three layers down.
+
+So the input is validated instead, and the error message names the two reasons and says
+what would actually be needed. Supporting arm64 is a multi-architecture image build plus
+this filter, in that order — not a different value for this variable.
+
+The validation matches Graviton families (`a1`, and any family carrying a `g` in the
+suffix after the generation digit) and deliberately does not match `g4dn`/`g6`, where the
+`g` is the family letter and the instance is x86. A family it fails to recognise falls
+through to EC2's own rejection, which is the pre-existing behaviour and is loud.
+
+### 8. Operator-supplied strings are constrained at the input, and the generated files interpolate rather than substitute
+
+Three inputs are written into files on the instance: `container_image` and
+`embedding_base_url` into both the ingest helper and the systemd unit, and `collection`
+into the helper. Two things now hold about that, and neither did.
+
+**Interpolation, not substitution.** The helper used to be written as a heredoc full of
+`IMAGE_PLACEHOLDER`-style tokens and then rewritten by `sed`. That is a second escaping
+context nobody asks for: `&` in a `sed` replacement means the matched text, `|` was the
+delimiter, and a backslash escapes. Terraform substitutes these values when it renders
+the template, long before the instance's shell sees anything, so the placeholders bought
+nothing and cost an injection surface. The quoted heredoc stays — it is what keeps `$@`
+literal when the file is written — but the values arrive already interpolated.
+
+**A character class per input, not a quoting convention.** The values are single-quoted
+in the generated script, and `collection`, `container_image` and `embedding_base_url` are
+validated against classes that exclude the single quote, `$`, backticks, backslashes and
+whitespace. Quoting alone would be a convention that the next edit to this template can
+silently drop; the validation is what makes it a property. `collection` deliberately
+mirrors `index/metadata.py`'s `_COLLECTION_NAME_PATTERN` and its `.`/`..` rejection, so a
+name the application itself would refuse cannot reach an instance and fail there instead.
+
+`&` remains legal in `embedding_base_url` — it is ordinary in a query string, and with
+`sed` gone it is ordinary here too. The rule is about shell and template metacharacters,
+not about punctuation in general.
 
 ## Alternatives considered
 

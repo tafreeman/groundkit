@@ -137,19 +137,32 @@ Human-readable formatting stays the default for a terminal; JSON is opt-in
 started printing JSON to a developer's terminal would be a regression in the tool's
 primary use.
 
-### 5. `ingest` and `retrieve` are instrumented in Phase 6; `synthesize` is deferred to the phase that builds it
+### 5. All three of SPEC.md §3's span sites are instrumented in Phase 6
 
-SPEC.md §3 names three span sites. Two exist: `Indexer.run` and `Retriever.search`.
-The third does not — query rewrite and cited synthesis are Phase 5, under construction
-concurrently with this phase.
+SPEC.md §3 names three: `ingest`, `retrieve`, `synthesize`. All three exist —
+`Indexer.run`, `Retriever.search`, and `Synthesizer.synthesize` — and Phase 6's
+instrumentation change covers all three.
 
-Instrumenting a module that does not exist is not possible, and instrumenting one that is
-being written concurrently means guessing at a seam whose shape is not settled. Phase 6
-therefore ships the two real span sites and a documented seam — the same tracer helper,
-the same attribute allowlist — for the third. The gap is recorded in
-KNOWN_LIMITATIONS.md rather than left for a reader to infer from a missing span in
-Jaeger, and closing it is an obligation on whichever phase lands synthesis, in the way
-ADR-0001's hazard list is an obligation on the phase that ports each defect.
+**This decision originally deferred the third, and that deferral is withdrawn rather
+than reworded.** It was written while Phase 5 was under construction concurrently, and
+its reasoning was sound then: instrumenting a module that does not exist is impossible,
+and guessing at a seam still being written is worse than waiting. Phase 5 then landed
+(SPEC.md §9 records it done 2026-08-15) and this branch merged `main`, so
+`src/groundkit/providers/synthesis.py` has been present in this very tree since that
+merge. The premise expired without the text changing, which is the failure mode to
+notice: a deferral justified by "it does not exist yet" has a shelf life, and nothing
+about merging the thing into existence makes the record update itself.
+
+Left as written, the consequence was concrete rather than cosmetic — the outstanding
+instrumentation change would have read an accepted ADR telling it to skip the
+`synthesize` span, and Phase 6 would have closed at two-thirds of a SPEC.md §3
+requirement by following its own documentation.
+
+The seam is settled and public: `async Synthesizer.synthesize(query, results) ->
+SynthesizedAnswer`. The span's attributes come from the same allowlist as the other two
+(decision 3), which matters more here than anywhere else: a synthesis span sits closest
+to prompt text, completion text and citation spans, and **none of those may become an
+attribute.** Result count, model identity, latency and a typed failure code may.
 
 ## Alternatives considered
 
@@ -192,9 +205,11 @@ ADR-0001's hazard list is an obligation on the phase that ports each defect.
   change lands. That ordering is deliberate — the topology is one change, the emission is
   the next — and both the compose README and the phase spec say so rather than implying
   a working trace pipeline.
-- `synthesize` spans do not exist in Phase 6. SPEC.md §3's three-site list is
-  therefore satisfied two-thirds, stated in KNOWN_LIMITATIONS.md as a named gap with an
-  owner phase.
+- SPEC.md §3's three-site list is satisfied in full by Phase 6's instrumentation change,
+  `synthesize` included. That was not the original plan — see decision 5 for why the
+  deferral was withdrawn — and it means the change carries a span over a module whose
+  inputs and outputs are the most sensitive in the codebase. The allowlist is what keeps
+  that safe, so it is the part of this ADR to read before writing that span.
 - The allowlist means a trace cannot answer "which query was slow" — only "a query
   against collection X in hybrid mode returning N results was slow." That is a real loss
   of debugging power and it is the intended trade; DEBUG logs, which stay in-process,

@@ -22,20 +22,63 @@ The instance needs **outbound HTTPS during bootstrap**: it installs docker from
 Amazon Linux's CDN and pulls the container image. A private subnet therefore
 wants a NAT gateway.
 
-`create_ssm_vpc_endpoints` is **not** a substitute. It creates the
-`ssm`/`ssmmessages`/`ec2messages` endpoints, which carry the Session Manager
-control channel and nothing else; neither the package repository nor a container
-registry is reachable through them. Set it on an otherwise egress-free subnet
-and you get an instance you can open a session to, running no service, because
-`set -e` ended bootstrap at `dnf install`. A genuinely egress-free deployment
-needs an AMI with docker and the image baked in, or `ecr.api` + `ecr.dkr`
-interface endpoints plus the `s3` gateway endpoint *and* a VPC-reachable package
-mirror — none of which this module builds.
+`create_ssm_vpc_endpoints` is **not** a substitute. It creates the endpoints in
+`ssm_vpc_endpoint_services` — by default `ssm` and `ssmmessages` — which carry
+the Session Manager control channel and nothing else; neither the package
+repository nor a container registry is reachable through them. Set it on an
+otherwise egress-free subnet and you get an instance you can open a session to,
+running no service, because `set -e` ended bootstrap at `dnf install`. A
+genuinely egress-free deployment needs an AMI with docker and the image baked
+in, or `ecr.api` + `ecr.dkr` interface endpoints plus the `s3` gateway endpoint
+*and* a VPC-reachable package mirror — none of which this module builds.
+
+`ec2messages` is **not** in the default set. It is the legacy channel — the SSM
+agent on the AL2023 image this module pins uses `ssm` and `ssmmessages` — and it
+is not offered in every region. `data.aws_vpc_endpoint_service` errors on a
+service its region does not offer, and that error fails the whole `plan` rather
+than the one endpoint, so including it by default let an optional convenience
+break a deployment that never needed it. Add it back through the variable if you
+run an older agent, in a region you have confirmed offers it.
+
+## The dense path needs an egress rule, and it is derived from the URL
+
+The security group's standing egress rule is TCP 443. Setting
+`embedding_base_url` adds a second rule for that endpoint's port when it is not
+443 — which is the usual case, because Ollama listens on **11434**. Without it
+the module planned, applied and booted a deployment configured for dense
+retrieval whose every embed call timed out at the security group.
+
+Host and port are parsed from the URL rather than taken as separate inputs. Two
+cases cannot be derived, and both fail at `plan` naming the reason rather than at
+request time with a timeout:
+
+| `embedding_base_url` | What you need |
+|---|---|
+| empty | nothing — BM25-only, no rule |
+| `https://embed.internal` (port 443) | nothing — the standing rule covers it |
+| `http://10.0.0.5:11434` | nothing — an IPv4 literal is its own `/32` |
+| `http://ollama.internal:11434` | `embedding_egress_cidr` — a DNS name resolves on the instance, not here |
+| any IPv6 endpoint, **any port** | refused at `plan`; this module writes `cidr_ipv4` rules only |
+| a query string, `#fragment`, or `user:pw@` | refused at `plan` — `utils/url_safety.validate_endpoint_shape` refuses all three, so accepting them here would provision an instance whose service fails at startup |
+
+The IPv6 refusal does not depend on the port, and that is load-bearing rather than
+pedantic: the standing HTTPS rule is `cidr_ipv4 = 0.0.0.0/0`, which does not
+carry IPv6 either. "Port 443 is already covered" is only true of IPv4.
+
+## x86_64 only, and `instance_type` is checked against it
+
+The AMI filter selects `al2023-ami-2023.*-x86_64` and the container image is
+built by a plain `docker build` on an amd64 runner, so a Graviton
+`instance_type` is refused by this module rather than by EC2 at launch. Adding
+arm64 means a multi-architecture image build first; it is not a different value
+for that variable. `g4dn` and `g6` are x86 despite the leading `g` and are
+accepted.
 
 ## Private ECR images work, and that is not automatic
 
 The `container_image` reference is matched against the private-ECR host pattern
-(`<account>.dkr.ecr.<region>.amazonaws.com/…`). When it matches, the role gains
+(`<account>.dkr.ecr.<region>.amazonaws.com/…`, and `.amazonaws.com.cn` in the
+China partition). When it matches, the role gains
 `AmazonEC2ContainerRegistryReadOnly` and bootstrap runs `aws ecr
 get-login-password | docker login` against that registry and region. When it
 does not — `ghcr.io`, Docker Hub, `public.ecr.aws`, all of which pull
@@ -101,7 +144,10 @@ sudo systemctl restart groundkit
 ```
 
 `groundkit-ingest` is rendered with the **same** embedding arguments as the
-service unit, from the same `embedding_base_url` input. That matters: a
+service unit, from the same `embedding_base_url` input, by the same Terraform
+interpolation — the helper is no longer assembled by a `sed` pass over
+placeholders, where an `&` in the URL corrupted the helper while the unit kept
+the real value. That matters: a
 BM25-only ingest feeding a `--dense` service produces a collection with no
 vectors and no embedding-identity manifest, so every dense and hybrid request is
 refused ([ADR-0008](../../../docs/adr/ADR-0008-dense-search-requires-a-dense-collection.md))
@@ -124,16 +170,18 @@ nothing. Ingest before concluding the deployment works.
 |---|---|---|---|
 | `name` | string | `groundkit` | Resource name prefix. |
 | `vpc_id` | string | — | Required. |
-| `subnet_id` | string | — | Required; a private subnet is the intended shape. |
+| `subnet_id` | string | — | Required; must be in `vpc_id` (checked at `plan`); a private subnet is the intended shape. |
 | `container_image` | string | — | Required; nothing is published. |
-| `instance_type` | string | `t3.small` | Memory is the dimension that matters — see below. |
+| `instance_type` | string | `t3.small` | **x86_64 only** — validated. Memory is the dimension that matters, see below. |
 | `root_volume_size_gb` | number | `20` | Encrypted. |
 | `data_volume_size_gb` | number | `20` | Encrypted; grows with the corpus, not with a fixed overhead. |
-| `data_volume_type` | string | `gp3` | Must stay a block type — ADR-0020 decision 1. |
+| `data_volume_type` | string | `gp3` | `gp3` or `gp2` only — io1/io2 need `iops`, st1/sc1 have a 125 GiB minimum. |
 | `collection` | string | `default` | Used by the `groundkit-ingest` helper. |
-| `embedding_base_url` | string | `""` | Empty runs the BM25-only path. |
-| `host_port` | number | `8765` | Loopback publish and SSM forward target. |
+| `embedding_base_url` | string | `""` | Empty runs the BM25-only path; otherwise the egress rule is derived from it. |
+| `embedding_egress_cidr` | string | `""` | Only for a DNS-name endpoint off 443 — see above. |
+| `host_port` | number | `8765` | Loopback publish and SSM forward target; a whole number in 1-65535. |
 | `create_ssm_vpc_endpoints` | bool | `false` | SSM control channel only; not a NAT replacement. |
+| `ssm_vpc_endpoint_services` | list(string) | `["ssm","ssmmessages"]` | Which endpoints that creates. `ec2messages` is opt-in — see above. |
 | `tags` | map(string) | `{}` | Merged onto everything. |
 
 Sizing note: `BM25Index.from_store()` rebuilds postings **in memory at every
@@ -168,18 +216,39 @@ instance runs out of memory, the corpus outgrew it — not the traffic.
 |---|---|
 | `terraform fmt -check -recursive` | **passed 2026-08-16** |
 | `terraform validate`, AWS provider 6.60.0 | **passed 2026-08-16** |
-| `terraform validate`, AWS provider 5.100.0 (the declared floor's major) | **passed 2026-08-15** |
+| `terraform validate`, AWS provider 5.100.0 (the declared floor's major) | **passed 2026-08-16** |
 | `bootstrap.sh.tftpl` renders for both the ECR/dense and public/BM25 cases; both pass `bash -n` | **passed 2026-08-16** |
 | Rendered systemd unit emits single-backslash continuations | **passed 2026-08-15** |
-| Rendered `groundkit-ingest` carries the service's embedding arguments | **passed 2026-08-16** |
-| ECR detection matches private ECR (incl. GovCloud) and not ghcr/Docker Hub/`public.ecr.aws` | **passed 2026-08-16** |
+| Rendered unit carries `RequiresMountsFor=/srv/groundkit`; bootstrap refuses an unmounted `/srv/groundkit` before creating anything under it | **passed 2026-08-16** |
+| Rendered `groundkit-ingest` carries the service's embedding arguments, and the unit carries the same endpoint | **passed 2026-08-16** |
+| A `%` in the endpoint URL renders `%%` in the unit and stays `%` in the helper | **passed 2026-08-16** |
+| Storage prep renders as a retrying oneshot and resolves the Xen `/dev/xvdf` name; the script it writes passes `bash -n` | **passed 2026-08-16** |
+| ECR detection matches private ECR in the commercial, GovCloud and China partitions, and not ghcr/Docker Hub/`public.ecr.aws` | **passed 2026-08-16** |
+| Egress derivation classifies sixteen `embedding_base_url` forms, including an IPv6 host flagged at every port | **passed 2026-08-16** |
+| The input validations reject what they claim to — Graviton types, shell metacharacters, bad ports, query/fragment/userinfo | **passed 2026-08-16** |
+| The three security-group **preconditions** actually reject | **not yet run** — needs a plan |
 | `terraform plan` against a real account | **not yet run** |
 | `terraform apply`, SSM session, a search over the tunnel | **not yet run** |
 
 `validate` proves the configuration is well-formed and satisfies the provider's
 schema. It does **not** prove the module applies: it makes no API calls, so an
 IAM permission that is missing, an instance type unavailable in the region, or
-an AMI filter that matches nothing are all invisible to it. The last two rows
-are what would close that, and neither has been run — see
+an AMI filter that matches nothing are all invisible to it. The last three rows
+are what would close that, and none has been run — see
 `docs/specs/phase-6-iac-observability.md` §6 for the environment that made the
 difference.
+
+Everything above the "not yet run" rows was executed locally on 2026-08-16 with
+`terraform console`, which resolves locals, variable validations and
+`templatefile()` without configuring a provider — so it needs no credential.
+**None of it is gated.** These are point-in-time local runs, not a check that
+would contradict them if they stopped being true. A CI gate for exactly these
+derivations exists and is parked on `chore/infra-ci-checks-parked` rather than
+shipped here: it re-tests Terraform's own validation engine more than it tests
+this module, and it is not where the module's real risk lies.
+
+That risk is the last three rows. `validate` and `console` make no API call, and
+a `precondition` is reachable by neither — so a missing IAM permission, an
+instance type unavailable in the region, an AMI filter matching nothing, and
+every precondition here are all still unproven. A mocked test suite would not
+change that; a `plan` against an account would.

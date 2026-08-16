@@ -58,7 +58,9 @@ terraform/aws-ec2/         ADR-0020's module
 
 ## Quick starts
 
-**Compose** (needs a Docker daemon; nothing else, and no credentials):
+**Compose** (needs a Docker daemon; nothing else, and no credentials). The first
+command waits on Ollama's healthcheck rather than merely on its container, so a
+cold stack does not race the daemon's listener:
 
 ```bash
 docker compose -f infra/compose/docker-compose.yml --profile setup run --rm ollama-pull
@@ -87,6 +89,11 @@ kubectl -n groundkit wait --for=condition=Ready pod/groundkit-corpus-loader
 kubectl -n groundkit cp ./docs groundkit-corpus-loader:/data/corpus
 kubectl -n groundkit delete pod groundkit-corpus-loader
 
+# Delete first, always. A Job's pod template is immutable, so `apply` over a
+# completed one creates no pod and changes nothing — and the `wait` below then
+# returns instantly on the OLD completion. Within the hour before its TTL
+# collects it, re-running the ingest without this line silently ingests nothing.
+kubectl -n groundkit delete job/groundkit-ingest --ignore-not-found
 kubectl apply -k infra/k8s/ingest
 kubectl -n groundkit wait --for=condition=complete job/groundkit-ingest --timeout=10m
 
@@ -105,7 +112,9 @@ and stalls in the real one.
 The instance needs outbound HTTPS during bootstrap — it installs docker and
 pulls the image — so a private subnet wants a NAT gateway.
 `create_ssm_vpc_endpoints` covers the SSM control channel only and does **not**
-make an egress-free subnet work.
+make an egress-free subnet work. Setting `embedding_base_url` adds an egress rule
+for that endpoint derived from the URL; a DNS-name host on a non-443 port also
+needs `embedding_egress_cidr`, and says so at `plan` rather than at request time.
 
 ## Traces: the stack is wired, and nothing emits yet
 
@@ -177,8 +186,11 @@ that job exists rather than being a formality.
 | compose | a groundkit span visible in Jaeger | **blocked** — needs the instrumentation change |
 | k8s | `kubectl kustomize` renders; every manifest parses as YAML | **passed 2026-08-15** |
 | k8s | `apply -k`, Job completes, Deployment Ready, port-forward serves | **not yet run** |
-| terraform | `fmt -check`, `validate` on providers 5.100.0 and 6.60.0 | **passed 2026-08-15** |
-| terraform | `bootstrap.sh.tftpl` renders; rendered script passes `bash -n` | **passed 2026-08-15** |
+| terraform | `fmt -check`, `validate` on providers 5.100.0 and 6.60.0 | **passed 2026-08-16** |
+| terraform | `bootstrap.sh.tftpl` renders; rendered script passes `bash -n` | **passed 2026-08-16** |
+| terraform | ECR, egress and instance-architecture inputs classify correctly | **passed 2026-08-16** |
+| compose | the one-shots gate on Ollama's healthcheck, `serve` deliberately does not | **passed 2026-08-16** |
+| terraform | the security-group preconditions actually reject | **not yet run** — needs a plan |
 | terraform | `plan` / `apply` against a real account | **not yet run** |
 
 What the passing rows do **not** cover, so a full column of green is not read as
