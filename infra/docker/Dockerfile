@@ -42,7 +42,7 @@ WORKDIR /src
 # hatchling reads them when the project itself is built in the next step.
 COPY pyproject.toml uv.lock README.md LICENSE ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev --no-install-project --extra dense
+    uv sync --locked --no-dev --no-install-project --extra dense --extra otel
 
 # Then the project. `--no-editable` installs a real copy into site-packages, so
 # the runtime stage needs no source tree on the path and `/src` is discarded
@@ -52,9 +52,16 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # topology includes Ollama, so the vector store has to be present for that
 # topology to mean anything; torch is multiple gigabytes for a capability
 # `Retriever.search` cannot reach at all (ADR-0012 decision 2).
+#
+# `--extra otel`: ADR-0022 decision 1. `opentelemetry-api` is already a base
+# dependency, so every instrumentation site works with no extra installed at
+# all — spans are just non-recording. This image is meant to actually ship
+# them, so it carries the SDK and OTLP exporter that make that true; the
+# compose stack's collector is what it exports to (ADR-0022 decision 2,
+# docker-compose.yml).
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev --no-editable --extra dense
+    uv sync --locked --no-dev --no-editable --extra dense --extra otel
 
 
 # -- runtime ---------------------------------------------------------------

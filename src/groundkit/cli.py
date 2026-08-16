@@ -102,6 +102,7 @@ from groundkit.runtime import CollectionRegistry
 # and never about availability.
 from groundkit.service.binding import DEFAULT_SERVE_HOST, DEFAULT_SERVE_PORT, ensure_bindable_host
 from groundkit.service.tools import ServiceContext
+from groundkit.telemetry import configure_logging, configure_tracing
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -135,7 +136,25 @@ _CHAT_FLAG_ATTRS: tuple[str, ...] = (
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Parse arguments and dispatch. Returns a process exit code."""
+    """Parse arguments and dispatch. Returns a process exit code.
+
+    ``configure_logging()`` runs first, before argument parsing touches
+    anything: it is what makes ``GROUNDKIT_LOG_FORMAT=json`` mean anything
+    anywhere else in the process, including inside argument parsing errors
+    argparse itself might print. It is idempotent, so nothing here is
+    order-sensitive with respect to other callers of ``main`` within the same
+    process (e.g. a test harness invoking it repeatedly).
+
+    ``configure_tracing()`` follows it, and is equally load-bearing: it is
+    the call that installs an SDK tracer provider, and without it every span
+    in this package is non-recording no matter how the ``OTEL_*``
+    environment is set (see :func:`~groundkit.telemetry.configure_tracing`).
+    It runs before dispatch so the spans opened inside a command are
+    recorded, and it no-ops unless the environment actually asks for export —
+    a plain ``grk search`` makes no network call because of it.
+    """
+    configure_logging()
+    configure_tracing()
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command is None:
@@ -596,6 +615,7 @@ async def _cmd_ingest(args: argparse.Namespace) -> int:
             FileLoader(allowed_base_dir=base_dir),
             embedder=embedder,
             vector_store=vector_store,
+            collection=args.collection,
         )
         if path.is_dir():
             report = await indexer.index_directory(str(path))
@@ -635,7 +655,11 @@ async def _cmd_search(args: argparse.Namespace) -> int:
         if args.mode != "bm25":
             embedder, vector_store = await _open_dense_deps(args)
         retriever = await Retriever.open(
-            store, RetrievalConfig(), embedder=embedder, vector_store=vector_store
+            store,
+            RetrievalConfig(),
+            embedder=embedder,
+            vector_store=vector_store,
+            collection=args.collection,
         )
         response = await retriever.search(args.query, top_k=args.top_k, mode=args.mode)
     finally:
@@ -676,7 +700,11 @@ async def _cmd_answer(args: argparse.Namespace) -> int:
         if args.mode != "bm25":
             embedder, vector_store = await _open_dense_deps(args)
         retriever = await Retriever.open(
-            store, RetrievalConfig(), embedder=embedder, vector_store=vector_store
+            store,
+            RetrievalConfig(),
+            embedder=embedder,
+            vector_store=vector_store,
+            collection=args.collection,
         )
         chat = build_chat(_resolve_chat_config(args))
         pipeline = AnswerPipeline(

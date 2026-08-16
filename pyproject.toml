@@ -42,6 +42,16 @@ dependencies = [
   # StreamableHTTPSessionManager on the FastAPI app). A lower floor would
   # advertise compatibility nothing checks.
   "mcp>=1.29,<2",
+  # OTel's own base/extra split (Phase 6, ADR-0022 decision 1): the API is pure
+  # Python with no transport, and with no SDK configured every span it creates
+  # is non-recording — no export, no collector, no error. Putting it here means
+  # instrumentation sites (telemetry.py and the ingest/retrieve/synthesize span
+  # sites) import it unconditionally, with no guarded import and no
+  # hand-rolled no-op shim to keep in signature parity by hand — this repo
+  # already has a written position on exactly that failure mode
+  # (tests/test_protocol_conformance.py). The SDK and OTLP exporter that
+  # actually ship a span live in the `otel` extra below.
+  "opentelemetry-api>=1.27,<2",
 ]
 
 [project.urls]
@@ -71,6 +81,26 @@ dense = [
 rerank = [
   "sentence-transformers>=3,<6",
 ]
+# Tracing SDK + OTLP exporters (Phase 6, ADR-0022 decision 1). `opentelemetry-api`
+# stays a base dependency above so instrumentation sites need no guarded
+# imports; this extra is what makes a span actually export anywhere. Both wire
+# protocols ship together rather than as separate extras: `OTEL_EXPORTER_OTLP_PROTOCOL`
+# picks between them at runtime (`configure_tracing`), and a two-extra split
+# would just move the same "which protocol does my collector speak" question
+# from configuration time to install time. Pinned in the dev group below too,
+# for the same reason `dense` is pinned there: the instrumentation tests need
+# the SDK's `InMemorySpanExporter` to assert a span was recorded and that the
+# attribute allowlist (decision 3) holds at runtime, and need both exporter
+# packages importable to prove `configure_tracing` actually selects between
+# them rather than only claiming to — a test that silently skips because a
+# package is absent proves nothing, which is the same principle behind
+# SPEC.md §3's rule that no job which is the sole proof of a backend may be
+# continue-on-error.
+otel = [
+  "opentelemetry-sdk>=1.27,<2",
+  "opentelemetry-exporter-otlp-proto-http>=1.27,<2",
+  "opentelemetry-exporter-otlp-proto-grpc>=1.27,<2",
+]
 
 [project.scripts]
 grk = "groundkit.cli:main"
@@ -84,6 +114,9 @@ dev = [
   "pip-audit>=2.7,<3",
   "pre-commit>=4,<6",
   "lancedb>=0.13,<1",
+  "opentelemetry-sdk>=1.27,<2",
+  "opentelemetry-exporter-otlp-proto-http>=1.27,<2",
+  "opentelemetry-exporter-otlp-proto-grpc>=1.27,<2",
 ]
 # Docs site (Phase 7). A separate group, not part of `dev`: the docs build is
 # its own CI job and its own gate, and every other job — lint, typecheck, the
@@ -204,6 +237,24 @@ precision = 2
 #    omission causes silent staleness is ungoverned by this gate, and
 #    `test_metadata_store.py`'s parameterized bump test plus its protocol
 #    classification guard are what stand in for it.
+#
+# 4. `telemetry.py` (Phase 6, ADR-0022) sits at the package root exactly like
+#    `runtime.py` above, so no glob here catches it either — and note 3's own
+#    entry is the precedent that a root module is added HERE, explicitly, when
+#    it belongs. This is the other side of that precedent: telemetry.py is
+#    deliberately left OUT, and the omission is argued rather than left
+#    silent, because an omission with no reasoning breaks this file's
+#    convention just as much as an entry without one.
+#
+#    Note 3 argues runtime.py's inclusion on a specific test: whether a module
+#    decides an answer is correct or current. telemetry.py fails that test in
+#    the direction that keeps it out — a tracer's absence changes no answer
+#    (ADR-0022 decision 1). With no `otel` extra installed, every span it
+#    creates is non-recording: no export, no config, no error, and nothing
+#    about what `grk search` returns changes. With the extra installed, the
+#    module still decides nothing about the response — only what gets shipped
+#    to a collector alongside it. It is covered by the whole-package 80% gate
+#    instead, the same treatment `service/` gets for the same reason.
 [tool.groundkit.coverage]
 core_subset = [
   "src/groundkit/retrieval/*",            # search orchestration + citation resolution

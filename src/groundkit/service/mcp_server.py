@@ -279,12 +279,21 @@ async def _dispatch(
         rendering = check_collection(ctx.index_dir, collection)
         if rendering is not None:
             logger.info(
-                "mcp tool=%s request_id=%s refused kind=%s", name, request_id, rendering.kind
+                "mcp tool=%s request_id=%s refused kind=%s",
+                name,
+                request_id,
+                rendering.kind,
+                extra={"tool": name, "request_id": request_id, "failure_kind": rendering.kind},
             )
             return _error_result(rendering, request_id)
 
     result = await spec.handler(ctx, request)
-    logger.info("mcp tool=%s request_id=%s ok", name, request_id)
+    logger.info(
+        "mcp tool=%s request_id=%s ok",
+        name,
+        request_id,
+        extra={"tool": name, "request_id": request_id, "status": "ok"},
+    )
     return _success_result(result)
 
 
@@ -322,11 +331,21 @@ def build_mcp_server(ctx: ServiceContext) -> Server[Any, Any]:
         try:
             return await _dispatch(ctx, name, arguments, request_id)
         except GroundkitError as exc:
-            logger.error("mcp tool=%s request_id=%s failed", name, request_id, exc_info=exc)
+            logger.error(
+                "mcp tool=%s request_id=%s failed",
+                name,
+                request_id,
+                exc_info=exc,
+                extra={"tool": name, "request_id": request_id, "status": "failed"},
+            )
             return _error_result(map_exception(exc), request_id)
         except Exception as exc:
             logger.error(
-                "mcp tool=%s request_id=%s failed unexpectedly", name, request_id, exc_info=exc
+                "mcp tool=%s request_id=%s failed unexpectedly",
+                name,
+                request_id,
+                exc_info=exc,
+                extra={"tool": name, "request_id": request_id, "status": "failed_unexpectedly"},
             )
             return _error_result(unexpected_error_rendering(), request_id)
 

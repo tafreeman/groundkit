@@ -54,6 +54,32 @@ Instrumentation sites import the API unconditionally and call
 `trace.get_tracer(__name__)`. With no SDK installed and nothing configured, every span is
 a non-recording span: no export, no collector, no configuration, no error.
 
+**Amendment (2026-08-16), added because the paragraph above is true and was still
+read as saying something false.** "Installing the SDK and setting `OTEL_*`" is *not*
+sufficient to make a span record. Those variables are consumed by
+`opentelemetry.sdk._configuration`, which runs under the `opentelemetry-instrument`
+launcher — **not on import**. A process with the `otel` extra installed and every
+variable in decision 2 set correctly still gets a `ProxyTracerProvider` and exports
+nothing unless something calls `trace.set_tracer_provider`. The instrumentation change
+shipped exactly that state first: all three span sites correct, the allowlist enforced,
+the unit suite green, and zero spans reaching the collector. It surfaced only on a real
+compose run, which is the argument for SPEC.md §1.4's verification rule in miniature.
+
+`groundkit.telemetry.configure_tracing()` is therefore part of this decision, not an
+implementation detail below it: it is called from the CLI entry point, it no-ops unless
+an OTLP endpoint is configured (so a default `grk search` still makes no network call,
+as the consequences below promise), and it builds the provider from the SDK's own
+env-reading components so decision 2's "standard `OTEL_*`, not groundkit config keys"
+still holds exactly.
+
+It also contains the **only guarded `opentelemetry` import in the package**, and that is
+consistent with this decision rather than an exception to it. What is rejected above is a
+guarded import *at every instrumentation site* plus a hand-rolled no-op shim to fall back
+to. Neither exists: the sites still import only the API, unconditionally, and when the
+extra is absent the fallback is `opentelemetry-api`'s own no-op path, not a fake of it. A
+bootstrap whose entire job is to tolerate an optional extra being absent is the one place
+a guard belongs.
+
 The alternative — putting the API behind the extra too — means every instrumentation site
 needs a guarded import and a hand-written no-op shim to fall back to. That shim is a
 second implementation of the thing `opentelemetry-api` already is, it has to be kept in
@@ -88,6 +114,25 @@ The consequence is accepted rather than hidden: these variables are *not* valida
 groundkit's config layer, so a typo in `OTEL_EXPORTER_OTLP_ENDPOINT` produces the SDK's
 own error, not a groundkit `ConfigurationError`. `config.py`'s guarantees do not extend
 here, and the docs say so.
+
+**ERRATUM: `OTEL_EXPORTER_OTLP_PROTOCOL` was listed above as "read by the SDK" from the
+first version of this decision, and for `configure_tracing`'s exporter it was not —
+`telemetry.py` unconditionally imported `OTLPSpanExporter` from the `http` module, which
+always speaks HTTP/protobuf regardless of that variable.** The confusion is real rather
+than a typo: `opentelemetry.sdk._configuration`, which runs under the
+`opentelemetry-instrument` launcher, *does* read this variable and select an exporter by
+its own entry-point resolution — but `configure_tracing` does not go through that launcher
+(decision 1's whole point is avoiding it), so its manually-constructed provider never saw
+that resolution. The result: `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` against a `grpc`-only
+collector — the common case, since most collectors default to `grpc` on `4317` — applied
+cleanly and then failed at every export call, the exact "documented variable, silently not
+honoured" shape ADR-0020's own amendments record repeatedly for a different module.
+`configure_tracing` now reads `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` then
+`OTEL_EXPORTER_OTLP_PROTOCOL` itself and imports the matching exporter class — `grpc` or
+`http`, both now shipped in the `otel` extra rather than only the `http` one — so the
+variable means for this function what the sentence above already claimed it did. See
+`tests/test_telemetry.py::TestConfigureTracing` for the regression coverage of both
+transports.
 
 ### 3. Span attributes are an allowlist, and free text is not on it
 
@@ -137,11 +182,11 @@ Human-readable formatting stays the default for a terminal; JSON is opt-in
 started printing JSON to a developer's terminal would be a regression in the tool's
 primary use.
 
-### 5. All three of SPEC.md §3's span sites are instrumented in Phase 6
+### 5. All three of SPEC.md §3's span sites are instrumented in Phase 6 — one of their names here was wrong
 
 SPEC.md §3 names three: `ingest`, `retrieve`, `synthesize`. All three exist —
-`Indexer.run`, `Retriever.search`, and `Synthesizer.synthesize` — and Phase 6's
-instrumentation change covers all three.
+`Indexer.index_source` and `Indexer.index_directory`, `Retriever.search`, and
+`Synthesizer.synthesize` — and Phase 6's instrumentation change covers all three.
 
 **This decision originally deferred the third, and that deferral is withdrawn rather
 than reworded.** It was written while Phase 5 was under construction concurrently, and
@@ -158,11 +203,36 @@ instrumentation change would have read an accepted ADR telling it to skip the
 `synthesize` span, and Phase 6 would have closed at two-thirds of a SPEC.md §3
 requirement by following its own documentation.
 
-The seam is settled and public: `async Synthesizer.synthesize(query, results) ->
-SynthesizedAnswer`. The span's attributes come from the same allowlist as the other two
-(decision 3), which matters more here than anywhere else: a synthesis span sits closest
-to prompt text, completion text and citation spans, and **none of those may become an
-attribute.** Result count, model identity, latency and a typed failure code may.
+**ERRATUM: this decision also named a method that has never existed — `Indexer.run` —
+and that is corrected here rather than silently.** Unlike the deferral above, whose
+premise expired between this record being written and the instrumenting change reading
+it, this one was simply wrong the day it was written: the tree has never had a method
+by that name. The real public ingest entry points, verified against
+`src/groundkit/indexer.py`, are `Indexer.index_source(source: str) -> IndexReport`
+(line 217) and `Indexer.index_directory(source_dir, max_concurrent=...) -> IndexReport`
+(line 256), both `async`, reached from the CLI (`cli.py`) and from `evals/runner.py`.
+An accepted ADR describing code that is not there is the same failure this decision
+already corrects once above for a different reason, so it is fixed the same way: named
+as an erratum, not quietly reworded. `docs/specs/phase-6-iac-observability.md` carried
+the same name and is corrected alongside this one.
+
+Two entry points rather than one settles a question the original text left implicit,
+so it is decided here rather than left to the instrumenting change: **one span per
+public entry point** — `index_source` and `index_directory` each get their own,
+attributed with the document and chunk counts each returns in its `IndexReport`.
+`index_directory` fans out concurrently over files internally (an inner `_one` onto
+`_process`); a child span per file is the natural next step if per-file latency is ever
+wanted, and it is deliberately not taken here. It keeps span cardinality bounded to the
+call rather than to the file count, and it avoids deciding span-per-file semantics
+under concurrent fan-out in the same change that introduces the tracer at all.
+Recorded as a follow-up, not a gap this change forgot.
+
+The seam for the third site is settled and public: `async Synthesizer.synthesize(query,
+results) -> SynthesizedAnswer`. The span's attributes come from the same allowlist as
+the other two (decision 3), which matters more here than anywhere else: a synthesis
+span sits closest to prompt text, completion text and citation spans, and **none of
+those may become an attribute.** Result count, model identity, latency and a typed
+failure code may.
 
 ## Alternatives considered
 

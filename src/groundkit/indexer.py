@@ -45,6 +45,7 @@ from groundkit.identity import identity_of, validate_dense_pair
 from groundkit.index.dense import verify_dense_side_present
 from groundkit.ingestion.chunking import RecursiveChunker
 from groundkit.ingestion.pipeline import DEFAULT_MAX_CONCURRENT, discover_files
+from groundkit.telemetry import get_tracer, span_attributes
 from groundkit.utils.path_safety import is_within_base
 
 if TYPE_CHECKING:
@@ -54,6 +55,14 @@ if TYPE_CHECKING:
     from groundkit.providers.protocols import EmbeddingProtocol
 
 logger = logging.getLogger(__name__)
+
+#: Tracer for this module's two ingest spans (ADR-0022 decision 5): one per
+#: public entry point (`index_source`, `index_directory`), never one per file
+#: processed inside `_process` — that per-file shape is a recorded follow-up,
+#: not this change (see the phase's ERRATUM note: `Indexer.run`, the method
+#: ADR-0022 decision 5 names, has never existed; the two real entry points
+#: below are what it actually describes).
+tracer = get_tracer()
 
 
 class IndexReport(BaseModel):
@@ -166,6 +175,13 @@ class Indexer:
             only ever describe the model that actually embedded.
         vector_store: Optional dense vector store (keyword-only), mutated
             in lockstep with the metadata store per the invariant above.
+        collection: Optional collection name (keyword-only), attached to
+            this indexer's two ingest spans as the ``groundkit.collection``
+            attribute (ADR-0022 decision 5) so an operator can filter a
+            trace backend by collection. Purely a telemetry label — nothing
+            in this class reads it back, and containment / storage scoping
+            still come entirely from ``store`` and ``loader``, unaffected
+            by whether this is supplied.
 
     Raises:
         ConfigurationError: Exactly one of ``embedder`` / ``vector_store``
@@ -183,6 +199,7 @@ class Indexer:
         *,
         embedder: EmbeddingProtocol | None = None,
         vector_store: VectorStoreProtocol | None = None,
+        collection: str | None = None,
     ) -> None:
         # The dense pair is validated at construction, not discovered
         # mid-ingest: half a dense path is always a caller bug, and each
@@ -209,6 +226,7 @@ class Indexer:
         self._chunking_config = chunking_config
         self._embedder = embedder
         self._vector_store = vector_store
+        self._collection = collection
         # True once this instance has successfully bound the collection
         # manifest; see _ensure_manifest for why binding waits for the
         # first real dense write instead of happening here or at run start.
@@ -233,6 +251,16 @@ class Indexer:
         or deleted — see :meth:`_verify_identity` for why it must come
         first.
 
+        Wrapped in one OTel span, ``groundkit.ingest.index_source``
+        (SPEC.md §3, ADR-0022 decision 5 — one span per public ingest entry
+        point, not one per file inside :meth:`_process`). Only allowlisted
+        attributes ever reach it: the collection name, the report's
+        document and chunk counts on success, and — on any failure — the
+        raised exception's type name as a typed failure code. ``source``
+        itself is a path and is never attached at any point (ADR-0022
+        decision 3 forbids absolute source paths on a span, at every
+        level); nothing in this method reads it back once loading starts.
+
         Raises:
             IngestionError: If loading or chunking fails.
             IndexIdentityError: The dense path is enabled and the
@@ -241,22 +269,85 @@ class Indexer:
             EmbeddingError: A dense-enabled run failed to embed.
             StorageError: If persisting fails.
         """
-        await self._verify_identity()
-        outcome = await self._process(source)
-        return IndexReport(
-            files_seen=1,
-            documents_indexed=outcome.documents_indexed,
-            documents_skipped=outcome.documents_skipped,
-            chunks_written=outcome.chunks_written,
-            documents_pruned=outcome.documents_pruned,
-            vectors_written=outcome.vectors_written,
-            vectors_deleted=outcome.vectors_deleted,
-        )
+        with tracer.start_as_current_span("groundkit.ingest.index_source") as span:
+            try:
+                await self._verify_identity()
+                outcome = await self._process(source)
+                report = IndexReport(
+                    files_seen=1,
+                    documents_indexed=outcome.documents_indexed,
+                    documents_skipped=outcome.documents_skipped,
+                    chunks_written=outcome.chunks_written,
+                    documents_pruned=outcome.documents_pruned,
+                    vectors_written=outcome.vectors_written,
+                    vectors_deleted=outcome.vectors_deleted,
+                )
+            except Exception as exc:
+                # Telemetry only: this except exists to label the span, never
+                # to handle the failure. The bare `raise` below re-raises the
+                # exact exception, unwrapped, so callers see exactly what they
+                # would have without this span.
+                span.set_attributes(
+                    span_attributes(collection=self._collection, failure_kind=type(exc).__name__)
+                )
+                raise
+            span.set_attributes(
+                span_attributes(
+                    collection=self._collection,
+                    document_count=report.documents_indexed,
+                    chunk_count=report.chunks_written,
+                )
+            )
+            return report
 
     async def index_directory(
         self, source_dir: str, max_concurrent: int = DEFAULT_MAX_CONCURRENT
     ) -> IndexReport:
         """Walk ``source_dir`` and ingest every supported file, incrementally.
+
+        Wrapped in one OTel span, ``groundkit.ingest.index_directory``
+        (SPEC.md §3, ADR-0022 decision 5 — one span per public ingest entry
+        point, not one per file). The walk-and-ingest logic itself is
+        unchanged and lives in :meth:`_index_directory_impl`, split out so
+        the span/error-labeling wrapper here does not push that long,
+        heavily-commented method two indent levels deeper. Only allowlisted
+        attributes ever reach the span: the collection name, the report's
+        document and chunk counts on success, and — on any failure — the
+        raised exception's type name as a typed failure code.
+        ``source_dir`` is a path and is never attached, at any point
+        (ADR-0022 decision 3).
+
+        See :meth:`_index_directory_impl` for the full behavior, ordering,
+        and pruning semantics — repeated there verbatim from before this
+        span existed.
+        """
+        with tracer.start_as_current_span("groundkit.ingest.index_directory") as span:
+            try:
+                report = await self._index_directory_impl(source_dir, max_concurrent)
+            except Exception as exc:
+                # Telemetry only: this except exists to label the span, never
+                # to handle the failure. The bare `raise` below re-raises the
+                # exact exception, unwrapped, so callers see exactly what they
+                # would have without this span.
+                span.set_attributes(
+                    span_attributes(collection=self._collection, failure_kind=type(exc).__name__)
+                )
+                raise
+            span.set_attributes(
+                span_attributes(
+                    collection=self._collection,
+                    document_count=report.documents_indexed,
+                    chunk_count=report.chunks_written,
+                )
+            )
+            return report
+
+    async def _index_directory_impl(self, source_dir: str, max_concurrent: int) -> IndexReport:
+        """Walk ``source_dir`` and ingest every supported file, incrementally.
+
+        The pre-instrumentation body of :meth:`index_directory`, moved here
+        unchanged so that method's new span wrapper stays shallow. Every
+        comment and ordering decision below predates this split.
 
         Discovery mirrors ``IngestionPipeline.ingest_directory`` (hidden
         directories skipped, deterministic path order). Loading and chunking

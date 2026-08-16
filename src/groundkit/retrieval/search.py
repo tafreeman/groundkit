@@ -23,13 +23,19 @@ from groundkit.identity import identity_of, validate_dense_pair
 from groundkit.index.bm25 import BM25Index
 from groundkit.index.dense import verify_dense_side_present
 from groundkit.retrieval.fusion import reciprocal_rank_fusion
+from groundkit.telemetry import get_tracer, span_attributes
 
 if TYPE_CHECKING:
     from groundkit.contracts import Chunk
     from groundkit.index.protocols import MetadataStoreProtocol, VectorStoreProtocol
     from groundkit.providers.protocols import EmbeddingProtocol
+    from groundkit.telemetry import Stage
 
 logger = logging.getLogger(__name__)
+
+#: Tracer for this module's one retrieval span, ``groundkit.retrieve.search``
+#: (ADR-0022 decision 5).
+tracer = get_tracer()
 
 #: Upper bound on a caller-supplied top_k (ported from ARP's tool validation).
 MAX_TOP_K: int = 50
@@ -103,6 +109,7 @@ class Retriever:
         vector_store: VectorStoreProtocol | None = None,
         documents_at_open: frozenset[str] | None = None,
         collection_is_dense_bound: bool = False,
+        collection: str | None = None,
     ) -> None:
         _validate_dense_pair(embedder, vector_store)
         if embedder is not None and documents_at_open is None:
@@ -120,6 +127,14 @@ class Retriever:
             documents_at_open if documents_at_open is not None else frozenset()
         )
         self._collection_is_dense_bound = collection_is_dense_bound
+        # Telemetry label only (ADR-0022 decision 5), never read back by this
+        # class. There is no MetadataStoreProtocol accessor for a collection's
+        # own name (see the class docstring's snapshot discussion for the
+        # analogous reasoning on documents_at_open) — widening that protocol
+        # for an observability nicety is out of proportion, so a caller that
+        # knows the name (CollectionRuntime, which opened the store from it)
+        # passes it through here instead.
+        self._collection = collection
 
     @classmethod
     async def open(
@@ -129,6 +144,7 @@ class Retriever:
         *,
         embedder: EmbeddingProtocol | None = None,
         vector_store: VectorStoreProtocol | None = None,
+        collection: str | None = None,
     ) -> Retriever:
         """Build a retriever over ``store``, rebuilding BM25 from persisted chunks.
 
@@ -173,6 +189,13 @@ class Retriever:
                 to embed queries; its ``(provider, model_name, dimensions)``
                 triple is verified against the collection manifest.
             vector_store: Optional dense vector store (keyword-only).
+            collection: Optional collection name (keyword-only), attached
+                to every span this retriever's :meth:`search` opens as the
+                ``groundkit.collection`` attribute (ADR-0022 decision 5).
+                Stored as-is on ``self._collection``; never validated
+                against ``store`` here, since the store carries no
+                collection-name accessor to validate it against (see
+                :meth:`__init__`).
 
         Returns:
             A ready-to-search :class:`Retriever`.
@@ -218,6 +241,7 @@ class Retriever:
             vector_store=vector_store,
             documents_at_open=documents_at_open,
             collection_is_dense_bound=dense_bound,
+            collection=collection,
         )
 
     async def search(
@@ -272,53 +296,93 @@ class Retriever:
                 case is refused rather than answered from an empty dense
                 side, which would return lexical results labelled as dense
                 or fused.
+
+        Wrapped in one OTel span, ``groundkit.retrieve.search`` (SPEC.md §3,
+        ADR-0022 decision 5), covering the whole call — validation, the
+        store read, and whichever mode branch runs. Only allowlisted
+        attributes ever reach it: collection name, retrieval mode, stage,
+        ``top_k``, result count, latency, and — on any failure — the raised
+        exception's type name as a typed failure code. **``query`` itself
+        is never attached, at any point in this method or anything it
+        calls** — SPEC.md §3 and ADR-0022 decision 3 forbid query text on a
+        span explicitly, and this is the one property
+        ``tests/test_span_instrumentation.py`` exists to pin down with a
+        sentinel value.
         """
-        if not query.strip():
-            raise RetrievalError("Query must not be empty")
-        k = top_k if top_k is not None else self._config.top_k
-        if not 1 <= k <= MAX_TOP_K:
-            raise RetrievalError(f"top_k must be between 1 and {MAX_TOP_K}, got {k}")
+        with tracer.start_as_current_span("groundkit.retrieve.search") as span:
+            try:
+                if not query.strip():
+                    raise RetrievalError("Query must not be empty")
+                k = top_k if top_k is not None else self._config.top_k
+                if not 1 <= k <= MAX_TOP_K:
+                    raise RetrievalError(f"top_k must be between 1 and {MAX_TOP_K}, got {k}")
 
-        started = time.perf_counter_ns()
-        sources = await self._store.get_document_sources()
+                started = time.perf_counter_ns()
+                sources = await self._store.get_document_sources()
 
-        metadata: dict[str, object]
-        if mode == "bm25":
-            pairs = self._bm25.search(query, top_k=k)
-            results = self._resolve(pairs, sources, apply_threshold=True)
-            metadata = {"stage": "bm25", "top_k": k}
-        elif mode == "dense":
-            embedder, vector_store = self._require_dense(mode)
-            pairs = await self._dense_candidates(query, k, sources, embedder, vector_store)
-            results = self._resolve(pairs, sources, apply_threshold=True)
-            metadata = {"stage": "dense", "top_k": k}
-        elif mode == "hybrid":
-            embedder, vector_store = self._require_dense(mode)
-            bm25_pairs = self._bm25.search(query, top_k=k)
-            dense_pairs = await self._dense_candidates(query, k, sources, embedder, vector_store)
-            fused = reciprocal_rank_fusion(
-                [bm25_pairs, dense_pairs], rrf_k=self._config.rrf_k, top_k=k
+                metadata: dict[str, object]
+                stage: Stage
+                if mode == "bm25":
+                    pairs = self._bm25.search(query, top_k=k)
+                    results = self._resolve(pairs, sources, apply_threshold=True)
+                    stage = "bm25"
+                    metadata = {"stage": stage, "top_k": k}
+                elif mode == "dense":
+                    embedder, vector_store = self._require_dense(mode)
+                    pairs = await self._dense_candidates(query, k, sources, embedder, vector_store)
+                    results = self._resolve(pairs, sources, apply_threshold=True)
+                    stage = "dense"
+                    metadata = {"stage": stage, "top_k": k}
+                elif mode == "hybrid":
+                    embedder, vector_store = self._require_dense(mode)
+                    bm25_pairs = self._bm25.search(query, top_k=k)
+                    dense_pairs = await self._dense_candidates(
+                        query, k, sources, embedder, vector_store
+                    )
+                    fused = reciprocal_rank_fusion(
+                        [bm25_pairs, dense_pairs], rrf_k=self._config.rrf_k, top_k=k
+                    )
+                    results = self._resolve(fused, sources, apply_threshold=False)
+                    stage = "fusion"
+                    metadata = {"stage": stage, "top_k": k, "rrf_k": self._config.rrf_k}
+                else:
+                    # SearchMode is a type hint, not a runtime guard. Falling
+                    # through to hybrid would answer a typo'd mode with fused
+                    # results and stamp metadata["stage"] = "fusion" on them —
+                    # a wrong answer reported as a valid one, which SPEC.md
+                    # §2's fail-closed rule forbids. An unknown mode is a
+                    # caller bug; name it.
+                    raise RetrievalError(
+                        f"Unknown search mode {mode!r}; expected one of 'bm25', 'dense', 'hybrid'"
+                    )
+
+                latency_ms = (time.perf_counter_ns() - started) / _NS_PER_MS
+                logger.info("Search returned %d results in %.2f ms", len(results), latency_ms)
+                response = SearchResponse(
+                    query=query,
+                    results=results,
+                    total_results=len(results),
+                    metadata={**metadata, "latency_ms": latency_ms},
+                )
+            except Exception as exc:
+                # Telemetry only: this except exists to label the span, never
+                # to handle the failure. The bare `raise` below re-raises the
+                # exact exception, unwrapped.
+                span.set_attributes(
+                    span_attributes(collection=self._collection, failure_kind=type(exc).__name__)
+                )
+                raise
+            span.set_attributes(
+                span_attributes(
+                    collection=self._collection,
+                    retrieval_mode=mode,
+                    stage=stage,
+                    top_k=k,
+                    result_count=len(results),
+                    duration_ms=latency_ms,
+                )
             )
-            results = self._resolve(fused, sources, apply_threshold=False)
-            metadata = {"stage": "fusion", "top_k": k, "rrf_k": self._config.rrf_k}
-        else:
-            # SearchMode is a type hint, not a runtime guard. Falling through
-            # to hybrid would answer a typo'd mode with fused results and
-            # stamp metadata["stage"] = "fusion" on them — a wrong answer
-            # reported as a valid one, which SPEC.md §2's fail-closed rule
-            # forbids. An unknown mode is a caller bug; name it.
-            raise RetrievalError(
-                f"Unknown search mode {mode!r}; expected one of 'bm25', 'dense', 'hybrid'"
-            )
-
-        latency_ms = (time.perf_counter_ns() - started) / _NS_PER_MS
-        logger.info("Search returned %d results in %.2f ms", len(results), latency_ms)
-        return SearchResponse(
-            query=query,
-            results=results,
-            total_results=len(results),
-            metadata={**metadata, "latency_ms": latency_ms},
-        )
+            return response
 
     def _require_dense(self, mode: str) -> tuple[EmbeddingProtocol, VectorStoreProtocol]:
         """Return the dense pair, or fail closed if this mode cannot be served.

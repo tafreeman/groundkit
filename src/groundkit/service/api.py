@@ -486,6 +486,13 @@ async def _handle_validation_error(request: Request, exc: Exception) -> Response
         request.method,
         request.url.path,
         422,
+        extra={
+            "request_id": request_id,
+            "method": request.method,
+            "route": request.url.path,
+            "status": 422,
+            "rejected": "schema_validation",
+        },
     )
     return _json_error(
         status_code=422, kind=VALIDATION_ERROR_KIND, detail=detail, request_id=request_id
@@ -501,6 +508,7 @@ def _log_access(
     line a test asserts against, so the fields are spelled ``key=value`` and
     kept stable rather than prose that a reword would quietly break.
     """
+    latency_ms = (time.perf_counter() - started) * 1000.0
     logger.info(
         "request_id=%s method=%s route=%s tool=%s status=%d latency_ms=%.2f results=%d",
         request_id,
@@ -508,8 +516,17 @@ def _log_access(
         spec.rest_path,
         spec.name,
         status_code,
-        (time.perf_counter() - started) * 1000.0,
+        latency_ms,
         result_count,
+        extra={
+            "request_id": request_id,
+            "method": spec.rest_method,
+            "route": spec.rest_path,
+            "tool": spec.name,
+            "status": status_code,
+            "latency_ms": latency_ms,
+            "results": result_count,
+        },
     )
 
 
@@ -531,4 +548,10 @@ def _log_failure(
         rendering.kind,
         rendering.status_code,
         exc_info=exc,
+        extra={
+            "request_id": request_id,
+            "tool": spec.name,
+            "failure_kind": rendering.kind,
+            "status": rendering.status_code,
+        },
     )

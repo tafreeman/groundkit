@@ -115,6 +115,7 @@ class CollectionRuntime:
         *,
         embedder: EmbeddingProtocol | None = None,
         vector_store_factory: Callable[[], Awaitable[VectorStoreProtocol]] | None = None,
+        collection: str | None = None,
     ) -> None:
         validate_dense_pair(
             embedder,
@@ -132,6 +133,15 @@ class CollectionRuntime:
         self._config = config
         self._embedder = embedder
         self._vector_store_factory = vector_store_factory
+        # Telemetry label only (ADR-0022 decision 5): threaded through to every
+        # Retriever this runtime builds in _rebuild, so its search spans carry
+        # the collection name. Optional and defaulted to None — rather than
+        # required, matching CollectionRuntime.open's own collection: str —
+        # because a handful of tests construct this class directly against a
+        # fake store with no collection name to give it; widening this
+        # constructor's REQUIRED surface would break every one of them for an
+        # observability nicety that costs nothing to leave optional.
+        self._collection = collection
         self._cached: AcquiredRetriever | None = None
         self._vector_store: VectorStoreProtocol | None = None
         self._rebuild_lock = asyncio.Lock()
@@ -166,6 +176,7 @@ class CollectionRuntime:
                 config,
                 embedder=embedder,
                 vector_store_factory=vector_store_factory,
+                collection=collection,
             )
         except BaseException:
             # The pair validation above can reject; do not leak the handle.
@@ -269,6 +280,7 @@ class CollectionRuntime:
             self._config,
             embedder=self._embedder,
             vector_store=vector_store,
+            collection=self._collection,
         )
         acquired = AcquiredRetriever(generation=generation, retriever=retriever)
 

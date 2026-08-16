@@ -116,18 +116,41 @@ make an egress-free subnet work. Setting `embedding_base_url` adds an egress rul
 for that endpoint derived from the URL; a DNS-name host on a non-443 port also
 needs `embedding_egress_cidr`, and says so at `plan` rather than at request time.
 
-## Traces: the stack is wired, and nothing emits yet
+## Traces: the instrumentation has landed, and a compose run has proved it
 
-Phase 6 lands in two changes (phase spec §3). This one is the additive half:
-`infra/`, the spec, the ADRs, the docs and the CI gate, with **no change under
-`src/`**. The collector and Jaeger are real, running and correctly wired — and
-groundkit emits no spans until the instrumentation change lands, so the Jaeger
-UI will show none.
+Phase 6 lands in two changes (phase spec §3). Change 1 was the additive half:
+`infra/`, the spec, the ADRs, the docs and the CI gate, with no change under
+`src/`. Change 2 has now landed the instrumentation — `telemetry.py`, spans on
+`Indexer.index_source`/`Indexer.index_directory`, `Retriever.search` and
+`Synthesizer.synthesize`, and the JSON log formatter (ADR-0022). The collector
+and Jaeger have been real, running and correctly wired since change 1, and
+groundkit should now emit spans wherever a live stack exercises those three
+call paths.
 
-The collector→Jaeger leg is provable on its own in the meantime by POSTing a
-synthetic OTLP/HTTP payload to the collector's `:4318/v1/traces` and finding it
-in the UI. `docker compose logs otel-collector` shows the `debug` exporter's
-view, which separates a receive problem from an export one.
+**That was run on 2026-08-16**, and both trace rows in the table below now
+carry that date: the collector→Jaeger leg on its own via a synthetic OTLP/HTTP
+payload, and then real `ingest` and `retrieve` spans from groundkit itself. The
+"Verification status" table is the record of what has and has not been run, and
+this section is not a substitute for it — read the scope note under the table
+before treating those two rows as broader than they are, because the run did
+**not** use the compose `groundkit` service or its loopback publish, and did
+not exercise the `synthesize` span at all.
+
+Two things are worth keeping from before that run, because they are still how
+you debug this stack. The collector→Jaeger leg is provable independently by
+POSTing a synthetic OTLP/HTTP payload to the collector's `:4318/v1/traces` and
+finding it in the UI; and `docker compose logs otel-collector` shows the
+`debug` exporter's view, which separates a receive problem from an export one.
+
+**If you get no spans at all, check this first.** Installing the `otel` extra
+and setting the `OTEL_*` variables is *not* enough on its own — those are read
+by `opentelemetry.sdk._configuration` under the `opentelemetry-instrument`
+launcher, not on import, so without `telemetry.configure_tracing()` having run
+the API hands out non-recording proxy spans with no error and no warning. That
+is precisely how the first version of this instrumentation passed its whole
+unit suite while exporting nothing (ADR-0022 decision 1 carries the amendment).
+`grk` calls it from its entry point, so a container running `grk` is fine; a
+process importing groundkit as a library and never calling it is not.
 
 ## Air-gap
 
@@ -182,22 +205,104 @@ that job exists rather than being a formality.
 | Dockerfile | `docker build` | **passed 2026-08-15** *(CI)* |
 | Dockerfile | container runs as uid 10001; CLI works; starts under `--read-only` with only the two named scratch mounts | **passed 2026-08-15** *(CI)* |
 | compose | `docker compose config` parses and interpolates | **passed 2026-08-15** |
-| compose | `up`, ingest, a real search over the loopback publish | **not yet run** |
-| compose | a groundkit span visible in Jaeger | **blocked** — needs the instrumentation change |
+| compose | `up`, ingest, a real search over the loopback publish | **not yet run** — the 2026-08-16 trace run reached the collector over the compose network with `docker run`, never through the `groundkit` service's host publish; bringing that service up also needs the Ollama model pulled, since its command is `--dense`. The LAN bind check (ADR-0021 decision 1's actual claim) needs a second host and is the half most likely to be skipped |
+| compose | collector→Jaeger leg, proved on its own with a synthetic OTLP/HTTP payload | **passed 2026-08-16** |
+| compose | a groundkit span visible in Jaeger, carrying no query text | **passed 2026-08-16** — `ingest` and `retrieve` spans observed; see the note below for what this run did and did not cover |
 | k8s | `kubectl kustomize` renders; every manifest parses as YAML | **passed 2026-08-15** |
-| k8s | `apply -k`, Job completes, Deployment Ready, port-forward serves | **not yet run** |
+| k8s | `apply -k`, Job completes, Deployment Ready, port-forward serves | **not yet run** — needs a cluster; `kubectl` is present with no context configured. Record *which kind* when it is run: on a single-node cluster the scale-down steps above are unnecessary, which is exactly what makes omitting them a trap — the documented sequence passes in the small case and stalls on a multi-attach error against the `ReadWriteOnce` claim in the real one |
 | terraform | `fmt -check`, `validate` on providers 5.100.0 and 6.60.0 | **passed 2026-08-16** |
 | terraform | `bootstrap.sh.tftpl` renders; rendered script passes `bash -n` | **passed 2026-08-16** |
 | terraform | ECR, egress and instance-architecture inputs classify correctly | **passed 2026-08-16** |
 | compose | the one-shots gate on Ollama's healthcheck, `serve` deliberately does not | **passed 2026-08-16** |
-| terraform | the security-group preconditions actually reject | **not yet run** — needs a plan |
-| terraform | `plan` / `apply` against a real account | **not yet run** |
+| terraform | the security-group preconditions actually reject | **passed 2026-08-16** — `terraform test` with `mock_provider`, 5 runs, no credentials and no API call |
+| terraform | `plan` / `apply` against a real account | **passed 2026-08-16** — real AWS account, `us-east-1`, single-node personal sandbox; see the note below for exact scope |
 
 What the passing rows do **not** cover, so a full column of green is not read as
-more than it is: no container has served a request, no manifest has reached a
-cluster, and `terraform validate` makes no API call — a missing IAM permission,
-an instance type unavailable in the region, or an AMI filter matching nothing
-are all invisible to it.
+more than it is: no manifest has reached a cluster, and `terraform validate`
+makes no API call — a missing IAM permission, an instance type unavailable in
+the region, or an AMI filter matching nothing are all invisible to it. The
+`plan` / `apply` row below is the exception: it is the one row that did make
+real API calls, in one specific region and account, and its own scope note
+says exactly what that does and does not settle.
+
+**Scope of the 2026-08-16 trace verification, stated because the row above is
+narrower than it looks.** The collector and Jaeger were started with
+`docker compose up -d otel-collector jaeger`. groundkit itself then ran as
+`docker run` containers attached to that stack's network (`groundkit_default`)
+performing a real `ingest` and a real `search`, with the standard `OTEL_*`
+variables set. Observed in Jaeger: `groundkit.ingest.index_directory` and
+`groundkit.retrieve.search`, the latter carrying `collection`, `retrieval.mode`,
+`retrieval.stage`, `top_k`, `result_count` and `duration_ms` — and a sweep of
+the raw trace payload for the search's own query string, the corpus path, and
+the document's text found none of them. Three things that run did **not** do,
+each of which is why a separate row above is still unfilled:
+
+- It did not bring the `groundkit` service up under compose or reach it through
+  the host-loopback publish, so the `up`, ingest, a real search over the
+  loopback publish row is untouched — and neither is the LAN bind check, which
+  is the actual security claim (ADR-0021 decision 1).
+- It did not exercise the `synthesize` span, which needs a chat provider that
+  run had none of. That span is covered by unit tests only.
+- It ran BM25-only, so no embedding-identity attributes were exercised.
+
+**This row was earned twice, and the first attempt is worth recording**, since
+it is the failure a green unit-test suite cannot see. The first run exported
+*nothing*: the SDK was installed and every `OTEL_*` variable was set, but
+`opentelemetry-api` still handed out a `ProxyTracerProvider` because those
+variables are read by `opentelemetry.sdk._configuration` under the
+`opentelemetry-instrument` launcher, not on import — so with no explicit
+`set_tracer_provider` call, every span was non-recording, with no error and no
+warning anywhere. `telemetry.configure_tracing()` is the fix, and
+`tests/test_telemetry.py::TestConfigureTracing` is the regression test. Nothing
+short of running the stack would have caught it.
+
+**Scope of the 2026-08-16 `plan`/`apply` verification.** Ran against a real AWS
+account (single personal free-tier sandbox, not a production or shared
+account), region `us-east-1`, the account's default VPC.
+
+The default VPC's six subnets are all public (`MapPublicIpOnLaunch: true`, a
+route table with only an internet-gateway route) and the account had no NAT
+gateway anywhere in the region. That matters because of the "Network
+prerequisite" section above: the module pins `associate_public_ip_address =
+false` unconditionally, so an instance launched into any of those subnets
+as-is would get no public IP and no usable route out through the IGW —
+`dnf install -y docker` would fail under `set -e` during bootstrap, the exact
+"healthy instance, no service" trap this file already warns about. A NAT
+gateway, a new route table (`0.0.0.0/0` → NAT), and its association with one
+subnet were created **as a prerequisite outside the module** before `plan`,
+and destroyed afterward along with everything else — the module itself does
+not build a NAT gateway (ADR-0020 decision 3) and this run did not change
+that.
+
+`container_image` was a real private ECR reference
+(`<account>.dkr.ecr.us-east-1.amazonaws.com/groundkit:phase6-verify`), pushed
+from the locally-built `groundkit:local` image for this run. `plan` showed 9
+resources to add, 0 to change, 0 to destroy, with a real AMI resolved
+(`al2023-ami-2023.*-x86_64` in `us-east-1`) and the ECR-detection logic
+correctly matching the image reference and attaching
+`AmazonEC2ContainerRegistryReadOnly`. `apply` created all 9 cleanly. On the
+instance: bootstrap installed docker, authenticated to the private ECR
+registry and pulled the image, formatted and mounted the data volume via the
+retrying `groundkit-storage.service` unit, and `groundkit.service` came up
+healthy — proving the ECR pull path and the storage-prep unit for real, not
+just at `bash -n`/`terraform console`. A document was placed under
+`/srv/groundkit/corpus`, `groundkit-ingest` was run, and `groundkit` was
+restarted; a real SSM port-forward session was then opened from the
+operator's own machine and a real `POST /v1/search` over that tunnel returned
+a correct, citation-bearing result for a planted marker token — that, not the
+successful `apply`, is what actually closes this row. `terraform destroy` ran
+in the same session; the ECR repository, NAT gateway, route table and Elastic
+IP (none of them terraform-managed) were deleted immediately afterward.
+
+What this run did **not** cover: the dense/hybrid path (`embedding_base_url`
+stayed unset, so the derived-egress-rule branch was exercised only by the
+existing `terraform console` checks, never against a real security group);
+`create_ssm_vpc_endpoints` (stayed `false` — this account had NAT-based
+egress, so the SSM-interface-endpoint resources were never applied for real);
+and any partition other than the commercial one (GovCloud/China ECR-host and
+managed-policy-ARN matching remain `terraform console`-only, as before). It
+is also a single run against a single account and region — the same caveat
+the k8s single-node row already carries.
 
 Update the rows, with the date, when you run one. Do not update a row you did
 not run.

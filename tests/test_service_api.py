@@ -36,6 +36,7 @@ from groundkit.service import api as api_module
 from groundkit.service.api import DOC_PATHS, REQUEST_ID_HEADER, McpMount, create_app
 from groundkit.service.schemas import ChunkFetchResponse, IndexStatusResponse, SearchRequest
 from groundkit.service.tools import TOOLS, ServiceContext
+from groundkit.telemetry import JsonLogFormatter
 
 if TYPE_CHECKING:
     from groundkit.service.tools import ToolHandler
@@ -387,6 +388,51 @@ def test_the_access_log_carries_the_request_id_and_never_the_query(
     assert all(query not in candidate for candidate in lines), (
         "the query text reached an INFO log line; it is DEBUG-only"
     )
+
+
+def test_the_access_log_promotes_structured_fields_under_json_formatting(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same access line, but as a collector under ``GROUNDKIT_LOG_FORMAT=json`` sees it.
+
+    Regression test: the access line carried every field spelled ``key=value``
+    inside the *message* string from the start, and the previous test already
+    held that to its promise. What it did not catch is that
+    :class:`~groundkit.telemetry.JsonLogFormatter` only promotes a field to a
+    top-level JSON key when the call site passes it via ``extra=`` —
+    ``_log_access`` passed everything as positional ``%s``/``%d`` arguments
+    instead, so under JSON formatting every one of those fields stayed
+    embedded in an opaque ``message`` string, unindexable by any collector
+    that parses JSON logs rather than the human-readable line. This is
+    exactly the shape of trace produced against the real Terraform-provisioned
+    instance during the 2026-08-16 verification.
+    """
+    app, _, _ = _make_app(tmp_path)
+
+    with TestClient(app) as client, caplog.at_level(logging.INFO, logger=_API_LOGGER):
+        response = client.post("/v1/search", json={"query": "turbine"})
+
+    assert response.status_code == 200
+    request_id = response.headers[REQUEST_ID_HEADER]
+
+    access_records = [
+        record
+        for record in caplog.records
+        if record.name == _API_LOGGER and getattr(record, "request_id", None) == request_id
+    ]
+    assert len(access_records) == 1, (
+        f"expected exactly one access record for {request_id}, got {access_records}"
+    )
+    record = access_records[0]
+
+    payload = json.loads(JsonLogFormatter().format(record))
+    assert payload["request_id"] == request_id
+    assert payload["method"] == "POST"
+    assert payload["route"] == "/v1/search"
+    assert payload["tool"] == "search"
+    assert payload["status"] == 200
+    assert isinstance(payload["latency_ms"], float)
+    assert isinstance(payload["results"], int)
 
 
 def test_out_of_range_requests_are_rejected_before_the_handler_runs(
