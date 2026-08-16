@@ -9,10 +9,14 @@
 # publish nothing at all — they are reachable only from this stack's network.
 #
 # READ THIS BEFORE LOOKING FOR TRACES: the collector and Jaeger are wired and
-# running, and until the instrumentation change lands (Phase 6's second change —
-# see docs/specs/phase-6-iac-observability.md §3) groundkit emits no spans, so
-# the Jaeger UI will show none. The collector→Jaeger leg can be proved on its
-# own with a synthetic OTLP payload; §6.2 of the phase spec has the procedure.
+# running, and Phase 6's second change (see docs/specs/phase-6-iac-observability.md
+# §3) has landed the instrumentation — telemetry.py, spans on ingest, retrieve
+# and synthesize, the JSON log formatter. What has NOT happened is a real run
+# of this stack: no `docker compose up` has been executed against it here, so
+# no groundkit span has actually been observed in Jaeger yet (infra/README.md's
+# verification table is the record of what has). The collector→Jaeger leg can
+# still be proved on its own with a synthetic OTLP payload; §6.2 of the phase
+# spec has the procedure.
 #
 # Image tags are pinned. None was pulled while this file was written — no
 # container runtime was available — so CI resolves each one with
@@ -45,13 +49,16 @@ services:
     # An OpenAI-compatible provider pointed at a private address would still be
     # refused.
     environment:
-      # ADR-0022 decision 2: standard OTel names, read by the SDK. Inert until
-      # the instrumentation change installs one; harmless before it.
-      OTEL_SERVICE_NAME: groundkit
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
-      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
-      OTEL_TRACES_EXPORTER: otlp
-      GROUNDKIT_LOG_FORMAT: json
+      # ADR-0022 decision 2: standard OTel names, read directly by the SDK —
+      # not by groundkit's config.py, which has no entry for any of these.
+      # Override any of them from `.env` (see .env.example); unset, they
+      # default to this stack's own collector.
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-groundkit}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-otlp}
+      OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-}
+      GROUNDKIT_LOG_FORMAT: ${GROUNDKIT_LOG_FORMAT:-json}
     ports:
       # HOST loopback only. `8765:8765` would publish an unauthenticated,
       # content-bearing surface on every interface of this machine.
@@ -161,6 +168,18 @@ services:
       - --embed-provider=ollama
       - --embed-base-url=http://ollama:11434
       - --embed-model=${GROUNDKIT_EMBED_MODEL:-nomic-embed-text}
+    environment:
+      # Same OTel names as the `groundkit` service above, so the ingest span
+      # (Indexer.index_directory — ADR-0022 decision 5) reaches the same
+      # collector. A distinct default service name keeps a one-shot ingest run
+      # visually separate from the long-running serve process in Jaeger; an
+      # explicit OTEL_SERVICE_NAME override in `.env` renames both together.
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-groundkit-ingest}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-otlp}
+      OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-}
+      GROUNDKIT_LOG_FORMAT: ${GROUNDKIT_LOG_FORMAT:-json}
     volumes:
       - groundkit-index:/data/index
       - ${GROUNDKIT_CORPUS_DIR:-../../docs}:/data/corpus:ro
@@ -179,6 +198,8 @@ services:
         # leaves a collection whose manifest is bound but whose vectors are
         # incomplete.
         condition: service_healthy
+      otel-collector:
+        condition: service_started
 
   # -------------------------------------------------- one-shot: pull a model
   # `docker compose --profile setup run --rm ollama-pull`

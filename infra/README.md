@@ -116,13 +116,21 @@ make an egress-free subnet work. Setting `embedding_base_url` adds an egress rul
 for that endpoint derived from the URL; a DNS-name host on a non-443 port also
 needs `embedding_egress_cidr`, and says so at `plan` rather than at request time.
 
-## Traces: the stack is wired, and nothing emits yet
+## Traces: the instrumentation has landed, and no compose run has proved it yet
 
-Phase 6 lands in two changes (phase spec §3). This one is the additive half:
-`infra/`, the spec, the ADRs, the docs and the CI gate, with **no change under
-`src/`**. The collector and Jaeger are real, running and correctly wired — and
-groundkit emits no spans until the instrumentation change lands, so the Jaeger
-UI will show none.
+Phase 6 lands in two changes (phase spec §3). Change 1 was the additive half:
+`infra/`, the spec, the ADRs, the docs and the CI gate, with no change under
+`src/`. Change 2 has now landed the instrumentation — `telemetry.py`, spans on
+`Indexer.index_source`/`Indexer.index_directory`, `Retriever.search` and
+`Synthesizer.synthesize`, and the JSON log formatter (ADR-0022). The collector
+and Jaeger have been real, running and correctly wired since change 1, and
+groundkit should now emit spans wherever a live stack exercises those three
+call paths.
+
+**That has not been run here.** No `docker compose up` has been executed
+against this instrumentation, so no groundkit span has actually been observed
+in Jaeger — the "Verification status" table below is the record of what has
+and has not been run, and this section is not a substitute for it.
 
 The collector→Jaeger leg is provable on its own in the meantime by POSTing a
 synthetic OTLP/HTTP payload to the collector's `:4318/v1/traces` and finding it
@@ -183,21 +191,52 @@ that job exists rather than being a formality.
 | Dockerfile | container runs as uid 10001; CLI works; starts under `--read-only` with only the two named scratch mounts | **passed 2026-08-15** *(CI)* |
 | compose | `docker compose config` parses and interpolates | **passed 2026-08-15** |
 | compose | `up`, ingest, a real search over the loopback publish | **not yet run** |
-| compose | a groundkit span visible in Jaeger | **blocked** — needs the instrumentation change |
+| compose | collector→Jaeger leg, proved on its own with a synthetic OTLP/HTTP payload | **passed 2026-08-16** |
+| compose | a groundkit span visible in Jaeger, carrying no query text | **passed 2026-08-16** — `ingest` and `retrieve` spans observed; see the note below for what this run did and did not cover |
 | k8s | `kubectl kustomize` renders; every manifest parses as YAML | **passed 2026-08-15** |
 | k8s | `apply -k`, Job completes, Deployment Ready, port-forward serves | **not yet run** |
 | terraform | `fmt -check`, `validate` on providers 5.100.0 and 6.60.0 | **passed 2026-08-16** |
 | terraform | `bootstrap.sh.tftpl` renders; rendered script passes `bash -n` | **passed 2026-08-16** |
 | terraform | ECR, egress and instance-architecture inputs classify correctly | **passed 2026-08-16** |
 | compose | the one-shots gate on Ollama's healthcheck, `serve` deliberately does not | **passed 2026-08-16** |
-| terraform | the security-group preconditions actually reject | **not yet run** — needs a plan |
+| terraform | the security-group preconditions actually reject | **passed 2026-08-16** — `terraform test` with `mock_provider`, 5 runs, no credentials and no API call |
 | terraform | `plan` / `apply` against a real account | **not yet run** |
 
 What the passing rows do **not** cover, so a full column of green is not read as
-more than it is: no container has served a request, no manifest has reached a
-cluster, and `terraform validate` makes no API call — a missing IAM permission,
-an instance type unavailable in the region, or an AMI filter matching nothing
-are all invisible to it.
+more than it is: no manifest has reached a cluster, and `terraform validate`
+makes no API call — a missing IAM permission, an instance type unavailable in
+the region, or an AMI filter matching nothing are all invisible to it.
+
+**Scope of the 2026-08-16 trace verification, stated because the row above is
+narrower than it looks.** The collector and Jaeger were started with
+`docker compose up -d otel-collector jaeger`. groundkit itself then ran as
+`docker run` containers attached to that stack's network (`groundkit_default`)
+performing a real `ingest` and a real `search`, with the standard `OTEL_*`
+variables set. Observed in Jaeger: `groundkit.ingest.index_directory` and
+`groundkit.retrieve.search`, the latter carrying `collection`, `retrieval.mode`,
+`retrieval.stage`, `top_k`, `result_count` and `duration_ms` — and a sweep of
+the raw trace payload for the search's own query string, the corpus path, and
+the document's text found none of them. Three things that run did **not** do,
+each of which is why a separate row above is still unfilled:
+
+- It did not bring the `groundkit` service up under compose or reach it through
+  the host-loopback publish, so the `up`, ingest, a real search over the
+  loopback publish row is untouched — and neither is the LAN bind check, which
+  is the actual security claim (ADR-0021 decision 1).
+- It did not exercise the `synthesize` span, which needs a chat provider that
+  run had none of. That span is covered by unit tests only.
+- It ran BM25-only, so no embedding-identity attributes were exercised.
+
+**This row was earned twice, and the first attempt is worth recording**, since
+it is the failure a green unit-test suite cannot see. The first run exported
+*nothing*: the SDK was installed and every `OTEL_*` variable was set, but
+`opentelemetry-api` still handed out a `ProxyTracerProvider` because those
+variables are read by `opentelemetry.sdk._configuration` under the
+`opentelemetry-instrument` launcher, not on import — so with no explicit
+`set_tracer_provider` call, every span was non-recording, with no error and no
+warning anywhere. `telemetry.configure_tracing()` is the fix, and
+`tests/test_telemetry.py::TestConfigureTracing` is the regression test. Nothing
+short of running the stack would have caught it.
 
 Update the rows, with the date, when you run one. Do not update a row you did
 not run.

@@ -4,9 +4,11 @@ Feature spec for SPEC.md §9 Phase 6: *multi-stage non-root Dockerfile; compose
 (service+Ollama+collector+Jaeger); k8s (deployment, service, PVC, probes);
 Terraform module for one concrete provider; OTel verified end-to-end in compose.*
 
-Status: **in progress — change 1 of 2 landed, change 2 outstanding.** Nothing
-here overrides SPEC.md; where this document makes a decision SPEC.md does not
-already contain, it names the ADR that holds it.
+Status: **in progress — change 1 landed 2026-08-15; change 2 (OTel
+instrumentation, JSON logs) implemented on this branch, not yet verified
+end-to-end in compose.** Nothing here overrides SPEC.md; where this document
+makes a decision SPEC.md does not already contain, it names the ADR that
+holds it.
 
 `infra/` is created by this phase and by no earlier one. SPEC.md §3 is explicit
 that empty IaC directories are decoration, which is why the directory arrives
@@ -69,7 +71,9 @@ deployment guide, nav, and the CI job that gates the infra. **Nothing under
 touch.
 
 **Change 2 — instrumentation.** The `opentelemetry-api` base dependency, the
-`otel` extra, the tracer helper, spans on `Indexer.run`, `Retriever.search` and
+`otel` extra, the tracer helper, spans on `Indexer.index_source` and
+`Indexer.index_directory` (not `Indexer.run` — that method has never
+existed; see ADR-0022 decision 5's erratum), `Retriever.search` and
 `Synthesizer.synthesize`, the JSON log formatter, the image gaining
 `--extra otel`, and the compose stack's first real trace.
 
@@ -216,8 +220,12 @@ base rather than against the branch.
 
 Change 2 adds, under `src/`: `groundkit/telemetry.py` (tracer accessor and the
 typed-keyword attribute helper ADR-0022 decision 3 requires), a
-`logging.Formatter` subclass, spans in `indexer.py`, `retrieval/search.py` and
-`providers/synthesis.py`, and `--extra otel` in the image build.
+`logging.Formatter` subclass, spans on `Indexer.index_source` and
+`Indexer.index_directory` (`indexer.py` — corrected from `Indexer.run`, which
+this document and ADR-0022 decision 5 both originally named and which has
+never existed), `Retriever.search` (`retrieval/search.py`) and
+`Synthesizer.synthesize` (`providers/synthesis.py`), and `--extra otel` in
+the image build.
 
 ## 6. Verification — what was executed, and what was not
 
@@ -321,10 +329,10 @@ of one another in a way most changes are not.
 `[tool.groundkit.coverage].core_subset` catches it, and `runtime.py`'s
 precedent shows root modules are added to that list *explicitly* when they
 belong there. Telemetry does not decide whether an answer is correct or current,
-which is the test `runtime.py`'s entry was argued on — so the expectation is
-that it stays out of the core subset and is covered by the whole-package gate
-like `service/`. Decided in change 2 with the reasoning written into
-`pyproject.toml` beside the existing entries, either way.
+which is the test `runtime.py`'s entry was argued on — so it stays out of the
+core subset and is covered by the whole-package gate like `service/`.
+**Decided in change 2**, with the reasoning written into `pyproject.toml`
+beside the existing entries (note 4, next to `runtime.py`'s note 3).
 
 **Q1 — Does a health endpoint land, and at what cost to the parity test?**
 §4.2 defers it. The question is not whether a probe target would be nicer — it

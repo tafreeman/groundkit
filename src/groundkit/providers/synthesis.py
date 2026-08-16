@@ -66,11 +66,29 @@ No exception raised here interpolates the answer, chunk content, or the query
 into its message — only structural facts (marker numbers, valid ranges,
 counts, provider/model identity) that cannot themselves carry retrieved or
 user-supplied content.
+
+## The synthesis span is the sharpest of SPEC.md §3's three (ADR-0022 decision 5)
+
+:meth:`Synthesizer.synthesize` opens one OTel span, ``groundkit.synthesize.synthesize``,
+around the whole call. It sits closer to prompt text, completion text, and
+citation spans than either of SPEC.md §3's other two span sites, which is
+exactly why the allowlist matters most here: **none of the query, the
+retrieved content, the rendered prompt, the completion, or a citation ever
+becomes a span attribute — not even truncated, not even on the error path.**
+Only a result count, latency, the chat provider/model identity ADR-0022
+decision 5 permits on this span specifically (configuration the operator
+chose, never content a user or a document supplied — and the attribute that
+makes "which model was slow" answerable without any of the above), and — on
+failure — the raised exception's type name as a typed failure code reach the
+span, all via
+:func:`~groundkit.telemetry.span_attributes`, which has no parameter any of
+the forbidden values could be passed through even by mistake.
 """
 
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Sequence
 from typing import Final
 
@@ -80,10 +98,16 @@ from groundkit.contracts import Citation, RetrievalResult
 from groundkit.errors import SynthesisError
 from groundkit.providers.context_assembly import sanitize_content
 from groundkit.providers.protocols import ChatProtocol
+from groundkit.telemetry import get_tracer, span_attributes
 
 #: Matches one bracketed citation marker, e.g. ``[1]``. See the module
 #: docstring's "Marker parsing rule" section for what counts as a match and why.
 _MARKER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\[(\d+)\]")
+
+#: Tracer for this module's one span, ``groundkit.synthesize.synthesize``
+#: (ADR-0022 decision 5). See the module docstring's final section for why
+#: this is the span the allowlist matters most on.
+tracer = get_tracer()
 
 #: Default prompt template. Presents each retrieved result as a numbered source
 #: and instructs the model to answer only from those sources, mark every claim
@@ -236,23 +260,61 @@ class Synthesizer:
                 ``1..len(results)``. Never repaired — a synthesis call that
                 fails this contract produces no answer at all.
             ChatError: Propagated untouched from ``chat.complete`` — this
-                method never catches or wraps a provider failure.
+                method never catches or wraps a provider failure. The span
+                below labels it with a typed failure code for telemetry and
+                then re-raises it exactly as received; that is not "catching"
+                it in the sense this docstring means, since nothing about the
+                exception is altered, inspected beyond its type, or swallowed.
+
+        Wrapped in one OTel span, ``groundkit.synthesize.synthesize`` — see
+        the module docstring's final section for what may and, above all,
+        may NOT become an attribute on it.
         """
-        if not results:
-            raise SynthesisError(
-                "synthesis requires at least one retrieved result; an answer cannot "
-                "cite spans that were never retrieved"
-            )
-        if not query.strip():
-            raise SynthesisError("synthesis requires a non-empty query")
+        with tracer.start_as_current_span("groundkit.synthesize.synthesize") as span:
+            started = time.perf_counter()
+            try:
+                if not results:
+                    raise SynthesisError(
+                        "synthesis requires at least one retrieved result; an answer cannot "
+                        "cite spans that were never retrieved"
+                    )
+                if not query.strip():
+                    raise SynthesisError("synthesis requires a non-empty query")
 
-        prompt = self._prompt_template.format(query=query, sources=_format_sources(results))
-        completion = await self._chat.complete(prompt)
-        answer = completion.strip()
-        if not answer:
-            raise SynthesisError(
-                f"{self._chat.provider}/{self._chat.model_name} returned an empty completion"
-            )
+                prompt = self._prompt_template.format(query=query, sources=_format_sources(results))
+                completion = await self._chat.complete(prompt)
+                answer = completion.strip()
+                if not answer:
+                    raise SynthesisError(
+                        f"{self._chat.provider}/{self._chat.model_name} returned an "
+                        "empty completion"
+                    )
 
-        citations = _resolve_citations(answer, results)
-        return SynthesizedAnswer(answer=answer, citations=citations)
+                citations = _resolve_citations(answer, results)
+                synthesized = SynthesizedAnswer(answer=answer, citations=citations)
+            except Exception as exc:
+                # Telemetry only: this except exists to label the span, never
+                # to handle the failure. The bare `raise` below re-raises the
+                # exact exception, unwrapped — see the Raises section above.
+                # Only the exception's TYPE NAME is read; its message (which,
+                # for SynthesisError, is guaranteed free of retrieved/user
+                # content per the module docstring, but is not re-verified
+                # here) is never touched.
+                span.set_attributes(
+                    span_attributes(
+                        duration_ms=(time.perf_counter() - started) * 1000,
+                        failure_kind=type(exc).__name__,
+                        chat_provider=self._chat.provider,
+                        chat_model=self._chat.model_name,
+                    )
+                )
+                raise
+            span.set_attributes(
+                span_attributes(
+                    result_count=len(results),
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                    chat_provider=self._chat.provider,
+                    chat_model=self._chat.model_name,
+                )
+            )
+            return synthesized

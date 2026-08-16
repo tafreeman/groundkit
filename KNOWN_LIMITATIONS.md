@@ -364,8 +364,8 @@ per SPEC.md §9:
   yet scheduled into a phase; the loader currently reads `.md`/`.markdown`/
   `.txt` only.
 - Synthesis, query rewrite, redaction (Phase 5); OTel observability (Phase 6's
-  second change — the IaC half has landed, see the Phase 6 section below);
-  docs site (Phase 7).
+  second change — landed in code, not yet verified end-to-end in compose; see
+  the Phase 6 section below); docs site (Phase 7).
 - BM25 rebuilds in memory at open — O(corpus) startup cost, accepted and
   bounded by ADR-0002's revisit trigger.
 - A UTF-8 BOM is not stripped at load (`utf-8`, not `utf-8-sig`), so a
@@ -458,30 +458,64 @@ per SPEC.md §9:
   `base_url` itself. The threat model is operator misconfiguration, not a
   hostile operator (ADR-0014 Consequences).
 
-## Phase 6 — IaC landed, observability has not
+## Phase 6 — IaC and OTel instrumentation landed; traces verified, most IaC paths not
 
 Phase 6 lands in two changes (`docs/specs/phase-6-iac-observability.md` §3). The
-first is `infra/` plus its ADRs and docs and **changes nothing under `src/`**;
+first is `infra/` plus its ADRs and docs and **changed nothing under `src/`**;
 the second adds the OpenTelemetry instrumentation and the JSON log formatter.
-Everything below describes the state between the two.
+Both have landed, and on 2026-08-16 a real groundkit span was observed in Jaeger.
+What remains is narrower than it was and is listed below: the trace verification
+covered two of the three span sites and did not use the compose service or its
+loopback publish, and most other IaC paths are still unrun. `infra/README.md` is
+the status board and records the exact scope of what was executed.
 
-- **Nothing emits a span, and the compose stack's collector and Jaeger receive
-  nothing.** SPEC.md §3 requires spans on ingest, retrieve and synthesize; there
-  is no `opentelemetry` dependency in the tree, no tracer, and no exporter. The
-  topology is real and correctly wired, so the Jaeger UI being empty is the
-  expected state rather than a misconfiguration — `infra/README.md` and the
-  deployment guide both say so where a reader would otherwise conclude the
-  opposite. The collector→Jaeger leg is provable on its own with a synthetic
-  OTLP payload in the meantime.
-- **All three of SPEC.md §3's span sites are Phase 6's to instrument, `synthesize`
-  included — this entry used to defer it and no longer does.** The deferral was
-  written while Phase 5 was under construction alongside this phase, when
-  `providers/synthesis.py` genuinely did not exist. Phase 5 then landed (SPEC.md
-  §9: done 2026-08-15) and this branch merged `main`, so the seam —
-  `async Synthesizer.synthesize(query, results)` — is present in this tree and
-  settled. The premise expired without the text changing; had it stayed, Phase 6
-  would have closed at two-thirds of a SPEC.md §3 requirement by following its
-  own documentation (ADR-0022 decision 5).
+- **A groundkit span has now been observed in Jaeger (2026-08-16), for `ingest`
+  and `retrieve` — not for `synthesize`.** `src/groundkit/telemetry.py` is the
+  tracer accessor and the typed attribute helper (ADR-0022 decision 3),
+  instrumenting `Indexer.index_source`, `Indexer.index_directory`,
+  `Retriever.search` and `Synthesizer.synthesize`. `opentelemetry-api` is a base
+  dependency (ADR-0022 decision 1), so every instrumentation site works with no
+  `otel` extra installed — spans are simply non-recording. The verified run
+  exercised a real `ingest` and `search` against the compose stack's collector,
+  and a sweep of the exported payload confirmed the allowlist held: no query
+  text, no source path, no document content. **The `synthesize` span has never
+  been observed in a real trace** — it needs a chat provider that run had none
+  of, and it is covered by unit tests only. That is the sharpest of the three
+  spans (it sits next to prompt and completion text), so it is the one where an
+  observed trace would be worth the most, and it is the one still owed.
+- **Installing the `otel` extra and setting `OTEL_*` does not, on its own, make
+  a span record — and this was shipped wrong before it was caught.** The
+  variables in ADR-0022 decision 2 are read by
+  `opentelemetry.sdk._configuration`, which runs under the
+  `opentelemetry-instrument` launcher and *not* on import, so absent an explicit
+  `trace.set_tracer_provider` call the API keeps returning a
+  `ProxyTracerProvider` whose spans are non-recording. The first version of this
+  change had all three span sites correct, the allowlist enforced, and a green
+  suite — and exported nothing at all, silently. `telemetry.configure_tracing()`
+  is the fix, called from the CLI entry point;
+  `tests/test_telemetry.py::TestConfigureTracing` is the regression test, and
+  ADR-0022 decision 1 carries an amendment recording the trap. The general
+  lesson is the one SPEC.md §1.4 already encodes: a unit suite cannot verify an
+  export path, and only running the stack found this.
+- **`Indexer.run` never existed, and ADR-0022 decision 5 originally named it —
+  the ADR now carries an erratum rather than a silent fix.** The real public
+  ingest entry points are `Indexer.index_source` and `Indexer.index_directory`
+  (both `async`, `src/groundkit/indexer.py`), and each gets its own span
+  rather than one shared "ingest" span — attributed with the document and
+  chunk counts from the `IndexReport` each returns. A child span per file, for
+  per-file latency, is a named follow-up and not part of this change: it would
+  need its own decision about span semantics under `index_directory`'s
+  concurrent fan-out.
+- **All three of SPEC.md §3's span sites were Phase 6's to instrument,
+  `synthesize` included — this entry used to defer it and no longer does.**
+  The deferral was written while Phase 5 was under construction alongside
+  this phase, when `providers/synthesis.py` genuinely did not exist. Phase 5
+  then landed (SPEC.md §9: done 2026-08-15) and this branch merged `main`, so
+  the seam — `async Synthesizer.synthesize(query, results)` — was present and
+  settled by the time this change was written. The premise expired without
+  the text changing, which is the failure mode to notice: a deferral
+  justified by "it does not exist yet" has a shelf life, and nothing about
+  merging the thing into existence makes the record update itself.
 
   The residual worth knowing is not a missing span but a sharper allowlist
   obligation: a synthesis span sits closer to prompt text, completion text and
