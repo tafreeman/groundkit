@@ -458,7 +458,7 @@ per SPEC.md §9:
   `base_url` itself. The threat model is operator misconfiguration, not a
   hostile operator (ADR-0014 Consequences).
 
-## Phase 6 — IaC and OTel instrumentation landed; traces, Terraform and compose verified, k8s not
+## Phase 6 — every IaC path exercised; two verifications are narrower than their rows read
 
 Phase 6 lands in two changes (`docs/specs/phase-6-iac-observability.md` §3). The
 first is `infra/` plus its ADRs and docs and **changed nothing under `src/`**;
@@ -466,12 +466,25 @@ the second adds the OpenTelemetry instrumentation and the JSON log formatter.
 Both have landed. On 2026-08-16 a real groundkit span was observed in Jaeger,
 and later the same day a real `terraform apply` against a live AWS account
 provisioned the instance, ingested a document, and served a real search over
-an SSM tunnel, and the full documented compose cold-start ran end to end. What
-remains is narrower than it was and is listed below: the trace verification
-covered two of the three span sites, one half of the compose bind check could
-not be run at all, and the Kubernetes path is still entirely unrun.
-`infra/README.md` is the status board and records the exact scope of what was
-executed.
+an SSM tunnel, the full documented compose cold-start ran end to end, and the
+Kubernetes sequence ran on a single-node cluster. **Every IaC path has now been
+exercised at least once**, so what remains is not missing coverage but two
+verifications whose scope is narrower than a green row reads, plus one span
+site. `infra/README.md` is the status board and records the exact scope of what
+was executed.
+
+- **The Kubernetes run was single-node, so the `ReadWriteOnce` hazard the
+  documented sequence guards against was never reproducible.** Docker Desktop
+  (kind mode, v1.36.1, one node) ran the sequence verbatim on 2026-08-16 —
+  scale-down steps included — through `apply -k`, corpus load, a completed
+  ingest Job (43 files, 1299 chunks), Deployment 1/1 Ready and a
+  citation-bearing search over `port-forward`. What a single node cannot do is
+  produce a multi-attach failure, because there is no second node to attach the
+  volume from. The manifests are therefore confirmed self-consistent and
+  confirmed to work in the small case; their multi-node behaviour is unproven.
+  This is the case `infra/README.md` explicitly warned would "pass in the small
+  case and stall in the real one", so the row names the cluster kind rather than
+  reading as a general pass.
 
 - **The compose stack's loopback-only binding is verified host-side only, and
   the other half could not be run.** The documented cold-start sequence

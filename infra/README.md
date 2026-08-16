@@ -210,7 +210,7 @@ that job exists rather than being a formality.
 | compose | collector→Jaeger leg, proved on its own with a synthetic OTLP/HTTP payload | **passed 2026-08-16** |
 | compose | a groundkit span visible in Jaeger, carrying no query text | **passed 2026-08-16** — `ingest` and `retrieve` spans observed; see the note below for what this run did and did not cover |
 | k8s | `kubectl kustomize` renders; every manifest parses as YAML | **passed 2026-08-15** |
-| k8s | `apply -k`, Job completes, Deployment Ready, port-forward serves | **not yet run** — needs a cluster; `kubectl` is present with no context configured. Record *which kind* when it is run: on a single-node cluster the scale-down steps above are unnecessary, which is exactly what makes omitting them a trap — the documented sequence passes in the small case and stalls on a multi-attach error against the `ReadWriteOnce` claim in the real one |
+| k8s | `apply -k`, Job completes, Deployment Ready, port-forward serves | **passed 2026-08-16 on a SINGLE-NODE cluster** — Docker Desktop 4.86.0 Kubernetes, kind mode, server v1.36.1, 1 node. The documented sequence run verbatim including the scale-down steps: `apply -k`, corpus loader + `kubectl cp` (43 files), ingest Job completed (43 files, 1299 chunks, BM25-only — the k8s stack has no Ollama), Deployment reached 1/1 Ready against the `GET /v1/collections` probe, and `port-forward` served a citation-bearing `POST /v1/search`. **The multi-node `ReadWriteOnce` path was NOT exercised** — see the note below |
 | terraform | `fmt -check`, `validate` on providers 5.100.0 and 6.60.0 | **passed 2026-08-16** |
 | terraform | `bootstrap.sh.tftpl` renders; rendered script passes `bash -n` | **passed 2026-08-16** |
 | terraform | ECR, egress and instance-architecture inputs classify correctly | **passed 2026-08-16** |
@@ -225,6 +225,40 @@ the region, or an AMI filter matching nothing are all invisible to it. The
 `plan` / `apply` row below is the exception: it is the one row that did make
 real API calls, in one specific region and account, and its own scope note
 says exactly what that does and does not settle.
+
+**Scope of the 2026-08-16 Kubernetes run, and why "single-node" is written into
+the row rather than left to be inferred.** This file already warned that the
+scale-down steps are unnecessary on a single-node cluster and that omitting
+them passes in the small case and stalls in the real one. The run that closed
+this row *was* the small case. The steps were followed verbatim anyway, so the
+documented sequence is confirmed self-consistent — but a single node can never
+produce the multi-attach failure the `ReadWriteOnce` claim guards against,
+because there is no second node for the volume to be attached from. **The
+multi-node behaviour of this manifest set is still unverified**, and that is
+the one thing a green row here must not be read as covering.
+
+What the run did establish, none of which needs a second node: the manifests
+apply as a set, the PVC binds, the ingest Job runs to completion against it,
+the Deployment reaches Ready on a probe that is a real operation rather than a
+static handler, the NetworkPolicy and `ClusterIP` are in place, the pod runs
+with `readOnlyRootFilesystem`, all capabilities dropped and no privilege
+escalation, and a citation-bearing search is served over `kubectl port-forward`.
+
+**A gotcha worth recording for the next person, because it is not in the
+sequence above.** Docker Desktop's Kubernetes runs in **kind mode**, whose
+containerd image store is *separate from the host Docker daemon's*. A local
+`groundkit` build is therefore invisible to the cluster and
+`imagePullPolicy: IfNotPresent` still ends in `ImagePullBackOff` — the same
+symptom the unpublished-placeholder trap produces, from an unrelated cause.
+Loading it explicitly is what fixes it:
+
+```bash
+docker tag groundkit:local ghcr.io/tafreeman/groundkit:dev
+docker save ghcr.io/tafreeman/groundkit:dev -o gk.tar
+docker exec -i desktop-control-plane ctr -n k8s.io images import - < gk.tar
+```
+
+`busybox:1.37` needs the same treatment for the corpus-loader pod.
 
 **Scope of the 2026-08-16 loopback-publish check, because "passed, host-side
 only" is a real qualifier and not a hedge.** ADR-0021 decision 1's claim is
