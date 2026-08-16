@@ -116,7 +116,7 @@ make an egress-free subnet work. Setting `embedding_base_url` adds an egress rul
 for that endpoint derived from the URL; a DNS-name host on a non-443 port also
 needs `embedding_egress_cidr`, and says so at `plan` rather than at request time.
 
-## Traces: the instrumentation has landed, and no compose run has proved it yet
+## Traces: the instrumentation has landed, and a compose run has proved it
 
 Phase 6 lands in two changes (phase spec §3). Change 1 was the additive half:
 `infra/`, the spec, the ADRs, the docs and the CI gate, with no change under
@@ -127,15 +127,30 @@ and Jaeger have been real, running and correctly wired since change 1, and
 groundkit should now emit spans wherever a live stack exercises those three
 call paths.
 
-**That has not been run here.** No `docker compose up` has been executed
-against this instrumentation, so no groundkit span has actually been observed
-in Jaeger — the "Verification status" table below is the record of what has
-and has not been run, and this section is not a substitute for it.
+**That was run on 2026-08-16**, and both trace rows in the table below now
+carry that date: the collector→Jaeger leg on its own via a synthetic OTLP/HTTP
+payload, and then real `ingest` and `retrieve` spans from groundkit itself. The
+"Verification status" table is the record of what has and has not been run, and
+this section is not a substitute for it — read the scope note under the table
+before treating those two rows as broader than they are, because the run did
+**not** use the compose `groundkit` service or its loopback publish, and did
+not exercise the `synthesize` span at all.
 
-The collector→Jaeger leg is provable on its own in the meantime by POSTing a
-synthetic OTLP/HTTP payload to the collector's `:4318/v1/traces` and finding it
-in the UI. `docker compose logs otel-collector` shows the `debug` exporter's
-view, which separates a receive problem from an export one.
+Two things are worth keeping from before that run, because they are still how
+you debug this stack. The collector→Jaeger leg is provable independently by
+POSTing a synthetic OTLP/HTTP payload to the collector's `:4318/v1/traces` and
+finding it in the UI; and `docker compose logs otel-collector` shows the
+`debug` exporter's view, which separates a receive problem from an export one.
+
+**If you get no spans at all, check this first.** Installing the `otel` extra
+and setting the `OTEL_*` variables is *not* enough on its own — those are read
+by `opentelemetry.sdk._configuration` under the `opentelemetry-instrument`
+launcher, not on import, so without `telemetry.configure_tracing()` having run
+the API hands out non-recording proxy spans with no error and no warning. That
+is precisely how the first version of this instrumentation passed its whole
+unit suite while exporting nothing (ADR-0022 decision 1 carries the amendment).
+`grk` calls it from its entry point, so a container running `grk` is fine; a
+process importing groundkit as a library and never calling it is not.
 
 ## Air-gap
 
@@ -190,11 +205,11 @@ that job exists rather than being a formality.
 | Dockerfile | `docker build` | **passed 2026-08-15** *(CI)* |
 | Dockerfile | container runs as uid 10001; CLI works; starts under `--read-only` with only the two named scratch mounts | **passed 2026-08-15** *(CI)* |
 | compose | `docker compose config` parses and interpolates | **passed 2026-08-15** |
-| compose | `up`, ingest, a real search over the loopback publish | **not yet run** |
+| compose | `up`, ingest, a real search over the loopback publish | **not yet run** — the 2026-08-16 trace run reached the collector over the compose network with `docker run`, never through the `groundkit` service's host publish; bringing that service up also needs the Ollama model pulled, since its command is `--dense`. The LAN bind check (ADR-0021 decision 1's actual claim) needs a second host and is the half most likely to be skipped |
 | compose | collector→Jaeger leg, proved on its own with a synthetic OTLP/HTTP payload | **passed 2026-08-16** |
 | compose | a groundkit span visible in Jaeger, carrying no query text | **passed 2026-08-16** — `ingest` and `retrieve` spans observed; see the note below for what this run did and did not cover |
 | k8s | `kubectl kustomize` renders; every manifest parses as YAML | **passed 2026-08-15** |
-| k8s | `apply -k`, Job completes, Deployment Ready, port-forward serves | **not yet run** |
+| k8s | `apply -k`, Job completes, Deployment Ready, port-forward serves | **not yet run** — needs a cluster; `kubectl` is present with no context configured. Record *which kind* when it is run: on a single-node cluster the scale-down steps above are unnecessary, which is exactly what makes omitting them a trap — the documented sequence passes in the small case and stalls on a multi-attach error against the `ReadWriteOnce` claim in the real one |
 | terraform | `fmt -check`, `validate` on providers 5.100.0 and 6.60.0 | **passed 2026-08-16** |
 | terraform | `bootstrap.sh.tftpl` renders; rendered script passes `bash -n` | **passed 2026-08-16** |
 | terraform | ECR, egress and instance-architecture inputs classify correctly | **passed 2026-08-16** |
