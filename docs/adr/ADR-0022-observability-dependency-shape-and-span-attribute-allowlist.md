@@ -115,6 +115,25 @@ groundkit's config layer, so a typo in `OTEL_EXPORTER_OTLP_ENDPOINT` produces th
 own error, not a groundkit `ConfigurationError`. `config.py`'s guarantees do not extend
 here, and the docs say so.
 
+**ERRATUM: `OTEL_EXPORTER_OTLP_PROTOCOL` was listed above as "read by the SDK" from the
+first version of this decision, and for `configure_tracing`'s exporter it was not —
+`telemetry.py` unconditionally imported `OTLPSpanExporter` from the `http` module, which
+always speaks HTTP/protobuf regardless of that variable.** The confusion is real rather
+than a typo: `opentelemetry.sdk._configuration`, which runs under the
+`opentelemetry-instrument` launcher, *does* read this variable and select an exporter by
+its own entry-point resolution — but `configure_tracing` does not go through that launcher
+(decision 1's whole point is avoiding it), so its manually-constructed provider never saw
+that resolution. The result: `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` against a `grpc`-only
+collector — the common case, since most collectors default to `grpc` on `4317` — applied
+cleanly and then failed at every export call, the exact "documented variable, silently not
+honoured" shape ADR-0020's own amendments record repeatedly for a different module.
+`configure_tracing` now reads `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` then
+`OTEL_EXPORTER_OTLP_PROTOCOL` itself and imports the matching exporter class — `grpc` or
+`http`, both now shipped in the `otel` extra rather than only the `http` one — so the
+variable means for this function what the sentence above already claimed it did. See
+`tests/test_telemetry.py::TestConfigureTracing` for the regression coverage of both
+transports.
+
 ### 3. Span attributes are an allowlist, and free text is not on it
 
 **Permitted:** collection name, retrieval mode (`bm25`/`dense`/`hybrid`), stage,

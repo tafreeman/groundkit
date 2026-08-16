@@ -46,6 +46,9 @@ from groundkit.service.mcp_server import (
 )
 from groundkit.service.schemas import ListCollectionsRequest
 from groundkit.service.tools import TOOL_NAMES, TOOLS, ServiceContext, ToolSpec
+from groundkit.telemetry import JsonLogFormatter
+
+_MCP_LOGGER = mcp_server.__name__
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -318,6 +321,62 @@ def test_every_tool_dispatches_through_call_tool(tmp_path: Path) -> None:
             assert _structured(status)["chunk_count"] == 1
         finally:
             await ctx.registry.aclose()
+
+    asyncio.run(run())
+
+
+def test_access_and_failure_logs_promote_structured_fields_under_json_formatting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The MCP transport's ``request_id``-carrying lines, as a JSON-log collector sees them.
+
+    Mirrors ``test_service_api.py``'s equivalent test for the REST surface's
+    access log. Both transports log the same shape (``tool=%s
+    request_id=%s ...``) as positional format arguments, so both needed the
+    same fix: pass the same values via ``extra=`` too, or
+    :class:`~groundkit.telemetry.JsonLogFormatter` has nothing to promote and
+    every field stays trapped inside the ``message`` string.
+    """
+
+    async def boom(ctx: ServiceContext, request: ListCollectionsRequest) -> list[str]:
+        del ctx, request
+        raise StorageError("boom") from RuntimeError("cause")
+
+    async def run() -> None:
+        index_dir, corpus, _ = await _seed(tmp_path)
+        ctx = _context(index_dir, corpus)
+        poisoned = tuple(
+            dataclasses.replace(spec, handler=boom) if spec.name == "list_collections" else spec
+            for spec in TOOLS
+        )
+        server = build_mcp_server(ctx)
+        try:
+            with caplog.at_level(logging.INFO, logger=_MCP_LOGGER):
+                ok_result = await _call(server, "search", {"query": "turbine"})
+                assert ok_result.isError is False
+
+                monkeypatch.setattr(mcp_server, "TOOLS", poisoned)
+                failed_result = await _call(server, "list_collections", {})
+                assert failed_result.isError is True
+        finally:
+            await ctx.registry.aclose()
+
+        records = [r for r in caplog.records if r.name == _MCP_LOGGER]
+        ok_records = [r for r in records if getattr(r, "tool", None) == "search"]
+        assert len(ok_records) == 1, f"expected exactly one search access record, got {ok_records}"
+        ok_payload = json.loads(JsonLogFormatter().format(ok_records[0]))
+        assert ok_payload["tool"] == "search"
+        assert ok_payload["status"] == "ok"
+        assert ok_payload["request_id"]
+
+        failed_records = [r for r in records if getattr(r, "tool", None) == "list_collections"]
+        assert len(failed_records) == 1, (
+            f"expected exactly one list_collections failure record, got {failed_records}"
+        )
+        failed_payload = json.loads(JsonLogFormatter().format(failed_records[0]))
+        assert failed_payload["tool"] == "list_collections"
+        assert failed_payload["status"] == "failed"
+        assert failed_payload["request_id"]
 
     asyncio.run(run())
 

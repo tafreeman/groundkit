@@ -81,18 +81,25 @@ dense = [
 rerank = [
   "sentence-transformers>=3,<6",
 ]
-# Tracing SDK + OTLP exporter (Phase 6, ADR-0022 decision 1). `opentelemetry-api`
+# Tracing SDK + OTLP exporters (Phase 6, ADR-0022 decision 1). `opentelemetry-api`
 # stays a base dependency above so instrumentation sites need no guarded
-# imports; this extra is what makes a span actually export anywhere. Pinned in
-# the dev group below too, for the same reason `dense` is pinned there: the
-# instrumentation tests need the SDK's `InMemorySpanExporter` to assert a span
-# was recorded and that the attribute allowlist (decision 3) holds at runtime —
-# a test that silently skips because the SDK is absent proves nothing, which is
-# the same principle behind SPEC.md §3's rule that no job which is the sole
-# proof of a backend may be continue-on-error.
+# imports; this extra is what makes a span actually export anywhere. Both wire
+# protocols ship together rather than as separate extras: `OTEL_EXPORTER_OTLP_PROTOCOL`
+# picks between them at runtime (`configure_tracing`), and a two-extra split
+# would just move the same "which protocol does my collector speak" question
+# from configuration time to install time. Pinned in the dev group below too,
+# for the same reason `dense` is pinned there: the instrumentation tests need
+# the SDK's `InMemorySpanExporter` to assert a span was recorded and that the
+# attribute allowlist (decision 3) holds at runtime, and need both exporter
+# packages importable to prove `configure_tracing` actually selects between
+# them rather than only claiming to — a test that silently skips because a
+# package is absent proves nothing, which is the same principle behind
+# SPEC.md §3's rule that no job which is the sole proof of a backend may be
+# continue-on-error.
 otel = [
   "opentelemetry-sdk>=1.27,<2",
   "opentelemetry-exporter-otlp-proto-http>=1.27,<2",
+  "opentelemetry-exporter-otlp-proto-grpc>=1.27,<2",
 ]
 
 [project.scripts]
@@ -109,6 +116,7 @@ dev = [
   "lancedb>=0.13,<1",
   "opentelemetry-sdk>=1.27,<2",
   "opentelemetry-exporter-otlp-proto-http>=1.27,<2",
+  "opentelemetry-exporter-otlp-proto-grpc>=1.27,<2",
 ]
 # Docs site (Phase 7). A separate group, not part of `dev`: the docs build is
 # its own CI job and its own gate, and every other job — lint, typecheck, the

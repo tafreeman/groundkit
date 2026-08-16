@@ -139,6 +139,23 @@ _TRACES_EXPORTER_ENV_VAR: Final[str] = "OTEL_TRACES_EXPORTER"
 #: environment.
 _EXPORTER_NONE: Final[str] = "none"
 
+#: Standard OTel variables selecting the OTLP wire protocol, most specific
+#: first — the traces-specific variable overrides the general one, per the
+#: OTel spec's own precedence rule. :func:`configure_tracing` used to ignore
+#: both and always construct the HTTP/protobuf exporter, which meant setting
+#: ``OTEL_EXPORTER_OTLP_PROTOCOL=grpc`` against a grpc-only collector (the
+#: common case — most collectors default to grpc on 4317) applied cleanly and
+#: then failed at every export call, silently by this module's own
+#: fail-closed-at-the-SDK design (see the docstring above).
+_OTLP_PROTOCOL_ENV_VARS: Final[tuple[str, ...]] = (
+    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+)
+
+#: The one value that selects gRPC. Anything else, including unset, keeps the
+#: HTTP/protobuf transport — the OTel spec's own default.
+_GRPC_PROTOCOL_VALUE: Final[str] = "grpc"
+
 #: The one value that selects JSON. Anything else, including unset, keeps
 #: human-readable formatting — see :func:`_select_formatter`.
 _JSON_FORMAT_VALUE: Final[str] = "json"
@@ -214,6 +231,21 @@ def _export_requested() -> bool:
     return any(os.environ.get(name, "").strip() for name in _OTLP_ENDPOINT_ENV_VARS)
 
 
+def _requested_protocol() -> str:
+    """Return the OTLP wire protocol the environment asks for, lower-cased.
+
+    Checks ``OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`` before the general
+    ``OTEL_EXPORTER_OTLP_PROTOCOL``, matching the OTel spec's precedence.
+    Empty when neither is set, which :func:`configure_tracing` treats the
+    same as the spec's own default (``http/protobuf``).
+    """
+    for name in _OTLP_PROTOCOL_ENV_VARS:
+        value = os.environ.get(name, "").strip().lower()
+        if value:
+            return value
+    return ""
+
+
 def configure_tracing() -> None:
     """Install an SDK tracer provider when the environment asks for one.
 
@@ -240,11 +272,19 @@ def configure_tracing() -> None:
 
     Configuration is entirely the standard ``OTEL_*`` environment (ADR-0022
     decision 2) — ``Resource.create()`` reads ``OTEL_SERVICE_NAME`` and
-    ``OTEL_RESOURCE_ATTRIBUTES``, and ``OTLPSpanExporter()`` reads the
-    endpoint and protocol variables. Nothing is passed explicitly, so there
-    is no second vocabulary and no precedence rule to invent, and a typo in
-    an endpoint produces the SDK's own error rather than a groundkit
-    ``ConfigurationError``.
+    ``OTEL_RESOURCE_ATTRIBUTES``, and each exporter's own constructor reads
+    the matching endpoint variable. Nothing is passed explicitly, so there is
+    no second vocabulary and no precedence rule to invent for those, and a
+    typo in an endpoint produces the SDK's own error rather than a groundkit
+    ``ConfigurationError``. The wire *protocol* is the one exception: an
+    ``OTLPSpanExporter`` reads its endpoint from the environment but not its
+    own transport — that is fixed by which class was imported, HTTP/protobuf
+    in the ``http`` module and gRPC in the ``grpc`` one — so this function
+    reads ``OTEL_EXPORTER_OTLP_*PROTOCOL`` itself and picks the class. A
+    version of this that always imported the HTTP class shipped first: it
+    applied cleanly against a ``grpc``-configured collector and then failed
+    at every export call, because nothing here was reading the variable the
+    docs already claimed it did.
 
     Calling this is optional and its absence changes no answer, so a missing
     SDK is a warning rather than a failure — SPEC.md §2's fail-closed rule
@@ -263,11 +303,13 @@ def configure_tracing() -> None:
     if not isinstance(trace.get_tracer_provider(), trace.ProxyTracerProvider):
         return
 
+    protocol = _requested_protocol()
+    use_grpc = protocol == _GRPC_PROTOCOL_VALUE
+
     try:
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
     except ImportError:
         logger.warning(
             "tracing requested via OTEL_* but the 'otel' extra is not installed; "
@@ -275,8 +317,41 @@ def configure_tracing() -> None:
         )
         return
 
+    exporter: SpanExporter
+    # The transport is a choice of *which class* to import — OTLPSpanExporter
+    # in the http module always speaks HTTP/protobuf and the one in the grpc
+    # module always speaks gRPC, neither reads OTEL_EXPORTER_OTLP_*PROTOCOL
+    # itself. Selecting the class here is what makes that variable mean
+    # anything for a manually-constructed provider like this one, rather than
+    # only for the auto-instrumentation launcher's entry-point resolution.
+    if use_grpc:
+        try:
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+                OTLPSpanExporter as GrpcSpanExporter,
+            )
+        except ImportError:
+            logger.warning(
+                "tracing requested via OTEL_EXPORTER_OTLP_*PROTOCOL=grpc but the grpc "
+                "exporter is not installed; no spans will be exported "
+                "(install groundkit[otel])",
+            )
+            return
+        exporter = GrpcSpanExporter()
+    else:
+        try:
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+                OTLPSpanExporter as HttpSpanExporter,
+            )
+        except ImportError:
+            logger.warning(
+                "tracing requested via OTEL_* but the 'otel' extra is not installed; "
+                "no spans will be exported (install groundkit[otel])",
+            )
+            return
+        exporter = HttpSpanExporter()
+
     provider = TracerProvider(resource=Resource.create())
-    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    provider.add_span_processor(BatchSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
 
 

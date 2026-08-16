@@ -32,6 +32,7 @@ from groundkit.telemetry import (
     _HANDLER_NAME,
     JsonLogFormatter,
     _export_requested,
+    _requested_protocol,
     configure_logging,
     configure_tracing,
     get_tracer,
@@ -54,10 +55,17 @@ _ENDPOINT_VARS: tuple[str, ...] = (
 )
 _EXPORTER_VAR: str = "OTEL_TRACES_EXPORTER"
 
+#: The protocol-selection variables :func:`_requested_protocol` consults,
+#: most-specific first.
+_PROTOCOL_VARS: tuple[str, ...] = (
+    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+)
+
 #: Every variable a tracing test must clear to start from a known-unset
 #: environment. Named once so a future addition cannot be cleared in three
 #: tests and forgotten in a fourth.
-_ALL_OTEL_VARS: tuple[str, ...] = (*_ENDPOINT_VARS, _EXPORTER_VAR)
+_ALL_OTEL_VARS: tuple[str, ...] = (*_ENDPOINT_VARS, _EXPORTER_VAR, *_PROTOCOL_VARS)
 
 
 class TestSpanAttributesSignatureShape:
@@ -496,6 +504,45 @@ class TestExportRequested:
         assert _export_requested() is False
 
 
+class TestRequestedProtocol:
+    """The variable :func:`configure_tracing` reads to pick an exporter class.
+
+    Regression coverage for the defect ADR-0022 decision 2's erratum
+    records: a manually-constructed ``TracerProvider`` never went through
+    ``opentelemetry.sdk._configuration``'s own protocol resolution, so
+    ``OTEL_EXPORTER_OTLP_PROTOCOL=grpc`` was silently ignored and the HTTP
+    exporter was always built regardless. These tests hold :func:`_requested_protocol`
+    itself to the OTel spec's precedence rule; :class:`TestConfigureTracing`
+    below holds the exporter *selection* to it.
+    """
+
+    def test_unset_means_http_protobuf_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Neither variable set: empty, which the caller treats as the spec default."""
+        for name in _PROTOCOL_VARS:
+            monkeypatch.delenv(name, raising=False)
+        assert _requested_protocol() == ""
+
+    def test_general_variable_is_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in _PROTOCOL_VARS:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+        assert _requested_protocol() == "grpc"
+
+    def test_traces_specific_variable_overrides_the_general_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The OTel spec's own precedence: the signal-specific variable wins."""
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf")
+        assert _requested_protocol() == "http/protobuf"
+
+    def test_value_is_lower_cased(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in _PROTOCOL_VARS:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "GRPC")
+        assert _requested_protocol() == "grpc"
+
+
 class TestConfigureTracing:
     """The bootstrap that makes any span in this package actually record.
 
@@ -601,3 +648,109 @@ class TestConfigureTracing:
         )
         assert completed.returncode == 0, completed.stderr
         assert "same=True" in completed.stdout, completed.stdout
+
+    #: Shared body for the exporter-selection tests below: patches
+    #: ``BatchSpanProcessor.__init__`` to capture which exporter class it was
+    #: handed, since there is no public API to read it back off a
+    #: ``TracerProvider`` afterwards.
+    _CAPTURE_EXPORTER_SCRIPT = textwrap.dedent(
+        """
+        from opentelemetry.sdk.trace import export as sdk_export
+
+        captured: dict[str, str] = {}
+        _original_init = sdk_export.BatchSpanProcessor.__init__
+
+        def _capture(self, span_exporter, *a, **kw):
+            captured["module"] = type(span_exporter).__module__
+            return _original_init(self, span_exporter, *a, **kw)
+
+        sdk_export.BatchSpanProcessor.__init__ = _capture
+
+        from groundkit.telemetry import configure_tracing
+
+        configure_tracing()
+        print(f"exporter_module={captured['module']}")
+        """
+    )
+
+    def test_selects_http_exporter_by_default(self) -> None:
+        """No protocol variable set: the HTTP/protobuf exporter is built.
+
+        This case happened to pass even before the fix below, since the
+        unconditional import it replaces always built the HTTP exporter. It
+        is here anyway, alongside the ``grpc`` case, so a future change
+        cannot make the default silently wrong while leaving ``grpc`` right.
+        """
+        env = {
+            **os.environ,
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+            "OTEL_TRACES_EXPORTER": "otlp",
+        }
+        for name in _PROTOCOL_VARS:
+            env.pop(name, None)
+        completed = subprocess.run(  # noqa: S603 - fixed argv, interpreter is sys.executable
+            [sys.executable, "-c", self._CAPTURE_EXPORTER_SCRIPT],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert (
+            "exporter_module=opentelemetry.exporter.otlp.proto.http.trace_exporter"
+            in completed.stdout
+        ), completed.stdout
+
+    def test_selects_grpc_exporter_when_protocol_is_grpc(self) -> None:
+        """``OTEL_EXPORTER_OTLP_PROTOCOL=grpc``: the gRPC exporter is built, not HTTP.
+
+        **This is the defect itself.** Before this fix, ``configure_tracing``
+        unconditionally imported the HTTP exporter regardless of this
+        variable, so this case built the HTTP exporter anyway — applying
+        cleanly against a ``grpc``-only collector (the common case: most
+        collectors default to ``grpc`` on ``4317``) and then failing at every
+        export call, silently. ADR-0022 decision 2's erratum records it.
+        """
+        env = {
+            **os.environ,
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4317",
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+        }
+        completed = subprocess.run(  # noqa: S603 - fixed argv, interpreter is sys.executable
+            [sys.executable, "-c", self._CAPTURE_EXPORTER_SCRIPT],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert (
+            "exporter_module=opentelemetry.exporter.otlp.proto.grpc.trace_exporter"
+            in completed.stdout
+        ), completed.stdout
+
+    def test_traces_specific_protocol_overrides_the_general_one_end_to_end(self) -> None:
+        """The precedence :class:`TestRequestedProtocol` checks in isolation,
+        proven here to actually reach exporter selection rather than stopping
+        at the helper function.
+        """
+        env = {
+            **os.environ,
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
+        }
+        completed = subprocess.run(  # noqa: S603 - fixed argv, interpreter is sys.executable
+            [sys.executable, "-c", self._CAPTURE_EXPORTER_SCRIPT],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert (
+            "exporter_module=opentelemetry.exporter.otlp.proto.http.trace_exporter"
+            in completed.stdout
+        ), completed.stdout
