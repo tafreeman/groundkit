@@ -63,6 +63,7 @@ from groundkit.config import (
     resolve_chat_config,
     resolve_embedding_config,
 )
+from groundkit.contracts import Citation
 from groundkit.errors import ConfigurationError, EvalError, GroundkitError
 from groundkit.evals.delta import StageDelta, derive_rerank_attribution, derive_stage_deltas
 from groundkit.evals.echo import (
@@ -715,9 +716,18 @@ def _print_answer_report(report: AnswerReport) -> None:
     if not report.citations:
         print("(abstained: the answer cites no retrieved span)")
     else:
+        # Labels reuse the answer's own [n] source numbers — each citation's
+        # 1-based position in report.results — never a fresh 1..k renumbering
+        # of the deduplicated list: an answer citing only source 3 must print
+        # a "[3]" entry, or the marker in the answer text resolves to nothing
+        # while "[1]" names a result the model never cited.
+        source_numbers: dict[Citation, int] = {}
+        for index, result in enumerate(report.results, start=1):
+            source_numbers.setdefault(result.citation, index)
         print()
-        for rank, citation in enumerate(report.citations, start=1):
-            print(f"[{rank}] {citation.source}#{citation.start_offset}-{citation.end_offset}")
+        for citation in report.citations:
+            number = source_numbers[citation]
+            print(f"[{number}] {citation.source}#{citation.start_offset}-{citation.end_offset}")
     if report.verdict is not None:
         verdict = "faithful" if report.verdict.faithful else "NOT faithful"
         print(f"judge (advisory, uncalibrated): {verdict}")

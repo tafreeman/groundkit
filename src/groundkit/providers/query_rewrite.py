@@ -31,6 +31,7 @@ from typing import Final
 
 from groundkit.errors import QueryRewriteError
 from groundkit.providers.protocols import ChatProtocol
+from groundkit.retrieval.search import MAX_QUERY_LEN
 
 #: Default prompt template sent verbatim as the ``prompt`` argument to
 #: ``ChatProtocol.complete`` (never split into a separate ``system``
@@ -165,10 +166,16 @@ class QueryRewriter:
         Raises:
             QueryRewriteError: If *query* is empty or whitespace-only
                 (raised before any provider call), if the completion is
-                empty or whitespace-only, or if the completion spans more
-                than one non-blank line (:func:`_reduce_completion`).
-                Messages carry lengths and counts only, never the query or
-                completion text itself.
+                empty or whitespace-only, if the completion spans more
+                than one non-blank line (:func:`_reduce_completion`), or if
+                the reduced rewrite exceeds
+                :data:`~groundkit.retrieval.search.MAX_QUERY_LEN` — that
+                constant's own contract is that callers at a trust boundary
+                bound the input before it reaches retrieval, and a model
+                completion is exactly such an input; ``Retriever.search``
+                deliberately does not police length itself. Messages carry
+                lengths and counts only, never the query or completion text
+                itself.
             ChatError: Propagated unmodified from the underlying provider —
                 never swallowed, never turned into a fallback to *query*.
             ChatProviderNotConfiguredError: Propagated unmodified from the
@@ -188,5 +195,10 @@ class QueryRewriter:
             raise QueryRewriteError(
                 f"query rewrite completion was empty or whitespace-only "
                 f"({len(completion)} chars received)"
+            )
+        if len(rewritten) > MAX_QUERY_LEN:
+            raise QueryRewriteError(
+                f"query rewrite completion exceeds MAX_QUERY_LEN "
+                f"({len(rewritten)} chars > {MAX_QUERY_LEN}); rejected, never truncated"
             )
         return rewritten

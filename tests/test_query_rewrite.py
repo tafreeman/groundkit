@@ -354,3 +354,30 @@ class TestNoQueryTextInExceptionMessages:
             asyncio.run(rewriter.rewrite(query))
 
         assert query not in str(excinfo.value)
+
+
+class TestQueryLengthBoundary:
+    """A rewrite is an untrusted producer inside the trust boundary.
+
+    ``MAX_QUERY_LEN``'s own docstring says callers at a trust boundary bound
+    the input before it reaches retrieval, and ``Retriever.search``
+    deliberately does not police length. A model completion is exactly such
+    an input (PR #14 review finding, shown to fail first).
+    """
+
+    def test_overlong_rewrite_rejected_before_search(self) -> None:
+        from groundkit.retrieval.search import MAX_QUERY_LEN
+
+        chat = _RewriteScriptedChat(["q" * (MAX_QUERY_LEN + 1)])
+        rewriter = QueryRewriter(chat)
+        with pytest.raises(QueryRewriteError) as excinfo:
+            asyncio.run(rewriter.rewrite("a query"))
+        message = str(excinfo.value)
+        assert "q" * 32 not in message
+
+    def test_rewrite_at_exactly_the_boundary_is_accepted(self) -> None:
+        from groundkit.retrieval.search import MAX_QUERY_LEN
+
+        chat = _RewriteScriptedChat(["q" * MAX_QUERY_LEN])
+        rewriter = QueryRewriter(chat)
+        assert asyncio.run(rewriter.rewrite("a query")) == "q" * MAX_QUERY_LEN
