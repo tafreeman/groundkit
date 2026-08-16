@@ -6,9 +6,19 @@ fallback or coercion (SPEC.md §2, fail closed).
 
 from __future__ import annotations
 
+from typing import Literal
+
 
 class GroundkitError(Exception):
     """Base exception for all groundkit errors."""
+
+
+#: The two failure verdicts a citation-resolution failure maps to. Distinct
+#: from ``service.schemas.VerificationVerdict`` (which also has ``"verified"``
+#: — a success, never carried by an exception) — ``CitationVerdict`` values
+#: are a literal subtype of it, so assigning one to a ``VerificationVerdict``-
+#: typed variable type-checks under ``mypy --strict`` with no cast.
+CitationVerdict = Literal["drifted", "unresolvable"]
 
 
 class ConfigurationError(GroundkitError):
@@ -51,7 +61,23 @@ class IndexIdentityError(StorageError):
 
 
 class RetrievalError(GroundkitError):
-    """Error during retrieval or search."""
+    """Error during retrieval or search.
+
+    Attributes:
+        verdict: For a citation-resolution failure raised by
+            ``retrieval.citations.resolve_citation``, which of
+            ``fetch_chunk``'s two failure verdicts this maps to (ADR-0016
+            decision 6). ``None`` for every other ``RetrievalError`` (an
+            index inconsistency, an empty query, an out-of-range ``top_k``)
+            — those have no ``fetch_chunk`` verdict to carry, and leaving
+            this unset for them is the point: nothing downstream can read a
+            guessed value for an error this attribute was never meant to
+            describe.
+    """
+
+    def __init__(self, message: str, *, verdict: CitationVerdict | None = None) -> None:
+        super().__init__(message)
+        self.verdict = verdict
 
 
 class RerankerNotConfiguredError(RetrievalError):

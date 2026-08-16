@@ -10,16 +10,67 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from pydantic import BaseModel, ConfigDict
+
+from groundkit.contracts import SourceClass
+
 if TYPE_CHECKING:
     from groundkit.contracts import Chunk, CollectionManifest, EmbeddingIdentity
+
+
+class DocumentRecord(BaseModel):
+    """A stored document's provenance, projected for the citation join (ADR-0016).
+
+    Read-only: a view over a ``documents`` row, never a second place that fact
+    is asserted from. ``source_class``/``extractor`` default exactly as
+    :class:`~groundkit.contracts.Document`'s own fields do, so a document a
+    store can only describe at the ``text`` default (see
+    :class:`DocumentRecordStoreProtocol`, below, for when that happens) reads
+    back as exactly what a plain ``text`` ingest would have produced — never
+    a fabricated richer answer.
+
+    Defined here, beside :class:`DocumentRecordStoreProtocol`, rather than in
+    ``contracts.py`` next to :data:`~groundkit.contracts.SourceClass` — its
+    most natural home, alongside the analogous
+    :class:`~groundkit.contracts.CollectionManifest` and
+    :class:`~groundkit.contracts.EmbeddingIdentity` view types — because this
+    change's scope is ``index/*.py`` and ``retrieval/search.py``. A later
+    change with ``contracts.py`` in scope is free to relocate it.
+
+    Attributes:
+        source: The document's source identifier (path/URL).
+        source_class: How ``source`` maps to stored content (ADR-0016).
+        extractor: Extractor identity for an ``extracted`` source; ``None``
+            for every other class.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source: str
+    source_class: SourceClass = "text"
+    extractor: str | None = None
 
 
 @runtime_checkable
 class MetadataStoreProtocol(Protocol):
     """Durable store for documents, chunks, and ingest state."""
 
-    async def upsert_document(self, source: str, document_id: str, content_hash: str) -> None:
-        """Record (or replace) a document's ingest state."""
+    async def upsert_document(
+        self,
+        source: str,
+        document_id: str,
+        content_hash: str,
+        *,
+        source_class: SourceClass = "text",
+        extractor: str | None = None,
+    ) -> None:
+        """Record (or replace) a document's ingest state.
+
+        ``source_class``/``extractor`` record how ``source`` maps to stored
+        content (ADR-0016) — keyword-only and defaulted so every caller that
+        predates this pair keeps compiling, and keeps meaning exactly what it
+        meant before, unchanged.
+        """
         ...
 
     async def get_document_hash(self, source: str) -> str | None:
@@ -39,7 +90,14 @@ class MetadataStoreProtocol(Protocol):
         ...
 
     async def replace_document(
-        self, source: str, document_id: str, content_hash: str, chunks: list[Chunk]
+        self,
+        source: str,
+        document_id: str,
+        content_hash: str,
+        chunks: list[Chunk],
+        *,
+        source_class: SourceClass = "text",
+        extractor: str | None = None,
     ) -> None:
         """Atomically replace a document's row and its chunks in one transaction.
 
@@ -49,6 +107,10 @@ class MetadataStoreProtocol(Protocol):
         carrying a fresh content hash with zero chunks if it is interrupted
         between the calls, and incremental re-index then skips that document
         forever on hash match.
+
+        ``source_class``/``extractor`` record how ``source`` maps to stored
+        content (ADR-0016) — keyword-only and defaulted so every caller that
+        predates this pair keeps compiling unchanged.
         """
         ...
 
@@ -124,6 +186,46 @@ class MetadataStoreProtocol(Protocol):
         "unchanged" is the silent-staleness failure this member exists to
         prevent, which is why the two are different values rather than a
         default.
+        """
+        ...
+
+
+@runtime_checkable
+class DocumentRecordStoreProtocol(Protocol):
+    """Optional capability: a store that can report each document's full ADR-0016 provenance.
+
+    Deliberately **not** a member of :class:`MetadataStoreProtocol`. That
+    protocol is held to two structural guards from outside this module —
+    ``tests/test_protocol_conformance.py``'s exact signature-parity check and
+    ``tests/test_metadata_store.py``'s mutating/read-only completeness
+    classification — and several hand-built protocol-conforming test doubles
+    elsewhere in the suite (retrieval and runtime tests that predate
+    ADR-0016) implement only the pre-existing member set. Folding this in as
+    a required member of ``MetadataStoreProtocol`` would fail every one of
+    them: the ``isinstance`` check some are asserted against (structural
+    Protocol conformance requires every declared member to be present), and
+    a real call from :class:`~groundkit.retrieval.search.Retriever` would
+    raise a bare ``AttributeError`` on the rest rather than the typed
+    refusal SPEC.md §2 asks for.
+
+    A store either implements this narrower, separate capability
+    (:class:`~groundkit.index.metadata.SQLiteMetadataStore` does) or it does
+    not, and ``Retriever`` degrades to ``text``/``None`` defaults for one
+    that does not (see ``Retriever._document_records``) — which is honest
+    rather than a silent downgrade: a store with no way to report richer
+    provenance never had it to report in the first place. That is different
+    from the actual ADR-0016 defect this capability closes, where a real
+    ``SQLiteMetadataStore`` *did* have the value (it was on the ingested
+    ``Document``) and dropped it on write.
+    """
+
+    async def get_document_records(self) -> dict[str, DocumentRecord]:
+        """Return ``{document_id: DocumentRecord}`` for every stored document.
+
+        Unlike :meth:`MetadataStoreProtocol.get_document_sources`, this
+        reports each document's full ADR-0016 provenance, not just its
+        source string — the read half of the join
+        :meth:`MetadataStoreProtocol.replace_document` writes.
         """
         ...
 

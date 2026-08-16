@@ -458,6 +458,40 @@ per SPEC.md §9:
   `base_url` itself. The threat model is operator misconfiguration, not a
   hostile operator (ADR-0014 Consequences).
 
+## Loaders workstream (ADR-0016) — the plumbing landed, the loaders have not
+
+ADR-0016 schedules PDF/HTML/URL support in four waves. **Waves 1 and 2 have landed; waves 3
+and 4 have not**, and the honest summary is that groundkit now *records and enforces* source
+classes it cannot yet *produce*.
+
+- **There is still no PDF loader, no HTML loader, and no URL ingestion.** `FileLoader` handles
+  `.md`/`.txt` exactly as before, so every document any shipped code path can create is
+  `source_class="text"`. ADR-0016 decisions 3, 4 and 5 are unbuilt; `pdf`/`html` extras do not
+  exist and `grk ingest` accepts no URL.
+- **The extractor-identity check is correct code that is currently always-refusing.** An
+  `extracted` citation resolves only if the recorded extractor identity is active in this
+  build, and no extractor is registered — so every such citation is refused as
+  `unresolvable`, naming the recorded identity and reporting the active set as empty. That is
+  the intended pre-wave-3 behaviour (fail closed, ADR-0016 decision 2), not a stub, and it
+  becomes useful the moment wave 3 registers a real extractor. `snapshot` citations are
+  likewise refused pending wave 4's snapshot storage, with their own distinct reason.
+- **A pre-v3 store is now refused for *writes*, which is broader than the earlier promise.**
+  `SCHEMA_VERSION` went 2→3 (ADR-0016 adds `source_class`/`extractor` to `documents`). Because
+  `CREATE TABLE IF NOT EXISTS` never adds a column to a table that already exists, a store
+  created before this cannot hold a source class, so `upsert_document`, `replace_document` and
+  `get_document_records` refuse with a `StorageError` naming delete-and-re-ingest as the
+  remedy. This supersedes the narrower rule that a legacy store "keeps serving BM25-only
+  indexing unchanged" — that promise was made before the columns existed. **Reads are
+  deliberately untouched**: an existing collection stays openable and searchable, it just
+  cannot be added to. Pre-1.0 the remedy is a rebuild, never a migration (ADR-0004 decision 5).
+- **The join has one narrow fallback worth knowing about.** `Retriever` reads provenance
+  through `DocumentRecordStoreProtocol` and, for a store that does not implement it, degrades
+  to `("text", None)`. That is sound rather than fail-open *for the stores it can apply to* — a
+  store with no way to report a source class never had one to drop, unlike the real defect this
+  work closed (a store that had the value and discarded it). `SQLiteMetadataStore` implements
+  the protocol and a conformance plus signature-parity test pins that. The residual is a
+  hypothetical *second* real store forgetting the method; there is only one today.
+
 ## Phase 6 — every IaC path exercised; two verifications are narrower than their rows read
 
 Phase 6 lands in two changes (`docs/specs/phase-6-iac-observability.md` §3). The

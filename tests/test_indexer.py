@@ -1392,10 +1392,27 @@ def test_legacy_unstamped_store_is_refused_for_dense_indexing(corpus: Path, tmp_
     is exactly the silent-corruption path ADR-0004 closes. A dense-enabled
     indexer over such a store must raise ``IndexIdentityError`` up front —
     before any load, chunk, embed, or delete has touched either store, so
-    both remain exactly as found. The refusal is scoped to dense work only:
-    the same legacy store must keep serving BM25-only indexing unchanged
-    (pre-1.0 the documented remedy is delete-and-reingest, not a migration
-    and not a lockout).
+    both remain exactly as found.
+
+    **Superseded in part by ADR-0016 (schema v3), and recorded rather than
+    quietly rewritten.** This test used to end by asserting the opposite of
+    what it now asserts: that the refusal was "scoped to dense work only" and
+    that the same legacy store "must keep serving BM25-only indexing
+    unchanged — not a migration and not a lockout". ADR-0016 added
+    ``source_class`` and ``extractor`` to the ``documents`` table and raised
+    ``SCHEMA_VERSION`` to 3, stating that existing collections must be
+    deleted and re-ingested. That is a lockout for *writes*, and it is not
+    optional: ``CREATE TABLE IF NOT EXISTS`` never adds a column to a table
+    that already exists, so a pre-v3 store physically has nowhere to put the
+    class, and accepting the write would mean either dropping it (the
+    fail-open defect ADR-0016 exists to close) or failing at the SQL layer
+    with a worse message.
+
+    So the scope of the refusal widened from "dense work" to "any write",
+    and the dense path still fails first and for its own ADR-0004 reason —
+    which is what the first half below pins. Reads are deliberately
+    untouched: an existing collection stays searchable, it just cannot be
+    added to.
     """
     _write_pre_manifest_store(tmp_path / "idx", "default")
 
@@ -1419,10 +1436,17 @@ def test_legacy_unstamped_store_is_refused_for_dense_indexing(corpus: Path, tmp_
             assert embedder.embed_calls == 0
             assert await _dense_rows(vector_store) == []
 
-            # …but only for dense work: BM25-only indexing still works.
+            # …and since ADR-0016's schema v3, BM25-only indexing is refused
+            # too — the store has no column to record a source class in. The
+            # error names the remedy (delete and re-ingest) rather than
+            # failing at the SQL layer.
             bm25_only = Indexer(store, FileLoader(allowed_base_dir=corpus))
-            report = await bm25_only.index_directory(str(corpus))
-            assert report.documents_indexed == 3
+            with pytest.raises(StorageError, match="re-ingest"):
+                await bm25_only.index_directory(str(corpus))
+
+            # Still refused before anything was written, on either store.
+            assert await store.get_document_sources() == {}
+            assert await store.get_chunks() == []
         finally:
             await store.close()
 

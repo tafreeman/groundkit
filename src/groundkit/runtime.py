@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
     from groundkit.config import RetrievalConfig
     from groundkit.contracts import Chunk, CollectionManifest
-    from groundkit.index.protocols import VectorStoreProtocol
+    from groundkit.index.protocols import DocumentRecord, VectorStoreProtocol
     from groundkit.providers.protocols import EmbeddingProtocol
 
     #: Produces a fresh vector-store handle for each rebuild. A factory rather
@@ -331,6 +331,18 @@ class CollectionRuntime:
         """Return ``{document_id: source}`` for every document in the collection."""
         self._require_open()
         return await self._store.get_document_sources()
+
+    async def get_document_records(self) -> dict[str, DocumentRecord]:
+        """Return ``{document_id: DocumentRecord}`` for every document in the collection.
+
+        The ADR-0016 sibling of :meth:`get_document_sources`: each record
+        carries the document's real ``source_class``/``extractor`` alongside
+        its source, for a caller (``fetch_chunk``) building a ``Citation``
+        that must not silently default to ``("text", None)`` regardless of
+        what was actually ingested.
+        """
+        self._require_open()
+        return await self._store.get_document_records()
 
     async def get_manifest(self) -> CollectionManifest | None:
         """Return the collection's embedding-identity manifest, or ``None``."""

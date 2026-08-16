@@ -268,10 +268,15 @@ async def handle_fetch_chunk(ctx: ServiceContext, request: FetchChunkRequest) ->
     try:
         resolved = await resolve_citation(citation, ctx.base_dir)
     except RetrievalError as exc:
-        # resolve_citation raises for both "source changed" and "cannot read".
-        # The message distinguishes them for a human; the verdict does for a
-        # client. Neither carries text a caller could attribute to the source.
-        verification = "drifted" if "changed since indexing" in str(exc) else "unresolvable"
+        # resolve_citation sets `verdict` explicitly at every one of its raise
+        # sites (ADR-0016 decision 6), so this reads a typed attribute instead
+        # of pattern-matching the message text the way an earlier version did.
+        # The `is None` fallback is defensive, not load-bearing: every path
+        # inside resolve_citation now sets a verdict, so it should never
+        # trigger. It exists so a future RetrievalError raised there without
+        # one fails toward the more conservative verdict — `unresolvable`
+        # never claims a definite "the source changed", `drifted` would.
+        verification = exc.verdict if exc.verdict is not None else "unresolvable"
         detail = str(exc)
     else:
         if resolved == chunk.content:
