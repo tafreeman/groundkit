@@ -302,6 +302,25 @@ resource "aws_volume_attachment" "data" {
   device_name = local.data_device_name
   volume_id   = aws_ebs_volume.data.id
   instance_id = aws_instance.this.id
+
+  # The provider defaults this to false, which forcibly detaches a volume that
+  # is still mounted and being written to. That is the wrong default for this
+  # module specifically, and on a path it deliberately makes routine.
+  #
+  # `data.aws_ami.al2023` uses `most_recent`, so an upstream AMI release plans
+  # an instance replacement — the comment on that data source calls it the
+  # correct trade for a cheap-to-replace instance. Replacing the instance
+  # replaces this attachment, and Terraform destroys the attachment BEFORE the
+  # instance it references, so the old host still has /srv/groundkit mounted
+  # when the volume goes away. ext4 loses writes; SQLite in WAL mode
+  # (ADR-0002) can lose more than that, and this is the volume ADR-0020
+  # decision 4 exists to preserve — `prevent_destroy` keeps the volume and
+  # would have kept a corrupted one.
+  #
+  # `true` stops the instance first, so the filesystem is quiesced before the
+  # detach. It makes replacement slower, which is the correct trade when the
+  # alternative is a silently damaged corpus.
+  stop_instance_before_detaching = true
 }
 
 # -- Compute ----------------------------------------------------------------

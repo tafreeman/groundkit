@@ -70,12 +70,17 @@ variable "instance_type" {
   default     = "t3.small"
 
   validation {
-    # Graviton families: `a1`, and any family whose suffix begins with `g` after
-    # the generation digit (t4g, m6gd, c7gn, im4gn, is4gen, x2gd, hpc7g, r8g).
-    # Deliberately not matched: g4dn/g6, where the `g` is the family letter and
-    # the instance is x86.
-    condition     = !can(regex("^(a1|[a-z]+[0-9]+g[a-z]*)\\.", var.instance_type))
-    error_message = "instance_type ${var.instance_type} looks like an arm64/Graviton family, and this module is x86_64 only: the AMI filter selects an x86_64 image and the container image is built for one architecture. Supporting arm64 means a multi-arch image build, not a different value here."
+    # arm64 families, in three groups because they are not named alike:
+    #   - `a1`
+    #   - Graviton: any family whose suffix begins with `g` after the
+    #     generation digit (t4g, m6gd, c7gn, im4gn, is4gen, x2gd, hpc7g, r8g)
+    #   - Apple silicon Macs: `mac2`, `mac2-m2`, `mac2-m1ultra`, … which carry
+    #     no `g` at all
+    # Deliberately NOT matched, and both are easy to get wrong in the other
+    # direction: `g4dn`/`g6`, where the `g` is the family letter and the
+    # instance is x86; and `mac1`, which is an Intel Mac.
+    condition     = !can(regex("^(a1|mac2[a-z0-9-]*|[a-z]+[0-9]+g[a-z]*)\\.", var.instance_type))
+    error_message = "instance_type ${var.instance_type} is an arm64 family (Graviton, a1, or an Apple-silicon Mac), and this module is x86_64 only: the AMI filter selects an x86_64 image and the container image is built for one architecture. Supporting arm64 means a multi-arch image build, not a different value here."
   }
 }
 
