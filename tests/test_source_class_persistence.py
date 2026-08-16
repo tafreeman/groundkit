@@ -30,6 +30,9 @@ from groundkit.index.metadata import SCHEMA_VERSION, SQLiteMetadataStore
 from groundkit.index.protocols import DocumentRecord, DocumentRecordStoreProtocol
 from groundkit.indexer import Indexer
 from groundkit.retrieval.search import Retriever
+from groundkit.runtime import CollectionRegistry
+from groundkit.service.schemas import ChunkFetchResponse, FetchChunkRequest
+from groundkit.service.tools import ServiceContext, handle_fetch_chunk
 from test_protocol_conformance import assert_signature_parity
 
 
@@ -193,7 +196,7 @@ def test_get_document_records_refuses_a_pre_v3_store(tmp_path: Path) -> None:
     async def run() -> None:
         store = await SQLiteMetadataStore.open(tmp_path, "col")
         try:
-            with pytest.raises(StorageError, match="source_class"):
+            with pytest.raises(StorageError, match="re-ingest"):
                 await store.get_document_records()
         finally:
             await store.close()
@@ -277,3 +280,61 @@ def test_ingested_text_document_still_reports_text_none_via_search(tmp_path: Pat
     assert result.extractor is None
     assert result.citation.source_class == "text"
     assert result.citation.extractor is None
+
+
+def test_fetch_chunk_reports_the_ingested_class_not_the_text_default(tmp_path: Path) -> None:
+    """The third call site, and the one an automated review caught still open.
+
+    ``handle_fetch_chunk`` builds its own ``Citation`` rather than going
+    through ``RetrievalResult.citation``, so fixing ``Indexer`` and
+    ``Retriever`` did not fix it: it read ``get_document_sources()`` (a bare
+    source string) and left ``source_class``/``extractor`` at their
+    ``("text", None)`` field defaults. Two read-only tools would then disagree
+    about one stored fact — ``search`` reporting ``"extracted"`` and
+    ``fetch_chunk`` reporting ``"text"`` for the same chunk — and worse,
+    ``resolve_citation`` would take the plain read-and-slice branch instead of
+    refusing, "verifying" derived offsets against raw file bytes.
+
+    This test exists because its absence is why that shipped: every other
+    ``fetch_chunk`` test seeds a ``text`` document or monkeypatches
+    ``resolve_citation``, so none of them ever drove the real Citation-building
+    path for a non-text document. Reverting ``handle_fetch_chunk``'s
+    ``get_document_records`` call makes this fail with ``'text' == 'extracted'``.
+    """
+    doc = Document(
+        source=str(tmp_path / "paper.pdf"),
+        content="Extracted body text about turbine maintenance intervals.",
+        source_class="extracted",
+        extractor="pdf-x/1",
+    )
+    index_dir = tmp_path / "index"
+    index_dir.mkdir()
+
+    async def run() -> ChunkFetchResponse:
+        store = await SQLiteMetadataStore.open(index_dir, "default")
+        try:
+            indexer = Indexer(store, _StubLoader(doc))
+            await indexer.index_source(doc.source)
+            chunks = await store.get_chunks()
+        finally:
+            await store.close()
+
+        ctx = ServiceContext(
+            registry=CollectionRegistry(index_dir), index_dir=index_dir, base_dir=tmp_path
+        )
+        return await handle_fetch_chunk(
+            ctx, FetchChunkRequest(collection="default", chunk_id=chunks[0].chunk_id)
+        )
+
+    response = asyncio.run(run())
+
+    assert response.citation.source_class == "extracted", (
+        "fetch_chunk silently reported the ('text', None) default"
+    )
+    assert response.citation.extractor == "pdf-x/1"
+
+    # And the class actually routes: an extracted citation with no registered
+    # extractor must refuse as `unresolvable` (ADR-0016 decisions 2 and 6),
+    # never be read-and-sliced as though it were plain text.
+    assert response.verification == "unresolvable"
+    assert response.content is None

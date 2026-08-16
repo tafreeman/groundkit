@@ -239,25 +239,38 @@ async def handle_fetch_chunk(ctx: ServiceContext, request: FetchChunkRequest) ->
     """
     async with ctx.registry.acquire(request.collection) as runtime:
         chunk = await runtime.get_chunk(request.chunk_id)
-        sources = await runtime.get_document_sources()
+        records = await runtime.get_document_records()
 
     if chunk is None:
         raise ConfigurationError(
             f"no chunk {request.chunk_id!r} in collection {request.collection!r}"
         )
 
-    source = sources.get(chunk.document_id)
-    if source is None:
+    record = records.get(chunk.document_id)
+    if record is None:
         # The dangling-document case Retriever.search already fails closed on.
         raise RetrievalError(
             f"chunk {chunk.chunk_id!r} belongs to document {chunk.document_id!r}, "
             "which has no stored source — the index is inconsistent"
         )
 
+    # ``get_document_records`` rather than ``get_document_sources`` (ADR-0016).
+    # A bare source string would leave this Citation at its ``("text", None)``
+    # field defaults no matter what the document was ingested as, and the
+    # consequences are not cosmetic: ``search`` would report a chunk's citation
+    # as ``extracted`` while ``fetch_chunk`` reported the same chunk as
+    # ``text`` — two read-only tools disagreeing about one stored fact — and
+    # ``resolve_citation`` would take the plain read-and-slice branch instead of
+    # refusing. For an extracted source that can "verify" against raw bytes the
+    # offsets were never measured against; for a snapshot source it hands a URL
+    # to ``ensure_within_base``, which is exactly the relative-path confusion
+    # ADR-0016 decision 4 closes by classifying before resolving.
     citation = Citation(
         document_id=chunk.document_id,
         chunk_id=chunk.chunk_id,
-        source=source,
+        source=record.source,
+        source_class=record.source_class,
+        extractor=record.extractor,
         start_offset=chunk.start_offset,
         end_offset=chunk.end_offset,
     )
