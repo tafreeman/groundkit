@@ -30,8 +30,14 @@ that guarantee moves one layer out and each surface here re-establishes it:
 | Surface | What keeps it private |
 |---|---|
 | compose | `ports: 127.0.0.1:8765:8765` — a host-loopback publish |
-| Kubernetes | a `ClusterIP` Service; reach it with `kubectl port-forward` |
+| Kubernetes | a `ClusterIP` Service **and** a default-deny-ingress NetworkPolicy; reach it with `kubectl port-forward` |
 | Terraform | no ingress rules at all; reach it with SSM port forwarding |
+
+The Kubernetes row takes both objects and is the weakest of the three. `ClusterIP`
+closes the cluster's *edge*; every pod in every namespace can still dial a
+ClusterIP directly, so `networkpolicy.yaml` is what actually closes in-cluster
+reachability — and a NetworkPolicy is **silently inert** on a cluster whose CNI
+does not enforce one. Read that file's header before treating it as a guarantee.
 
 `docker run -p 8765:8765 groundkit` — the obvious shorter command — publishes an
 unauthenticated, content-bearing surface on every interface of the host. The
@@ -44,7 +50,9 @@ docker/Dockerfile          multi-stage, non-root (uid 10001), read-only-root rea
 compose/docker-compose.yml service + Ollama + OTel collector + Jaeger
 compose/otel-collector.yaml  OTLP in; OTLP to Jaeger + debug out
 compose/.env.example       names only, never values
-k8s/                       namespace, PVC, Deployment, Service (+ two one-shots)
+k8s/                       namespace, NetworkPolicy, PVC, Deployment, Service
+k8s/ingest/                the ingest Job, its own kustomization (image override)
+k8s/pod-corpus-loader.yaml a `kubectl cp` target; plain `-f`, needs no override
 terraform/aws-ec2/         ADR-0020's module
 ```
 
@@ -60,20 +68,44 @@ curl -s http://127.0.0.1:8765/v1/collections
 # Jaeger UI: http://127.0.0.1:16686  (see "Traces" below before looking for spans)
 ```
 
-**Kubernetes** (needs a cluster and a pushed image — none is published):
+**Kubernetes** (needs a cluster and a pushed image — none is published). Set the
+image in **both** `k8s/kustomization.yaml` and `k8s/ingest/kustomization.yaml`
+first; a kustomize `images:` transformer reaches only its own kustomization's
+resources.
 
 ```bash
 kubectl kustomize infra/k8s                      # render, offline
 kubectl apply -k infra/k8s
+
+# The PVC is ReadWriteOnce, so exactly one pod may hold it. Scale down before
+# running either one-shot, or on a multi-node cluster they stall Pending on a
+# multi-attach error rather than failing.
+kubectl -n groundkit scale deploy/groundkit --replicas=0
+
 kubectl apply -f infra/k8s/pod-corpus-loader.yaml
 kubectl -n groundkit wait --for=condition=Ready pod/groundkit-corpus-loader
 kubectl -n groundkit cp ./docs groundkit-corpus-loader:/data/corpus
 kubectl -n groundkit delete pod groundkit-corpus-loader
-kubectl apply -f infra/k8s/job-ingest.yaml
+
+kubectl apply -k infra/k8s/ingest
+kubectl -n groundkit wait --for=condition=complete job/groundkit-ingest --timeout=10m
+
+# Scaling back up is also the retriever reopen: a Retriever is a snapshot as of
+# open() and never refreshes, so a pod that had been serving would return zero
+# results for everything the ingest just added.
+kubectl -n groundkit scale deploy/groundkit --replicas=1
 kubectl -n groundkit port-forward svc/groundkit 8765:8765
 ```
 
+On a single-node cluster the scale-down steps happen to be unnecessary, which is
+precisely what makes omitting them a trap: the sequence passes in the small case
+and stalls in the real one.
+
 **Terraform**: see [`terraform/aws-ec2/README.md`](terraform/aws-ec2/README.md).
+The instance needs outbound HTTPS during bootstrap — it installs docker and
+pulls the image — so a private subnet wants a NAT gateway.
+`create_ssm_vpc_endpoints` covers the SSM control channel only and does **not**
+make an egress-free subnet work.
 
 ## Traces: the stack is wired, and nothing emits yet
 

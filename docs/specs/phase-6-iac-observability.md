@@ -159,9 +159,50 @@ infra/
   compose/docker-compose.yml     service + ollama + otel-collector + jaeger
   compose/otel-collector.yaml    OTLP in, OTLP to Jaeger + debug out
   compose/.env.example           names only; no values, ever
-  k8s/                           namespace, pvc, deployment, service, ingest Job
+  k8s/                           namespace, NetworkPolicy, pvc, deployment, service
+  k8s/ingest/                    the ingest Job, own kustomization (image override)
+  k8s/pod-corpus-loader.yaml     a `kubectl cp` target; plain -f, no override needed
   terraform/aws-ec2/             ADR-0020's module
 ```
+
+### 5.1 Corrected after review
+
+Six findings from the automated review of the first push were confirmed against
+the tree and fixed; none was a false positive. Recorded here because four of
+them share a shape worth naming — **a manifest that is accepted, renders, and
+does the wrong thing at apply time**, which is precisely the class that
+`kustomize`-renders-cleanly and `terraform validate`-passes cannot catch:
+
+1. **`ClusterIP` was described as re-establishing the access boundary.** It
+   closes the cluster's edge only; any pod in any namespace can dial it.
+   `infra/k8s/networkpolicy.yaml` (default-deny ingress) is new, and ADR-0021's
+   claim is corrected rather than quietly softened.
+2. **The ingest Job never received the kustomize image override**, because a
+   transformer reaches only its own kustomization's resources — so the
+   documented `kubectl apply -f` ended in `ImagePullBackOff` on the unpublished
+   placeholder. It now has its own kustomization at `k8s/ingest/`.
+3. **The documented Kubernetes sequence started the Deployment before the
+   one-shots**, which stalls on a multi-attach error against a `ReadWriteOnce`
+   claim on any multi-node cluster — and works on a single-node one, which is
+   what would have let it ship.
+4. **`create_ssm_vpc_endpoints` was advertised as making a NAT-free subnet
+   work.** It carries the SSM control channel; bootstrap still needs egress for
+   `dnf` and the image pull.
+5. **The documented private-ECR image could not be pulled**: the role carried
+   SSM permissions only and bootstrap performed no `docker login`. ECR is now
+   detected from the image reference, which scopes the IAM grant and keeps the
+   documented example working without a flag anyone has to remember.
+6. **The `groundkit-ingest` helper ingested BM25-only while the service served
+   `--dense`**, producing a manifest-less collection whose every dense and
+   hybrid request is refused (ADR-0008) — reported as an index inconsistency
+   three steps from its cause. Both are now rendered from one input.
+
+The review also missed one, found by diffing the merge against `origin/main`:
+merging `main` into this branch **deleted Phase 5's `KNOWN_LIMITATIONS.md`
+section and reverted its SPEC.md §9 row to `pending`**. Both are restored
+verbatim. A merge that resolves a shared file wholesale to one side is not
+visible in that side's own diff, which is why the check has to be against the
+base rather than against the branch.
 
 Change 2 adds, under `src/`: `groundkit/telemetry.py` (tracer accessor and the
 typed-keyword attribute helper ADR-0022 decision 3 requires), a

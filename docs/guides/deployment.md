@@ -31,8 +31,17 @@ decision 1):
 | Surface | What keeps it private | How you reach it |
 |---|---|---|
 | compose | host-loopback publish (`127.0.0.1:8765:8765`) | `curl http://127.0.0.1:8765/…` |
-| Kubernetes | `ClusterIP` Service — not NodePort, not LoadBalancer | `kubectl port-forward` |
+| Kubernetes | `ClusterIP` Service **and** a default-deny-ingress NetworkPolicy | `kubectl port-forward` |
 | Terraform (AWS) | security group with no ingress rules at all | SSM port forwarding |
+
+The Kubernetes row needs both objects, and it is the weakest of the three.
+A `ClusterIP` closes the cluster's *edge* — it is not `NodePort` and not
+`LoadBalancer` — but any pod in any namespace can dial a ClusterIP directly, so
+on its own it is a smaller blast radius rather than a boundary. The
+NetworkPolicy is what closes that, and a NetworkPolicy is **silently inert** on a
+cluster whose CNI does not enforce one: the API server accepts it, reports no
+status, and emits no warning. compose and Terraform rest on a kernel-level
+socket bind instead, which is contingent on nothing.
 
 The image itself cannot enforce any of this. `docker run -p 8765:8765
 groundkit` — the obvious shorter command — publishes an unauthenticated,
@@ -119,7 +128,19 @@ an error.
 
 Two one-shot manifests sit beside the base and are deliberately not part of it —
 a Job's pod template is immutable, so it would break the second `apply -k`, and
-a loader pod would hold the RWO claim the Deployment needs.
+a loader pod would hold the RWO claim the Deployment needs. The ingest Job has
+its own kustomization rather than being a loose `kubectl apply -f`, because a
+kustomize `images:` transformer rewrites only its own kustomization's resources:
+applied loose, the Job kept the unpublished placeholder image and the documented
+workflow ended in `ImagePullBackOff`. Set the image in both places.
+
+**Scale the Deployment to zero before running either one-shot.** One RWO claim
+admits one pod; on a multi-node cluster the one-shot otherwise sits Pending on a
+multi-attach error. Scaling back up afterwards is not just restoring service —
+a `Retriever` is a snapshot as of `open()` and never refreshes, so the restart
+*is* the reopen that makes newly ingested content visible. On a single-node
+cluster the scale-down is unnecessary, which is exactly what makes skipping it a
+trap: it passes in the small case and stalls in the real one.
 
 ## Terraform (AWS)
 
@@ -131,6 +152,20 @@ storage: SQLite's WAL coordination uses a memory-mapped `-shm` sidecar that is
 not reliable over a network filesystem, which disqualifies every
 serverless-container-plus-managed-filesystem answer before compute is even
 considered.
+
+Two operational facts that are easy to get wrong and fail silently:
+
+- **The instance needs outbound HTTPS during bootstrap** — it installs docker
+  and pulls the image — so a private subnet wants a NAT gateway.
+  `create_ssm_vpc_endpoints` carries the Session Manager control channel only;
+  on an otherwise egress-free subnet it yields an instance you can open a
+  session to and no service running on it.
+- **A private ECR image is detected and authenticated.** When
+  `container_image` matches the private-ECR host pattern, the role gains
+  `AmazonEC2ContainerRegistryReadOnly` and bootstrap performs a `docker login`;
+  otherwise neither happens. Detected rather than flagged because an
+  unauthenticated pull of a private image ends bootstrap before the service unit
+  is written, and the instance then looks healthy while serving nothing.
 
 The module creates **no** backup schedule. `prevent_destroy` on the data volume
 means it survives instance replacement and nothing more, and SPEC.md §7 is
