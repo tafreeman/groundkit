@@ -363,7 +363,9 @@ per SPEC.md §9:
 - PDF/HTML loaders and URL ingestion (with the SSRF guard) — v1 scope, not
   yet scheduled into a phase; the loader currently reads `.md`/`.markdown`/
   `.txt` only.
-- IaC and OTel observability (Phase 6).
+- Synthesis, query rewrite, redaction (Phase 5); OTel observability (Phase 6's
+  second change — the IaC half has landed, see the Phase 6 section below);
+  docs site (Phase 7).
 - BM25 rebuilds in memory at open — O(corpus) startup cost, accepted and
   bounded by ADR-0002's revisit trigger.
 - A UTF-8 BOM is not stripped at load (`utf-8`, not `utf-8-sig`), so a
@@ -455,6 +457,224 @@ per SPEC.md §9:
   legitimately need, to close a bypass in the same trust domain as
   `base_url` itself. The threat model is operator misconfiguration, not a
   hostile operator (ADR-0014 Consequences).
+
+## Phase 6 — IaC landed, observability has not
+
+Phase 6 lands in two changes (`docs/specs/phase-6-iac-observability.md` §3). The
+first is `infra/` plus its ADRs and docs and **changes nothing under `src/`**;
+the second adds the OpenTelemetry instrumentation and the JSON log formatter.
+Everything below describes the state between the two.
+
+- **Nothing emits a span, and the compose stack's collector and Jaeger receive
+  nothing.** SPEC.md §3 requires spans on ingest, retrieve and synthesize; there
+  is no `opentelemetry` dependency in the tree, no tracer, and no exporter. The
+  topology is real and correctly wired, so the Jaeger UI being empty is the
+  expected state rather than a misconfiguration — `infra/README.md` and the
+  deployment guide both say so where a reader would otherwise conclude the
+  opposite. The collector→Jaeger leg is provable on its own with a synthetic
+  OTLP payload in the meantime.
+- **All three of SPEC.md §3's span sites are Phase 6's to instrument, `synthesize`
+  included — this entry used to defer it and no longer does.** The deferral was
+  written while Phase 5 was under construction alongside this phase, when
+  `providers/synthesis.py` genuinely did not exist. Phase 5 then landed (SPEC.md
+  §9: done 2026-08-15) and this branch merged `main`, so the seam —
+  `async Synthesizer.synthesize(query, results)` — is present in this tree and
+  settled. The premise expired without the text changing; had it stayed, Phase 6
+  would have closed at two-thirds of a SPEC.md §3 requirement by following its
+  own documentation (ADR-0022 decision 5).
+
+  The residual worth knowing is not a missing span but a sharper allowlist
+  obligation: a synthesis span sits closer to prompt text, completion text and
+  citation spans than any other site, and none of those may become a span
+  attribute. Model identity, result count, latency and a typed failure code may.
+- **The read-only-mount deferral is discharged in part, and the part is worth
+  stating precisely.** The "read-only does not mean the process writes no bytes"
+  entry above deferred filesystem-level enforcement to this phase. What that
+  buys is the **corpus** mount: `/data/corpus` is a read-only mount in every
+  deployment surface, so the documents each citation resolves against are
+  unwritable by the serving process, enforced by the kernel rather than scoped
+  in Python. `/data/index` remains read-write and no mount flag changes that
+  while ADR-0002 keeps the store in WAL mode — `SQLiteMetadataStore.open` writes
+  its sidecars, runs `CREATE TABLE IF NOT EXISTS`, and chmods, on every open. So
+  read-only is now true of the corpus and still false of the index (ADR-0021
+  decision 2). A read-only *open path* in `index/metadata.py` would close the
+  rest and is a separate `src/` change with its own ADR.
+- **A container cannot enforce the loopback bind, so the image is not safe to
+  run with the obvious short command.** Inside a container a process bound to
+  `127.0.0.1` is reachable from nothing, so the image binds `0.0.0.0` with
+  `--allow-remote-access` and the guarantee moves to the publish boundary:
+  host-loopback publish in compose, a ClusterIP Service in Kubernetes, no
+  ingress rules at all in Terraform (ADR-0021 decision 1, ADR-0020 decision 2).
+  `docker run -p 8765:8765` and `--network host` both publish an
+  unauthenticated, content-bearing surface on every interface of the host, and
+  the image cannot tell those cases from the safe one. What was a refusal in
+  Phase 4 is a warning in a container.
+- **The Kubernetes probes target a real operation because there is no health
+  endpoint.** `GET /v1/collections` proves the process is serving HTTP and the
+  index directory is listable; it does **not** prove any collection is usable,
+  because `handle_list_collections` returns `[]` for a missing or empty index
+  directory rather than failing. A pod with an unmounted volume therefore
+  reports ready. Adding `/healthz` means widening ADR-0014 decision 2's
+  route-parity exclusion set — a security-relevant `src/` change deliberately
+  not taken in a change that touches no `src/` file
+  (`docs/specs/phase-6-iac-observability.md` §4.2, Q1).
+- **The Kubernetes in-cluster boundary rests on a NetworkPolicy, which can be
+  silently inert.** A `ClusterIP` Service closes the cluster's edge and nothing
+  else — every pod in every namespace can dial one directly — so
+  `infra/k8s/networkpolicy.yaml` (default-deny ingress, empty `podSelector`) is
+  what actually closes in-cluster reachability to this unauthenticated,
+  content-bearing surface. On a cluster whose CNI does not enforce
+  NetworkPolicy, the API server accepts the object, reports no status, emits no
+  warning, and every pod can still reach the service. Enforcement has to be
+  confirmed against the cluster; no manifest can assert it. The same policy may
+  also break `kubectl port-forward` on a CNI that blocks node-to-pod traffic —
+  most permit it, since kubelet probes would otherwise fail, but that is a CNI
+  behaviour rather than a Kubernetes guarantee. compose and the Terraform
+  module rest on a kernel-level socket bind instead and are contingent on
+  nothing.
+- **The base kustomization pins `sortOptions: order: fifo`, and that is
+  load-bearing.** Kustomize's legacy sort reorders by kind and has no entry for
+  `NetworkPolicy`, so it rendered *after* the Deployment — meaning a first
+  `apply -k` to a shared cluster could have the Deployment controller create a
+  reachable pod before the default-deny policy was submitted. For an
+  unauthenticated, content-bearing service that window is the whole exposure.
+  FIFO makes declaration order the applied order. Verified by rendering:
+  `kubectl kustomize infra/k8s` now emits `NetworkPolicy` second, ahead of
+  `Deployment`. Not gated — a render-order assertion is parked on
+  `chore/infra-ci-checks-parked`.
+- **The Kubernetes manifests do not solve getting documents onto the volume.**
+  `pod-corpus-loader.yaml` is a `kubectl cp` target and a recipe, not a
+  mechanism. A real deployment substitutes whatever it already uses.
+- **Three Kubernetes sequencing rules are not enforceable by a manifest.** The
+  `ReadWriteOnce` claim admits one pod, so the Deployment must be scaled to zero
+  before either one-shot runs, or they sit Pending on a multi-attach error — on
+  a multi-node cluster only, which means the wrong order passes on a laptop
+  cluster and stalls in production. The image must be set in **both**
+  `k8s/kustomization.yaml` and `k8s/ingest/kustomization.yaml`, because a
+  kustomize `images:` transformer reaches only its own kustomization's
+  resources; setting one leaves the other on the unpublished placeholder, and
+  setting them differently has an ingest and the serve reading it disagree about
+  the code that built the index. And the ingest Job must be **deleted before it
+  is re-applied**: a Job's pod template is immutable, so `apply` over a
+  completed one is accepted, creates no pod, and leaves a following
+  `wait --for=condition=complete` to return immediately against the *previous*
+  run — so within the hour before `ttlSecondsAfterFinished` collects it,
+  re-ingesting after copying new documents reports success having done nothing.
+  All three are documented in `infra/README.md` and in the manifests themselves;
+  none is checked by anything.
+- **`create_ssm_vpc_endpoints` creates `ssm` and `ssmmessages` only.**
+  `ec2messages` is the legacy channel — the SSM agent on the pinned AL2023 image
+  uses the other two — and it is not offered in every region. That is more than
+  a tidiness point: `data.aws_vpc_endpoint_service` errors on a service its
+  region does not offer, and a failing data source fails the entire `plan`, so
+  an optional endpoint nothing used could break the whole module. Add it back
+  through `ssm_vpc_endpoint_services` if you run an older agent, in a region you
+  have confirmed offers it.
+- **`embedding_base_url` is escaped differently for the systemd unit than for
+  the ingest helper, and that asymmetry is deliberate.** systemd reads `%` in
+  `ExecStart` as the start of a unit specifier, so `%20` is not a space but an
+  invalid specifier and `systemctl enable --now` refuses the whole unit —
+  ending bootstrap with no service. The unit therefore doubles `%` to `%%` and
+  the helper does not, because a shell has no such rule and doubling it there
+  would pass a different URL to the ingest. Both still carry the same URL; only
+  one has to say so in systemd's escaping. An explicit port is separately
+  validated to 1-65535, since port 0 otherwise produces a real egress rule
+  permitting nothing usable.
+- **The Terraform module's data volume is prepared by a retrying unit, because
+  the attachment can arrive after cloud-init has finished.**
+  `aws_volume_attachment` cannot be requested until the instance resource
+  completes, by which time cloud-init is already running. A slow attach used to
+  exhaust a bounded inline wait and end provisioning permanently, while
+  Terraform went on to attach the volume and report a clean apply — an
+  apparently applied deployment with no service and nothing that would retry.
+  Storage prep is now `groundkit-storage.service`, a `oneshot` with
+  `Restart=on-failure` that starts `groundkit.service` on success. It also
+  resolves the volume under three names, since a Xen instance renames the
+  requested `/dev/sdf` to `/dev/xvdf` and has neither the NVMe by-id link nor
+  the requested name.
+- **`data_volume_type` accepts only `gp3` and `gp2`, which is narrower than
+  "any block device type".** `io1`/`io2` require an `iops` argument this module
+  does not set and `st1`/`sc1` have a 125 GiB minimum the 20 GiB default
+  violates, so both fail at apply for a value the docs used to invite.
+  Supporting them means exposing and validating type-dependent size and IOPS.
+- **The Terraform module needs outbound HTTPS at boot, so a private subnet needs
+  NAT.** Bootstrap installs docker from Amazon Linux's CDN and pulls the
+  container image. `create_ssm_vpc_endpoints` carries the Session Manager
+  control channel only: set on an otherwise egress-free subnet it produces an
+  instance an operator can open a session to and no service running on it,
+  because `set -e` ended bootstrap at `dnf install`. A genuinely egress-free
+  deployment needs a prebaked AMI, or `ecr.api`/`ecr.dkr` interface endpoints
+  plus the `s3` gateway endpoint *and* a VPC-reachable package mirror — none of
+  which this module builds (ADR-0020 decision 3).
+- **The Terraform module's embedding egress is derived, and two forms of
+  endpoint it cannot derive fail at `plan` rather than being supported.** The
+  standing egress rule is TCP 443; `embedding_base_url` adds a rule for its own
+  port when that is not 443, which is the documented case, since Ollama listens
+  on 11434. A host given as a **DNS name** cannot be turned into a CIDR at plan
+  time and needs `embedding_egress_cidr` supplied alongside it. An **IPv6**
+  endpoint is not supported at any port: the module writes `cidr_ipv4` rules
+  only, the standing HTTPS rule included, so "443 is already covered" is a
+  statement about IPv4 and nothing else. Both refuse loudly, which is the
+  intended trade — the alternative is an embed call that times out at the
+  security group on a deployment that applied cleanly.
+- **Three Terraform inputs are constrained to character classes because they are
+  written into files on the instance.** `container_image` and
+  `embedding_base_url` reach both the generated ingest helper and the systemd
+  unit; `collection` reaches the helper. They are single-quoted there, and the
+  classes — which exclude the single quote, `$`, backticks, backslashes and
+  whitespace — are what make that quoting a property rather than a convention.
+  `collection` mirrors `index/metadata.py`'s own pattern and `.`/`..` rejection,
+  so a name groundkit would refuse cannot reach an instance. A legitimate value
+  outside those classes is rejected at `plan`; `&` is deliberately still allowed.
+- **The Terraform deployment is x86_64 and `instance_type` is validated against
+  it.** The AMI filter selects `al2023-ami-2023.*-x86_64` and the container image
+  is built by a plain `docker build` on an amd64 runner, so it carries one
+  manifest. A Graviton instance type is refused at `plan` rather than by EC2 at
+  launch, and arm64 support is a multi-architecture image build rather than a
+  different value for that variable. A Graviton family the pattern does not
+  recognise falls through to EC2's own launch rejection, which is loud.
+
+  The conditions that produce those refusals are resource `precondition`
+  blocks, and **they have never executed.** `terraform validate` does not
+  evaluate a precondition and `terraform console` cannot reach one, so nothing
+  offline can. CI checks the state they reject rather than the rejection
+  itself — see `infra/terraform/aws-ec2/README.md`'s status table, where that
+  row is deliberately separate from the rows CI earned. The `instance_type`
+  refusal is a variable `validation` instead, which *is* reachable offline and
+  is checked directly.
+- **No groundkit image is published to any registry**, so the image reference in
+  `deployment.yaml` is a placeholder that will not pull, and the Terraform
+  module's `container_image` has no default.
+- **The Terraform module creates no backups.** `prevent_destroy` on the data
+  volume means the index survives instance replacement and nothing more; there
+  is no snapshot schedule and no DLM policy. SPEC.md §7 names backup scope,
+  retention and deletion behaviour as product decisions owed before any
+  deployment that is not a single user's local machine, and ADR-0020 decision 4
+  settles exactly one of them. It is also a single instance: every AMI or
+  instance-type change is downtime.
+- **Most IaC paths are not yet verified, and `infra/README.md` is the status
+  board.** SPEC.md §1.4 requires each path be verified with the date recorded
+  and SPEC.md §2 forbids recording a date no run produced, so some rows are
+  empty. The machine this tree was written on had a Docker CLI with **no running
+  daemon**, a `kubectl` with **no cluster context**, and no cloud credential —
+  nothing was built, pulled, applied or planned there. What *was* executed and
+  observed: the compose file parses and interpolates, the Kubernetes base
+  renders and every manifest parses, the Terraform module passes `fmt -check`
+  and `validate` against AWS provider 5.100.0 and 6.60.0, and the user-data
+  template renders to a script that passes `bash -n`. The `infra` CI job covers
+  what that machine could not — on this change's first run the image built, ran
+  as uid 10001 under a read-only root, and all six pinned third-party tags
+  resolved — and it gates all of that on every pull request from now on. It also
+  now evaluates the two things this module *derives* from string inputs, rather
+  than only proving they parse: the ECR-registry match that decides an IAM
+  attachment and a `docker login`, and the egress rule the embedding endpoint
+  needs. Both are checked with `terraform console`, which resolves locals and
+  `templatefile()` without a provider credential. What remains unrun: no
+  container has served a request, no manifest has reached a cluster, no
+  precondition has been evaluated, and `terraform validate` makes no API call,
+  so a missing IAM permission or an AMI filter matching nothing is invisible to
+  it. A real `compose up`, a cluster apply and a Terraform apply are the
+  operator's to run.
 
 ## Phase 5 caveats (the LLM boundary)
 
