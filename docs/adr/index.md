@@ -22,9 +22,9 @@ that were considered; deviating from SPEC.md requires an ADR proposal first.
 | [ADR-0014](ADR-0014-read-only-service-surface-and-outbound-endpoint-safety.md) | Phase 4 is a read-only service surface, and outbound endpoints are guarded | Accepted |
 | [ADR-0015](ADR-0015-service-dependencies-are-base-not-an-extra.md) | Service dependencies are base requirements, not an optional extra | Accepted |
 | [ADR-0016](ADR-0016-citation-verifiability-for-extracted-and-remote-sources.md) | Citation verifiability for extracted and remote sources | Accepted |
-| [ADR-0020](ADR-0020-terraform-target-single-host-with-block-storage.md) | The Terraform module targets one AWS host with attached block storage, reachable only through SSM | Accepted |
-| [ADR-0021](ADR-0021-container-exposure-and-filesystem-hardening.md) | In a container the loopback guarantee moves outward, and the read-only claim splits in two | Accepted |
-| [ADR-0022](ADR-0022-observability-dependency-shape-and-span-attribute-allowlist.md) | The OTel API is a base dependency, the SDK is an extra, and span attributes are an allowlist | Accepted |
 | [ADR-0017](ADR-0017-chat-seam-and-redaction-boundary.md) | One narrow chat seam, implemented directly, with redaction wrapped around it | Accepted |
 | [ADR-0018](ADR-0018-llm-output-is-validated-never-trusted.md) | LLM output is validated, never trusted: cited synthesis, the echo check, and an advisory judge | Accepted |
 | [ADR-0019](ADR-0019-grk-answer-and-no-synthesis-on-the-service-surface.md) | Synthesis lands as `grk answer`, and does not reach the service surface | Accepted |
+| [ADR-0020](ADR-0020-terraform-target-single-host-with-block-storage.md) | The Terraform module targets one AWS host with attached block storage, reachable only through SSM | Accepted |
+| [ADR-0021](ADR-0021-container-exposure-and-filesystem-hardening.md) | In a container the loopback guarantee moves outward, and the read-only claim splits in two | Accepted |
+| [ADR-0022](ADR-0022-observability-dependency-shape-and-span-attribute-allowlist.md) | The OTel API is a base dependency, the SDK is an extra, and span attributes are an allowlist | Accepted |
