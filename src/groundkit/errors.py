@@ -68,3 +68,56 @@ class RerankerNotConfiguredError(RetrievalError):
 
 class EvalError(GroundkitError):
     """Error loading, validating, or resolving the golden eval corpus."""
+
+
+class ChatError(GroundkitError):
+    """Error while calling a chat/completion provider (Phase 5 boundary)."""
+
+
+class ChatProviderNotConfiguredError(ChatError):
+    """A chat provider was requested but is not configured. Never falls back."""
+
+
+class QueryRewriteError(GroundkitError):
+    """An enabled query rewrite failed.
+
+    Deliberately **not** a silent fallback to the original query: a rewrite
+    that quietly passes its input through is indistinguishable from one that
+    worked, so retrieval quality attributed to "rewrite on" would really be
+    the un-rewritten path's (SPEC.md §2, fail closed).
+    """
+
+
+class SynthesisError(GroundkitError):
+    """Synthesis failed or its output violated the citation contract.
+
+    An answer citing a span that was not among the retrieved results is
+    rejected, never repaired: synthesis may cite only retrieved spans
+    (SPEC.md §2), and coercing an out-of-set marker would assert a
+    verifiable citation that verifies nothing.
+    """
+
+
+class JudgeError(GroundkitError):
+    """The faithfulness judge could not produce a schema-valid verdict.
+
+    Malformed model output is a rejection, never a coercion (SPEC.md §2).
+    Advisory semantics — the judge gating nothing — live at the harness
+    surface, not here: a broken judge is still a typed failure.
+    """
+
+
+class RedactionError(GroundkitError):
+    """Base error for the redaction pass at the LLM boundary (ADR-0017)."""
+
+
+class UnknownRedactionTokenError(RedactionError):
+    """``restore()`` saw a token shaped like a category this instance knows,
+    but whose specific counter this instance never issued.
+
+    Fail closed rather than leaving the bracketed text in place: a silent
+    pass-through would hide exactly the failure mode this exists to catch —
+    restoring text produced by a different ``Redactor`` instance (a
+    different config, a different run), or a token mangled in transit
+    through the LLM boundary the redaction module guards.
+    """

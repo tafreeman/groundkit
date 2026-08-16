@@ -54,6 +54,24 @@ _WRITE_PATH_MODULES = frozenset(
     }
 )
 
+#: Modules on the synthesis boundary. Barred from the service package by
+#: ADR-0019 decision 4: synthesis is a read, but serving it would add cost
+#: amplification (an unauthenticated request triggering a billable model
+#: call) and egress amplification (a caller making the operator publish
+#: their corpus to a cloud provider) — neither bounded by the loopback bind.
+_SYNTHESIS_PATH_MODULES = frozenset(
+    {
+        "groundkit.providers.llm",
+        "groundkit.providers.query_rewrite",
+        "groundkit.providers.synthesis",
+        "groundkit.evals.judge",
+        "groundkit.answer",
+    }
+)
+
+#: The full barred set the AST scan enforces.
+_BARRED_SERVICE_IMPORTS = _WRITE_PATH_MODULES | _SYNTHESIS_PATH_MODULES
+
 
 async def _seed(tmp_path: Path) -> tuple[Path, Path, str]:
     """Write a real source file and index it so citations genuinely resolve."""
@@ -150,26 +168,28 @@ def test_request_models_reject_unknown_fields() -> None:
 
 
 def test_service_package_imports_no_write_path() -> None:
-    """AST scan: no service module reaches the ingest path.
+    """AST scan: no service module reaches the ingest path or the synthesis boundary.
 
     Guard, demonstrated by injection: add ``from groundkit.indexer import
     Indexer`` to any service module and this fails. It fires three steps
     upstream of the route that would have exposed a write, which is why it is
-    worth having alongside the registry check.
+    worth having alongside the registry check. ADR-0019 decision 4 extends
+    the barred set to the synthesis boundary for the same three-steps-upstream
+    reason — see ``_SYNTHESIS_PATH_MODULES``.
     """
     offenders: list[str] = []
     for path in _SERVICE_DIR.glob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module in _WRITE_PATH_MODULES:
+            if isinstance(node, ast.ImportFrom) and node.module in _BARRED_SERVICE_IMPORTS:
                 offenders.append(f"{path.name} -> {node.module}")
             elif isinstance(node, ast.Import):
                 offenders.extend(
                     f"{path.name} -> {alias.name}"
                     for alias in node.names
-                    if alias.name in _WRITE_PATH_MODULES
+                    if alias.name in _BARRED_SERVICE_IMPORTS
                 )
-    assert not offenders, f"service package reaches the write path: {offenders}"
+    assert not offenders, f"service package reaches a barred module: {offenders}"
 
 
 def test_collection_runtime_exposes_no_mutating_member() -> None:

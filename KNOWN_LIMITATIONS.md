@@ -2,7 +2,7 @@
 
 Honest and current, per repo policy. Updated with each phase.
 
-## Current state (Phase 3 and Phase 4, service surface built)
+## Current state (Phases 3–5: hybrid retrieval, service surface, LLM boundary)
 
 Hybrid retrieval works end-to-end locally, behind opt-in flags: `grk
 ingest --dense` embeds each chunk into a LanceDB vector store alongside the
@@ -547,8 +547,10 @@ Everything below describes the state between the two.
 
 - The adversarial category does not test prompt-injection resistance. With
   no LLM in the retrieval path, "injected text must never surface as
-  instructions" is untestable in Phase 2; that arrives with the Phase 5
-  faithfulness judge. What Phase 2 asserts is fixture correctness — that
+  instructions" was untestable in Phase 2. Phase 5 added the structural
+  sanitization pass and the advisory judge described above, but neither
+  turns this category into a resistance test — that remains an unclaimed
+  property. What Phase 2 asserts is fixture correctness — that
   documents referenced by adversarial judgments genuinely contain
   injection-styled text, and that retrieval returns it verbatim like any
   other content. A passing adversarial test is **not** a claim that

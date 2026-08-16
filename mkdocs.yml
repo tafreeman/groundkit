@@ -117,6 +117,7 @@ nav:
       - The LLM boundary: architecture/llm-boundary.md
       - Phase 3 spec — hybrid retrieval: specs/phase-3-hybrid-retrieval.md
       - Phase 6 spec — IaC and observability: specs/phase-6-iac-observability.md
+      - Phase 5 spec — boundary features: specs/phase-5-boundary-features.md
   - API reference:
       - Contracts: reference/contracts.md
       - Configuration: reference/config.md
@@ -144,6 +145,9 @@ nav:
       - "ADR-0020 — Terraform target: one host with block storage": adr/ADR-0020-terraform-target-single-host-with-block-storage.md
       - "ADR-0021 — Container exposure and filesystem hardening": adr/ADR-0021-container-exposure-and-filesystem-hardening.md
       - "ADR-0022 — Observability dependency shape and span attributes": adr/ADR-0022-observability-dependency-shape-and-span-attribute-allowlist.md
+      - "ADR-0017 — Chat seam and redaction boundary": adr/ADR-0017-chat-seam-and-redaction-boundary.md
+      - "ADR-0018 — LLM output is validated, never trusted": adr/ADR-0018-llm-output-is-validated-never-trusted.md
+      - "ADR-0019 — grk answer, and no synthesis on the service surface": adr/ADR-0019-grk-answer-and-no-synthesis-on-the-service-surface.md
   - Project:
       - Security: security.md
       - Known limitations: limitations.md

@@ -1057,3 +1057,43 @@ def test_eval_rerank_attribution_delta_printed_on_fusion_input(
     out = capsys.readouterr().out
     assert "delta[rerank vs bm25]:" in out
     assert "delta[rerank vs fusion]:" in out
+
+
+def test_answer_citation_labels_preserve_source_numbers(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The printed citation list must reuse the answer's own [n] source numbers.
+
+    An answer citing only source 3 must print a "[3]" entry — renumbering the
+    deduplicated citation list from 1 would leave the answer's "[3]" marker
+    unresolved and falsely associate "[1]" with the third retrieved result
+    (PR #14 review finding, shown to fail against the renumbering printer).
+    """
+    from groundkit.answer import AnswerReport
+    from groundkit.cli import _print_answer_report
+    from groundkit.contracts import RetrievalResult
+
+    results = tuple(
+        RetrievalResult(
+            content=f"source text {n}",
+            score=1.0,
+            document_id=f"doc-{n}",
+            chunk_id=f"chunk-{n}",
+            source=f"doc-{n}.txt",
+            start_offset=0,
+            end_offset=len(f"source text {n}"),
+        )
+        for n in (1, 2, 3)
+    )
+    report = AnswerReport(
+        query="which source?",
+        rewritten_query=None,
+        answer="Only the third source answers this [3].",
+        citations=(results[2].citation,),
+        results=results,
+        verdict=None,
+    )
+    _print_answer_report(report)
+    out = capsys.readouterr().out
+    assert "[3] doc-3.txt#0-13" in out
+    assert "[1] doc-3.txt" not in out

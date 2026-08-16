@@ -235,9 +235,10 @@ disagrees with `pyproject.toml` — which today still carries `0.1.0.dev0`, so
 the machinery fails closed against exactly this premature release.
 
 The docs site describes only what is built, and states the gaps where they
-fall. When Phases 4–6 land, the docs owed are the service/MCP pages, the IaC
-verification dates, and the row in the LLM-boundary egress inventory that must
-stop saying the redaction pass does not exist.
+fall. Phase 4's service/MCP pages and Phase 5's LLM-boundary update have
+landed — the egress inventory now documents the redaction pass where it
+actually runs (cloud chat, ADR-0017), not the embedding row this paragraph
+originally predicted. Still owed with Phase 6: the IaC verification dates.
 
 ## 10. Definition of done (v1)
 
