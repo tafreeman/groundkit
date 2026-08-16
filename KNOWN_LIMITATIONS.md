@@ -512,9 +512,43 @@ Everything below describes the state between the two.
   route-parity exclusion set — a security-relevant `src/` change deliberately
   not taken in a change that touches no `src/` file
   (`docs/specs/phase-6-iac-observability.md` §4.2, Q1).
+- **The Kubernetes in-cluster boundary rests on a NetworkPolicy, which can be
+  silently inert.** A `ClusterIP` Service closes the cluster's edge and nothing
+  else — every pod in every namespace can dial one directly — so
+  `infra/k8s/networkpolicy.yaml` (default-deny ingress, empty `podSelector`) is
+  what actually closes in-cluster reachability to this unauthenticated,
+  content-bearing surface. On a cluster whose CNI does not enforce
+  NetworkPolicy, the API server accepts the object, reports no status, emits no
+  warning, and every pod can still reach the service. Enforcement has to be
+  confirmed against the cluster; no manifest can assert it. The same policy may
+  also break `kubectl port-forward` on a CNI that blocks node-to-pod traffic —
+  most permit it, since kubelet probes would otherwise fail, but that is a CNI
+  behaviour rather than a Kubernetes guarantee. compose and the Terraform
+  module rest on a kernel-level socket bind instead and are contingent on
+  nothing.
 - **The Kubernetes manifests do not solve getting documents onto the volume.**
   `pod-corpus-loader.yaml` is a `kubectl cp` target and a recipe, not a
   mechanism. A real deployment substitutes whatever it already uses.
+- **Two Kubernetes sequencing rules are not enforceable by a manifest.** The
+  `ReadWriteOnce` claim admits one pod, so the Deployment must be scaled to zero
+  before either one-shot runs, or they sit Pending on a multi-attach error — on
+  a multi-node cluster only, which means the wrong order passes on a laptop
+  cluster and stalls in production. And the image must be set in **both**
+  `k8s/kustomization.yaml` and `k8s/ingest/kustomization.yaml`, because a
+  kustomize `images:` transformer reaches only its own kustomization's
+  resources; setting one leaves the other on the unpublished placeholder, and
+  setting them differently has an ingest and the serve reading it disagree about
+  the code that built the index. Both are documented in `infra/README.md` and in
+  the manifests themselves; neither is checked by anything.
+- **The Terraform module needs outbound HTTPS at boot, so a private subnet needs
+  NAT.** Bootstrap installs docker from Amazon Linux's CDN and pulls the
+  container image. `create_ssm_vpc_endpoints` carries the Session Manager
+  control channel only: set on an otherwise egress-free subnet it produces an
+  instance an operator can open a session to and no service running on it,
+  because `set -e` ended bootstrap at `dnf install`. A genuinely egress-free
+  deployment needs a prebaked AMI, or `ecr.api`/`ecr.dkr` interface endpoints
+  plus the `s3` gateway endpoint *and* a VPC-reachable package mirror — none of
+  which this module builds (ADR-0020 decision 3).
 - **No groundkit image is published to any registry**, so the image reference in
   `deployment.yaml` is a placeholder that will not pull, and the Terraform
   module's `container_image` has no default.
@@ -542,6 +576,72 @@ Everything below describes the state between the two.
   cluster, and `terraform validate` makes no API call, so a missing IAM
   permission or an AMI filter matching nothing is invisible to it. A real
   `compose up`, a cluster apply and a Terraform apply are the operator's to run.
+
+## Phase 5 caveats (the LLM boundary)
+
+- **The redaction pass exists and is wired at exactly one boundary: cloud
+  chat egress.** `build_chat` wraps every `openai_compatible` chat provider
+  in `RedactingChat` with no operator opt-out (ADR-0017), constructing a
+  fresh `Redactor` per call — a long-lived one would let `restore()` expand
+  a token from one request into a value captured in another, a
+  cross-request disclosure the mitigation itself would manufacture
+  (regression-tested). The default pattern floor covers structurally
+  recognizable values only: emails, E.164/US phone shapes, IPv4, long
+  secret-shaped tokens. **No person-name pattern ships** — free-text name
+  detection by regex is unreliable enough that shipping one under the label
+  "redacts names" would be a false promise; SPEC.md §2's "names → tokens"
+  is met through *configured* patterns, which is what its own "configurable
+  patterns" clause provides. Two recorded residuals: the **embedding
+  boundary is not redacted** — a deliberate SPEC §2 deviation (ADR-0017
+  decision 5: order-dependent tokens are unstable across ingest/search
+  processes, a vector over redacted text stops describing the stored chunk,
+  and `CollectionManifest` records nothing about redaction, so a mixed
+  collection would pass identity verification); and text that already
+  contains a literal token-shaped substring (`[EMAIL_1]`) is
+  indistinguishable from a real token once redaction runs, so `restore()`
+  corrupts it (tested, documented, unfixed).
+- **The faithfulness judge is advisory and uncalibrated.** Verdicts gate
+  nothing and the exit code never depends on them; malformed or incoherent
+  model output is a `JudgeError`, never coerced. The calibration procedure
+  required before gating could ever be proposed is documented in
+  `evals/judge.py`'s module docstring; no human-labeled verdict set exists
+  yet, and normal CI never runs the judge.
+- **Synthesis quality is unmeasured offline, and nothing re-measures it
+  automatically.** `grk eval --synthesis` runs the planted-marker
+  citation-echo check (SPEC.md §2) against a real chat provider and writes
+  its own artifact (`evals/results/echo-latest.json`); there is
+  deliberately no offline double for it — an echo number from a scripted
+  chat would be noise presented as a measurement. No gated synthesis
+  workflow exists yet (the `eval-gated`/`rerank-gated` posture, but the
+  workflow file itself is not written), so every echo result is a
+  point-in-time local measurement. `EvalReport.synthesis`
+  (`SynthesisReport`) is structure without a producer: `grk eval` does not
+  yet fold judge tallies over the golden corpus into the main artifact.
+- **`grk answer` is CLI-only; synthesis is off the service surface
+  (ADR-0019).** Synthesis is a read, but it adds cost amplification and
+  egress amplification that a loopback bind does not bound. Named
+  consequence: agentic-evalkit can grade groundkit's *retrieval* through
+  the HTTP/MCP `ExecutionTarget` boundary, but not its generative half.
+- **Prompt-injection defense at the synthesis boundary is structural
+  only.** Retrieved content passes through `sanitize_content`
+  (`providers/context_assembly.py`, ported from ARP per ADR-0001) before
+  entering a prompt: delimiter-tag forgery is neutralized, control
+  characters stripped, lines quote-prefixed. Instruction-like phrasing
+  survives verbatim inside the quoting — this raises the bar against naive
+  smuggling and is not a guarantee a model treats the content as inert.
+  The ported `TokenBudgetAssembler`/`frame_content` envelope is available
+  but unwired; only `sanitize_content` is live.
+- **Citation-marker parsing is deliberately naive.** Every `[n]` in a
+  completion counts as a marker, including bracketed numbers inside echoed
+  source text — the distinction is not reliably recoverable from text
+  alone (documented in `providers/synthesis.py`). Redaction tokens cannot
+  collide with markers: the marker regex is digits-only and token
+  categories always carry letters (regression-tested against ADR-0018's
+  recorded hazard).
+- **Query rewrite is reachable only through `grk answer --rewrite` and no
+  eval number measures it.** Enabling it changes retrieval inputs, so its
+  effect on retrieval quality is unquantified; a rewrite failure is a
+  typed error, never a silent fallback to the original query.
 
 ## Phase 2 caveats
 
