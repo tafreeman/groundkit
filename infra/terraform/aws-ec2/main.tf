@@ -34,10 +34,71 @@ locals {
   # operator had to remember would be a flag whose omission silently breaks the
   # documented path. Deriving it also keeps the IAM grant below narrow: the ECR
   # policy attaches only when there is genuinely an ECR image to pull.
-  ecr_match    = regexall("^([0-9]{12}\\.dkr\\.ecr\\.([a-z0-9-]+)\\.amazonaws\\.com)/", var.container_image)
+  #
+  # The `.cn` suffix is not decoration. A private ECR registry in cn-north-1 or
+  # cn-northwest-1 is `<account>.dkr.ecr.<region>.amazonaws.com.cn`, and a
+  # matcher that stops at `.amazonaws.com` skips both the policy attachment and
+  # the `docker login` for it — the same silent failure this detection exists to
+  # prevent, in the partition where it is hardest to debug. Non-capturing so the
+  # group indices below stay put.
+  ecr_match    = regexall("^([0-9]{12}\\.dkr\\.ecr\\.([a-z0-9-]+)\\.amazonaws\\.com(?:\\.cn)?)/", var.container_image)
   ecr_registry = length(local.ecr_match) > 0 ? local.ecr_match[0][0] : ""
   ecr_region   = length(local.ecr_match) > 0 ? local.ecr_match[0][1] : ""
+
+  # The embedding endpoint's egress, derived from the URL rather than asked for
+  # as a separate host/port pair: two inputs that have to agree are one input
+  # and a latent bug.
+  #
+  # The standing egress rule below is TCP 443 and nothing else, which is right
+  # for the SSM channel, the package CDN and a registry — and wrong for the
+  # endpoint this module's own variable documentation gives as the usual case.
+  # Ollama listens on 11434, so a deployment configured for dense retrieval had
+  # `groundkit-ingest` and every dense and hybrid request time out at the
+  # security group, with nothing in the service's own logs to say why: the
+  # module was configured for the dense path and silently could not reach it.
+  embed_match  = var.embedding_base_url == "" ? [] : regexall("^(https?)://(\\[[^]]+\\]|[^/:?#]+)(?::([0-9]+))?", var.embedding_base_url)
+  embed_scheme = length(local.embed_match) > 0 ? local.embed_match[0][0] : ""
+  embed_host   = length(local.embed_match) > 0 ? local.embed_match[0][1] : ""
+  embed_port = length(local.embed_match) == 0 ? 0 : (
+    local.embed_match[0][2] != null
+    ? tonumber(local.embed_match[0][2])
+    : (local.embed_scheme == "https" ? 443 : 80)
+  )
+
+  # An IPv4 literal is its own /32. A DNS name resolves on the instance at
+  # request time and there is nothing here to resolve it from, so that case has
+  # to be given — see the precondition on the security group.
+  embed_cidr = (
+    var.embedding_egress_cidr != ""
+    ? var.embedding_egress_cidr
+    : (can(cidrnetmask("${local.embed_host}/32")) ? "${local.embed_host}/32" : "")
+  )
+
+  # A bracketed host is an IPv6 literal, and this module has NO IPv6 egress at
+  # all: every rule it writes is `cidr_ipv4`, the standing HTTPS rule included.
+  # So the address family is rejected on its own terms, independently of port.
+  #
+  # It was not, and the bug that hid in the difference is worth keeping: the
+  # rejection used to ride on `embed_needs_egress`, which is false at port 443
+  # because the standing rule covers it. That reasoning holds only for IPv4. An
+  # `https://[2001:db8::10]` endpoint therefore skipped the rejection, created
+  # no rule, and applied cleanly onto a security group with no IPv6 egress
+  # whatsoever — every embedding request timing out with nothing refused.
+  # Deriving a rejection from a port was the mistake; an address family is not
+  # a function of a port.
+  embed_is_ipv6 = startswith(local.embed_host, "[")
+
+  # No second rule when the endpoint is already covered: the HTTPS rule is
+  # 0.0.0.0/0, so an IPv4 endpoint on 443 needs nothing further, and a duplicate
+  # would be one more rule to read in the console for no reachability.
+  embed_needs_egress = local.embed_scheme != "" && !local.embed_is_ipv6 && local.embed_port != 443
 }
+
+# The partition, so the AWS-managed policy ARNs below are not commercial-only.
+# This module already resolves VPC endpoint service names through a data source
+# for exactly this reason; a hardcoded `arn:aws:` is the same class of mistake
+# one layer up, and it fails at role creation in GovCloud and China.
+data "aws_partition" "current" {}
 
 data "aws_subnet" "this" {
   id = var.subnet_id
@@ -48,6 +109,14 @@ data "aws_subnet" "this" {
 # rebuild picks up patches; the cost is that `terraform plan` can show an
 # instance replacement after an upstream AMI release, which is the correct
 # trade for a single-instance deployment whose replacement is cheap.
+#
+# x86_64 is hardcoded here and `instance_type` is validated against it, because
+# this filter is only half the constraint: the container image is built by a
+# plain `docker build` on an amd64 runner and has one manifest. Deriving the
+# architecture from the instance type instead would launch an arm64 host that
+# boots, passes its SSM check, and then fails to pull the image at bootstrap --
+# trading EC2's loud launch rejection for a silent one. The variable's
+# validation is where that is refused; see its description.
 data "aws_ami" "al2023" {
   most_recent = true
   owners      = ["amazon"]
@@ -94,7 +163,7 @@ resource "aws_iam_role" "this" {
 # the failure would look like a broken instance rather than a stale policy.
 resource "aws_iam_role_policy_attachment" "ssm" {
   role       = aws_iam_role.this.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 # Pull-only, and attached only when `container_image` is an ECR reference. The
@@ -105,7 +174,7 @@ resource "aws_iam_role_policy_attachment" "ecr_pull" {
   count = local.ecr_registry == "" ? 0 : 1
 
   role       = aws_iam_role.this.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
 
 resource "aws_iam_instance_profile" "this" {
@@ -118,12 +187,56 @@ resource "aws_iam_instance_profile" "this" {
 
 resource "aws_security_group" "instance" {
   name_prefix = "${var.name}-"
-  description = "groundkit: no ingress; egress HTTPS only (ADR-0020 decision 2/3)."
+  description = "groundkit: no ingress; egress is HTTPS plus the configured embedding endpoint (ADR-0020 decision 2/3)."
   vpc_id      = var.vpc_id
   tags        = local.tags
 
   lifecycle {
     create_before_destroy = true
+
+    # `terraform validate` does not evaluate a precondition; `plan` does, which
+    # is early enough. What it replaces is a request-time timeout on a
+    # deployment that validated, planned and applied without a complaint.
+    # The subnet must be IN the VPC this group is created in. `variables.tf`
+    # has always said so and nothing enforced it: the group is created in
+    # `vpc_id`, the instance launches in `subnet_id`, and EC2 rejects the
+    # combination at `RunInstances` — after the role, the profile, the volume
+    # and this group already exist. The data source knows the answer, so the
+    # documented constraint becomes a plan-time one.
+    precondition {
+      condition     = data.aws_subnet.this.vpc_id == var.vpc_id
+      error_message = "subnet_id belongs to VPC ${data.aws_subnet.this.vpc_id}, not to vpc_id ${var.vpc_id}. EC2 would reject the instance launch after the other resources were created."
+    }
+
+    precondition {
+      condition     = var.embedding_base_url == "" || local.embed_scheme != ""
+      error_message = "embedding_base_url must be an http:// or https:// URL. Got: ${var.embedding_base_url}"
+    }
+
+    # Independent of port, and that independence is the whole point: every rule
+    # this module writes is `cidr_ipv4`, so an IPv6 endpoint is unreachable
+    # whatever port it is on. Gating this on `embed_needs_egress` made the
+    # rejection an accident of the port number and let `https://[2001:db8::10]`
+    # through.
+    precondition {
+      condition = !local.embed_is_ipv6
+      error_message = join(" ", [
+        "embedding_base_url names the IPv6 endpoint ${local.embed_host}, which this",
+        "module cannot reach: every egress rule it writes is cidr_ipv4, including",
+        "the standing HTTPS rule. Use an IPv4 or DNS-named endpoint, or add IPv6",
+        "egress to this module first.",
+      ])
+    }
+
+    precondition {
+      condition = !local.embed_needs_egress || local.embed_cidr != ""
+      error_message = join(" ", [
+        "embedding_base_url resolves to ${local.embed_host}:${local.embed_port},",
+        "which the HTTPS egress rule does not cover, and its host is not an IPv4",
+        "literal this module can turn into a /32.",
+        "Set embedding_egress_cidr to the IPv4 CIDR the endpoint is reachable at.",
+      ])
+    }
   }
 }
 
@@ -140,6 +253,27 @@ resource "aws_vpc_security_group_egress_rule" "https" {
   from_port         = 443
   to_port           = 443
   cidr_ipv4         = "0.0.0.0/0"
+  tags              = local.tags
+}
+
+# The dense path's egress, and the only rule here that is not 443. Created only
+# when `embedding_base_url` names a port the rule above does not already cover,
+# and scoped to that one endpoint rather than widening the standing rule: this
+# is the single outbound destination that carries query text, so it earns its
+# own rule with its own description rather than hiding inside a broader one.
+#
+# Absent it, the module accepted `embedding_base_url`, rendered `--dense` into
+# both the service unit and the ingest helper, and then let every embed call
+# time out at the security group.
+resource "aws_vpc_security_group_egress_rule" "embedding" {
+  count = local.embed_needs_egress ? 1 : 0
+
+  security_group_id = aws_security_group.instance.id
+  description       = "Embedding endpoint for the dense path (${local.embed_host}:${local.embed_port})."
+  ip_protocol       = "tcp"
+  from_port         = local.embed_port
+  to_port           = local.embed_port
+  cidr_ipv4         = local.embed_cidr
   tags              = local.tags
 }
 
@@ -263,8 +397,20 @@ resource "aws_vpc_security_group_ingress_rule" "endpoints_https" {
 # major this module's version range spans, and a hand-built service name is a
 # string this module would get wrong in exactly the partitions (GovCloud, China)
 # where nobody would be around to notice.
+#
+# The set is a VARIABLE and no longer the hardcoded three, because this data
+# source is strict: a service name the region does not offer is an error, and it
+# fails the whole plan rather than that one endpoint. `ec2messages` was in the
+# hardcoded set and is the one that provokes it — it is the legacy channel, not
+# required by the SSM agent AL2023 ships (3.3+ uses ssm and ssmmessages), and
+# not offered everywhere. So an optional convenience could take the module down
+# in a region that has no use for the endpoint it was failing on.
+#
+# Default is therefore the two the pinned AMI's agent actually uses. An operator
+# on an older agent adds "ec2messages" back through the variable, in a region
+# they have already confirmed offers it.
 data "aws_vpc_endpoint_service" "ssm" {
-  for_each = var.create_ssm_vpc_endpoints ? toset(["ssm", "ssmmessages", "ec2messages"]) : toset([])
+  for_each = var.create_ssm_vpc_endpoints ? toset(var.ssm_vpc_endpoint_services) : toset([])
 
   service = each.key
 }
