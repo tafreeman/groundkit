@@ -49,7 +49,13 @@ from groundkit.providers.embeddings import (
     OllamaEmbedder,
     OpenAICompatibleEmbedder,
 )
-from groundkit.providers.protocols import EmbeddingProtocol
+from groundkit.providers.llm import (
+    OllamaChat,
+    OpenAICompatChat,
+    RedactingChat,
+    ScriptedChatProvider,
+)
+from groundkit.providers.protocols import ChatProtocol, EmbeddingProtocol
 from groundkit.retrieval.protocols import RerankerProtocol
 from groundkit.retrieval.rerank import CrossEncoderReranker
 
@@ -353,3 +359,24 @@ class TestRerankerProtocolConformance:
 
     def test_cross_encoder_reranker_matches_reranker_protocol(self) -> None:
         assert_signature_parity(RerankerProtocol, CrossEncoderReranker)
+
+
+# ── ChatProtocol <- OllamaChat, OpenAICompatChat, ScriptedChatProvider, RedactingChat ──
+
+
+class TestChatProtocolConformance:
+    def test_ollama_chat_matches_chat_protocol(self) -> None:
+        assert_signature_parity(ChatProtocol, OllamaChat)
+
+    def test_openai_compat_chat_matches_chat_protocol(self) -> None:
+        assert_signature_parity(ChatProtocol, OpenAICompatChat)
+
+    def test_scripted_chat_provider_matches_chat_protocol(self) -> None:
+        assert_signature_parity(ChatProtocol, ScriptedChatProvider)
+
+    def test_redacting_chat_matches_chat_protocol(self) -> None:
+        """The decorator most of all (ADR-0017 decision 3 / SPEC.md's own
+        argument): a wrapper that drifts from the seam it wraps is
+        ADR-0001 hazard 4 with an extra frame, and plain ``isinstance``
+        would not catch it."""
+        assert_signature_parity(ChatProtocol, RedactingChat)

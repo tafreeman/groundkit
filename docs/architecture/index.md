@@ -38,7 +38,7 @@ SPEC.md §2's non-negotiables has a mechanism:
 |---|---|
 | Deterministic core, LLM at the boundary | No model import anywhere under `retrieval/`; the rerank model import is deferred and optional. See [The LLM boundary](llm-boundary.md). |
 | Citations are verifiable | Every result carries document ID, chunk ID and char offsets; `retrieval.verify_citation` re-reads the source and checks them. |
-| Anonymization at the LLM boundary | *Not yet enforced* — the redaction pass is Phase 5. The boundary is documented in full [here](llm-boundary.md), including what that gap means today. |
+| Anonymization at the LLM boundary | Enforced on cloud **chat** egress (`build_chat` wraps it in `RedactingChat`, no opt-out); deliberately absent on the embedding boundary (ADR-0017 decision 5). The boundary is documented in full [here](llm-boundary.md), including exactly what the pattern pass does and does not cover. |
 | Fail closed | Frozen Pydantic models with `extra="forbid"`; unconfigured provider raises a typed error; no cross-provider embedding fallback, ever. |
 | Real data only | No metric value is written into any document by policy. Numbers come from generated eval artifacts or live badges. |
 | No in-process state shadowing persisted state | SQLite is the durable truth; the BM25 index is rebuilt at open ([ADR-0002](../adr/ADR-0002-index-persistence.md)). |

@@ -11,31 +11,39 @@ the design intends. Where the two differ, the difference is stated rather than
 smoothed over — a boundary document that describes an aspiration is worse than
 none, because it is the document a reader trusts when deciding what to index.
 
-!!! warning "Current state: the redaction pass is not implemented"
+!!! note "Current state: the redaction pass exists, on exactly one boundary"
 
-    `groundkit.providers.redaction` is a docstring and nothing else. It is
-    Phase 5 work. **No redaction runs on any path today.** Every claim below
-    about what is redacted is therefore a claim about *nothing being
-    redacted*, and the local-first defaults are doing all of the work.
+    Phase 5 built `groundkit.providers.redaction` and wired it into **cloud
+    chat egress**: `build_chat` wraps every `openai_compatible` chat
+    provider in `RedactingChat`, with no operator opt-out (ADR-0017). The
+    **embedding** boundary is deliberately *not* redacted — a recorded
+    SPEC §2 deviation with its reasoning in ADR-0017 decision 5, restated
+    in row 2's section below. Every "Redacted?" cell in the inventory is a
+    statement about code that runs today.
 
 ## The one-sentence version
 
 With default configuration groundkit makes no network calls to anything except
 a loopback Ollama endpoint, and nothing leaves the machine. Change
 `EmbeddingConfig.provider` to `openai_compatible` and **your full document
-text and every query go to that endpoint verbatim, unredacted**.
+text and every query go to that endpoint verbatim, unredacted**; change
+`ChatConfig.provider` to `openai_compatible` and the prompt text `grk answer`
+sends goes through the pattern-based redaction pass first — which is a
+narrower promise than it sounds, and its limits are stated below.
 
 ## Egress inventory
 
 Every point at which bytes derived from your content can leave the process.
-This list is exhaustive as of Phase 3; the "not built yet" section below names
+This list is exhaustive as of Phase 5; the "not built yet" section below names
 the paths that will extend it.
 
 | # | Path | What leaves | Default | Redacted? |
 |---|------|-------------|---------|-----------|
 | 1 | `OllamaEmbedder` | Chunk text at ingest; query text at search | **On** — loopback only | No — and it does not leave the machine |
-| 2 | `OpenAICompatibleEmbedder` | Chunk text at ingest; query text at search | Off (opt-in) | **No** |
+| 2 | `OpenAICompatibleEmbedder` | Chunk text at ingest; query text at search | Off (opt-in) | **No — deliberate deviation, ADR-0017 decision 5** |
 | 3 | `CrossEncoderReranker` model load | Model *name* only, to a model host | Off (`rerank` extra) | N/A — no content in the request |
+| 4 | `OllamaChat` (`grk answer`, `grk eval --synthesis`) | Query, retrieved chunk text, candidate answers — whatever the rewrite/synthesis/judge prompt carries | Off (opt-in commands) — loopback only | No — and it does not leave the machine |
+| 5 | `OpenAICompatChat`, always inside `RedactingChat` | The same prompt text, after the pattern pass | Off (opt-in) | **Pattern-based** — structural values by default, person names only via configured patterns |
 
 ### 1. Ollama embeddings — the default, and the reason the default is safe
 
@@ -63,14 +71,26 @@ implicit.
 
 `OpenAICompatibleEmbedder` POSTs to `{base_url}/v1/embeddings`. This is the
 path SPEC.md §2's anonymization requirement is written for, and it is the path
-where that requirement is currently unmet.
+where that requirement is **deliberately not met** — a recorded deviation, not
+a gap waiting for wiring (ADR-0017 decision 5). Three independent reasons:
+redaction tokens are allocated in encounter order, so the same value redacts
+to different tokens in the ingest process and the search process, splitting
+the semantic space; a vector computed over redacted text stops describing the
+chunk the store actually holds; and `CollectionManifest` records nothing about
+redaction, so a collection mixing redacted and unredacted vectors would pass
+ADR-0004's identity verification — the exact silent-corruption class that
+check exists to catch, arriving through the mitigation. Reopening this needs
+value-derived stable tokens *and* a redaction marker in the manifest,
+together.
 
 **What is sent:** the full text of every chunk of every document you ingest,
 and the full text of every query you search with. Batched
 (`EmbeddingConfig.batch_size`, default 32), otherwise unmodified. No
 truncation, no tokenization, no transformation — embedding requires the text.
 
-**What is redacted: nothing.** There is no redaction pass on this path.
+**What is redacted: nothing, on purpose.** The redaction pass exists
+(`providers/redaction.py`) and runs on the chat path below; it is kept off
+this path for the reasons above.
 
 **What is protected:** credentials, not content. The API key is read from
 `os.environ[config.api_key_env]` at call time and is never stored in the
@@ -98,6 +118,39 @@ to a local cache. Only the model name crosses the wire; none of your content
 does. On an air-gapped machine, pre-populate the cache — the load is the only
 step that needs the network, and it happens once.
 
+### 4–5. The chat boundary — rewrite, synthesis, and the judge share one seam
+
+`grk answer` (and `grk eval --synthesis`) drive every LLM feature through one
+`ChatProtocol` provider: the optional query rewrite sends the query, synthesis
+sends the query plus every retrieved chunk's sanitized text, and the advisory
+judge sends the query, the candidate answer, and the source texts. Which
+feature is calling does not change the boundary — the provider is the egress
+point, so the inventory lists providers, not features.
+
+**Local (`OllamaChat`, the default):** the prompt goes to loopback verbatim,
+unredacted, exactly like row 1 — it does not leave the machine, and wrapping
+it in a redaction pass would add cost to every call for no benefit
+(ADR-0017).
+
+**Cloud (`OpenAICompatChat`):** `build_chat` always wraps it in
+`RedactingChat` — there is no bare-cloud-chat construction path and no
+opt-out flag, and a cloud chat config with an explicitly empty pattern set is
+refused at construction. Each call constructs a fresh `Redactor`, redacts the
+prompt (and system text), and restores tokens in the completion. Fresh-per-
+call is load-bearing: a long-lived redactor would let `restore()` expand a
+token minted in one request into a value captured in another — a
+cross-request disclosure manufactured by the mitigation itself
+(regression-tested).
+
+**What the pattern pass actually covers:** the default floor is structural —
+emails, E.164/US phone shapes, IPv4 addresses, long secret-shaped tokens.
+**Person names are redacted only via operator-configured patterns.** No
+default name regex ships, because free-text name detection by regex is
+unreliable enough that shipping one under the label "redacts names" would be
+a false promise. SPEC.md §2's "names → tokens" is met through its own
+"configurable patterns" clause, and an operator who configures none should
+assume names cross the wire.
+
 ## What is *not* on the list
 
 Stating the negative space explicitly, because "it isn't in the table" is
@@ -121,16 +174,18 @@ they land, rather than quietly falling out of date:
 
 | Path | Phase | Boundary obligation |
 |---|---|---|
-| Redaction pass (`providers/redaction.py`) | 5 | Names → tokens, configurable patterns; must run **before** any text reaches a cloud provider |
-| Optional query rewrite | 5 | Sends the query to an LLM; must be skippable |
-| Optional cited synthesis | 5 | Sends retrieved spans to an LLM; may cite only retrieved spans |
-| Advisory faithfulness judge | 5 | LLM-as-judge over candidate answers; advisory only, gates nothing |
-| URL ingestion | 4 | Inbound fetch — SSRF guard with `redirect: error` (SPEC.md §7) |
-| REST + MCP surfaces | 4 | Mutating operations behind a shared-secret header, binding 127.0.0.1 by default |
+| URL ingestion | v1, unscheduled (ADR-0016 opened the design) | Inbound fetch — SSRF guard with `redirect: error` (SPEC.md §7) |
 
-When Phase 5 lands the redaction pass, row 2 of the egress inventory is the
-row that changes, and the "Redacted?" column is the cell that has to stop
-saying **No**. Until then, treat the OpenAI-compatible provider as sending
+The Phase 5 rows this table used to carry — the redaction pass, query
+rewrite, synthesis, the judge — have landed and moved up into the inventory.
+The REST + MCP surfaces landed read-only with **no mutating operation on
+either transport** (ADR-0014), so SPEC.md §7's shared-secret obligation is
+dormant until a mutating operation exists.
+
+Phase 5 changed row 5, not row 2. SPEC.md §9 expected the embedding row to
+be the cell that stopped saying **No**; ADR-0017 decision 5 records why it
+deliberately still says it, and the chat row is where the redaction pass
+actually runs. Treat the OpenAI-compatible *embedding* provider as sending
 your corpus to a third party in the clear, because that is what it does.
 
 ## Practical guidance
@@ -144,3 +199,8 @@ your corpus to a third party in the clear, because that is what it does.
   `base_url` as carefully as you check `provider`.
 - **Air-gapped?** Everything works except the first cross-encoder model load.
   Pre-seed the model cache and the `rerank` extra runs offline too.
+- **Using a cloud chat provider with `grk answer`?** The pattern pass covers
+  structural identifiers, not meaning: the provider still sees your retrieved
+  content's substance, your questions, and — unless you configure name
+  patterns — every person name in them. Redaction narrows what crosses the
+  boundary; it does not make cloud synthesis private.

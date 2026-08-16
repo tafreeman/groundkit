@@ -453,6 +453,125 @@ class StageResult(BaseModel):
         return self
 
 
+class SynthesisReport(BaseModel):
+    """Synthesis and advisory-judge outcomes for one eval run (Phase 5, SPEC.md §2, §6).
+
+    A structural record only — no faithfulness rate, no aggregated judge
+    score, and no invented metric of any kind (SPEC.md §2). What this model
+    carries is *counts* and *identities*: how many answers landed in which
+    outcome bucket, which model and prompt produced them, and whether
+    redaction ran — enough for a reader to know what was measured and by
+    what, never enough to imply a quality number this phase has not earned.
+
+    Deliberately not nested under a stage: ``input_stage`` names which
+    retrieval stage's results synthesis was run over, but synthesis itself
+    produces no ``@k`` metrics and has no baseline delta, so it is not one of
+    :data:`StageName`'s members and never will be (see
+    ``docs/adr/ADR-0018-llm-output-is-validated-never-trusted.md`` decision 6).
+
+    Judge identity and verdict-tally fields are an all-or-nothing group,
+    mirroring :meth:`RunConfig._require_all_or_none`'s pattern for the same
+    reason: ``grk eval --judge`` requires ``--synthesis`` (a
+    ``ConfigurationError`` otherwise), so a report with half a judge record
+    would describe a run that could not have happened.
+
+    Attributes:
+        input_stage: The retrieval stage whose results synthesis answered
+            from.
+        synthesis_provider: The synthesizing chat model's provider identity,
+            read from the :class:`~groundkit.providers.protocols.ChatProtocol`
+            that produced it (ADR-0004's argument one layer up: an identity a
+            caller could pass and disagree with is not this).
+        synthesis_model: The synthesizing chat model's model identity.
+        synthesis_prompt_hash: SHA-256 hex digest of the rendered synthesis
+            prompt template, so a prompt change is detectable the same way
+            :class:`RunMetadata.corpus_hash` makes a corpus change detectable.
+        redacted: Whether the chat boundary redaction pass (ADR-0017) was
+            applied to this run's synthesis calls.
+        answered_count: Queries that produced a non-empty ``citations`` tuple
+            — a genuine cited answer.
+        abstained_count: Queries that produced a valid, empty-``citations``
+            completion (:class:`~groundkit.providers.synthesis.SynthesizedAnswer`'s
+            documented abstention shape) rather than an error.
+        rejected_count: Queries where synthesis raised
+            :class:`~groundkit.errors.SynthesisError` (SPEC.md §2: discarding
+            a malformed answer is not coercion, and a high count here is
+            information about the model, not a harness failure).
+        judge_provider: The judge model's provider identity, or ``None`` if
+            ``--judge`` was not enabled for this run.
+        judge_model: The judge model's model identity, or ``None``.
+        judge_prompt_hash: SHA-256 hex digest of the rendered judge prompt
+            template, or ``None`` — changing either the judge's identity or
+            its prompt invalidates any future calibration
+            (ADR-0018 decision 5).
+        judged_count: Answers the judge actually evaluated, or ``None``.
+        faithful_count: Verdicts with ``faithful=True``, or ``None``.
+        unfaithful_count: Verdicts with ``faithful=False``, or ``None``.
+        judge_error_count: Judge calls that raised
+            :class:`~groundkit.errors.JudgeError` (malformed verdict JSON),
+            or ``None``. **Advisory only** — see
+            :mod:`groundkit.evals.judge`'s module docstring: nothing here
+            gates on any of these three tallies.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    input_stage: StageName
+    synthesis_provider: str
+    synthesis_model: str
+    synthesis_prompt_hash: str
+    redacted: bool
+    answered_count: int = Field(ge=0)
+    abstained_count: int = Field(ge=0)
+    rejected_count: int = Field(ge=0)
+    judge_provider: str | None = None
+    judge_model: str | None = None
+    judge_prompt_hash: str | None = None
+    judged_count: int | None = Field(default=None, ge=0)
+    faithful_count: int | None = Field(default=None, ge=0)
+    unfaithful_count: int | None = Field(default=None, ge=0)
+    judge_error_count: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_judge_fields(self) -> SynthesisReport:
+        """The seven ``judge_*``/``judged_count``/verdict-tally fields are all-or-nothing.
+
+        Same defect ``RunConfig._require_all_or_none`` prevents for the dense
+        and rerank field groups: a half-populated judge record does not fail
+        anywhere on its own — it is read, believed, and compared against a
+        run that meant something different. ``grk eval --judge`` cannot run
+        without ``--synthesis``, so every judge field is present together or
+        this run never invoked the judge at all.
+        """
+        group = (
+            "judge_provider",
+            "judge_model",
+            "judge_prompt_hash",
+            "judged_count",
+            "faithful_count",
+            "unfaithful_count",
+            "judge_error_count",
+        )
+        present = [name for name in group if getattr(self, name) is not None]
+        if present and len(present) != len(group):
+            missing = [name for name in group if getattr(self, name) is None]
+            raise ValueError(
+                f"{', '.join(group)} describe a judge run and must be set together or "
+                f"not at all; got {sorted(present)} without {sorted(missing)}"
+            )
+        if self.judged_count is not None:
+            faithful = self.faithful_count or 0
+            unfaithful = self.unfaithful_count or 0
+            errors = self.judge_error_count or 0
+            if faithful + unfaithful + errors != self.judged_count:
+                raise ValueError(
+                    f"faithful_count ({faithful}) + unfaithful_count ({unfaithful}) + "
+                    f"judge_error_count ({errors}) must equal judged_count "
+                    f"({self.judged_count})"
+                )
+        return self
+
+
 class EvalReport(BaseModel):
     """The complete artifact for one eval run — the reference report shape.
 
@@ -480,6 +599,15 @@ class EvalReport(BaseModel):
         run: Provenance and settings for this run.
         stages: Per-stage results; non-empty, with exactly one baseline
             stage, at index 0, and that stage is BM25.
+        synthesis: Phase 5 synthesis/judge outcomes, or ``None`` for a run
+            that did not enable ``--synthesis``. Additive-with-default —
+            this is the **third** reliance on the licence this module's
+            docstring states (Wave E's ``embedding``/``rrf_k``, ADR-0012's
+            three ``rerank_*`` fields, now this), which holds only because
+            ``evals/results/`` stays gitignored so no artifact outlives the
+            code that reads it. ``tests/test_echo.py`` and this repo's suite
+            both assert that precondition directly rather than trusting the
+            docstring (ADR-0018 decision 6).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -487,6 +615,7 @@ class EvalReport(BaseModel):
     schema_version: Literal[1] = 1
     run: RunMetadata
     stages: list[StageResult]
+    synthesis: SynthesisReport | None = None
 
     @model_validator(mode="after")
     def _validate_baseline_invariants(self) -> EvalReport:
