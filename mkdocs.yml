@@ -118,6 +118,7 @@ nav:
       - Phase 3 spec — hybrid retrieval: specs/phase-3-hybrid-retrieval.md
       - Phase 6 spec — IaC and observability: specs/phase-6-iac-observability.md
       - Phase 5 spec — boundary features: specs/phase-5-boundary-features.md
+      - Extracted and remote sources spec: specs/loaders-extracted-and-remote-sources.md
   - API reference:
       - Contracts: reference/contracts.md
       - Configuration: reference/config.md

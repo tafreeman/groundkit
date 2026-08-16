@@ -35,8 +35,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, TypeVar
 
-from groundkit.contracts import Chunk, CollectionManifest, EmbeddingIdentity
+from groundkit.contracts import Chunk, CollectionManifest, EmbeddingIdentity, SourceClass
 from groundkit.errors import ConfigurationError, IndexIdentityError, StorageError
+from groundkit.index.protocols import DocumentRecord
 from groundkit.utils.path_safety import ensure_within_base
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,9 @@ CREATE TABLE IF NOT EXISTS documents (
     document_id TEXT PRIMARY KEY,
     source TEXT UNIQUE NOT NULL,
     content_hash TEXT NOT NULL,
-    ingested_at TEXT NOT NULL
+    ingested_at TEXT NOT NULL,
+    source_class TEXT NOT NULL DEFAULT 'text',
+    extractor TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -127,7 +130,22 @@ APPLICATION_ID: Final[int] = 0x47524B31  # "GRK1"
 #: would serve its cached retriever forever. With the bump, such a store is
 #: not schema-current, ``get_generation`` returns ``None``, and the runtime
 #: degrades to rebuilding every request instead of caching a stale index.
-SCHEMA_VERSION: Final[int] = 2
+#:
+#: Bumped 2 -> 3 by ADR-0016, which added ``source_class``/``extractor`` to
+#: ``documents``. Unlike the 1 -> 2 bump, this one is not additive: it
+#: changes the ``documents`` table itself — the table every read and write
+#: already goes through — rather than adding a new table alongside it.
+#: ``CREATE TABLE IF NOT EXISTS`` is a no-op against an existing ``documents``
+#: table, so a v1 or v2 store's table genuinely lacks the two new columns; an
+#: ``INSERT`` naming them would fail with a raw ``sqlite3.OperationalError``.
+#: :meth:`SQLiteMetadataStore._require_source_class_capable` is the guard
+#: (:meth:`upsert_document`, :meth:`replace_document`,
+#: :meth:`get_document_records` only — see its docstring for why the other
+#: methods are untouched), refusing with a clear :class:`StorageError` naming
+#: the delete-and-re-ingest remedy instead of surfacing that raw driver
+#: error. Pre-1.0, there is no migration path (ADR-0004 decision 5): every
+#: index is reproducible from ``grk ingest`` in seconds.
+SCHEMA_VERSION: Final[int] = 3
 
 
 class SQLiteMetadataStore:
@@ -271,7 +289,15 @@ class SQLiteMetadataStore:
             await asyncio.to_thread(self._conn.close)
         logger.debug("closed metadata store")
 
-    async def upsert_document(self, source: str, document_id: str, content_hash: str) -> None:
+    async def upsert_document(
+        self,
+        source: str,
+        document_id: str,
+        content_hash: str,
+        *,
+        source_class: SourceClass = "text",
+        extractor: str | None = None,
+    ) -> None:
         """Record (or replace) a document's ingest state.
 
         If ``source`` already has a document row (possibly under a different
@@ -284,18 +310,27 @@ class SQLiteMetadataStore:
             source: File path, URL, or other source identifier. Unique.
             document_id: Identifier to store the document under.
             content_hash: Hash of the document's current content.
+            source_class: How ``source`` maps to stored content (ADR-0016).
+                Keyword-only, defaulting to ``"text"`` so every caller that
+                predates this parameter keeps compiling unchanged.
+            extractor: Extractor identity for an ``extracted`` source;
+                ``None`` for every other class.
 
         Raises:
-            StorageError: On a backend failure.
+            StorageError: This store predates the ``source_class``/
+                ``extractor`` columns (schema v3, ADR-0016), or a backend
+                failure occurs.
         """
+        self._require_source_class_capable("upsert a document")
         ingested_at = _now_iso()
 
         def _op() -> None:
             self._delete_existing_source(source)
             self._conn.execute(
-                "INSERT INTO documents (document_id, source, content_hash, ingested_at) "
-                "VALUES (?, ?, ?, ?)",
-                (document_id, source, content_hash, ingested_at),
+                "INSERT INTO documents "
+                "(document_id, source, content_hash, ingested_at, source_class, extractor) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (document_id, source, content_hash, ingested_at, source_class, extractor),
             )
             self._bump_generation()
             self._conn.commit()
@@ -351,6 +386,15 @@ class SQLiteMetadataStore:
     async def get_document_sources(self) -> dict[str, str]:
         """Return a ``document_id -> source`` map for every stored document.
 
+        Deliberately narrower than :meth:`get_document_records`: this query
+        never selects ``source_class``/``extractor``, so it keeps working
+        unchanged against a v1, v2, *or* v3 store — none of this store's five
+        pre-ADR-0016 callers (``Indexer``'s two prune paths, the dense-side
+        presence check, and two ``evals/runner.py`` reads) need the richer
+        record, and widening this method's return type would force every one
+        of them to change for a field they never use. See
+        :meth:`get_document_records`'s docstring for the fuller read.
+
         Raises:
             StorageError: On a backend failure.
         """
@@ -358,6 +402,40 @@ class SQLiteMetadataStore:
         def _op() -> dict[str, str]:
             cur = self._conn.execute("SELECT document_id, source FROM documents")
             return {str(row[0]): str(row[1]) for row in cur.fetchall()}
+
+        return await self._run(_op)
+
+    async def get_document_records(self) -> dict[str, DocumentRecord]:
+        """Return a ``document_id -> DocumentRecord`` map for every stored document.
+
+        A sibling of :meth:`get_document_sources`, not a widening of it
+        (ADR-0016). Every one of that method's five existing call sites reads
+        only the source string or the key set, so changing its return type
+        would touch five call sites for a field none of them need; adding
+        this method instead confines the change to the two call sites that
+        actually need the richer read (``Retriever._resolve`` and
+        ``handle_fetch_chunk``, both building a ``Citation``/
+        ``RetrievalResult`` that must carry the document's real
+        ``source_class``/``extractor`` rather than silently defaulting to
+        ``("text", None)`` — the fail-open defect this method closes).
+
+        Raises:
+            StorageError: This store predates the ``source_class``/
+                ``extractor`` columns (schema v3, ADR-0016), or a backend
+                failure occurs.
+        """
+        self._require_source_class_capable("read document records")
+
+        def _op() -> dict[str, DocumentRecord]:
+            cur = self._conn.execute(
+                "SELECT document_id, source, source_class, extractor FROM documents"
+            )
+            return {
+                str(row[0]): DocumentRecord(
+                    source=str(row[1]), source_class=row[2], extractor=row[3]
+                )
+                for row in cur.fetchall()
+            }
 
         return await self._run(_op)
 
@@ -400,7 +478,14 @@ class SQLiteMetadataStore:
         await self._run(_op)
 
     async def replace_document(
-        self, source: str, document_id: str, content_hash: str, chunks: list[Chunk]
+        self,
+        source: str,
+        document_id: str,
+        content_hash: str,
+        chunks: list[Chunk],
+        *,
+        source_class: SourceClass = "text",
+        extractor: str | None = None,
     ) -> None:
         """Atomically replace a document's row and its chunks in one transaction.
 
@@ -425,20 +510,31 @@ class SQLiteMetadataStore:
             document_id: Identifier to store the document under.
             content_hash: Hash of the document's current content.
             chunks: Chunks to persist for this document. May be empty.
+            source_class: How ``source`` maps to stored content (ADR-0016).
+                Keyword-only, defaulting to ``"text"`` so every caller that
+                predates this parameter keeps compiling unchanged. This is
+                the field the ADR-0016 fail-open defect dropped silently:
+                :class:`~groundkit.indexer.Indexer` now passes
+                ``document.source_class`` through here on every write.
+            extractor: Extractor identity for an ``extracted`` source;
+                ``None`` for every other class.
 
         Raises:
-            StorageError: A chunk's ``document_id`` does not match
-                ``document_id``, a chunk has non-JSON-serializable metadata,
-                or a backend failure occurs.
+            StorageError: This store predates the ``source_class``/
+                ``extractor`` columns (schema v3, ADR-0016); a chunk's
+                ``document_id`` does not match ``document_id``; a chunk has
+                non-JSON-serializable metadata; or a backend failure occurs.
         """
+        self._require_source_class_capable("replace a document")
         ingested_at = _now_iso()
 
         def _op() -> None:
             self._delete_existing_source(source)
             self._conn.execute(
-                "INSERT INTO documents (document_id, source, content_hash, ingested_at) "
-                "VALUES (?, ?, ?, ?)",
-                (document_id, source, content_hash, ingested_at),
+                "INSERT INTO documents "
+                "(document_id, source, content_hash, ingested_at, source_class, extractor) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (document_id, source, content_hash, ingested_at, source_class, extractor),
             )
             for chunk in chunks:
                 if chunk.document_id != document_id:
@@ -785,6 +881,53 @@ class SQLiteMetadataStore:
                 f"{self.db_path}: it predates the manifest (ADR-0004) or was not "
                 "created by groundkit. Pre-1.0 there is no migration path for dense "
                 "data — delete this collection and re-ingest it."
+            )
+
+    def _require_source_class_capable(self, action: str) -> None:
+        """Guard ``source_class``/``extractor`` operations against a store that predates them.
+
+        Mirrors :meth:`_require_manifest_capable`'s shape exactly (same
+        ``self._schema_current`` flag, checked outside :meth:`_run` for the
+        same reason: it is a plain attribute fixed at :meth:`open`, so
+        nothing here needs the lock) but raises a different, narrower
+        exception: a store below schema v3 is missing the ``documents``
+        columns this guards, which has nothing to do with the ADR-0004
+        embedding-identity manifest :meth:`_require_manifest_capable` guards,
+        so it gets its own :class:`StorageError` naming the actual cause
+        rather than borrowing :class:`IndexIdentityError`'s manifest-specific
+        message.
+
+        Called by :meth:`upsert_document`, :meth:`replace_document`, and
+        :meth:`get_document_records` — the only three methods that read or
+        write ``source_class``/``extractor`` (ADR-0016). Every other method
+        (``get_document_hash``, ``get_document_id``, ``get_document_sources``,
+        ``add_chunks``, ``get_chunks``, ``get_chunk``, ``delete_document``,
+        the manifest and generation methods) never references the two new
+        columns and keeps its existing schema-currency requirements exactly
+        as they were before this guard existed — in particular,
+        ``get_document_sources``'s query never selects them, so it keeps
+        working unchanged against a v1, v2, or v3 store.
+
+        Args:
+            action: Short description of the attempted operation, folded
+                into the error message (e.g. ``"upsert a document"``).
+
+        Raises:
+            StorageError: This store's ``PRAGMA application_id``/
+                ``user_version`` do not match groundkit's current stamp — it
+                predates the ``source_class``/``extractor`` columns
+                (ADR-0016 raised the schema version to 3), it predates
+                ADR-0004's stamp entirely, or it was never created by
+                groundkit at all. Pre-1.0 there is no migration path: every
+                index is reproducible from ``grk ingest`` in seconds, so the
+                remedy is to delete the collection and re-ingest it.
+        """
+        if not self._schema_current:
+            raise StorageError(
+                f"cannot {action}: the store at {self.db_path} predates the "
+                "source_class/extractor columns (schema v3, ADR-0016), or was never "
+                "created by groundkit. Pre-1.0 there is no migration path — delete "
+                "this collection and re-ingest it."
             )
 
     async def _run(self, fn: Callable[[], _T]) -> _T:

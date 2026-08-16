@@ -603,6 +603,13 @@ class Indexer:
         - The manifest is bound after embedding succeeds and before the
           first ``add`` (see :meth:`_ensure_manifest`).
 
+        ``doc.source_class``/``doc.extractor`` are passed through to
+        ``replace_document`` unchanged (ADR-0016): before this, the store
+        silently dropped both on every write and every later read reported
+        the ``("text", None)`` default regardless of what was actually
+        ingested — a downgrade, not an absence, since the value existed on
+        ``doc`` the whole time and was simply never carried past this call.
+
         Replace-path reconciliation: unlike the prune paths, there is no
         chunk-delete count to reconcile the dense delete against —
         ``replace_document`` returns ``None``, and the previous version's
@@ -643,6 +650,8 @@ class Indexer:
             document_id=doc.document_id,
             content_hash=doc_hash,
             chunks=chunks,
+            source_class=doc.source_class,
+            extractor=doc.extractor,
         )
         return vectors_written, vectors_deleted
 

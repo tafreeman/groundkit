@@ -22,6 +22,7 @@ from groundkit.errors import ConfigurationError, RetrievalError
 from groundkit.identity import identity_of, validate_dense_pair
 from groundkit.index.bm25 import BM25Index
 from groundkit.index.dense import verify_dense_side_present
+from groundkit.index.protocols import DocumentRecord, DocumentRecordStoreProtocol
 from groundkit.retrieval.fusion import reciprocal_rank_fusion
 from groundkit.telemetry import get_tracer, span_attributes
 
@@ -318,31 +319,31 @@ class Retriever:
                     raise RetrievalError(f"top_k must be between 1 and {MAX_TOP_K}, got {k}")
 
                 started = time.perf_counter_ns()
-                sources = await self._store.get_document_sources()
+                records = await self._document_records()
 
                 metadata: dict[str, object]
                 stage: Stage
                 if mode == "bm25":
                     pairs = self._bm25.search(query, top_k=k)
-                    results = self._resolve(pairs, sources, apply_threshold=True)
+                    results = self._resolve(pairs, records, apply_threshold=True)
                     stage = "bm25"
                     metadata = {"stage": stage, "top_k": k}
                 elif mode == "dense":
                     embedder, vector_store = self._require_dense(mode)
-                    pairs = await self._dense_candidates(query, k, sources, embedder, vector_store)
-                    results = self._resolve(pairs, sources, apply_threshold=True)
+                    pairs = await self._dense_candidates(query, k, records, embedder, vector_store)
+                    results = self._resolve(pairs, records, apply_threshold=True)
                     stage = "dense"
                     metadata = {"stage": stage, "top_k": k}
                 elif mode == "hybrid":
                     embedder, vector_store = self._require_dense(mode)
                     bm25_pairs = self._bm25.search(query, top_k=k)
                     dense_pairs = await self._dense_candidates(
-                        query, k, sources, embedder, vector_store
+                        query, k, records, embedder, vector_store
                     )
                     fused = reciprocal_rank_fusion(
                         [bm25_pairs, dense_pairs], rrf_k=self._config.rrf_k, top_k=k
                     )
-                    results = self._resolve(fused, sources, apply_threshold=False)
+                    results = self._resolve(fused, records, apply_threshold=False)
                     stage = "fusion"
                     metadata = {"stage": stage, "top_k": k, "rrf_k": self._config.rrf_k}
                 else:
@@ -429,11 +430,40 @@ class Retriever:
             )
         return self._embedder, self._vector_store
 
+    async def _document_records(self) -> dict[str, DocumentRecord]:
+        """Read every stored document's provenance for this search's one join.
+
+        Prefers ``get_document_records`` (:class:`DocumentRecordStoreProtocol`)
+        when ``self._store`` implements that capability — every
+        :class:`~groundkit.index.metadata.SQLiteMetadataStore` does, and this
+        is the ADR-0016 read half of the join
+        :meth:`~groundkit.index.protocols.MetadataStoreProtocol.replace_document`
+        writes — and degrades to plain ``get_document_sources`` otherwise,
+        wrapping each bare source string in a :class:`DocumentRecord` at the
+        ``text``/``None`` default.
+
+        That fallback is deliberately narrow rather than folded into
+        :class:`~groundkit.index.protocols.MetadataStoreProtocol` itself —
+        see :class:`DocumentRecordStoreProtocol`'s docstring for why
+        widening the required protocol would break every hand-built
+        protocol-conforming store double that predates ADR-0016. It is
+        honest rather than a silent downgrade: a store with no way to report
+        ``source_class``/``extractor`` never had richer data to report in
+        the first place, unlike the actual fail-open defect this method
+        closes (a real store dropping a value it *did* have).
+        """
+        if isinstance(self._store, DocumentRecordStoreProtocol):
+            return await self._store.get_document_records()
+        sources = await self._store.get_document_sources()
+        return {
+            document_id: DocumentRecord(source=source) for document_id, source in sources.items()
+        }
+
     async def _dense_candidates(
         self,
         query: str,
         k: int,
-        sources: dict[str, str],
+        records: dict[str, DocumentRecord],
         embedder: EmbeddingProtocol,
         vector_store: VectorStoreProtocol,
     ) -> list[tuple[Chunk, float]]:
@@ -443,11 +473,11 @@ class Retriever:
         dense path the same ``open()``-time snapshot semantics the BM25
         rebuild has structurally (see the class docstring). Three cases per
         hit, decided against the open()-time snapshot and the live
-        ``sources`` map:
+        ``records`` map:
 
         - document known at ``open()`` → kept (the join may still fail
           closed later if the document has since been deleted).
-        - unknown at ``open()`` but present in ``sources`` → ingested after
+        - unknown at ``open()`` but present in ``records`` → ingested after
           ``open()``; dropped silently, exactly as invisible as it is to the
           stale in-memory BM25 index.
         - in neither → orphaned vectors; fail closed loudly.
@@ -480,7 +510,7 @@ class Retriever:
         fetch = k
         for attempt in range(_MAX_SNAPSHOT_FETCH_ATTEMPTS):
             pairs = await vector_store.search(embedding, top_k=fetch)
-            kept = self._apply_snapshot_filter(pairs, sources)
+            kept = self._apply_snapshot_filter(pairs, records)
             if len(kept) >= k or len(pairs) < fetch:
                 # Enough survivors, or the store returned less than asked and
                 # therefore holds nothing more to widen into.
@@ -501,7 +531,7 @@ class Retriever:
         return kept[:k]
 
     def _apply_snapshot_filter(
-        self, pairs: list[tuple[Chunk, float]], sources: dict[str, str]
+        self, pairs: list[tuple[Chunk, float]], records: dict[str, DocumentRecord]
     ) -> list[tuple[Chunk, float]]:
         """Keep only hits whose document existed at ``open()``; fail closed on orphans.
 
@@ -513,7 +543,7 @@ class Retriever:
             if chunk.document_id in self._documents_at_open:
                 kept.append((chunk, score))
                 continue
-            if chunk.document_id in sources:
+            if chunk.document_id in records:
                 continue
             raise RetrievalError(
                 f"Index inconsistency: dense hit for chunk {chunk.chunk_id} references "
@@ -525,11 +555,11 @@ class Retriever:
     def _resolve(
         self,
         pairs: list[tuple[Chunk, float]],
-        sources: dict[str, str],
+        records: dict[str, DocumentRecord],
         *,
         apply_threshold: bool,
     ) -> list[RetrievalResult]:
-        """Join ``(chunk, score)`` pairs to their documents' sources — the ONE join.
+        """Join ``(chunk, score)`` pairs to their documents' records — the ONE join.
 
         Every mode funnels through here exactly once per search, after
         fusion in hybrid mode (ADR-0006: the join happens on the surviving
@@ -537,8 +567,16 @@ class Retriever:
         ``apply_threshold=False`` is the hybrid path: ADR-0005 decision 6
         keeps ``score_threshold`` away from rank-derived fused scores.
 
+        Every constructed :class:`RetrievalResult` carries the document's
+        real ``source_class``/``extractor`` (ADR-0016) rather than the
+        ``("text", None)`` default — the fail-open defect this closes: before
+        this, every result silently reported ``"text"`` regardless of what
+        was actually ingested, routing an ``extracted`` or ``snapshot``
+        citation into a resolver path that would compare its offsets against
+        text they were never measured against.
+
         Raises:
-            RetrievalError: A chunk's document has no stored source — fail
+            RetrievalError: A chunk's document has no stored record — fail
                 closed rather than emit an unverifiable citation.
         """
         threshold = self._config.score_threshold if apply_threshold else None
@@ -546,8 +584,8 @@ class Retriever:
         for chunk, score in pairs:
             if threshold is not None and score < threshold:
                 continue
-            source = sources.get(chunk.document_id)
-            if source is None:
+            record = records.get(chunk.document_id)
+            if record is None:
                 raise RetrievalError(
                     f"Index inconsistency: chunk {chunk.chunk_id} references "
                     f"document {chunk.document_id} which has no stored source"
@@ -558,7 +596,9 @@ class Retriever:
                     score=score,
                     document_id=chunk.document_id,
                     chunk_id=chunk.chunk_id,
-                    source=source,
+                    source=record.source,
+                    source_class=record.source_class,
+                    extractor=record.extractor,
                     start_offset=chunk.start_offset,
                     end_offset=chunk.end_offset,
                     metadata=chunk.metadata,

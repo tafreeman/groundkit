@@ -726,30 +726,51 @@ def test_fresh_store_stamps_application_id_and_user_version(tmp_path: Path) -> N
 
 
 def test_legacy_store_without_manifest_stamp_is_refused_for_dense_work(tmp_path: Path) -> None:
-    """A store predating ADR-0004 refuses manifest writes/verifies but still opens fine.
+    """A store predating ADR-0004 refuses manifest writes/verifies and, since
+    schema v3, refuses document writes too — while reads still open fine.
 
-    BM25-only collections must keep working: a store created before the
-    embedding-identity manifest existed has no PRAGMA application_id/
-    user_version stamp, so opening it and doing ordinary document/chunk work
-    succeeds unchanged. Only the manifest-specific operations — which would
-    otherwise trust an identity this store never recorded — are refused,
-    with a clear IndexIdentityError rather than a guess. Pre-1.0 there is no
-    migration path: the fix is delete-and-reingest.
+    **This test's promise narrowed at ADR-0016, and the change is recorded
+    rather than silently applied.** It used to assert that "BM25-only
+    collections must keep working" — that ordinary document/chunk work on an
+    unstamped legacy store "succeeds unchanged", with only manifest-specific
+    operations refused. ADR-0016 added ``source_class``/``extractor`` to the
+    ``documents`` table and raised ``SCHEMA_VERSION`` to 3, and states that
+    existing collections must be deleted and re-ingested. A pre-v3 store has
+    no column to record a source class in — ``CREATE TABLE IF NOT EXISTS``
+    does not add one to a table that already exists — so a write must be
+    refused rather than silently dropping the class, which is precisely the
+    fail-open defect ADR-0016 closes.
+
+    What did **not** change, and is asserted below: **reads still work.** The
+    guard is scoped to the three methods that touch the new columns, so an
+    existing collection stays openable and searchable; it just cannot be
+    written to. And the manifest operations still fail with their own
+    ``IndexIdentityError`` for ADR-0004's reason rather than being folded
+    into the schema refusal, so the two failures stay distinguishable.
     """
     _write_legacy_schema(tmp_path, "col")
 
-    async def _bm25_only_work() -> tuple[str | None, CollectionManifest | None]:
+    async def _write_is_refused() -> None:
         store = await SQLiteMetadataStore.open(tmp_path, "col")
         try:
-            await store.upsert_document(source="a.md", document_id="doc-1", content_hash="h1")
-            doc_hash = await store.get_document_hash("a.md")
-            manifest = await store.get_manifest()  # a plain read: never raises
-            return doc_hash, manifest
+            with pytest.raises(StorageError, match="re-ingest"):
+                await store.upsert_document(source="a.md", document_id="doc-1", content_hash="h1")
         finally:
             await store.close()
 
-    doc_hash, manifest = asyncio.run(_bm25_only_work())
-    assert doc_hash == "h1"
+    asyncio.run(_write_is_refused())
+
+    async def _reads_still_work() -> tuple[dict[str, str], CollectionManifest | None]:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            sources = await store.get_document_sources()
+            manifest = await store.get_manifest()  # a plain read: never raises
+            return sources, manifest
+        finally:
+            await store.close()
+
+    sources, manifest = asyncio.run(_reads_still_work())
+    assert sources == {}
     assert manifest is None
 
     embedding = EmbeddingIdentity(provider="ollama", model_name="nomic-embed-text", dimensions=768)

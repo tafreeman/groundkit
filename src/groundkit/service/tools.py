@@ -239,25 +239,38 @@ async def handle_fetch_chunk(ctx: ServiceContext, request: FetchChunkRequest) ->
     """
     async with ctx.registry.acquire(request.collection) as runtime:
         chunk = await runtime.get_chunk(request.chunk_id)
-        sources = await runtime.get_document_sources()
+        records = await runtime.get_document_records()
 
     if chunk is None:
         raise ConfigurationError(
             f"no chunk {request.chunk_id!r} in collection {request.collection!r}"
         )
 
-    source = sources.get(chunk.document_id)
-    if source is None:
+    record = records.get(chunk.document_id)
+    if record is None:
         # The dangling-document case Retriever.search already fails closed on.
         raise RetrievalError(
             f"chunk {chunk.chunk_id!r} belongs to document {chunk.document_id!r}, "
             "which has no stored source — the index is inconsistent"
         )
 
+    # ``get_document_records`` rather than ``get_document_sources`` (ADR-0016).
+    # A bare source string would leave this Citation at its ``("text", None)``
+    # field defaults no matter what the document was ingested as, and the
+    # consequences are not cosmetic: ``search`` would report a chunk's citation
+    # as ``extracted`` while ``fetch_chunk`` reported the same chunk as
+    # ``text`` — two read-only tools disagreeing about one stored fact — and
+    # ``resolve_citation`` would take the plain read-and-slice branch instead of
+    # refusing. For an extracted source that can "verify" against raw bytes the
+    # offsets were never measured against; for a snapshot source it hands a URL
+    # to ``ensure_within_base``, which is exactly the relative-path confusion
+    # ADR-0016 decision 4 closes by classifying before resolving.
     citation = Citation(
         document_id=chunk.document_id,
         chunk_id=chunk.chunk_id,
-        source=source,
+        source=record.source,
+        source_class=record.source_class,
+        extractor=record.extractor,
         start_offset=chunk.start_offset,
         end_offset=chunk.end_offset,
     )
@@ -268,10 +281,15 @@ async def handle_fetch_chunk(ctx: ServiceContext, request: FetchChunkRequest) ->
     try:
         resolved = await resolve_citation(citation, ctx.base_dir)
     except RetrievalError as exc:
-        # resolve_citation raises for both "source changed" and "cannot read".
-        # The message distinguishes them for a human; the verdict does for a
-        # client. Neither carries text a caller could attribute to the source.
-        verification = "drifted" if "changed since indexing" in str(exc) else "unresolvable"
+        # resolve_citation sets `verdict` explicitly at every one of its raise
+        # sites (ADR-0016 decision 6), so this reads a typed attribute instead
+        # of pattern-matching the message text the way an earlier version did.
+        # The `is None` fallback is defensive, not load-bearing: every path
+        # inside resolve_citation now sets a verdict, so it should never
+        # trigger. It exists so a future RetrievalError raised there without
+        # one fails toward the more conservative verdict — `unresolvable`
+        # never claims a definite "the source changed", `drifted` would.
+        verification = exc.verdict if exc.verdict is not None else "unresolvable"
         detail = str(exc)
     else:
         if resolved == chunk.content:
