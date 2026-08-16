@@ -42,11 +42,22 @@ deployment surface states it explicitly:
 
 - **compose** publishes `127.0.0.1:8765:8765` — a host-loopback publish, so the socket
   the outside world could reach does not exist.
-- **Kubernetes** uses a `ClusterIP` Service. Not `NodePort`, not `LoadBalancer`; reaching
-  it is `kubectl port-forward`, which is authenticated and authorised by the cluster's
-  own RBAC.
+- **Kubernetes** uses a `ClusterIP` Service **plus a default-deny-ingress
+  NetworkPolicy**, and it takes both. `ClusterIP` closes the cluster's *edge* — not
+  `NodePort`, not `LoadBalancer` — but every pod in every namespace can dial a ClusterIP
+  directly, so on its own it is a smaller blast radius rather than a boundary. This
+  record originally claimed the Service alone re-established the guarantee; it does not,
+  and `infra/k8s/networkpolicy.yaml` is the object that does. Reaching the service is
+  `kubectl port-forward`, authorised by the cluster's own RBAC.
 - **Terraform** (ADR-0020 decision 2) publishes `127.0.0.1:8765` on the instance and
   opens no ingress at all; access is SSM port forwarding.
+
+The Kubernetes row is the weakest of the three and is worth saying so plainly: a
+NetworkPolicy is **silently inert** on a cluster whose CNI does not enforce one — the
+API server accepts it, reports no status and emits no warning — so that surface's
+guarantee is contingent on a cluster property this repo cannot check from a manifest.
+compose and Terraform both rest on a kernel-level socket bind instead, which is not
+contingent on anything.
 
 **The consequence, stated plainly because it is the cost of decision 1: the image is not
 safe to run with a bare `-p 8765:8765` or with `--network host`.** Either publishes an

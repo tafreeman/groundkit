@@ -1,11 +1,23 @@
-# One-shot ingest. Applied on its own, NOT part of kustomization.yaml.
+# One-shot ingest. Applied through its own kustomization, NOT the base.
 #
-#     kubectl apply -f infra/k8s/job-ingest.yaml
+#     kubectl -n groundkit scale deploy/groundkit --replicas=0   # release the claim
+#     kubectl apply -k infra/k8s/ingest
+#     kubectl -n groundkit wait --for=condition=complete job/groundkit-ingest --timeout=10m
+#     kubectl -n groundkit scale deploy/groundkit --replicas=1   # reopen the retriever
+#
+# Both scale steps are load-bearing. The PVC is ReadWriteOnce, so on a
+# multi-node cluster this Job cannot attach a volume the running Deployment
+# holds — it stalls on a multi-attach error rather than failing. And scaling
+# back up is not merely restoring service: a `Retriever` is a snapshot of the
+# store as of `open()` and never refreshes, so a pod that was serving before
+# this Job ran would return zero results for everything the Job added. The
+# restart IS the reopen.
 #
 # Out of the kustomize base for a concrete reason rather than for tidiness: a
 # Job's pod template is immutable, so `kubectl apply -k` would succeed the first
 # time and fail on every subsequent apply of the whole base. Delete and re-apply
-# this file to re-run it.
+# to re-run. It has its own `kustomization.yaml` rather than being applied with
+# `-f` so the image override reaches it — see that file.
 #
 # This Job exists because `grk serve` will not create an index — `--index-dir`
 # must already exist and the service never creates a collection (ADR-0014

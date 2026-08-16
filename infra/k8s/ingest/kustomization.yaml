@@ -1,0 +1,37 @@
+# The ingest Job, in its own kustomization rather than the base.
+#
+#     kubectl apply -k infra/k8s/ingest
+#
+# **Its own kustomization, not a loose `kubectl apply -f`, because the image
+# override has to reach it.** A kustomize `images:` transformer rewrites only
+# the resources in the kustomization that declares it, so while this Job sat
+# beside the base as a standalone file it kept the `ghcr.io/tafreeman/groundkit`
+# placeholder — which is published nowhere — and the documented workflow ended
+# in `ImagePullBackOff`. Set the image in **both** this file and `../` , or the
+# Deployment and the Job will run different builds against one index.
+#
+# **Its own kustomization and not part of the base**, because a Job's pod
+# template is immutable: including it in the base would succeed on the first
+# `apply -k` and fail on every one after it. Delete and re-apply this to re-run.
+#
+# Read `../README.md` on ordering before running it. The Deployment must be
+# scaled to zero first — the ReadWriteOnce claim admits one pod, and on a
+# multi-node cluster this Job otherwise stalls on a multi-attach error.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: groundkit
+
+resources:
+  - job.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: groundkit
+
+# Keep in step with ../kustomization.yaml. Two transformers rather than one is
+# the cost of the Job needing an independent lifecycle; the alternative is the
+# placeholder that shipped, so this is the cheaper failure.
+images:
+  - name: ghcr.io/tafreeman/groundkit
+    newTag: dev

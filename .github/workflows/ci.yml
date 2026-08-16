@@ -122,7 +122,10 @@ jobs:
           uv run --no-project --with pyyaml python - <<'PY' >> images.txt
           import glob
           import yaml
-          for path in sorted(glob.glob("infra/k8s/*.yaml")):
+          # Recursive: the ingest Job lives in its own kustomization directory so
+          # the image override reaches it, and a non-recursive glob would have
+          # quietly stopped covering it the moment it moved.
+          for path in sorted(glob.glob("infra/k8s/**/*.yaml", recursive=True)):
               for doc in yaml.safe_load_all(open(path, encoding="utf-8")):
                   if not isinstance(doc, dict):
                       continue
@@ -185,19 +188,38 @@ jobs:
         run: |
           set -euo pipefail
           kubectl kustomize infra/k8s > rendered.yaml
+          kubectl kustomize infra/k8s/ingest > rendered-ingest.yaml
           uv run --no-project --with pyyaml python - <<'PY'
           import glob
           import yaml
-          rendered = [d for d in yaml.safe_load_all(open("rendered.yaml", encoding="utf-8")) if d]
-          kinds = sorted(d["kind"] for d in rendered)
-          print("rendered:", kinds)
-          assert kinds == ["Deployment", "Namespace", "PersistentVolumeClaim", "Service"], kinds
-          # The one-shots are deliberately outside the kustomization (a Job's
-          # pod template is immutable; a loader pod would hold the RWO claim),
-          # so they are parsed here rather than left unchecked.
-          for path in sorted(glob.glob("infra/k8s/*.yaml")):
-              docs = [d for d in yaml.safe_load_all(open(path, encoding="utf-8")) if d]
-              assert docs, f"{path} parsed to nothing"
+
+          def load(path):
+              return [d for d in yaml.safe_load_all(open(path, encoding="utf-8")) if d]
+
+          base = load("rendered.yaml")
+          kinds = sorted(d["kind"] for d in base)
+          print("base:", kinds)
+          assert kinds == [
+              "Deployment", "Namespace", "NetworkPolicy", "PersistentVolumeClaim", "Service"
+          ], kinds
+
+          # The NetworkPolicy is what actually closes in-cluster reachability
+          # (ADR-0021 decision 1); a ClusterIP alone does not. Asserted here
+          # because its absence looks like nothing at all — the service keeps
+          # working, just reachable from every pod in the cluster.
+          policy = next(d for d in base if d["kind"] == "NetworkPolicy")
+          assert policy["spec"]["podSelector"] == {}, "policy must select every pod"
+          assert policy["spec"]["policyTypes"] == ["Ingress"], policy["spec"]["policyTypes"]
+          assert "ingress" not in policy["spec"], "an ingress rule would un-deny the default-deny"
+
+          # The ingest Job renders from its own kustomization so the image
+          # transformer reaches it. Applied with `-f` it kept the unpublished
+          # placeholder and the documented workflow ended in ImagePullBackOff.
+          ingest = load("rendered-ingest.yaml")
+          assert [d["kind"] for d in ingest] == ["Job"], [d["kind"] for d in ingest]
+
+          for path in sorted(glob.glob("infra/k8s/**/*.yaml", recursive=True)):
+              assert load(path), f"{path} parsed to nothing"
           print("all infra/k8s manifests parse")
           PY
 

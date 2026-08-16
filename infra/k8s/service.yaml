@@ -1,4 +1,4 @@
-# ClusterIP, and the type is the access-control decision (ADR-0021 decision 1).
+# ClusterIP, which closes EXTERNAL publication and nothing more.
 #
 # `NodePort` or `LoadBalancer` here would publish an UNAUTHENTICATED,
 # content-bearing surface — document text and absolute source paths over
@@ -6,6 +6,13 @@
 # whoever can reach the node or the load balancer. Phase 4 ships no
 # authentication of any kind (ADR-0014 decision 1), so there is nothing behind
 # this Service to stop them.
+#
+# **A ClusterIP is not an access boundary, and this comment used to imply it
+# was.** Every pod in every namespace, and the nodes themselves, can dial a
+# ClusterIP directly; the type only keeps the surface off the cluster's edge.
+# What actually closes in-cluster reachability is `networkpolicy.yaml`'s
+# default-deny ingress — read its header before relying on it, because a
+# NetworkPolicy is silently inert on a cluster whose CNI does not enforce one.
 #
 # Reaching it is:
 #
