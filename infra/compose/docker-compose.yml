@@ -56,6 +56,21 @@ services:
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-groundkit}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+      # The trace-specific overrides. `configure_tracing` gives these
+      # precedence over the general pair above (matching the OTel spec), so
+      # omitting them here made a documented `.env` override silently
+      # unreachable: a trace-specific `grpc` was dropped and the general
+      # `http/protobuf` default won -- the exact failure the protocol fix
+      # existed to end, reintroduced one layer out.
+      #
+      # Written as a bare key with NO value, which is compose's pass-through
+      # form: the variable reaches the container only if it is set in the
+      # environment or `.env`, and is absent otherwise. `${VAR:-}` would be
+      # wrong here -- it sets the variable to an EMPTY STRING, which is a
+      # different thing from unset, and would leave the container's
+      # environment claiming a trace-specific override that nobody made.
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:
+      OTEL_EXPORTER_OTLP_TRACES_PROTOCOL:
       OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-otlp}
       OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-}
       GROUNDKIT_LOG_FORMAT: ${GROUNDKIT_LOG_FORMAT:-json}
@@ -177,6 +192,21 @@ services:
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-groundkit-ingest}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+      # The trace-specific overrides. `configure_tracing` gives these
+      # precedence over the general pair above (matching the OTel spec), so
+      # omitting them here made a documented `.env` override silently
+      # unreachable: a trace-specific `grpc` was dropped and the general
+      # `http/protobuf` default won -- the exact failure the protocol fix
+      # existed to end, reintroduced one layer out.
+      #
+      # Written as a bare key with NO value, which is compose's pass-through
+      # form: the variable reaches the container only if it is set in the
+      # environment or `.env`, and is absent otherwise. `${VAR:-}` would be
+      # wrong here -- it sets the variable to an EMPTY STRING, which is a
+      # different thing from unset, and would leave the container's
+      # environment claiming a trace-specific override that nobody made.
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:
+      OTEL_EXPORTER_OTLP_TRACES_PROTOCOL:
       OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-otlp}
       OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-}
       GROUNDKIT_LOG_FORMAT: ${GROUNDKIT_LOG_FORMAT:-json}

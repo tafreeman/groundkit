@@ -68,6 +68,36 @@ SideEffect = Literal["read_only"]
 #: surface knows how to render.
 ToolResult = SearchResponse | ChunkFetchResponse | IndexStatusResponse | list[str]
 
+
+def result_count(result: ToolResult) -> int:
+    """Number of items an access log reports for ``result``.
+
+    A single-object read counts as one: the field exists so an operator can
+    see "this search matched nothing" in the log without the query being in
+    it, and reporting ``0`` for a successful ``fetch_chunk`` would make that
+    reading wrong.
+
+    Lives here, beside :data:`ToolResult`, because **both** transports need
+    it and neither may import the other. ``api.py`` deliberately does not
+    import ``mcp_server``, and the reverse would pull FastAPI into the stdio
+    MCP path for the sake of one ``isinstance`` chain. A shared seam with a
+    shared type is the right home; a second copy in the other transport is
+    how the two access logs would drift into disagreeing about what a
+    "result" is.
+
+    Args:
+        result: Whatever a handler returned.
+
+    Returns:
+        The count an access log should report.
+    """
+    if isinstance(result, SearchResponse):
+        return len(result.results)
+    if isinstance(result, list):
+        return len(result)
+    return 1
+
+
 if TYPE_CHECKING:
     #: The request parameter is ``Any`` because the registry is heterogeneous —
     #: each handler takes its own request model, and a homogeneous tuple cannot

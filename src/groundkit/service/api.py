@@ -63,7 +63,6 @@ from pydantic import BaseModel, ValidationError
 from starlette.types import ASGIApp
 
 from groundkit import __version__
-from groundkit.contracts import SearchResponse
 from groundkit.errors import ConfigurationError, GroundkitError
 from groundkit.service.errors import (
     ErrorRendering,
@@ -71,7 +70,7 @@ from groundkit.service.errors import (
     map_exception,
     unexpected_error_rendering,
 )
-from groundkit.service.tools import TOOLS
+from groundkit.service.tools import TOOLS, result_count
 
 if TYPE_CHECKING:
     from groundkit.service.tools import ServiceContext, ToolResult, ToolSpec
@@ -392,23 +391,8 @@ async def _dispatch(
         _log_access(spec, request_id, rendering.status_code, started, 0)
         return _error_response(rendering, request_id)
 
-    _log_access(spec, request_id, 200, started, _result_count(result))
+    _log_access(spec, request_id, 200, started, result_count(result))
     return result
-
-
-def _result_count(result: ToolResult) -> int:
-    """Number of items an access-log line reports for ``result``.
-
-    A single-object read counts as one: the field exists so an operator can see
-    "this search matched nothing" in the log without the query being in it, and
-    reporting ``0`` for a successful ``fetch_chunk`` would make that reading
-    wrong.
-    """
-    if isinstance(result, SearchResponse):
-        return len(result.results)
-    if isinstance(result, list):
-        return len(result)
-    return 1
 
 
 # -- Rendering and logging -------------------------------------------------

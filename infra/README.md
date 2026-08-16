@@ -205,11 +205,12 @@ that job exists rather than being a formality.
 | Dockerfile | `docker build` | **passed 2026-08-15** *(CI)* |
 | Dockerfile | container runs as uid 10001; CLI works; starts under `--read-only` with only the two named scratch mounts | **passed 2026-08-15** *(CI)* |
 | compose | `docker compose config` parses and interpolates | **passed 2026-08-15** |
-| compose | `up`, ingest, a real search over the loopback publish | **not yet run** — the 2026-08-16 trace run reached the collector over the compose network with `docker run`, never through the `groundkit` service's host publish; bringing that service up also needs the Ollama model pulled, since its command is `--dense`. The LAN bind check (ADR-0021 decision 1's actual claim) needs a second host and is the half most likely to be skipped |
+| compose | `up`, ingest, a real search over the loopback publish | **passed 2026-08-16** — the documented cold-start sequence in full: `--profile setup run --rm ollama-pull`, `--profile ingest run --rm ingest` (43 files, 1299 chunks, 1299 vectors via Ollama), `up -d`, then `GET /v1/collections` → `["default"]` and `POST /v1/search` → 200 with a citation-bearing result, both over `127.0.0.1:8765` |
+| compose | published ports are loopback-only | **passed 2026-08-16, host-side only** — a differential through this host's own LAN interface address, not loopback: `10.0.0.16:8766` (a control container published `0.0.0.0`) returned 200 while `10.0.0.16:8765` (the `groundkit` service, published `127.0.0.1`) was actively refused, with `Get-NetTCPConnection` showing `0.0.0.0` and `127.0.0.1` respectively. **The from-another-host leg was attempted and did NOT complete** — see the scope note below |
 | compose | collector→Jaeger leg, proved on its own with a synthetic OTLP/HTTP payload | **passed 2026-08-16** |
 | compose | a groundkit span visible in Jaeger, carrying no query text | **passed 2026-08-16** — `ingest` and `retrieve` spans observed; see the note below for what this run did and did not cover |
 | k8s | `kubectl kustomize` renders; every manifest parses as YAML | **passed 2026-08-15** |
-| k8s | `apply -k`, Job completes, Deployment Ready, port-forward serves | **not yet run** — needs a cluster; `kubectl` is present with no context configured. Record *which kind* when it is run: on a single-node cluster the scale-down steps above are unnecessary, which is exactly what makes omitting them a trap — the documented sequence passes in the small case and stalls on a multi-attach error against the `ReadWriteOnce` claim in the real one |
+| k8s | `apply -k`, Job completes, Deployment Ready, port-forward serves | **passed 2026-08-16 on a SINGLE-NODE cluster** — Docker Desktop 4.86.0 Kubernetes, kind mode, server v1.36.1, 1 node. The documented sequence run verbatim including the scale-down steps: `apply -k`, corpus loader + `kubectl cp` (43 files), ingest Job completed (43 files, 1299 chunks, BM25-only — the k8s stack has no Ollama), Deployment reached 1/1 Ready against the `GET /v1/collections` probe, and `port-forward` served a citation-bearing `POST /v1/search`. **The multi-node `ReadWriteOnce` path was NOT exercised** — see the note below |
 | terraform | `fmt -check`, `validate` on providers 5.100.0 and 6.60.0 | **passed 2026-08-16** |
 | terraform | `bootstrap.sh.tftpl` renders; rendered script passes `bash -n` | **passed 2026-08-16** |
 | terraform | ECR, egress and instance-architecture inputs classify correctly | **passed 2026-08-16** |
@@ -224,6 +225,68 @@ the region, or an AMI filter matching nothing are all invisible to it. The
 `plan` / `apply` row below is the exception: it is the one row that did make
 real API calls, in one specific region and account, and its own scope note
 says exactly what that does and does not settle.
+
+**Scope of the 2026-08-16 Kubernetes run, and why "single-node" is written into
+the row rather than left to be inferred.** This file already warned that the
+scale-down steps are unnecessary on a single-node cluster and that omitting
+them passes in the small case and stalls in the real one. The run that closed
+this row *was* the small case. The steps were followed verbatim anyway, so the
+documented sequence is confirmed self-consistent — but a single node can never
+produce the multi-attach failure the `ReadWriteOnce` claim guards against,
+because there is no second node for the volume to be attached from. **The
+multi-node behaviour of this manifest set is still unverified**, and that is
+the one thing a green row here must not be read as covering.
+
+What the run did establish, none of which needs a second node: the manifests
+apply as a set, the PVC binds, the ingest Job runs to completion against it,
+the Deployment reaches Ready on a probe that is a real operation rather than a
+static handler, the NetworkPolicy and `ClusterIP` are in place, the pod runs
+with `readOnlyRootFilesystem`, all capabilities dropped and no privilege
+escalation, and a citation-bearing search is served over `kubectl port-forward`.
+
+**A gotcha worth recording for the next person, because it is not in the
+sequence above.** Docker Desktop's Kubernetes runs in **kind mode**, whose
+containerd image store is *separate from the host Docker daemon's*. A local
+`groundkit` build is therefore invisible to the cluster and
+`imagePullPolicy: IfNotPresent` still ends in `ImagePullBackOff` — the same
+symptom the unpublished-placeholder trap produces, from an unrelated cause.
+Loading it explicitly is what fixes it:
+
+```bash
+docker tag groundkit:local ghcr.io/tafreeman/groundkit:dev
+docker save ghcr.io/tafreeman/groundkit:dev -o gk.tar
+docker exec -i desktop-control-plane ctr -n k8s.io images import - < gk.tar
+```
+
+`busybox:1.37` needs the same treatment for the corpus-loader pod.
+
+**Scope of the 2026-08-16 loopback-publish check, because "passed, host-side
+only" is a real qualifier and not a hedge.** ADR-0021 decision 1's claim is
+that containerising groundkit does not publish it beyond loopback. What was
+demonstrated: a control container published on `0.0.0.0:8766` answered on
+`10.0.0.16:8766` (this host's LAN interface address, not `127.0.0.1`), while
+the `groundkit` service published on `127.0.0.1:8765` was actively refused on
+`10.0.0.16:8765` in the same minute. Two ports, one host, the same Docker
+publish mechanism, differing only in bind address — and the refusal is the
+kernel declining a connection to an address nothing is bound to, which is the
+same path a remote packet meets at its destination.
+
+What that does **not** cover, and why the row says host-side only: the packets
+never crossed the network, so firewall rules, routing and AP behaviour were
+not exercised. A genuine from-another-host check was attempted the same day
+from a phone and **could not complete** — that phone could not reach the
+`0.0.0.0` control port either, though this host reaches it fine over the same
+address, which places the fault in the wireless network rather than in
+anything here. The Wi-Fi is a `-Guest` SSID with client isolation, so no device
+on it can reach this machine at all. Closing the remaining leg needs a wired
+host, or a device on the non-guest network. Recorded rather than quietly
+counted as done, because "the check passed" and "the check could not run" are
+opposite claims and a green row must not blur them.
+
+Groundkit's own access log corroborates the negative independently: across the
+whole session it recorded requests from `127.0.0.1` and from Docker's bridge
+gateway `172.18.0.1` (the healthcheck) and **from no `10.0.0.0/24` address at
+all**.
 
 **Scope of the 2026-08-16 trace verification, stated because the row above is
 narrower than it looks.** The collector and Jaeger were started with
