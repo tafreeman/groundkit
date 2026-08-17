@@ -1,0 +1,42 @@
+# gitleaks configuration.
+#
+# This file exists for exactly one reason: `tests/test_url_redaction.py` plants
+# credential-shaped sentinels in a URL and asserts they are ABSENT from every
+# rendered message. A real secret there would defeat the test rather than
+# constitute one -- the values are fake by construction, and the file's whole
+# purpose is proving they never reach a log line.
+#
+# gitleaks' default `generic-api-key` rule matches on shape, so it flagged one
+# of them and failed the `secrets` job. The inline `# gitleaks:allow` marker
+# those lines already carry does NOT fix that, and the reason is worth writing
+# down because it is easy to get wrong twice: the CI action scans a COMMIT
+# RANGE (`gitleaks detect --log-opts=...<first-commit>^..<head>`), not the
+# working tree. An inline marker added in a later commit cannot change what an
+# earlier commit's diff contains, so the finding is re-reported against the
+# commit that introduced the line no matter what HEAD looks like. A config file
+# is read from the worktree at scan time and therefore applies across the whole
+# scanned range, which is why the exemption has to live here.
+#
+# The inline markers are kept anyway: they are what a reader of that file sees,
+# and they cover the pre-commit hook, which scans staged content rather than a
+# range.
+
+[extend]
+# Without this, supplying a config REPLACES the default ruleset rather than
+# adding to it -- every rule would vanish, the job would go green, and nothing
+# would be scanned at all. A silently disabled scanner is a worse outcome than
+# the failure this file exists to fix, so the extend is load-bearing.
+useDefault = true
+
+[[allowlists]]
+description = "Planted non-secret sentinels in tests/test_url_redaction.py"
+# Matched against the detected secret itself, and deliberately spelled as the
+# two exact literal values rather than as a path exemption. A path rule
+# (`^tests/test_url_redaction\.py$`) would exempt that entire file from every
+# rule forever, including a credential pasted into it by accident later. These
+# regexes can only ever suppress these two strings, whose own text says what
+# they are.
+regexes = [
+  '''hunter2-must-never-be-logged''',
+  '''sk-live-must-never-be-logged''',
+]
