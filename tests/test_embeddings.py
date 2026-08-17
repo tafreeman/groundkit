@@ -204,6 +204,28 @@ class TestOllamaEmbedder:
         with pytest.raises(EmbeddingError, match="connection refused"):
             asyncio.run(embedder.embed(["x"]))
 
+    def test_a_timeout_names_its_exception_type_rather_than_nothing(self) -> None:
+        """The embedding half of the same defect the chat path had.
+
+        Both error builders interpolated ``str(exc)``, which is empty for
+        several ``httpx`` timeout types. Only the chat side was reported; this
+        side would have rendered an equally reasonless ``failed:`` message, so
+        the fix lives in the shared ``_error_detail`` helper and both call
+        sites are pinned.
+        """
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("")
+
+        config = EmbeddingConfig(provider="ollama", dimensions=2)
+        embedder = OllamaEmbedder(config, client=_client(handler))
+
+        with pytest.raises(EmbeddingError) as exc_info:
+            asyncio.run(embedder.embed(["x"]))
+        message = str(exc_info.value)
+        assert "ReadTimeout" in message
+        assert not message.rstrip().endswith("failed:")
+
     @pytest.mark.parametrize(
         "response_body",
         [

@@ -209,9 +209,38 @@ def _raise_embedding_error(url: str, exc: Exception, *, secret: str | None) -> N
         EmbeddingError: Always.
     """
     safe_url = _sanitize_url(url, secret)
-    detail = _scrub(str(exc), secret)
+    detail = _error_detail(exc, secret)
     logger.debug("Embedding request to %s failed: %s", safe_url, detail)
     raise EmbeddingError(f"Embedding request to {safe_url} failed: {detail}") from None
+
+
+def _error_detail(exc: Exception, secret: str | None) -> str:
+    """Scrubbed one-line description of *exc* that is never empty.
+
+    ``str()`` on several ``httpx`` timeout types -- ``ReadTimeout``,
+    ``WriteTimeout``, ``PoolTimeout``, ``ConnectTimeout`` -- is the empty
+    string. Interpolated directly, that rendered a provider timeout as
+    ``"... failed: "`` with nothing after the colon: the scrubbing was correct
+    and the message was still undiagnosable, which is the whole failure this
+    helper exists to prevent. The fallback is the exception's class name,
+    which carries the one fact the empty message was hiding and cannot itself
+    contain a credential.
+
+    Shared by :func:`_raise_embedding_error` and
+    :func:`groundkit.providers.llm._raise_chat_error` so the two cannot drift
+    -- the chat helper already reuses this module's :func:`_scrub` and
+    :func:`_sanitize_url` for the same reason (ADR-0001 hazard 6).
+
+    Args:
+        exc: The exception raised while sending or decoding the request.
+        secret: The credential to scrub out of the message, or ``None``.
+
+    Returns:
+        The scrubbed message, or ``type(exc).__name__`` when it is empty or
+        whitespace-only.
+    """
+    detail = _scrub(str(exc), secret)
+    return detail if detail.strip() else type(exc).__name__
 
 
 def _scrub(text: str, secret: str | None) -> str:
