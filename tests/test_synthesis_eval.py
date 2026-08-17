@@ -246,6 +246,33 @@ class TestJudgeTallies:
         # Exactly 5 calls made — proves C's judge call never fired.
         assert len(chat.calls) == 5
 
+    def test_all_unfaithful_tallied_correctly(self) -> None:
+        """Guards the direction the mixed-verdict cases cannot distinguish.
+
+        A tally that counted judge *calls* rather than reading each verdict
+        would pass every mixed case and fail only here, where the correct
+        answer is that nothing is faithful.
+        """
+        chat = _SynthesisEvalScriptedChat(
+            [
+                "answer A",
+                _verdict_json(faithful=False),
+                "answer B",
+                _verdict_json(faithful=False),
+            ]
+        )
+        judge = FaithfulnessJudge(chat)
+        query_results = [
+            ("q1", [_result()]),
+            ("q2", [_result()]),
+        ]
+        report = asyncio.run(
+            run_synthesis_eval(query_results, chat=chat, input_stage="bm25", judge=judge)
+        )
+        assert report.faithful_count == 0
+        assert report.unfaithful_count == 2
+        assert report.judged_count == 2
+
     def test_judge_provider_and_model_identity_recorded(self) -> None:
         chat = _SynthesisEvalScriptedChat(
             ["the answer is here [1]", _verdict_json(faithful=True)],
