@@ -540,7 +540,8 @@ was executed.
   refused" are different claims, and only the first is currently true.
 
 - **A groundkit span has now been observed in Jaeger (2026-08-16), for `ingest`
-  and `retrieve` — not for `synthesize`.** `src/groundkit/telemetry.py` is the
+  `retrieve` and — since a later run the same day — `synthesize`.**
+  `src/groundkit/telemetry.py` is the
   tracer accessor and the typed attribute helper (ADR-0022 decision 3),
   instrumenting `Indexer.index_source`, `Indexer.index_directory`,
   `Retriever.search` and `Synthesizer.synthesize`. `opentelemetry-api` is a base
@@ -548,11 +549,28 @@ was executed.
   `otel` extra installed — spans are simply non-recording. The verified run
   exercised a real `ingest` and `search` against the compose stack's collector,
   and a sweep of the exported payload confirmed the allowlist held: no query
-  text, no source path, no document content. **The `synthesize` span has never
-  been observed in a real trace** — it needs a chat provider that run had none
-  of, and it is covered by unit tests only. That is the sharpest of the three
-  spans (it sits next to prompt and completion text), so it is the one where an
-  observed trace would be worth the most, and it is the one still owed.
+  text, no source path, no document content. The `synthesize` span was then
+  observed too, from a `docker compose run … grk answer` against the running
+  stack: it carried `chat.model`, `chat.provider`, `duration_ms` and
+  `result_count` and nothing else, and a sweep for the question text, the
+  completion text, both citations' offsets, the corpus path and the source
+  filename found none of them. **Two caveats keep that from being a
+  self-contained stack test.** The chat model was the operator's *host* Ollama
+  via `host.docker.internal`, because the stack's own `ollama` volume holds
+  only the embedding model; and the first attempts, with a larger local model,
+  timed out against `ChatConfig.timeout_seconds`' 60-second default, which no
+  CLI flag can raise. Those timeouts were independently useful: the error-path
+  span carried `otel.status_code=ERROR` and `groundkit.failure_kind=ChatError`
+  and still leaked nothing, which is the harder half of the allowlist claim.
+- **A chat provider timeout reports no reason at all.**
+  `providers/llm.py`'s `_raise_chat_error` renders the message as
+  `f"... failed: {detail}"` where `detail = _scrub(str(exc), secret)`, and
+  `str()` on several `httpx` timeout exceptions is the empty string — so a
+  60-second `ReadTimeout` surfaces to an operator as `Chat request to <url>
+  failed:` with nothing after the colon. The scrubbing is correct and must
+  stay; what is missing is a fallback to the exception's *type* when its
+  message is empty. Found while verifying the `synthesize` span, where it cost
+  real time to diagnose a plain timeout.
 - **Installing the `otel` extra and setting `OTEL_*` does not, on its own, make
   a span record — and this was shipped wrong before it was caught.** The
   variables in ADR-0022 decision 2 are read by
@@ -838,9 +856,20 @@ was executed.
   chat would be noise presented as a measurement. No gated synthesis
   workflow exists yet (the `eval-gated`/`rerank-gated` posture, but the
   workflow file itself is not written), so every echo result is a
-  point-in-time local measurement. `EvalReport.synthesis`
-  (`SynthesisReport`) is structure without a producer: `grk eval` does not
-  yet fold judge tallies over the golden corpus into the main artifact.
+  point-in-time local measurement.
+
+  **`EvalReport.synthesis` now has a producer** — it was "structure without a
+  producer" until `grk eval --judge` landed (2026-08-16), which requires
+  `--synthesis`, synthesizes over the golden corpus against the run's best
+  stage, and folds the judge tallies into the main artifact. Two limits
+  survive that change and are the reason this entry is not simply deleted.
+  The judge is **advisory only — it exits 0 and gates nothing** (SPEC.md §6)
+  until calibrated against human labels, so a falling faithfulness tally
+  fails no build. And the producer needs a live chat provider, so it does not
+  run in normal CI at all — which means the automatic re-measurement this
+  entry's title is about still does not exist. What changed is that the
+  number can now be produced on demand; what did not is that anything
+  produces it unprompted.
 - **`grk answer` is CLI-only; synthesis is off the service surface
   (ADR-0019).** Synthesis is a read, but it adds cost amplification and
   egress amplification that a loopback bind does not bound. Named
