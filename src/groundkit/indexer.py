@@ -36,6 +36,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -63,6 +64,24 @@ logger = logging.getLogger(__name__)
 #: ADR-0022 decision 5 names, has never existed; the two real entry points
 #: below are what it actually describes).
 tracer = get_tracer()
+
+
+def _is_url_source(source: str) -> bool:
+    """True when ``source`` is shaped like an http(s) URL, not a filesystem path.
+
+    Answers a narrower question than the CLI's own classification
+    (``groundkit.cli``'s dispatch to :class:`~groundkit.ingestion.url_loader.UrlLoader`
+    vs :class:`~groundkit.ingestion.loaders.FileLoader`) and is deliberately
+    a second, tiny copy rather than an import of it: this one exists only so
+    :meth:`Indexer._prune_emptied_source` can decide whether a stored
+    ``source`` is comparable via ``os.path.realpath`` at all — a URL's
+    ``source`` field is never realpath-resolved (:class:`UrlLoader` stores it
+    verbatim, exactly as fetched — ADR-0016 decision 4), so realpath-resolving
+    it before comparing would produce a string that could never match the
+    literal URL actually stored, silently defeating the emptied-source prune
+    for every URL whose content later becomes empty.
+    """
+    return urlsplit(source).scheme in {"http", "https"}
 
 
 class IndexReport(BaseModel):
@@ -812,11 +831,18 @@ class Indexer:
         :func:`~groundkit.utils.path_safety.ensure_within_base` before
         storing it), so ``source`` must be realpath-resolved the same way
         before comparing — done off the event loop, consistent with every
-        other blocking filesystem call in this module.
+        other blocking filesystem call in this module. A URL ``source`` is
+        the one exception: :class:`~groundkit.ingestion.url_loader.UrlLoader`
+        stores it verbatim, never realpath-resolved (ADR-0016 decision 4 —
+        ``os.path.realpath`` would mangle a URL into an unrelated relative
+        path, so realpath-resolving it here first would guarantee the
+        comparison below never matches), so a URL ``source`` is compared
+        literally instead.
 
         Args:
-            source: The path this run was asked to index, as given by the
-                caller (relative or absolute, not yet resolved).
+            source: The path or URL this run was asked to index, as given by
+                the caller (relative or absolute, not yet resolved; verbatim
+                for a URL).
 
         Returns:
             ``(1, vectors_deleted)`` if a stored document was found and
@@ -824,10 +850,13 @@ class Indexer:
             it — or ``(0, 0)`` if ``source`` was never indexed (nothing to
             prune).
         """
-        resolved = await asyncio.to_thread(os.path.realpath, source)
+        if _is_url_source(source):
+            comparable = source
+        else:
+            comparable = await asyncio.to_thread(os.path.realpath, source)
         sources = await self._store.get_document_sources()
         for document_id, stored_source in sources.items():
-            if stored_source == resolved:
+            if stored_source == comparable:
                 _, vectors_deleted = await self._delete_document_everywhere(document_id)
                 logger.info("Emptied source, pruning stored document: %s", source)
                 return 1, vectors_deleted

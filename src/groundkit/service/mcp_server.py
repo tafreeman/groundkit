@@ -254,7 +254,19 @@ def _parse_request(spec: ToolSpec, arguments: dict[str, Any]) -> BaseModel:
     try:
         return spec.request_model.model_validate(arguments)
     except ValidationError as exc:
-        raise ConfigurationError(_validation_detail(exc)) from exc
+        # `from None`, deliberately, and this is the one place in this module
+        # where dropping a cause is the correct call rather than a lossy one.
+        # `_validation_detail` reports `loc` and `type` only, precisely because
+        # (its own words) `input` "has no business being reflected back through
+        # a server that also logs it" — but `from exc` handed the raw
+        # `ValidationError` to `__cause__`, and `_call_tool`'s
+        # `logger.error(..., exc_info=exc)` renders the whole chain. So the
+        # client response was sanitized while the SERVER LOG carried the
+        # rejected input verbatim, which is the leak the sanitizing existed to
+        # prevent, moved one channel over. CLAUDE.md requires scrubbing to cover
+        # `__cause__` chains, not just messages. The `loc`/`type` summary is
+        # what an operator needs; the submitted value is what they must not get.
+        raise ConfigurationError(_validation_detail(exc)) from None
 
 
 async def _dispatch(

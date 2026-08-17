@@ -35,14 +35,17 @@ import math
 import os
 import struct
 from typing import ClassVar, Final, NoReturn
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
 from groundkit.config import EmbeddingConfig
 from groundkit.errors import EmbeddingError, ProviderNotConfiguredError
 from groundkit.providers.protocols import EmbeddingProtocol
-from groundkit.utils.url_safety import ensure_safe_endpoint, validate_endpoint_shape
+from groundkit.utils.url_safety import (
+    ensure_safe_endpoint,
+    sanitize_url,
+    validate_endpoint_shape,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -251,56 +254,16 @@ def _scrub(text: str, secret: str | None) -> str:
 
 
 def _sanitize_url(url: str, secret: str | None) -> str:
-    """Return *url* with every query-parameter value and any userinfo redacted,
-    and *secret* scrubbed.
+    """Return *url* with query values and userinfo redacted, and *secret* scrubbed.
 
-    Query values are redacted unconditionally, not just when they match
-    *secret*: ``base_url`` is free-form operator-controlled configuration, so
-    an Azure-style ``?api-key=...`` or Google-style ``?key=...`` credential
-    must never reach a log line or exception message, even one this function
-    was not told to expect (ADR-0001 hazard 6 / SPEC.md §7).
-
-    Userinfo (``user:pass@host``) is redacted the same way, for the same
-    reason (ADR-0014 fact 1). The straightforward rebuild —
-    ``urlunsplit((scheme, parsed.netloc, path, ...))`` — carries
-    ``user:password@`` straight through, because ``netloc`` is the *raw*
-    authority component and redacting the query does nothing to it: run
-    against that version, ``https://user:hunter2@api.example.com/v1/
-    embeddings?api-key=sk-live-123`` sanitized to ``.../embeddings?api-
-    key=***`` with the password still verbatim in the URL. This function
-    rebuilds the netloc from ``hostname``/``port`` instead of reusing
-    ``parsed.netloc``, so there is no component left for a credential to
-    hide in.
-
-    Scheme, host, and path are left intact so the sanitized URL still names
-    which endpoint failed.
-
-    Args:
-        url: The request URL to sanitize.
-        secret: The configured credential to additionally scrub verbatim
-            from what remains, or ``None``.
-
-    Returns:
-        ``url`` with its query string's values redacted, its fragment
-        dropped, any userinfo redacted, and *secret* scrubbed from the
-        result.
+    Thin alias over :func:`groundkit.utils.url_safety.sanitize_url`, which is
+    where this logic now lives: ADR-0016's URL ingestion needs exactly the same
+    redaction on exactly the same hazard, and two copies of a
+    credential-redaction routine is how one of them silently stops matching the
+    other. Kept as a module-local name because every call site here reads
+    better for it and the tests reference it.
     """
-    parsed = urlsplit(url)
-    redacted_query = urlencode(
-        [(key, _REDACTED_PLACEHOLDER) for key, _ in parse_qsl(parsed.query, keep_blank_values=True)]
-    )
-
-    host = parsed.hostname or ""
-    if ":" in host:
-        # An IPv6 literal — urlsplit().hostname strips the brackets, so they
-        # must go back on or the rebuilt netloc is not a valid authority.
-        host = f"[{host}]"
-    netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
-    if parsed.username is not None or parsed.password is not None:
-        netloc = f"{_REDACTED_PLACEHOLDER}@{netloc}"
-
-    sanitized = urlunsplit((parsed.scheme, netloc, parsed.path, redacted_query, ""))
-    return _scrub(sanitized, secret)
+    return sanitize_url(url, secret)
 
 
 def _coerce_vector(values: list[object], *, provider_label: str) -> list[float]:

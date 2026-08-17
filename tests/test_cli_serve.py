@@ -24,6 +24,7 @@ import pytest
 from groundkit import cli
 from groundkit.contracts import RetrievalResult
 from groundkit.errors import ConfigurationError, RerankerNotConfiguredError
+from groundkit.providers import embeddings as embeddings_module
 from groundkit.retrieval import rerank as rerank_module
 from groundkit.service import mcp_server
 from groundkit.service.binding import (
@@ -611,7 +612,7 @@ def test_dense_serve_builds_a_per_collection_vector_store_factory(
     args = cli._build_parser().parse_args(
         _argv("serve", index_dir, base_dir, "--dense", "--embed-provider", "inmemory")
     )
-    ctx = cli._build_service_context(args)
+    ctx, _embedder = cli._build_service_context(args)
 
     async def open_both() -> None:
         # Wrapped rather than calling `asyncio.run(factory(...))` directly: the
@@ -628,3 +629,115 @@ def test_dense_serve_builds_a_per_collection_vector_store_factory(
         asyncio.run(ctx.registry.aclose())
 
     assert opened == [index_dir / "alpha.lance", index_dir / "beta.lance"]
+
+
+# --- Serve-time embedder ownership -----------------------------------------
+#
+# `CollectionRuntime.aclose` states outright that it does not close an embedder
+# it was merely handed ("a runtime does not own what it was handed"), and
+# `CollectionRegistry.aclose` only closes runtimes. That leaves exactly one
+# owner for the embedder `_build_service_context` constructs: the command that
+# asked for it. Before the fix neither serve command had one, so `grk serve
+# --dense` and `grk serve-mcp --dense` returned with a live `httpx.AsyncClient`
+# and its connection pool still open.
+#
+# These tests assert on `OllamaEmbedder`'s own client rather than on a fake's
+# "was aclose called" flag, because the flag would pass against an `aclose`
+# that did nothing. Constructing an `OllamaEmbedder` performs no I/O — only
+# `validate_endpoint_shape` — so no network is involved here.
+
+
+def _patch_embedder_capture(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Record every embedder `_build_service_context` builds, unmodified.
+
+    Wraps the real ``build_embedder`` rather than substituting a fake, so what
+    the assertions inspect afterwards is the actual provider object the command
+    would have used, with its actual client.
+
+    The wrapped function is taken from ``providers.embeddings``, its home
+    module, while the patch is applied to ``cli`` -- the name ``cli`` binds is
+    what ``_build_service_context`` actually calls, but reading it back off
+    ``cli`` would be reaching through a re-export the module does not declare.
+    """
+    built: list[Any] = []
+    real_build_embedder = embeddings_module.build_embedder
+
+    def recording_build_embedder(config: Any) -> Any:
+        embedder = real_build_embedder(config)
+        built.append(embedder)
+        return embedder
+
+    monkeypatch.setattr(cli, "build_embedder", recording_build_embedder)
+    return built
+
+
+def test_serve_closes_the_embedder_it_built(
+    monkeypatch: pytest.MonkeyPatch, index_dir: Path, base_dir: Path
+) -> None:
+    """`grk serve --dense` must not return with its HTTP client still open."""
+    _patch_serve_http(monkeypatch)
+    built = _patch_embedder_capture(monkeypatch)
+
+    assert (
+        cli.main(_argv("serve", index_dir, base_dir, "--dense", "--embed-provider", "ollama")) == 0
+    )
+
+    assert len(built) == 1, "the dense path must build exactly one embedder"
+    assert built[0]._client.is_closed is True
+
+
+def test_serve_mcp_closes_the_embedder_it_built(
+    monkeypatch: pytest.MonkeyPatch, index_dir: Path, base_dir: Path
+) -> None:
+    """The stdio transport owns its embedder identically -- the leak was in
+    both commands, and fixing only the one with a socket would leave the
+    long-lived one (an MCP server runs for a whole client session) leaking.
+    """
+    _patch_run_stdio(monkeypatch)
+    built = _patch_embedder_capture(monkeypatch)
+
+    argv = _argv("serve-mcp", index_dir, base_dir, "--dense", "--embed-provider", "ollama")
+    assert cli.main(argv) == 0
+
+    assert len(built) == 1
+    assert built[0]._client.is_closed is True
+
+
+def test_serve_closes_the_embedder_when_serving_raises(
+    monkeypatch: pytest.MonkeyPatch, index_dir: Path, base_dir: Path
+) -> None:
+    """The close is in a ``finally``, so a crash mid-serve still releases it.
+
+    This is the case that matters operationally: a clean shutdown leaks a
+    client into a process that is exiting anyway, while a crash inside a
+    supervised, restarting service leaks one per restart.
+    """
+    built = _patch_embedder_capture(monkeypatch)
+
+    async def exploding_serve_http(ctx: ServiceContext, *, host: str, port: int) -> None:
+        del ctx, host, port
+        raise RuntimeError("uvicorn fell over")
+
+    monkeypatch.setattr(cli, "_serve_http", exploding_serve_http)
+
+    args = cli._build_parser().parse_args(
+        _argv("serve", index_dir, base_dir, "--dense", "--embed-provider", "ollama")
+    )
+    with pytest.raises(RuntimeError, match="uvicorn fell over"):
+        asyncio.run(cli._cmd_serve(args))
+
+    assert len(built) == 1
+    assert built[0]._client.is_closed is True
+
+
+def test_serve_without_dense_builds_no_embedder_to_close(
+    monkeypatch: pytest.MonkeyPatch, index_dir: Path, base_dir: Path
+) -> None:
+    """The ``None`` branch: no embedder is built, and the added close is a
+    no-op rather than an ``AttributeError`` on the default (BM25-only) path.
+    """
+    _patch_serve_http(monkeypatch)
+    built = _patch_embedder_capture(monkeypatch)
+
+    assert cli.main(_argv("serve", index_dir, base_dir)) == 0
+    assert built == []

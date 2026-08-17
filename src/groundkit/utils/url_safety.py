@@ -37,7 +37,7 @@ import re
 import socket
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Final
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from groundkit.errors import ConfigurationError
 
@@ -173,6 +173,65 @@ def validate_endpoint_shape(
             raise ConfigurationError(
                 "embedding endpoint host looks like an IPv4 address but is not a valid one"
             ) from None
+
+
+#: What a redacted credential is replaced with. Short and obviously not a
+#: real value, so a reader of a log line sees redaction rather than a
+#: plausible-looking secret.
+REDACTED_PLACEHOLDER: Final[str] = "***"
+
+
+def sanitize_url(url: str, secret: str | None = None) -> str:
+    """Return *url* with any userinfo and every query-parameter value redacted.
+
+    **Use this on any URL that reaches a log line, an exception message, or a
+    client-visible ``detail`` field.** A URL is not safe to echo: it is
+    caller-supplied, and both of the places a credential hides in one are
+    invisible to a casual reading of the code that formats it.
+
+    Query values are redacted *unconditionally*, not only when they match
+    *secret*: an Azure-style ``?api-key=...``, a Google-style ``?key=...`` or
+    an ordinary ``?token=...`` must never survive into a log, including one
+    this function was never told to expect (ADR-0001 hazard 6, SPEC.md §7).
+
+    Userinfo (``user:pass@host``) is redacted for the same reason, and the
+    rebuild is deliberate. The obvious implementation —
+    ``urlunsplit((scheme, parsed.netloc, ...))`` — carries ``user:password@``
+    through untouched, because ``netloc`` is the *raw* authority and redacting
+    the query does nothing to it: ``https://user:hunter2@api.example.com/v1?
+    api-key=sk-live-123`` would sanitize to ``...?api-key=***`` with the
+    password still verbatim. Rebuilding the netloc from ``hostname``/``port``
+    leaves no component for a credential to hide in.
+
+    Scheme, host and path survive, so the sanitized URL still names which
+    endpoint was involved — the whole point of putting it in the message.
+
+    Args:
+        url: The URL to sanitize.
+        secret: A configured credential to additionally scrub verbatim from
+            what remains, or ``None``.
+
+    Returns:
+        The sanitized URL.
+    """
+    parsed = urlsplit(url)
+    redacted_query = urlencode(
+        [(key, REDACTED_PLACEHOLDER) for key, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+    )
+
+    host = parsed.hostname or ""
+    if ":" in host:
+        # An IPv6 literal — urlsplit().hostname strips the brackets, so they
+        # must go back on or the rebuilt netloc is not a valid authority.
+        host = f"[{host}]"
+    netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+    if parsed.username is not None or parsed.password is not None:
+        netloc = f"{REDACTED_PLACEHOLDER}@{netloc}"
+
+    sanitized = urlunsplit((parsed.scheme, netloc, parsed.path, redacted_query, ""))
+    if secret:
+        sanitized = sanitized.replace(secret, REDACTED_PLACEHOLDER)
+    return sanitized
 
 
 def classify_address(literal: str) -> str | None:

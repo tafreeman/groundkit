@@ -123,7 +123,19 @@ def test_extractor_identity_mismatch_is_unresolvable_and_names_both_identities(
 def test_snapshot_citation_is_unresolvable_with_a_reason_distinct_from_extracted(
     tmp_path: Path,
 ) -> None:
-    """Both non-text classes refuse, but no longer by sharing one generic message."""
+    """Both non-text classes refuse, but no longer by sharing one generic message.
+
+    **Narrowed by Wave 4.** A ``snapshot`` citation is no longer refused
+    unconditionally — with a ``snapshot_dir`` it now resolves against the
+    stored bytes (``tests/test_snapshot_integration.py``). What this pins is
+    the remaining refusal: called *without* one, there is nowhere to read the
+    snapshot from, and that is ``unresolvable`` rather than an attempt to read
+    the URL as a path. The assertion deliberately keys on the class name and
+    on the extracted branch's wording being absent, not on the refusal's own
+    prose — an earlier version asserted the literal phrase "local snapshot"
+    and broke when Wave 4 reworded the message without changing its meaning,
+    which is a test coupled to prose rather than to behaviour.
+    """
 
     async def run() -> None:
         with pytest.raises(RetrievalError) as exc_info:
@@ -133,7 +145,7 @@ def test_snapshot_citation_is_unresolvable_with_a_reason_distinct_from_extracted
         exc = exc_info.value
         assert exc.verdict == "unresolvable"
         message = str(exc)
-        assert "local snapshot" in message
+        assert "snapshot" in message
         # The extracted branch's specific wording must not leak into the
         # snapshot refusal -- proof the two no longer share a single message.
         assert "extractor identity recorded at ingest" not in message
@@ -224,8 +236,10 @@ def test_fetch_chunk_classifies_by_verdict_not_by_message_text(
         index_dir, corpus, chunk_id = await _seed(tmp_path, text="turbine maintenance")
         ctx = _context(index_dir, corpus)
 
-        async def _fake_resolve_citation(citation: Citation, allowed_base_dir: Path) -> str:
-            del citation, allowed_base_dir
+        async def _fake_resolve_citation(
+            citation: Citation, allowed_base_dir: Path, *, snapshot_dir: Path | None = None
+        ) -> str:
+            del citation, allowed_base_dir, snapshot_dir
             raise RetrievalError(
                 "the recorded extractor identity diverged from the active build",
                 verdict="drifted",
@@ -260,8 +274,10 @@ def test_fetch_chunk_does_not_key_off_the_retired_phrase(
         index_dir, corpus, chunk_id = await _seed(tmp_path, text="turbine maintenance")
         ctx = _context(index_dir, corpus)
 
-        async def _fake_resolve_citation(citation: Citation, allowed_base_dir: Path) -> str:
-            del citation, allowed_base_dir
+        async def _fake_resolve_citation(
+            citation: Citation, allowed_base_dir: Path, *, snapshot_dir: Path | None = None
+        ) -> str:
+            del citation, allowed_base_dir, snapshot_dir
             raise RetrievalError(
                 "unrelated failure that happens to mention: source changed since indexing",
                 verdict="unresolvable",
