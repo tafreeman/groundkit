@@ -80,8 +80,68 @@ jobs:
       # workflow holds `contents: read`, and widening it to write just to
       # upload an SBOM would grant this workflow the ability to mutate the
       # repository it is publishing from.
+      #
+      # `requirements`, NOT `environment`. `cyclonedx-py environment` inventories
+      # the environment of the interpreter running it — under `uvx` that is the
+      # ephemeral tool environment holding cyclonedx-bom and its own transitive
+      # dependencies. Run here it produced a 33-component SBOM whose root
+      # component was null, which listed `cyclonedx-bom`, `jsonschema` and
+      # `defusedxml`, and which contained neither groundkit nor a single one of
+      # its dependencies: not fastapi, not mcp, not httpx, not pydantic. It is
+      # the worst shape a supply-chain artifact can take — well-formed, validating
+      # cleanly, attached to the release, and describing a different piece of
+      # software entirely.
+      #
+      # The lockfile is the honest source instead. `--no-dev` keeps ruff/pytest
+      # out of a consumer-facing document, `--all-extras` puts every optional
+      # backend in (the export resolves metadata and installs nothing, so naming
+      # `rerank` here costs no torch download), and `--pyproject` sets the root
+      # component to groundkit itself, which the environment mode never had.
+      # `uv export` also refuses a drifted lockfile, so a release cannot ship an
+      # SBOM describing a dependency set that is not the one being published.
       - name: Generate SBOM
-        run: uvx --from cyclonedx-bom cyclonedx-py environment --of JSON --output-file sbom.json
+        run: |
+          uv export --no-dev --all-extras --no-emit-project \
+            --format requirements.txt -o sbom-requirements.txt
+          uvx --from cyclonedx-bom cyclonedx-py requirements sbom-requirements.txt \
+            --pyproject pyproject.toml --mc-type library \
+            --of JSON --output-file sbom.json
+
+      # The defect above was silent: the artifact was generated, uploaded and
+      # retained for a year while describing the wrong software. Nothing failed,
+      # so nothing drew attention to it. This step is what makes the next such
+      # regression loud — it asserts the two properties whose absence defined
+      # the defect (the SBOM describes groundkit; it inventories groundkit's
+      # dependencies) rather than merely that a file was produced.
+      - name: Verify the SBOM describes this project
+        run: |
+          python3 - <<'PY'
+          import json, sys
+
+          bom = json.load(open("sbom.json", encoding="utf-8"))
+          root = bom.get("metadata", {}).get("component") or {}
+          names = {c["name"].lower() for c in bom.get("components", [])}
+
+          problems = []
+          if root.get("name") != "groundkit":
+              problems.append(f"root component is {root.get('name')!r}, expected 'groundkit'")
+          # Base dependencies, per pyproject's [project.dependencies]. Every one
+          # of these was missing from the environment-mode SBOM.
+          for required in ("fastapi", "mcp", "httpx", "pydantic", "uvicorn"):
+              if required not in names:
+                  problems.append(f"missing base dependency {required!r}")
+          # The tell-tale of the environment-mode defect: the SBOM generator
+          # inventorying itself.
+          if "cyclonedx-bom" in names:
+              problems.append("'cyclonedx-bom' is present, so this inventories the tool env")
+
+          if problems:
+              print("SBOM does not describe this project:", file=sys.stderr)
+              for problem in problems:
+                  print(f"  - {problem}", file=sys.stderr)
+              sys.exit(1)
+          print(f"SBOM OK: root={root.get('name')} {root.get('version')}, {len(names)} components")
+          PY
 
       - name: Upload SBOM
         uses: actions/upload-artifact@v4
