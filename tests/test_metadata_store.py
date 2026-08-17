@@ -439,6 +439,89 @@ def test_open_raises_storage_error_on_corrupted_file(tmp_path: Path) -> None:
         asyncio.run(_open())
 
 
+def test_open_refuses_a_foreign_sqlite_file_and_leaves_it_byte_identical(
+    tmp_path: Path,
+) -> None:
+    """Opening an unrelated database must not write groundkit's schema into it.
+
+    ``open`` applies ``_SCHEMA`` unconditionally, so before the read-only
+    identity probe it would *create* ``documents``, ``chunks``,
+    ``collection_manifest`` and ``collection_state`` inside any pre-existing
+    ``*.sqlite3`` it was pointed at. Combined with ``list_collections``
+    advertising every such file, a read-only service surface mutated a
+    stranger's database: list it, then ask ``index_status`` for it.
+
+    Asserting the bytes are unchanged is deliberately stronger than asserting
+    the table set: a stamped ``PRAGMA application_id`` alters the header
+    without adding a table, and that is a write too.
+    """
+    foreign = tmp_path / "notes.sqlite3"
+    conn = sqlite3.connect(str(foreign))
+    try:
+        conn.execute("CREATE TABLE journal (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.execute("INSERT INTO journal (body) VALUES ('private')")
+        conn.commit()
+    finally:
+        conn.close()
+    before = foreign.read_bytes()
+    siblings_before = sorted(p.name for p in tmp_path.iterdir())
+
+    async def _open() -> SQLiteMetadataStore:
+        return await SQLiteMetadataStore.open(tmp_path, "notes")
+
+    with pytest.raises(StorageError, match="not a groundkit collection"):
+        asyncio.run(_open())
+
+    assert foreign.read_bytes() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == siblings_before
+
+    conn = sqlite3.connect(str(foreign))
+    try:
+        tables = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+    finally:
+        conn.close()
+    assert tables == {"journal"}
+
+
+def test_open_still_accepts_a_legacy_unstamped_groundkit_store(tmp_path: Path) -> None:
+    """A store predating ``PRAGMA application_id`` must keep opening.
+
+    Keying the probe on the stamp alone would lock out exactly the older
+    stores ADR-0016's narrow write-guard was written to keep readable, so the
+    unstamped case is recognized by its marker tables instead.
+    """
+
+    async def _make() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "legacy")
+        await store.close()
+
+    asyncio.run(_make())
+
+    # A real store with its stamp cleared -- the actual shape of a pre-stamp
+    # store, rather than a hand-built file that only shares the table names.
+    legacy = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(str(legacy))
+    try:
+        conn.execute("PRAGMA application_id = 0")
+        conn.commit()
+    finally:
+        conn.close()
+    conn = sqlite3.connect(str(legacy))
+    try:
+        assert int(conn.execute("PRAGMA application_id").fetchone()[0]) == 0
+    finally:
+        conn.close()
+
+    async def _reopen() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "legacy")
+        await store.close()
+
+    asyncio.run(_reopen())
+
+
 def test_open_rejects_parent_traversal_collection_and_creates_nothing_outside(
     tmp_path: Path,
 ) -> None:

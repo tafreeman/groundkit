@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import sqlite3
 import typing
 from pathlib import Path
 
@@ -361,6 +362,36 @@ def test_list_collections_opens_nothing(tmp_path: Path) -> None:
             names = await tools_module.handle_list_collections(ctx, ListCollectionsRequest())
             assert names == ["default"]
             assert sorted(p.name for p in index_dir.iterdir()) == before
+        finally:
+            await ctx.registry.aclose()
+
+    asyncio.run(run())
+
+
+def test_list_collections_skips_a_foreign_sqlite_file(tmp_path: Path) -> None:
+    """An unrelated database in the index directory is not a collection.
+
+    Advertising it was the first half of a read-only surface mutating a
+    stranger's database: a caller who saw the name then asked ``index_status``
+    for it, and ``SQLiteMetadataStore.open`` wrote groundkit's four tables
+    into it. The filter here and the refusal in ``open`` close the two halves.
+    """
+
+    async def run() -> None:
+        index_dir, corpus, _ = await _seed(tmp_path)
+        foreign = index_dir / "someone-elses.sqlite3"
+        conn = sqlite3.connect(str(foreign))
+        try:
+            conn.execute("CREATE TABLE journal (id INTEGER PRIMARY KEY, body TEXT)")
+            conn.commit()
+        finally:
+            conn.close()
+
+        ctx = _context(index_dir, corpus)
+        try:
+            names = await tools_module.handle_list_collections(ctx, ListCollectionsRequest())
+            assert names == ["default"]
+            assert "someone-elses" not in names
         finally:
             await ctx.registry.aclose()
 
