@@ -37,7 +37,7 @@ import asyncio
 import builtins
 import logging
 from collections.abc import Callable, Iterator, Sequence
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Final
 
 import httpx
@@ -667,7 +667,6 @@ class TestUrlLoaderSnapshotContainment:
             "../../etc/passwd",
             "../escape.txt",
             "/etc/passwd",
-            "C:\\Windows\\System32\\drivers\\etc\\hosts",
         ],
     )
     def test_traversal_and_absolute_shapes_are_refused(
@@ -682,6 +681,53 @@ class TestUrlLoaderSnapshotContainment:
         # intended root as a side effect of the refused attempt.
         assert not (snapshot_dir.parent / "etc").exists()
         assert not Path("/etc/passwd_should_never_exist_from_this_test").exists()
+
+    def test_windows_drive_shape_cannot_escape_on_either_platform(self, tmp_path: Path) -> None:
+        """A Windows drive-absolute ``document_id`` is refused on Windows and
+        inert on POSIX -- and the property under test is containment, not the
+        refusal it happens to take on one of them.
+
+        Split out of the parametrized case above, which asserted the refusal
+        unconditionally and so passed on Windows and failed on Linux CI:
+        ``C:\\Windows\\...`` is only an absolute path where the drive-letter
+        syntax means something. On POSIX a backslash is an ordinary filename
+        character, so the whole string is a single legal component under
+        ``snapshot_dir`` -- ``ensure_within_base`` correctly does not raise,
+        because nothing escaped.
+
+        Branching on ``PurePath(...).is_absolute()`` rather than ``os.name``
+        states that reasoning as the condition itself: the guard refuses
+        exactly what the running platform considers absolute. Neither branch
+        is a weakened assertion -- both end at "no byte was written outside
+        the containment root", which is the guarantee spec §10.1 actually
+        makes.
+        """
+        document_id = "C:\\Windows\\System32\\drivers\\etc\\hosts"
+        snapshot_dir = tmp_path / "col.snapshots"
+        loader = UrlLoader(snapshot_dir)
+
+        if PurePath(document_id).is_absolute():
+            with pytest.raises(IngestionError, match="escapes"):
+                loader._write_snapshot(document_id, "content")
+            # A refused write leaves nothing behind, not even the root it would
+            # have written into. (`_write_snapshot` mkdirs only after the
+            # containment check passes.)
+            assert not snapshot_dir.exists()
+        else:
+            written = loader._write_snapshot(document_id, "content")
+            assert written.is_relative_to(snapshot_dir.resolve())
+            assert written.parent == snapshot_dir.resolve()
+            assert written.read_text(encoding="utf-8") == "content"
+            # The backslashes bought no extra directory levels: one file, one
+            # level down, which is what "inert" means here.
+            assert [entry.name for entry in snapshot_dir.iterdir()] == [document_id]
+
+        # Whatever the platform decided above, nothing escaped `tmp_path`.
+        # Deliberately not phrased as `not Path("/Windows/...").exists()`: on
+        # Windows that resolves against the current drive to the REAL system
+        # hosts file, so the assertion passes or fails on what was already on
+        # the machine rather than on anything this test did.
+        assert [entry.name for entry in tmp_path.iterdir()] in ([], ["col.snapshots"])
 
     def test_encoded_separator_is_inert_not_a_traversal(self, tmp_path: Path) -> None:
         """A document_id containing a percent-encoded separator is never

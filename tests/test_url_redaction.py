@@ -27,8 +27,17 @@ from groundkit.utils.url_safety import REDACTED_PLACEHOLDER, sanitize_url
 #: The S105 suppressions below are the opposite of what that rule guards: these
 #: are sentinels asserted ABSENT from every rendered message, so a real secret
 #: here would defeat the test rather than constitute one.
-_PASSWORD = "hunter2-must-never-be-logged"  # noqa: S105
-_TOKEN = "sk-live-must-never-be-logged"  # noqa: S105
+#:
+#: `gitleaks:allow` for the same reason, one scanner over: gitleaks' default
+#: `generic-api-key` rule matched `_PASSWORD` on shape alone and failed the
+#: `secrets` job. Both lines carry the marker rather than only the one that
+#: tripped, because `sk-live-` is a live-key prefix by construction and a
+#: future ruleset flagging it would fail CI on a value that is, by this file's
+#: whole design, not a secret. A repo-level `.gitleaks.toml` allowlist was the
+#: alternative; an inline marker keeps the exemption next to the reason for it
+#: and cannot silently widen to cover a real leak elsewhere in the tree.
+_PASSWORD = "hunter2-must-never-be-logged"  # noqa: S105  # gitleaks:allow
+_TOKEN = "sk-live-must-never-be-logged"  # noqa: S105  # gitleaks:allow
 
 _CREDENTIALED_URL = f"https://svc:{_PASSWORD}@internal.example.com/export?token={_TOKEN}"
 
