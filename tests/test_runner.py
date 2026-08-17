@@ -18,8 +18,9 @@ import pytest
 
 from groundkit.config import ChunkingConfig, RetrievalConfig
 from groundkit.contracts import Chunk, Document
-from groundkit.errors import ConfigurationError, EvalError, GroundkitError
+from groundkit.errors import ChatError, ConfigurationError, EvalError, GroundkitError
 from groundkit.evals.delta import derive_stage_deltas
+from groundkit.evals.judge import FaithfulnessJudge
 from groundkit.evals.runner import (
     EVAL_CHUNKING_CONFIG,
     MIN_EVAL_TOP_K,
@@ -32,6 +33,7 @@ from groundkit.index.dense import InMemoryVectorStore
 from groundkit.index.protocols import VectorStoreProtocol
 from groundkit.ingestion.chunking import RecursiveChunker
 from groundkit.providers.embeddings import InMemoryEmbedder
+from groundkit.providers.protocols import ChatProtocol
 from groundkit.retrieval.search import MAX_TOP_K
 
 
@@ -1059,3 +1061,143 @@ class TestCallerVectorStoreIsNotContaminated:
 
         leftovers = asyncio.run(store.search([1.0] + [0.0] * 31, top_k=100))
         assert leftovers == [], "a failed run must not leave vectors behind either"
+
+
+class _RunnerScriptedChat:
+    """FIFO-scripted ``ChatProtocol`` double, local to this module.
+
+    Distinct from ``tests/test_synthesis_eval.py``'s own scripted double and
+    from ``groundkit.providers.llm.ScriptedChatProvider`` (a
+    production-facing type this test suite never touches) — each test module
+    owns its own fake rather than sharing one (matching
+    ``tests/test_echo.py``'s and ``tests/test_synthesis.py``'s stated
+    convention). Used here only to prove ``run_eval`` wires ``chat``/``judge``
+    through to :func:`~groundkit.evals.synthesis_eval.run_synthesis_eval`
+    correctly; the outcome-counting logic itself is
+    ``tests/test_synthesis_eval.py``'s responsibility, not retested here.
+    """
+
+    def __init__(self, script: list[str]) -> None:
+        self._script = list(script)
+        self._index = 0
+
+    @property
+    def provider(self) -> str:
+        return "runner-scripted"
+
+    @property
+    def model_name(self) -> str:
+        return "runner-scripted-v1"
+
+    async def complete(self, prompt: str, *, system: str | None = None) -> str:
+        if self._index >= len(self._script):
+            raise ChatError("runner-scripted chat's script is exhausted")
+        text = self._script[self._index]
+        self._index += 1
+        return text
+
+
+class TestSynthesisPass:
+    """``run_eval(chat=..., judge=...)`` folds a ``SynthesisReport`` into ``report.synthesis``.
+
+    SPEC.md §8's red/green protocol for this feature: before ``chat``/``judge``
+    existed as ``run_eval`` parameters at all, every test below failed with
+    ``TypeError: run_eval() got an unexpected keyword argument`` — not an
+    assertion failure, but exactly the failure a genuinely new parameter
+    produces on the unfixed signature. Reverting ``src/groundkit/evals/runner.py``
+    and re-running reproduces that; restoring makes the class pass again
+    (reported in the task's final summary, not repeated as a docstring claim
+    here).
+    """
+
+    def test_synthesis_is_none_when_chat_is_omitted(self, corpus: Path, tmp_path: Path) -> None:
+        """The default: --synthesis-alone behavior (the echo check) is untouched."""
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(corpus, judgments_path)
+
+        report = asyncio.run(run())
+        assert report.synthesis is None
+
+    def test_chat_supplied_populates_synthesis_report(self, corpus: Path, tmp_path: Path) -> None:
+        chat: ChatProtocol = _RunnerScriptedChat(["the quokka answer is here [1]"])
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(corpus, judgments_path, chat=chat)
+
+        report = asyncio.run(run())
+
+        assert report.synthesis is not None
+        assert report.synthesis.input_stage == "bm25"
+        assert report.synthesis.synthesis_provider == "runner-scripted"
+        assert report.synthesis.answered_count == 1
+        assert report.synthesis.abstained_count == 0
+        assert report.synthesis.rejected_count == 0
+        # No judge was supplied: the judge field group stays all-None.
+        assert report.synthesis.judged_count is None
+
+    def test_input_stage_is_fusion_when_a_dense_pair_is_supplied(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        """The synthesis pass reads off the run's best stage, not a fixed one."""
+        chat: ChatProtocol = _RunnerScriptedChat(["the quokka answer is here [1]"])
+        embedder, vector_store = _dense_pair()
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(
+                corpus,
+                judgments_path,
+                embedder=embedder,
+                vector_store=vector_store,
+                chat=chat,
+            )
+
+        report = asyncio.run(run())
+
+        assert [stage.stage for stage in report.stages] == ["bm25", "dense", "fusion"]
+        assert report.synthesis is not None
+        assert report.synthesis.input_stage == "fusion"
+
+    def test_judge_without_chat_raises_configuration_error(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        judge = FaithfulnessJudge(_RunnerScriptedChat([]))
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(corpus, judgments_path, judge=judge)
+
+        with pytest.raises(ConfigurationError, match="judge without chat"):
+            asyncio.run(run())
+
+    def test_judge_supplied_alongside_chat_folds_verdict_tallies_in(
+        self, corpus: Path, tmp_path: Path
+    ) -> None:
+        chat: ChatProtocol = _RunnerScriptedChat(
+            [
+                "the quokka answer is here [1]",  # synthesis
+                '{"faithful": true, "unsupported_claims": [], "reasoning": "ok"}',  # verdict
+            ]
+        )
+        judge = FaithfulnessJudge(chat)
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(corpus, judgments_path, chat=chat, judge=judge)
+
+        report = asyncio.run(run())
+
+        assert report.synthesis is not None
+        assert report.synthesis.judged_count == 1
+        assert report.synthesis.faithful_count == 1
+        assert report.synthesis.unfaithful_count == 0
+        assert report.synthesis.judge_error_count == 0
+        assert report.synthesis.judge_provider == "runner-scripted"

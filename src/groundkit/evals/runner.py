@@ -80,6 +80,7 @@ from groundkit.evals.corpus import (
     read_corpus_doc,
     resolve_gold_span,
 )
+from groundkit.evals.judge import DEFAULT_JUDGE_PROMPT
 from groundkit.evals.metrics import (
     NDCG_K,
     RECALL_K_VALUES,
@@ -100,20 +101,24 @@ from groundkit.evals.schema import (
     StageName,
     StageResult,
 )
+from groundkit.evals.synthesis_eval import run_synthesis_eval
 from groundkit.identity import identity_of, validate_dense_pair
 from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.indexer import Indexer
 from groundkit.ingestion.loaders import FileLoader
 from groundkit.providers.embeddings import INMEMORY_PROVIDER
+from groundkit.providers.synthesis import DEFAULT_SYNTHESIS_PROMPT
 from groundkit.retrieval.search import MAX_TOP_K, Retriever
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from groundkit.contracts import Chunk
+    from groundkit.contracts import Chunk, RetrievalResult
     from groundkit.evals.corpus import GoldSpan, Judgment
+    from groundkit.evals.judge import FaithfulnessJudge
+    from groundkit.evals.schema import SynthesisReport
     from groundkit.index.protocols import MetadataStoreProtocol, VectorStoreProtocol
-    from groundkit.providers.protocols import EmbeddingProtocol
+    from groundkit.providers.protocols import ChatProtocol, EmbeddingProtocol
     from groundkit.retrieval.protocols import RerankerProtocol
     from groundkit.retrieval.search import SearchMode
 
@@ -201,6 +206,10 @@ async def run_eval(
     vector_store: VectorStoreProtocol | None = None,
     reranker: RerankerProtocol | None = None,
     rerank_candidates: int = MAX_TOP_K,
+    chat: ChatProtocol | None = None,
+    judge: FaithfulnessJudge | None = None,
+    synthesis_prompt_template: str = DEFAULT_SYNTHESIS_PROMPT,
+    judge_prompt_template: str = DEFAULT_JUDGE_PROMPT,
 ) -> EvalReport:
     """Run the retrieval eval over a corpus and judgment set, one stage per strategy.
 
@@ -246,6 +255,21 @@ async def run_eval(
     ``report.run.config.embedding`` so a reader can tell which case they are
     looking at without being told.
 
+    A ``chat`` argument enables one more pass, after every stage above has
+    scored: :func:`~groundkit.evals.synthesis_eval.run_synthesis_eval`
+    synthesizes an answer for every judgment's query against whichever stage
+    this run actually produced as its best available one — ``rerank`` if a
+    reranker was supplied, else ``fusion`` with a dense pair, else the
+    ``bm25`` baseline — and folds the result into ``report.synthesis``
+    (ADR-0018 decision 6). This is independent of, and shares no code path
+    with, :mod:`groundkit.evals.echo`'s planted-marker check: that check
+    answers one fixed question against a synthetic corpus it builds itself,
+    while this pass answers the golden corpus's own queries against results
+    this same retriever already knows how to produce. Supplying ``judge``
+    alongside ``chat`` additionally judges every non-rejected synthesis
+    outcome (SPEC.md §6's advisory faithfulness judge) — never gating
+    anything here or anywhere downstream.
+
     Args:
         corpus_dir: Root directory of the corpus documents (e.g.
             ``evals/corpus/``, or a synthetic fixture built the same way).
@@ -275,15 +299,35 @@ async def run_eval(
             for before the reranker truncates back to ``top_k``. Between
             ``top_k`` and :data:`~groundkit.retrieval.search.MAX_TOP_K`;
             ignored, and not recorded, when ``reranker`` is ``None``.
+        chat: Optional chat provider (keyword-only) enabling the
+            golden-corpus synthesis pass described above. ``report.synthesis``
+            stays ``None`` when omitted — the default, and the whole of this
+            run's behavior when a caller wants only the stages above.
+        judge: Optional :class:`~groundkit.evals.judge.FaithfulnessJudge`
+            (keyword-only), reused exactly as given — this function never
+            constructs one. Requires ``chat`` (there is nothing for a judge
+            to evaluate without a synthesized answer); supplying ``judge``
+            without ``chat`` is rejected before any corpus work starts.
+        synthesis_prompt_template: Forwarded to the internal
+            :class:`~groundkit.providers.synthesis.Synthesizer` and hashed
+            into ``report.synthesis.synthesis_prompt_hash``. Ignored when
+            ``chat`` is ``None``.
+        judge_prompt_template: The template ``judge`` was itself constructed
+            with, used only to compute
+            ``report.synthesis.judge_prompt_hash`` — never passed to
+            ``judge``, which already carries its own. Ignored when ``judge``
+            is ``None``.
 
     Returns:
         An :class:`EvalReport` whose ``stages[0]`` is always the ``bm25``
         baseline, followed by ``dense`` and ``fusion`` when a dense pair was
-        supplied and ``rerank`` when a reranker was.
+        supplied and ``rerank`` when a reranker was. ``synthesis`` is set
+        when ``chat`` was supplied, ``None`` otherwise.
 
     Raises:
         ConfigurationError: Exactly one of ``embedder`` / ``vector_store``
-            was supplied, or ``vector_store`` already holds vectors.
+            was supplied, ``vector_store`` already holds vectors, or
+            ``judge`` was supplied without ``chat``.
         EvalError: A judgment or gold span fails to load or resolve against
             the corpus, or a gold span's document (or a retrieved hit's
             document) has no corresponding entry among the corpus's
@@ -296,6 +340,11 @@ async def run_eval(
             measurement.
         IngestionError: Ingesting ``corpus_dir`` fails.
         StorageError: The throwaway index fails to open or write.
+        ChatError: Propagated unmodified from ``chat`` (via the synthesis or
+            judge call) — a provider failure is not a per-query outcome.
+        JudgeError: Never escapes this function — caught per-judgment inside
+            :func:`~groundkit.evals.synthesis_eval.run_synthesis_eval` and
+            folded into ``judge_error_count``.
         RetrievalError: A search call fails (e.g. an index inconsistency,
             or an out-of-range ``top_k``).
     """
@@ -319,6 +368,12 @@ async def run_eval(
             f"result list; above {MAX_TOP_K} Retriever.search would reject the request "
             "— and both are checked here, before an ingest and a model load are spent "
             "on a run that was always going to be rejected."
+        )
+    if judge is not None and chat is None:
+        raise ConfigurationError(
+            "run_eval was given a judge without chat. The judge evaluates a synthesized "
+            "answer, and nothing here can produce one without a chat provider — pass "
+            "chat too, or drop judge, before any corpus work starts."
         )
     if embedder is not None and vector_store is not None:
         await _require_empty_vector_store(vector_store, embedder.dimensions)
@@ -461,6 +516,37 @@ async def run_eval(
                         is_baseline=not stages,
                     )
                 )
+
+            synthesis_report: SynthesisReport | None = None
+            if chat is not None:
+                # The best stage this run actually produced — the same
+                # "best upstream" the rerank stage itself reorders
+                # (_planned_stages): `planned[-1]` is `rerank` if a reranker
+                # was supplied, else `fusion` with a dense pair, else the
+                # `bm25` baseline. Run while `retriever` (and `reranker`,
+                # for a rerank input) are still open, so this pass shares
+                # the one index and one retriever every stage above already
+                # shares — never a second ingest of the same corpus.
+                synthesis_input = planned[-1]
+                synthesis_inputs: list[tuple[str, list[RetrievalResult]]] = []
+                for judgment in judgments:
+                    results, _latency_ms = await _fetch_stage_results(
+                        retriever,
+                        judgment.query,
+                        top_k=top_k,
+                        mode=synthesis_input.mode,
+                        reranker=reranker if synthesis_input.reranks else None,
+                        rerank_candidates=rerank_candidates,
+                    )
+                    synthesis_inputs.append((judgment.query, results))
+                synthesis_report = await run_synthesis_eval(
+                    synthesis_inputs,
+                    chat=chat,
+                    input_stage=synthesis_input.stage,
+                    judge=judge,
+                    synthesis_prompt_template=synthesis_prompt_template,
+                    judge_prompt_template=judge_prompt_template,
+                )
         finally:
             # Purge BEFORE closing: the document set lives in the store, and
             # the store is about to go away with the temp directory.
@@ -507,7 +593,7 @@ async def run_eval(
         document_count,
         chunk_count,
     )
-    return EvalReport(run=run_metadata, stages=stages)
+    return EvalReport(run=run_metadata, stages=stages, synthesis=synthesis_report)
 
 
 def _planned_stages(
@@ -827,6 +913,65 @@ def _build_gold(
     return _JudgmentGold(chunk_ids=chunk_ids, spans=spans)
 
 
+async def _fetch_stage_results(
+    retriever: Retriever,
+    query: str,
+    *,
+    top_k: int,
+    mode: SearchMode,
+    reranker: RerankerProtocol | None,
+    rerank_candidates: int,
+) -> tuple[list[RetrievalResult], float]:
+    """Retrieve one query's candidates for a stage, reranking if configured.
+
+    The one place "what would this stage return for this query" is answered
+    — shared by :func:`_evaluate_judgment` (scoring a stage against the
+    golden corpus judgments) and :func:`run_eval`'s golden-corpus synthesis
+    pass (the ``chat`` argument), so the two cannot independently drift on
+    what a rerank stage's candidates actually are.
+
+    Args:
+        retriever: An open retriever snapshotting the freshly-ingested
+            corpus.
+        query: The query to retrieve for.
+        top_k: Results requested. With a ``reranker``, this is the count
+            reranking truncates back down to after reordering.
+        mode: The retrieval mode. For a rerank stage this is the *input*
+            stage's mode — a reranker consumes results rather than
+            producing them (ADR-0012 decision 2).
+        reranker: Reranker to apply, or ``None`` for a plain retrieval call.
+        rerank_candidates: Candidates fetched before reranking. Unused when
+            ``reranker`` is ``None``.
+
+    Returns:
+        The stage's results (reranked, when ``reranker`` is given) and the
+        latency, in milliseconds, retrieval (plus reranking, if applied)
+        took.
+
+    Raises:
+        RerankerNotConfiguredError: The reranker cannot load its model.
+        RetrievalError: The search or the reranker failed.
+    """
+    fetch_k = rerank_candidates if reranker is not None else top_k
+    response = await retriever.search(query, top_k=fetch_k, mode=mode)
+    latency_ms = float(response.metadata["latency_ms"])
+    results = list(response.results)
+
+    if reranker is not None:
+        # Timed here and ADDED to the retrieval latency, rather than
+        # replacing it or being dropped. The cross-encoder is by a wide
+        # margin the most expensive thing in this stage — it is the cost a
+        # reader is weighing the quality gain against — so a rerank stage
+        # reporting only its retrieval time would show the model as very
+        # nearly free, which is the opposite of true and is the number
+        # `latency_p50_delta_ms` would then publish.
+        rerank_started = time.perf_counter_ns()
+        results = await reranker.rerank(query, results, top_k=top_k)
+        latency_ms += (time.perf_counter_ns() - rerank_started) / _NS_PER_MS
+
+    return results, latency_ms
+
+
 async def _evaluate_judgment(
     judgment: Judgment,
     gold: _JudgmentGold,
@@ -876,22 +1021,14 @@ async def _evaluate_judgment(
     gold_ids = gold.chunk_ids
     gold_results = gold.spans
 
-    fetch_k = rerank_candidates if reranker is not None else top_k
-    response = await retriever.search(judgment.query, top_k=fetch_k, mode=mode)
-    latency_ms = float(response.metadata["latency_ms"])
-    results = response.results
-
-    if reranker is not None:
-        # Timed here and ADDED to the retrieval latency, rather than
-        # replacing it or being dropped. The cross-encoder is by a wide
-        # margin the most expensive thing in this stage — it is the cost a
-        # reader is weighing the quality gain against — so a rerank stage
-        # reporting only its retrieval time would show the model as very
-        # nearly free, which is the opposite of true and is the number
-        # `latency_p50_delta_ms` would then publish.
-        rerank_started = time.perf_counter_ns()
-        results = await reranker.rerank(judgment.query, list(results), top_k=top_k)
-        latency_ms += (time.perf_counter_ns() - rerank_started) / _NS_PER_MS
+    results, latency_ms = await _fetch_stage_results(
+        retriever,
+        judgment.query,
+        top_k=top_k,
+        mode=mode,
+        reranker=reranker,
+        rerank_candidates=rerank_candidates,
+    )
 
     ranked_ids = [result.chunk_id for result in results]
 
