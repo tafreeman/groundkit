@@ -17,8 +17,9 @@ from typing import Any
 import pytest
 
 from groundkit.config import ChunkingConfig, RetrievalConfig
-from groundkit.contracts import Chunk, Document
+from groundkit.contracts import Chunk, Document, RetrievalResult
 from groundkit.errors import ChatError, ConfigurationError, EvalError, GroundkitError
+from groundkit.evals import runner as runner_module
 from groundkit.evals.delta import derive_stage_deltas
 from groundkit.evals.judge import FaithfulnessJudge
 from groundkit.evals.runner import (
@@ -1139,6 +1140,44 @@ class TestSynthesisPass:
         assert report.synthesis.rejected_count == 0
         # No judge was supplied: the judge field group stays all-None.
         assert report.synthesis.judged_count is None
+
+    def test_synthesis_reuses_the_scoring_passes_retrieval(
+        self, corpus: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exactly one retrieval per (judgment, stage) — never a second pass.
+
+        The synthesis pass used to re-fetch the winning stage for every
+        judgment, so a BM25-only run over one judgment hit the retriever twice
+        instead of once; with a dense or hybrid stage that doubled the
+        embedding-provider calls too. Counting is the only way to see this: the
+        report is byte-identical either way, so no assertion about its contents
+        could catch the regression.
+        """
+        queried: list[str] = []
+        real_fetch = runner_module._fetch_stage_results
+
+        async def counting_fetch(
+            retriever: Any,
+            query: str,
+            **kwargs: Any,
+        ) -> tuple[list[RetrievalResult], float]:
+            queried.append(query)
+            return await real_fetch(retriever, query, **kwargs)
+
+        monkeypatch.setattr(runner_module, "_fetch_stage_results", counting_fetch)
+        chat: ChatProtocol = _RunnerScriptedChat(["the quokka answer is here [1]"])
+
+        async def run() -> EvalReport:
+            judgments_path = tmp_path / "judgments.jsonl"
+            _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+            return await run_eval(corpus, judgments_path, chat=chat)
+
+        report = asyncio.run(run())
+
+        assert report.synthesis is not None
+        assert report.synthesis.answered_count == 1
+        # One judgment, one planned stage (bm25 only): one retrieval.
+        assert len(queried) == 1
 
     def test_input_stage_is_fusion_when_a_dense_pair_is_supplied(
         self, corpus: Path, tmp_path: Path

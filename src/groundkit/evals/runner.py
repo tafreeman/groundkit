@@ -487,21 +487,29 @@ async def run_eval(
             }
 
             stages: list[StageResult] = []
+            # Captured while scoring the stage synthesis will run over, rather
+            # than re-retrieved afterwards. `planned[-1]` is that stage (see
+            # the synthesis block below), and its scoring pass already performs
+            # exactly the retrieval synthesis needs.
+            synthesis_inputs: list[tuple[str, list[RetrievalResult]]] = []
+            capture_for_synthesis = chat is not None
             for plan in planned:
+                is_synthesis_input = capture_for_synthesis and plan is planned[-1]
                 query_results: list[QueryResult] = []
                 for judgment in judgments:
-                    query_results.append(
-                        await _evaluate_judgment(
-                            judgment,
-                            gold_by_query[judgment.query_id],
-                            retriever=retriever,
-                            top_k=top_k,
-                            mode=plan.mode,
-                            document_id_to_relpath=document_id_to_relpath,
-                            reranker=reranker if plan.reranks else None,
-                            rerank_candidates=rerank_candidates,
-                        )
+                    query_result, raw_results = await _evaluate_judgment(
+                        judgment,
+                        gold_by_query[judgment.query_id],
+                        retriever=retriever,
+                        top_k=top_k,
+                        mode=plan.mode,
+                        document_id_to_relpath=document_id_to_relpath,
+                        reranker=reranker if plan.reranks else None,
+                        rerank_candidates=rerank_candidates,
                     )
+                    query_results.append(query_result)
+                    if is_synthesis_input:
+                        synthesis_inputs.append((judgment.query, raw_results))
                 stages.append(
                     _build_stage_result(
                         query_results,
@@ -516,22 +524,15 @@ async def run_eval(
                 # "best upstream" the rerank stage itself reorders
                 # (_planned_stages): `planned[-1]` is `rerank` if a reranker
                 # was supplied, else `fusion` with a dense pair, else the
-                # `bm25` baseline. Run while `retriever` (and `reranker`,
-                # for a rerank input) are still open, so this pass shares
-                # the one index and one retriever every stage above already
-                # shares — never a second ingest of the same corpus.
+                # `bm25` baseline. It shares the one index and one retriever
+                # every stage above already shares — never a second ingest of
+                # the same corpus, and since `synthesis_inputs` was captured
+                # during that stage's own scoring pass, never a second
+                # *retrieval* either. Re-fetching here was the earlier shape:
+                # correct, but it ran every query through the retriever twice
+                # and, on a dense or hybrid stage, through the embedding
+                # provider twice.
                 synthesis_input = planned[-1]
-                synthesis_inputs: list[tuple[str, list[RetrievalResult]]] = []
-                for judgment in judgments:
-                    results, _latency_ms = await _fetch_stage_results(
-                        retriever,
-                        judgment.query,
-                        top_k=top_k,
-                        mode=synthesis_input.mode,
-                        reranker=reranker if synthesis_input.reranks else None,
-                        rerank_candidates=rerank_candidates,
-                    )
-                    synthesis_inputs.append((judgment.query, results))
                 synthesis_report = await run_synthesis_eval(
                     synthesis_inputs,
                     chat=chat,
@@ -974,7 +975,7 @@ async def _evaluate_judgment(
     document_id_to_relpath: dict[str, str],
     reranker: RerankerProtocol | None = None,
     rerank_candidates: int = MAX_TOP_K,
-) -> QueryResult:
+) -> tuple[QueryResult, list[RetrievalResult]]:
     """Score one judgment against a live retriever in one retrieval mode.
 
     With a ``reranker``, this asks the retriever for ``rerank_candidates``
@@ -1000,7 +1001,14 @@ async def _evaluate_judgment(
             ``reranker`` is ``None``.
 
     Returns:
-        This judgment's fully-scored :class:`~groundkit.evals.schema.QueryResult`.
+        This judgment's fully-scored
+        :class:`~groundkit.evals.schema.QueryResult`, and the raw
+        :class:`~groundkit.contracts.RetrievalResult` list it was scored
+        from. The raw list is returned rather than discarded so the synthesis
+        pass can reuse the retrieval this call already performed: it used to
+        re-fetch the winning stage for every judgment, doubling retrieval work
+        on the ``--judge`` path and, with a dense or hybrid stage, doubling
+        the embedding-provider calls too.
 
     Raises:
         EvalError: A retrieved hit's document has no corresponding entry
@@ -1056,16 +1064,19 @@ async def _evaluate_judgment(
         )
         total_relevant_chunks = len(gold_ids)
 
-    return QueryResult(
-        query_id=judgment.query_id,
-        query=judgment.query,
-        category=judgment.category,
-        is_no_answer=is_no_answer,
-        gold=gold_results,
-        total_relevant_chunks=total_relevant_chunks,
-        retrieved=retrieved,
-        metrics=metrics,
-        latency_ms=latency_ms,
+    return (
+        QueryResult(
+            query_id=judgment.query_id,
+            query=judgment.query,
+            category=judgment.category,
+            is_no_answer=is_no_answer,
+            gold=gold_results,
+            total_relevant_chunks=total_relevant_chunks,
+            retrieved=retrieved,
+            metrics=metrics,
+            latency_ms=latency_ms,
+        ),
+        results,
     )
 
 

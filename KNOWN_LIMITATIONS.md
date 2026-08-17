@@ -439,6 +439,24 @@ per SPEC.md §9:
   chunk, and manifest state — enforced in Python, not by the filesystem:
   the process holds a read-write file handle throughout. Filesystem-level
   enforcement (a read-only mount) is deferred to Phase 6.
+- **FIXED 2026-08-16 — two read-only operations wrote into unrelated
+  databases.** `handle_list_collections` advertised every contained
+  `*.sqlite3`, and `SQLiteMetadataStore.open` applies `_SCHEMA`
+  unconditionally, so asking `index_status` for one of those names created
+  `documents`, `chunks`, `collection_manifest` and `collection_state` inside a
+  database that was not groundkit's. Both halves now go through
+  `metadata.is_groundkit_store`, a read-only identity probe: listing skips a
+  foreign file, and `open` refuses it with a `StorageError` before any schema
+  is applied. Two details are worth keeping rather than deleting with the
+  entry. The probe opens with **`mode=ro&immutable=1`, and both flags are
+  load-bearing** — `mode=ro` alone makes SQLite create the `-shm`/`-wal`
+  sidecars of a WAL database, so the guard would have performed the very write
+  it exists to prevent (caught by
+  `test_list_collections_opens_nothing`, which already asserted the directory
+  is unchanged). And the probe keys on `application_id` **only**, never
+  `user_version`, so a pre-v3 store stays readable — folding the version in
+  would have locked out exactly the stores ADR-0016's narrow write-guard was
+  written to keep working.
 - **Reranking a hybrid search returns a ranking no `grk search --mode
   hybrid` produces.** RRF is not depth-invariant: it sums
   `1/(rrf_k + rank)` over the rankings a chunk is visible in at the fetched
@@ -460,14 +478,23 @@ per SPEC.md §9:
 
 ## Loaders workstream (ADR-0016) — the plumbing landed, the loaders have not
 
-ADR-0016 schedules PDF/HTML/URL support in four waves. **Waves 1 and 2 have landed; waves 3
-and 4 have not**, and the honest summary is that groundkit now *records and enforces* source
-classes it cannot yet *produce*.
+ADR-0016 schedules PDF/HTML/URL support in four waves. **Waves 1, 2 and most of wave 3 have
+landed; the ingest-side loaders and wave 4 have not** — so the honest summary is still that
+groundkit *records, enforces and can now re-verify* a source class it cannot yet *produce*.
+This is item 1 of SPEC.md §4.1's v0.1.0 scope amendment.
 
-- **There is still no PDF loader, no HTML loader, and no URL ingestion.** `FileLoader` handles
-  `.md`/`.txt` exactly as before, so every document any shipped code path can create is
-  `source_class="text"`. ADR-0016 decisions 3, 4 and 5 are unbuilt; `pdf`/`html` extras do not
-  exist and `grk ingest` accepts no URL.
+- **The extractors exist; the loaders that would use them do not.** `groundkit/extraction.py`
+  ships `PdfExtractor` and `HtmlExtractor` behind the `pdf` and `html` extras, with
+  deterministic pinned configuration (`extraction_mode="plain"`, `html.parser`) and an
+  identity string derived from distribution metadata. `resolve_citation` looks a citation's
+  recorded extractor up in `active_extractors()` and re-extracts on a match. What is missing is
+  the `.pdf`/`.html` **loader** reachable from `grk ingest`: that needs multi-loader dispatch,
+  which `docs/specs/loaders-extracted-and-remote-sources.md` §9.6 declines to design rather
+  than guess at. `FileLoader` still handles `.md`/`.txt` only, so every document a shipped code
+  path can create is `source_class="text"`, and the re-extraction path is exercised by tests
+  rather than by a live ingest.
+- **There is still no URL ingestion** (wave 4, ADR-0016 decision 4). `grk ingest` accepts no
+  URL, and a `snapshot`-class citation is refused with that specific reason.
 - **The extractor-identity check is correct code that is currently always-refusing.** An
   `extracted` citation resolves only if the recorded extractor identity is active in this
   build, and no extractor is registered — so every such citation is refused as
@@ -562,15 +589,21 @@ was executed.
   CLI flag can raise. Those timeouts were independently useful: the error-path
   span carried `otel.status_code=ERROR` and `groundkit.failure_kind=ChatError`
   and still leaked nothing, which is the harder half of the allowlist claim.
-- **A chat provider timeout reports no reason at all.**
-  `providers/llm.py`'s `_raise_chat_error` renders the message as
-  `f"... failed: {detail}"` where `detail = _scrub(str(exc), secret)`, and
-  `str()` on several `httpx` timeout exceptions is the empty string — so a
-  60-second `ReadTimeout` surfaces to an operator as `Chat request to <url>
-  failed:` with nothing after the colon. The scrubbing is correct and must
-  stay; what is missing is a fallback to the exception's *type* when its
-  message is empty. Found while verifying the `synthesize` span, where it cost
-  real time to diagnose a plain timeout.
+- **FIXED 2026-08-16 — a provider timeout reported no reason at all.** Both
+  `providers/llm.py`'s `_raise_chat_error` and
+  `providers/embeddings.py`'s `_raise_embedding_error` rendered
+  `f"... failed: {detail}"` from `_scrub(str(exc), secret)`, and `str()` on
+  several `httpx` timeout types is the empty string — so a 60-second
+  `ReadTimeout` surfaced as `Chat request to <url> failed:` with nothing after
+  the colon. Found while verifying the `synthesize` span, where it cost three
+  runs to identify a plain timeout. A shared `_error_detail` helper now falls
+  back to the exception's class name; the scrubbing is unchanged. Recorded
+  rather than deleted for one reason worth keeping: **only the chat half was
+  reported**, and the embedding half had the identical defect, which is why the
+  fix went into a helper both call rather than into the reported call site.
+  A chat provider timeout still cannot be raised past
+  `ChatConfig.timeout_seconds`' 60-second default from the CLI — no flag
+  exposes it.
 - **Installing the `otel` extra and setting `OTEL_*` does not, on its own, make
   a span record — and this was shipped wrong before it was caught.** The
   variables in ADR-0022 decision 2 are read by

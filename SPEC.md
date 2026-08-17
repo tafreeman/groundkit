@@ -93,6 +93,37 @@ optional non-LLM local cross-encoder rerank; persisted index with incremental
 re-index; MCP server (four tools above); FastAPI REST mirroring the MCP tools;
 eval harness; CLI (`grk ingest | search | eval | serve | serve-mcp`); IaC.
 
+### 4.1 Scope amendment for v0.1.0 (2026-08-16)
+
+**Three items in the "In" list above did not ship in v0.1.0, and this section
+is the explicit amendment rather than a silent shortfall.** §9 calls the
+release unblocked; that was inconsistent with the list above until this
+section existed, and the inconsistency is the kind §2's "real data only" rule
+exists to prevent — a scope claim is a claim like any other.
+
+1. **PDF/HTML ingestion is not reachable from `grk ingest`.** The
+   deterministic extractors, the extractor-identity binding, and resolve-time
+   citation re-verification all shipped (behind the `pdf` and `html` extras,
+   ADR-0016). What did not is the ingest-side loader: routing `.pdf`/`.html`
+   to a different loader inside one `grk ingest` invocation needs multi-loader
+   dispatch, which `docs/specs/loaders-extracted-and-remote-sources.md` §9.6
+   deliberately declines to design rather than guess at. Consequence, stated
+   plainly: nothing in-tree yet *produces* an `extracted` document, so that
+   verification path is proven by tests rather than by a live ingest.
+2. **URL ingestion and snapshot storage are not built.** Designed (§10 of the
+   same spec), unbuilt. A `snapshot`-class citation is refused with that
+   reason rather than resolved against a source that is not there.
+3. **No generated HTML eval report.** §6 asks for one alongside
+   `evals/results/latest.json`; `grk eval` writes the JSON artifact only. The
+   JSON is the machine-readable contract and the thing every gate and delta
+   reads, so this is a presentation gap, not a measurement one.
+
+These stay v1 scope and stay in the list above — the amendment narrows
+**v0.1.0**, not v1. Each is recorded in `KNOWN_LIMITATIONS.md` and in
+`CHANGELOG.md`'s release entry, so a reader arriving from PyPI meets the gap
+before the feature list. §10's definition of done is read against this
+section.
+
 **Out (recorded in KNOWN_LIMITATIONS.md, not built):** multi-tenant auth,
 distributed indexing, fine-tuning, agent loops, UI beyond the docs site,
 GraphRAG, additional vector DBs, semantic KV memory store (ARP's `memory.py`,
@@ -152,6 +183,9 @@ tests on both paths.
   reports its delta vs baseline in the generated report; a feature that does
   not beat baseline is reported as such.
 - Results: `evals/results/latest.json` (gitignored) + generated HTML report.
+  **The HTML report is deferred past v0.1.0 — see §4.1 item 3.** The JSON
+  artifact is what every gate, delta and consumer reads; the HTML would be a
+  second rendering of it.
   A gated workflow (`EVAL_GATED=1`) runs real-model paths on schedule/label
   and skips cleanly when unconfigured.
 
@@ -257,3 +291,10 @@ real client with documented config · eval report reproducible from a clean
 clone in ≤ 2 commands · each IaC path verified once with the verification
 date recorded · KNOWN_LIMITATIONS.md honest and current · no number in any
 doc that wasn't generated.
+
+Read against **§4.1**, which narrows what v0.1.0 claims to have built. "Works
+end-to-end" therefore means md/txt ingestion, not the pdf/html/URL loaders
+§4.1 defers; "eval report" means the JSON artifact, not the HTML rendering.
+Amending the scope in the open is the honest way to meet a definition of done;
+quietly reading these clauses loosely is not, and is why §4.1 exists as a
+dated section rather than a softened word here.
