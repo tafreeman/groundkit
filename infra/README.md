@@ -127,14 +127,16 @@ and Jaeger have been real, running and correctly wired since change 1, and
 groundkit should now emit spans wherever a live stack exercises those three
 call paths.
 
-**That was run on 2026-08-16**, and both trace rows in the table below now
-carry that date: the collector→Jaeger leg on its own via a synthetic OTLP/HTTP
-payload, and then real `ingest` and `retrieve` spans from groundkit itself. The
-"Verification status" table is the record of what has and has not been run, and
-this section is not a substitute for it — read the scope note under the table
-before treating those two rows as broader than they are, because the run did
-**not** use the compose `groundkit` service or its loopback publish, and did
-not exercise the `synthesize` span at all.
+**That was run on 2026-08-16**, and the trace rows in the table below carry
+that date: the collector→Jaeger leg on its own via a synthetic OTLP/HTTP
+payload, then real `ingest` and `retrieve` spans from groundkit itself, and —
+in a later run the same day — the `synthesize` span, which completes SPEC.md
+§3's three-site list. The "Verification status" table is the record of what has
+and has not been run, and this section is not a substitute for it: read the
+scope notes under the table before treating any row as broader than it is. In
+particular the `ingest`/`retrieve` run did **not** use the compose `groundkit`
+service or its loopback publish, and the `synthesize` run reached its chat
+model on the host rather than in the stack.
 
 Two things are worth keeping from before that run, because they are still how
 you debug this stack. The collector→Jaeger leg is provable independently by
@@ -209,6 +211,7 @@ that job exists rather than being a formality.
 | compose | published ports are loopback-only | **passed 2026-08-16, host-side only** — a differential through this host's own LAN interface address, not loopback: `10.0.0.16:8766` (a control container published `0.0.0.0`) returned 200 while `10.0.0.16:8765` (the `groundkit` service, published `127.0.0.1`) was actively refused, with `Get-NetTCPConnection` showing `0.0.0.0` and `127.0.0.1` respectively. **The from-another-host leg was attempted and did NOT complete** — see the scope note below |
 | compose | collector→Jaeger leg, proved on its own with a synthetic OTLP/HTTP payload | **passed 2026-08-16** |
 | compose | a groundkit span visible in Jaeger, carrying no query text | **passed 2026-08-16** — `ingest` and `retrieve` spans observed; see the note below for what this run did and did not cover |
+| compose | the `synthesize` span in a real trace, allowlist holding | **passed 2026-08-16** — observed from the compose `groundkit` image against the running stack; see the scope note below |
 | k8s | `kubectl kustomize` renders; every manifest parses as YAML | **passed 2026-08-15** |
 | k8s | `apply -k`, Job completes, Deployment Ready, port-forward serves | **passed 2026-08-16 on a SINGLE-NODE cluster** — Docker Desktop 4.86.0 Kubernetes, kind mode, server v1.36.1, 1 node. The documented sequence run verbatim including the scale-down steps: `apply -k`, corpus loader + `kubectl cp` (43 files), ingest Job completed (43 files, 1299 chunks, BM25-only — the k8s stack has no Ollama), Deployment reached 1/1 Ready against the `GET /v1/collections` probe, and `port-forward` served a citation-bearing `POST /v1/search`. **The multi-node `ReadWriteOnce` path was NOT exercised** — see the note below |
 | terraform | `fmt -check`, `validate` on providers 5.100.0 and 6.60.0 | **passed 2026-08-16** |
@@ -304,9 +307,35 @@ each of which is why a separate row above is still unfilled:
   the host-loopback publish, so the `up`, ingest, a real search over the
   loopback publish row is untouched — and neither is the LAN bind check, which
   is the actual security claim (ADR-0021 decision 1).
-- It did not exercise the `synthesize` span, which needs a chat provider that
-  run had none of. That span is covered by unit tests only.
 - It ran BM25-only, so no embedding-identity attributes were exercised.
+
+**Scope of the 2026-08-16 `synthesize` span verification** (the row added
+above; it was a separate, later run). The full four-service stack was up
+(`groundkit`, `ollama`, `otel-collector`, `jaeger`). A one-off
+`docker compose run --rm --no-deps groundkit answer …` against `/data/index`
+returned a cited answer over 2 BM25 results, and
+`groundkit.synthesize.synthesize` appeared in Jaeger carrying exactly
+`groundkit.chat.model`, `groundkit.chat.provider`, `groundkit.duration_ms` and
+`groundkit.result_count`. A sweep of the exported payload for the question
+text, the completion text, both citations' offsets, the corpus path and the
+source filename found **none of them** — ADR-0022 decision 3's allowlist holds
+on the span it matters most on.
+
+Three caveats, so the row is not read as more than it is:
+
+- **The chat model was the operator's host Ollama** (`host.docker.internal`),
+  not the stack's own `ollama` service, whose volume holds only the embedding
+  model. `OllamaChat._allow_private_endpoint` is what permits that address.
+  Nothing about the span path differs, but the stack was not self-contained
+  for this run.
+- The run used `--chat-model qwen3:1.7b`. The first attempts used a larger
+  local model and **timed out against `ChatConfig.timeout_seconds`' 60-second
+  default**, which there is no CLI flag to raise.
+- Those timeouts did produce a useful negative result worth keeping: the
+  **error-path** span carried `otel.status_code=ERROR` and
+  `groundkit.failure_kind=ChatError` and still leaked nothing — the allowlist
+  holds where a completion never arrived, which is where a leak would be
+  easiest to miss.
 
 **This row was earned twice, and the first attempt is worth recording**, since
 it is the failure a green unit-test suite cannot see. The first run exported
