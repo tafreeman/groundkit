@@ -71,9 +71,10 @@ module's to paper over by mislabeling it as a per-query rejection.
 :attr:`~groundkit.evals.schema.SynthesisReport.synthesis_prompt_hash` and
 :attr:`~groundkit.evals.schema.SynthesisReport.judge_prompt_hash` are each a
 single value for the whole run, so they hash the constant *template* string
-(``{query}``/``{sources}`` placeholders and all) that ``synthesis_prompt_template``
-/ ``judge_prompt_template`` supply — never a per-query rendering, which would
-differ by query and could not collapse into one run-level hash.
+(``{query}``/``{sources}`` placeholders and all) — never a per-query
+rendering, which would differ by query and could not collapse into one
+run-level hash. The synthesis template is the one this function is given; the
+judge template is read off the judge itself, never taken from a caller.
 """
 
 from __future__ import annotations
@@ -82,7 +83,6 @@ import hashlib
 from typing import TYPE_CHECKING
 
 from groundkit.errors import JudgeError, SynthesisError
-from groundkit.evals.judge import DEFAULT_JUDGE_PROMPT
 from groundkit.evals.schema import SynthesisReport
 from groundkit.providers.llm import RedactingChat
 from groundkit.providers.synthesis import DEFAULT_SYNTHESIS_PROMPT, Synthesizer
@@ -121,7 +121,6 @@ async def run_synthesis_eval(
     input_stage: StageName,
     judge: FaithfulnessJudge | None = None,
     synthesis_prompt_template: str = DEFAULT_SYNTHESIS_PROMPT,
-    judge_prompt_template: str = DEFAULT_JUDGE_PROMPT,
 ) -> SynthesisReport:
     """Synthesize an answer for every ``(query, results)`` pair, judging each if asked.
 
@@ -130,11 +129,16 @@ async def run_synthesis_eval(
     every pair — mirroring how :func:`~groundkit.evals.runner.run_eval`
     reuses one :class:`~groundkit.retrieval.search.Retriever` across every
     judgment. ``judge``, when supplied, is used exactly as given — this
-    function never constructs a judge itself, so the caller's
-    ``judge_prompt_template`` and the judge's actual configured prompt stay
-    the caller's responsibility to keep in agreement (the same trust
-    :func:`~groundkit.evals.runner.run_eval` already places in a
-    caller-supplied ``reranker``).
+    function never constructs a judge itself, and every ``judge_*`` field on
+    the report is read **off the judge**, never off ``chat``. Those are the
+    same object on the ``grk eval --judge`` path, which is exactly why
+    inferring them from ``chat`` was a trap: it stayed correct until someone
+    judged with a different provider, and then the artifact misreported which
+    model produced the verdicts while every test still passed. An earlier
+    revision took a ``judge_prompt_template`` argument and asked the caller to
+    keep it in agreement with the judge's real one; that is the hand-maintained
+    parity ``tests/test_protocol_conformance.py`` exists to argue against, so
+    the argument is gone rather than documented.
 
     Args:
         query_results: One entry per judgment: the query text and the
@@ -152,17 +156,15 @@ async def run_synthesis_eval(
         input_stage: Which retrieval stage produced ``query_results`` —
             recorded verbatim onto the report.
         judge: Optional. When supplied, every non-rejected synthesis outcome
-            is judged (see the module docstring). When omitted, every
-            ``judge_*`` field on the returned report is ``None``, honoring
+            is judged (see the module docstring), and its own
+            ``provider``/``model_name``/``prompt_template`` become the
+            report's judge provenance. When omitted, every ``judge_*`` field
+            on the returned report is ``None``, honoring
             :meth:`~groundkit.evals.schema.SynthesisReport._validate_judge_fields`'s
             all-or-nothing group.
         synthesis_prompt_template: Template the internal ``Synthesizer``
             renders; also what :attr:`SynthesisReport.synthesis_prompt_hash`
             hashes.
-        judge_prompt_template: The template ``judge`` was constructed with;
-            used only for :attr:`SynthesisReport.judge_prompt_hash` — never
-            passed to ``judge`` itself, since ``judge`` already carries its
-            own template.
 
     Returns:
         The completed :class:`~groundkit.evals.schema.SynthesisReport`.
@@ -216,9 +218,16 @@ async def run_synthesis_eval(
         answered_count=answered_count,
         abstained_count=abstained_count,
         rejected_count=rejected_count,
-        judge_provider=chat.provider if run_judge else None,
-        judge_model=chat.model_name if run_judge else None,
-        judge_prompt_hash=hash_prompt_template(judge_prompt_template) if run_judge else None,
+        # Read from the judge, never from `chat`. They are the same object on
+        # the `grk eval --judge` path, which is exactly why taking the easy
+        # one is a trap: it is right until someone judges with a different
+        # provider, and then the artifact misreports which model produced the
+        # verdicts while every test still passes.
+        judge_provider=judge.provider if judge is not None else None,
+        judge_model=judge.model_name if judge is not None else None,
+        judge_prompt_hash=(
+            hash_prompt_template(judge.prompt_template) if judge is not None else None
+        ),
         judged_count=judged_count if run_judge else None,
         faithful_count=faithful_count if run_judge else None,
         unfaithful_count=unfaithful_count if run_judge else None,

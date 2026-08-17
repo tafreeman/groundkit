@@ -80,7 +80,6 @@ from groundkit.evals.corpus import (
     read_corpus_doc,
     resolve_gold_span,
 )
-from groundkit.evals.judge import DEFAULT_JUDGE_PROMPT
 from groundkit.evals.metrics import (
     NDCG_K,
     RECALL_K_VALUES,
@@ -209,7 +208,6 @@ async def run_eval(
     chat: ChatProtocol | None = None,
     judge: FaithfulnessJudge | None = None,
     synthesis_prompt_template: str = DEFAULT_SYNTHESIS_PROMPT,
-    judge_prompt_template: str = DEFAULT_JUDGE_PROMPT,
 ) -> EvalReport:
     """Run the retrieval eval over a corpus and judgment set, one stage per strategy.
 
@@ -312,11 +310,6 @@ async def run_eval(
             :class:`~groundkit.providers.synthesis.Synthesizer` and hashed
             into ``report.synthesis.synthesis_prompt_hash``. Ignored when
             ``chat`` is ``None``.
-        judge_prompt_template: The template ``judge`` was itself constructed
-            with, used only to compute
-            ``report.synthesis.judge_prompt_hash`` — never passed to
-            ``judge``, which already carries its own. Ignored when ``judge``
-            is ``None``.
 
     Returns:
         An :class:`EvalReport` whose ``stages[0]`` is always the ``bm25``
@@ -545,7 +538,6 @@ async def run_eval(
                     input_stage=synthesis_input.stage,
                     judge=judge,
                     synthesis_prompt_template=synthesis_prompt_template,
-                    judge_prompt_template=judge_prompt_template,
                 )
         finally:
             # Purge BEFORE closing: the document set lives in the store, and

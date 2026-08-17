@@ -190,20 +190,61 @@ class TestPromptHashes:
         )
         assert report.synthesis_prompt_hash == hashlib.sha256(template.encode("utf-8")).hexdigest()
 
-    def test_judge_prompt_hash_matches_the_template_the_judge_was_built_with(self) -> None:
+    def test_judge_prompt_hash_is_read_off_the_judge_not_a_caller_argument(self) -> None:
+        """The judge's *own* template decides the hash.
+
+        The earlier version of this test built the judge with the default
+        template and passed that same default in, so it asserted only that two
+        copies of one constant hash alike -- it could not have failed if the
+        hash were computed from the caller's argument instead of the judge's
+        real prompt. Building the judge with a non-default template is what
+        makes the assertion mean anything.
+        """
+        custom = DEFAULT_JUDGE_PROMPT + "\n\nAnswer tersely."
         chat = _SynthesisEvalScriptedChat(["the answer is here [1]", _verdict_json(faithful=True)])
-        judge = FaithfulnessJudge(chat)
-        template = DEFAULT_JUDGE_PROMPT
+        judge = FaithfulnessJudge(chat, prompt_template=custom)
         report = asyncio.run(
             run_synthesis_eval(
                 [("q", [_result()])],
                 chat=chat,
                 input_stage="bm25",
                 judge=judge,
-                judge_prompt_template=template,
             )
         )
-        assert report.judge_prompt_hash == hashlib.sha256(template.encode("utf-8")).hexdigest()
+        assert report.judge_prompt_hash == hashlib.sha256(custom.encode("utf-8")).hexdigest()
+        assert (
+            report.judge_prompt_hash
+            != hashlib.sha256(DEFAULT_JUDGE_PROMPT.encode("utf-8")).hexdigest()
+        )
+
+    def test_judge_identity_is_the_judges_chat_not_the_synthesis_chat(self) -> None:
+        """Judge provenance must survive a judge that uses a different provider.
+
+        On the ``grk eval --judge`` path the synthesis chat and the judge's
+        chat are the same object, which is exactly why reading provenance off
+        the synthesis chat stayed correct in every test while being wrong in
+        principle. Here they differ, so the two disagree unless the report
+        reads the judge.
+        """
+        synth_chat = _SynthesisEvalScriptedChat(["the answer is here [1]"])
+        judge_chat = _SynthesisEvalScriptedChat(
+            [_verdict_json(faithful=True)],
+            provider="other-provider",
+            model_name="other-model",
+        )
+        judge = FaithfulnessJudge(judge_chat)
+        report = asyncio.run(
+            run_synthesis_eval(
+                [("q", [_result()])],
+                chat=synth_chat,
+                input_stage="bm25",
+                judge=judge,
+            )
+        )
+        assert report.judge_provider == "other-provider"
+        assert report.judge_model == "other-model"
+        assert report.synthesis_provider == synth_chat.provider
+        assert report.judge_provider != report.synthesis_provider
 
     def test_hash_prompt_template_is_plain_sha256_hex(self) -> None:
         assert hash_prompt_template("hello") == hashlib.sha256(b"hello").hexdigest()
