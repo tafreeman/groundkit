@@ -95,7 +95,7 @@ import httpx
 
 from groundkit.config import DEFAULT_CHAT_MODEL, DEFAULT_OLLAMA_BASE_URL, ChatConfig
 from groundkit.errors import ChatError, ChatProviderNotConfiguredError, ConfigurationError
-from groundkit.providers.embeddings import _post_json, _sanitize_url, _scrub
+from groundkit.providers.embeddings import _error_detail, _post_json, _sanitize_url
 from groundkit.providers.protocols import ChatProtocol
 from groundkit.providers.redaction import RedactionConfig, Redactor
 from groundkit.utils.url_safety import ensure_safe_endpoint, validate_endpoint_shape
@@ -189,7 +189,7 @@ def _raise_chat_error(url: str, exc: Exception, *, secret: str | None) -> NoRetu
         ChatError: Always.
     """
     safe_url = _sanitize_url(url, secret)
-    detail = _scrub(str(exc), secret)
+    detail = _error_detail(exc, secret)
     logger.debug("Chat request to %s failed: %s", safe_url, detail)
     raise ChatError(f"Chat request to {safe_url} failed: {detail}") from None
 

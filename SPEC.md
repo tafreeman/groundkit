@@ -93,6 +93,37 @@ optional non-LLM local cross-encoder rerank; persisted index with incremental
 re-index; MCP server (four tools above); FastAPI REST mirroring the MCP tools;
 eval harness; CLI (`grk ingest | search | eval | serve | serve-mcp`); IaC.
 
+### 4.1 Scope amendment for v0.1.0 (2026-08-16)
+
+**Three items in the "In" list above did not ship in v0.1.0, and this section
+is the explicit amendment rather than a silent shortfall.** §9 calls the
+release unblocked; that was inconsistent with the list above until this
+section existed, and the inconsistency is the kind §2's "real data only" rule
+exists to prevent — a scope claim is a claim like any other.
+
+1. **PDF/HTML ingestion is not reachable from `grk ingest`.** The
+   deterministic extractors, the extractor-identity binding, and resolve-time
+   citation re-verification all shipped (behind the `pdf` and `html` extras,
+   ADR-0016). What did not is the ingest-side loader: routing `.pdf`/`.html`
+   to a different loader inside one `grk ingest` invocation needs multi-loader
+   dispatch, which `docs/specs/loaders-extracted-and-remote-sources.md` §9.6
+   deliberately declines to design rather than guess at. Consequence, stated
+   plainly: nothing in-tree yet *produces* an `extracted` document, so that
+   verification path is proven by tests rather than by a live ingest.
+2. **URL ingestion and snapshot storage are not built.** Designed (§10 of the
+   same spec), unbuilt. A `snapshot`-class citation is refused with that
+   reason rather than resolved against a source that is not there.
+3. **No generated HTML eval report.** §6 asks for one alongside
+   `evals/results/latest.json`; `grk eval` writes the JSON artifact only. The
+   JSON is the machine-readable contract and the thing every gate and delta
+   reads, so this is a presentation gap, not a measurement one.
+
+These stay v1 scope and stay in the list above — the amendment narrows
+**v0.1.0**, not v1. Each is recorded in `KNOWN_LIMITATIONS.md` and in
+`CHANGELOG.md`'s release entry, so a reader arriving from PyPI meets the gap
+before the feature list. §10's definition of done is read against this
+section.
+
 **Out (recorded in KNOWN_LIMITATIONS.md, not built):** multi-tenant auth,
 distributed indexing, fine-tuning, agent loops, UI beyond the docs site,
 GraphRAG, additional vector DBs, semantic KV memory store (ARP's `memory.py`,
@@ -152,6 +183,9 @@ tests on both paths.
   reports its delta vs baseline in the generated report; a feature that does
   not beat baseline is reported as such.
 - Results: `evals/results/latest.json` (gitignored) + generated HTML report.
+  **The HTML report is deferred past v0.1.0 — see §4.1 item 3.** The JSON
+  artifact is what every gate, delta and consumer reads; the HTML would be a
+  second rendering of it.
   A gated workflow (`EVAL_GATED=1`) runs real-model paths on schedule/label
   and skips cleanly when unconfigured.
 
@@ -215,8 +249,8 @@ alike. Revert the source (not the test), run, restore, run.
 | 3 | Hybrid + rerank | dense (LanceDB w/ metadata filtering), RRF, optional cross-encoder (normalized scores); each with eval delta vs baseline | done 2026-08-15 |
 | 4 | Service + MCP | FastAPI + MCP server + CLI; `grk ingest ./docs && grk serve-mcp` connectable from Claude Desktop/Code with documented client config | done 2026-08-15 |
 | 5 | Boundary features | optional query rewrite + cited synthesis; redaction pass (names → tokens, configurable patterns); advisory faithfulness judge | done 2026-08-15 (redaction covers cloud **chat** egress only — the embedding boundary is a recorded deviation, ADR-0017; no gated synthesis workflow yet) |
-| 6 | IaC + observability | multi-stage non-root Dockerfile; compose (service+Ollama+collector+Jaeger); k8s (deployment, service, PVC, probes); Terraform module for one concrete provider; OTel verified end-to-end in compose | in progress — `infra/` landed 2026-08-15 (ADR-0020/0021/0022, `docs/specs/phase-6-iac-observability.md`); OTel instrumentation and JSON logs implemented (Phase 6 change 2: `telemetry.py`, spans on `Indexer.index_source`/`Indexer.index_directory`, `Retriever.search`, `Synthesizer.synthesize`) and verified in compose 2026-08-16: `ingest` and `retrieve` spans observed in Jaeger with the ADR-0022 attribute allowlist holding (no query text, source path or document content in the exported payload), plus the collector→Jaeger leg and the Terraform security-group preconditions. Also 2026-08-16: `terraform plan`/`apply` against a real AWS account (`us-east-1`, personal sandbox) — instance provisioned, image pulled from a real private ECR repo, a document ingested, and a real search served over an SSM port-forward tunnel; `terraform destroy` ran in the same session. Also 2026-08-16: the full documented compose cold-start — `ollama-pull`, the `ingest` one-shot (43 files, 1299 chunks, 1299 vectors), `up -d`, and `GET /v1/collections` plus a citation-bearing `POST /v1/search` over the `127.0.0.1:8765` publish; the loopback-only binding was demonstrated host-side (a `0.0.0.0` control port answered on this host's LAN address while `:8765` was refused on the same address), and the from-another-host leg was attempted and **could not complete** because the only available Wi-Fi is a guest SSID with client isolation. And 2026-08-16: the documented Kubernetes sequence verbatim on a **single-node** Docker Desktop (kind mode, v1.36.1) — `apply -k`, corpus load, ingest Job complete (43 files, 1299 chunks), Deployment 1/1 Ready, and a citation-bearing search over `kubectl port-forward`. **Every IaC path in this row has now been exercised at least once.** Two qualifiers remain rather than gaps in coverage: the multi-node `ReadWriteOnce` path a single node cannot produce, and the from-another-host half of the compose bind check, which could not run because the only Wi-Fi available is a guest SSID with client isolation. Still unverified: the `synthesize` span in a real trace, plus those two; `infra/README.md` is the status board and records the exact scope of each run |
-| 7 | Docs + release | MkDocs site, README live badges only, MIT, v0.1.0 tag, PyPI publish workflow | machinery done 2026-08-15; **release blocked on Phases 4–6** |
+| 6 | IaC + observability | multi-stage non-root Dockerfile; compose (service+Ollama+collector+Jaeger); k8s (deployment, service, PVC, probes); Terraform module for one concrete provider; OTel verified end-to-end in compose | done 2026-08-16 — `infra/` landed 2026-08-15 (ADR-0020/0021/0022, `docs/specs/phase-6-iac-observability.md`); OTel instrumentation and JSON logs implemented (Phase 6 change 2: `telemetry.py`, spans on `Indexer.index_source`/`Indexer.index_directory`, `Retriever.search`, `Synthesizer.synthesize`) and verified in compose 2026-08-16: `ingest` and `retrieve` spans observed in Jaeger with the ADR-0022 attribute allowlist holding (no query text, source path or document content in the exported payload), plus the collector→Jaeger leg and the Terraform security-group preconditions. Also 2026-08-16: `terraform plan`/`apply` against a real AWS account (`us-east-1`, personal sandbox) — instance provisioned, image pulled from a real private ECR repo, a document ingested, and a real search served over an SSM port-forward tunnel; `terraform destroy` ran in the same session. Also 2026-08-16: the full documented compose cold-start — `ollama-pull`, the `ingest` one-shot (43 files, 1299 chunks, 1299 vectors), `up -d`, and `GET /v1/collections` plus a citation-bearing `POST /v1/search` over the `127.0.0.1:8765` publish; the loopback-only binding was demonstrated host-side (a `0.0.0.0` control port answered on this host's LAN address while `:8765` was refused on the same address), and the from-another-host leg was attempted and **could not complete** because the only available Wi-Fi is a guest SSID with client isolation. And 2026-08-16: the documented Kubernetes sequence verbatim on a **single-node** Docker Desktop (kind mode, v1.36.1) — `apply -k`, corpus load, ingest Job complete (43 files, 1299 chunks), Deployment 1/1 Ready, and a citation-bearing search over `kubectl port-forward`. **Every IaC path in this row has now been exercised at least once.** Two qualifiers remain rather than gaps in coverage: the multi-node `ReadWriteOnce` path a single node cannot produce, and the from-another-host half of the compose bind check, which could not run because the only Wi-Fi available is a guest SSID with client isolation. And 2026-08-16: the **`synthesize` span in a real trace**, completing SPEC.md §3's three-site list — a `docker compose run … grk answer` against the running four-service stack returned a cited answer over 2 BM25 results and produced `groundkit.synthesize.synthesize` in Jaeger carrying only `chat.model`, `chat.provider`, `duration_ms` and `result_count`; a sweep of the exported payload for the question text, the completion text, both citations' offsets, the corpus path and the source filename found none of them, and an error-path span from an earlier timed-out attempt leaked nothing either. Scope: the chat model was the operator's host Ollama rather than the stack's own (which holds only the embedding model). **Every span site and every IaC path in this row has now been exercised.** What remains is not unverified work but two limits of the available hardware, accepted and recorded rather than left open: the multi-node `ReadWriteOnce` path a single node cannot produce, and the from-another-host half of the compose bind check, blocked by a guest SSID with client isolation. `infra/README.md` is the status board and records the exact scope of each run |
+| 7 | Docs + release | MkDocs site, README live badges only, MIT, v0.1.0 tag, PyPI publish workflow | machinery done 2026-08-15; **Phases 4–6 are now closed, so the release is unblocked** — version bumped to `0.1.0` on 2026-08-16 in both `pyproject.toml` and `groundkit.__version__`; PyPI pending publisher registered 2026-08-16 (trusted publishing has no token path, so this had to precede the first upload); what remains is the tag and the published GitHub release itself |
 
 Phase 7 ran out of order, deliberately and partially. Everything in it that
 does not describe Phases 4–6 has landed: the MkDocs site (strict build, gated
@@ -226,13 +260,21 @@ release-gate suite that blocks it, and the re-enabled `eval-gated` /
 `rerank-gated` schedules those workflows reserved for "end of development".
 
 What has **not** happened is the release itself. No v0.1.0 tag, no GitHub
-release, nothing published to PyPI — §10's definition of done is unmet while
-the MCP server, the service surface and the IaC do not exist, and a 0.1.0 on
-PyPI describing a retrieval library with no service surface would be a version
-number that cannot be withdrawn and reused. The publish workflow is inert
-until a release is published, and its gate refuses a tag whose version
-disagrees with `pyproject.toml` — which today still carries `0.1.0.dev0`, so
-the machinery fails closed against exactly this premature release.
+release, nothing published to PyPI. The reason that paragraph used to give —
+that the MCP server, the service surface and the IaC did not exist, so a 0.1.0
+on PyPI would be a version number that could not be withdrawn and reused — has
+expired: Phases 4, 5 and 6 are all closed. The version was bumped off
+`0.1.0.dev0` on 2026-08-16, in both `pyproject.toml` and
+`groundkit.__version__` (two independent declarations that nothing but
+`tests/test_smoke.py::test_version_matches_pyproject` holds together — the
+release gate's parity step reads `pyproject.toml` alone).
+
+The PyPI *pending publisher* — required because `publish.yml` is
+**trusted-publishing only**, with no token input wired, against a project that
+does not exist on PyPI yet — was registered by the owner on 2026-08-16. What
+remains is the release event itself: the publish workflow is inert until a
+GitHub release is published, and the tag it carries must match
+`pyproject.toml`'s version or the parity gate refuses it.
 
 The docs site describes only what is built, and states the gaps where they
 fall. Phase 4's service/MCP pages and Phase 5's LLM-boundary update have
@@ -249,3 +291,10 @@ real client with documented config · eval report reproducible from a clean
 clone in ≤ 2 commands · each IaC path verified once with the verification
 date recorded · KNOWN_LIMITATIONS.md honest and current · no number in any
 doc that wasn't generated.
+
+Read against **§4.1**, which narrows what v0.1.0 claims to have built. "Works
+end-to-end" therefore means md/txt ingestion, not the pdf/html/URL loaders
+§4.1 defers; "eval report" means the JSON artifact, not the HTML rendering.
+Amending the scope in the open is the honest way to meet a definition of done;
+quietly reading these clauses loosely is not, and is why §4.1 exists as a
+dated section rather than a softened word here.

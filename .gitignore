@@ -78,3 +78,7 @@ site/
 crash.log
 *.tfvars
 !*.tfvars.example
+
+# Internal design documents kept alongside the repo but never published
+# with it (they are not part of the package and carry no license header).
+*.docx

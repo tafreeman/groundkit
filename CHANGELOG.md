@@ -1,0 +1,119 @@
+# Changelog
+
+All notable changes to groundkit are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+No metric value appears in this file. Retrieval-quality numbers come from
+generated eval artifacts, never from prose (SPEC.md §2), so a release note
+here says which stages a run reports and where the report lands — never what
+it scored.
+
+## [Unreleased]
+
+Nothing yet.
+
+## [0.1.0]
+
+First release. Everything below is initial, so this entry describes the
+surface as shipped rather than a diff against an earlier version.
+
+### Retrieval
+
+- Persisted index, one directory per collection: SQLite as the durable truth
+  for documents and chunks, with a LanceDB table for vectors. The BM25 index
+  holds no on-disk form of its own and is rebuilt from the persisted chunk set
+  at open, so nothing in memory can drift out of sync with what is on disk.
+- Character-offset citations on every result. A citation is verified by
+  re-reading the span from its source and byte-comparing it, not by asserting
+  it — `groundkit.retrieval.verify_citation`.
+- `bm25`, `dense`, and `hybrid` retrieval modes; hybrid fuses with reciprocal
+  rank. BM25 is the default and stays the default: unlike the dense-side
+  modes it abstains when no indexed chunk shares a term with the query.
+- Optional local cross-encoder rerank behind the `rerank` extra. Non-LLM,
+  and reported in the eval harness as its own stage with a measured delta.
+- Incremental ingestion with content-hash dedup; unchanged files are skipped.
+- Embedding identity is bound to a collection on its first dense write, and
+  verified at both the ingest and retrieval boundaries. A mismatch is a typed
+  error — never a re-embed, and never a cross-provider fallback.
+
+### Service surface
+
+- `grk serve` runs the FastAPI REST surface and the MCP streamable-HTTP
+  transport over one runtime; `grk serve-mcp` runs the MCP stdio transport for
+  Claude Desktop and Claude Code.
+- Four read-only operations, generated from one registry so the two transports
+  cannot diverge: `search`, `fetch_chunk`, `list_collections`, `index_status`.
+- Binds `127.0.0.1` by default and refuses a non-loopback bind without an
+  explicit acknowledgement. **There is no authentication of any kind**, so the
+  address the service is reachable at is its entire access control.
+
+### LLM boundary
+
+- Optional query rewrite and cited synthesis, both skippable, both behind
+  interfaces. No LLM runs anywhere in the retrieval path.
+- Synthesis may cite only retrieved spans. An out-of-set citation is an error,
+  never repaired. Empty citations are a genuine abstention, not a failure.
+- A redaction pass wraps cloud chat egress with no operator opt-out. The
+  embedding boundary is a deliberate, documented exception — see
+  `docs/architecture/llm-boundary.md`.
+- An advisory faithfulness judge (`grk answer --judge`, `grk eval --judge`).
+  **Advisory only: it exits 0 and gates nothing** until calibrated against
+  human labels.
+- Synthesis is CLI-only and deliberately absent from the service surface.
+
+### Eval harness
+
+- `grk eval` scores a committed golden corpus with deterministic, unit-tested
+  metrics: recall@k (hit-rate at k=1,5,10), MRR, and nDCG@10, plus per-stage
+  latency percentiles.
+- BM25-only is always the intra-run baseline, and every later stage reports
+  its signed delta against it in the same report — including when it loses.
+  Deltas are derived at read time rather than stored, so they cannot disagree
+  with their inputs.
+- Gold spans resolve against corpus text before any indexing runs, failing
+  closed on a missing or ambiguous quote.
+- `InMemoryEmbedder` produces hash-derived vectors. It exercises code paths
+  offline and is wrong for measuring quality; a report produced with it is
+  labelled as such.
+
+### Observability
+
+- OpenTelemetry spans on ingest, retrieve, and synthesize. `opentelemetry-api`
+  is a base dependency so instrumentation needs no guarded imports; the SDK
+  and OTLP exporters live in the `otel` extra. With neither configured, every
+  span is non-recording.
+- Span attributes are an allowlist enforced by a typed-keyword helper with no
+  `**kwargs`, so query text, document content, citation spans, absolute source
+  paths, and metadata-filter values cannot become attributes by construction.
+- Structured JSON logs opt-in via `GROUNDKIT_LOG_FORMAT=json`; human-readable
+  stays the default for a terminal.
+
+### Infrastructure
+
+- Multi-stage non-root image (uid 10001), ready for a read-only root
+  filesystem; a compose stack with Ollama, an OTel collector and Jaeger;
+  Kubernetes manifests including a default-deny NetworkPolicy and the one-shot
+  ingest Job; and a Terraform module for a single EC2 host with block storage
+  and no inbound path, reached over SSM port forwarding.
+- Every path has been exercised at least once, with the scope of each run
+  recorded in `infra/README.md` — including which runs were narrower than
+  their row reads.
+
+### Known gaps in this release
+
+Named here because they are v1 scope that did not ship, not oversights.
+`KNOWN_LIMITATIONS.md` is the full and current record.
+
+- **PDF/HTML ingestion is not reachable from `grk ingest`.** The deterministic
+  extractors and resolve-time citation re-verification exist behind the `pdf`
+  and `html` extras, but the ingest-side loaders need multi-loader dispatch
+  that is deliberately undesigned.
+- **URL ingestion and snapshot storage are not built.** Designed, unbuilt; a
+  `snapshot`-class citation is refused rather than guessed at.
+- **No HTML eval report.** `grk eval` writes JSON only.
+- No authentication, no rate limiting, and no multi-tenancy on the service
+  surface.
+
+[Unreleased]: https://github.com/tafreeman/groundkit/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/tafreeman/groundkit/releases/tag/v0.1.0

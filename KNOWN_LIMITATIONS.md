@@ -439,6 +439,24 @@ per SPEC.md §9:
   chunk, and manifest state — enforced in Python, not by the filesystem:
   the process holds a read-write file handle throughout. Filesystem-level
   enforcement (a read-only mount) is deferred to Phase 6.
+- **FIXED 2026-08-16 — two read-only operations wrote into unrelated
+  databases.** `handle_list_collections` advertised every contained
+  `*.sqlite3`, and `SQLiteMetadataStore.open` applies `_SCHEMA`
+  unconditionally, so asking `index_status` for one of those names created
+  `documents`, `chunks`, `collection_manifest` and `collection_state` inside a
+  database that was not groundkit's. Both halves now go through
+  `metadata.is_groundkit_store`, a read-only identity probe: listing skips a
+  foreign file, and `open` refuses it with a `StorageError` before any schema
+  is applied. Two details are worth keeping rather than deleting with the
+  entry. The probe opens with **`mode=ro&immutable=1`, and both flags are
+  load-bearing** — `mode=ro` alone makes SQLite create the `-shm`/`-wal`
+  sidecars of a WAL database, so the guard would have performed the very write
+  it exists to prevent (caught by
+  `test_list_collections_opens_nothing`, which already asserted the directory
+  is unchanged). And the probe keys on `application_id` **only**, never
+  `user_version`, so a pre-v3 store stays readable — folding the version in
+  would have locked out exactly the stores ADR-0016's narrow write-guard was
+  written to keep working.
 - **Reranking a hybrid search returns a ranking no `grk search --mode
   hybrid` produces.** RRF is not depth-invariant: it sums
   `1/(rrf_k + rank)` over the rankings a chunk is visible in at the fetched
@@ -460,14 +478,23 @@ per SPEC.md §9:
 
 ## Loaders workstream (ADR-0016) — the plumbing landed, the loaders have not
 
-ADR-0016 schedules PDF/HTML/URL support in four waves. **Waves 1 and 2 have landed; waves 3
-and 4 have not**, and the honest summary is that groundkit now *records and enforces* source
-classes it cannot yet *produce*.
+ADR-0016 schedules PDF/HTML/URL support in four waves. **Waves 1, 2 and most of wave 3 have
+landed; the ingest-side loaders and wave 4 have not** — so the honest summary is still that
+groundkit *records, enforces and can now re-verify* a source class it cannot yet *produce*.
+This is item 1 of SPEC.md §4.1's v0.1.0 scope amendment.
 
-- **There is still no PDF loader, no HTML loader, and no URL ingestion.** `FileLoader` handles
-  `.md`/`.txt` exactly as before, so every document any shipped code path can create is
-  `source_class="text"`. ADR-0016 decisions 3, 4 and 5 are unbuilt; `pdf`/`html` extras do not
-  exist and `grk ingest` accepts no URL.
+- **The extractors exist; the loaders that would use them do not.** `groundkit/extraction.py`
+  ships `PdfExtractor` and `HtmlExtractor` behind the `pdf` and `html` extras, with
+  deterministic pinned configuration (`extraction_mode="plain"`, `html.parser`) and an
+  identity string derived from distribution metadata. `resolve_citation` looks a citation's
+  recorded extractor up in `active_extractors()` and re-extracts on a match. What is missing is
+  the `.pdf`/`.html` **loader** reachable from `grk ingest`: that needs multi-loader dispatch,
+  which `docs/specs/loaders-extracted-and-remote-sources.md` §9.6 declines to design rather
+  than guess at. `FileLoader` still handles `.md`/`.txt` only, so every document a shipped code
+  path can create is `source_class="text"`, and the re-extraction path is exercised by tests
+  rather than by a live ingest.
+- **There is still no URL ingestion** (wave 4, ADR-0016 decision 4). `grk ingest` accepts no
+  URL, and a `snapshot`-class citation is refused with that specific reason.
 - **The extractor-identity check is correct code that is currently always-refusing.** An
   `extracted` citation resolves only if the recorded extractor identity is active in this
   build, and no extractor is registered — so every such citation is refused as
@@ -540,7 +567,8 @@ was executed.
   refused" are different claims, and only the first is currently true.
 
 - **A groundkit span has now been observed in Jaeger (2026-08-16), for `ingest`
-  and `retrieve` — not for `synthesize`.** `src/groundkit/telemetry.py` is the
+  `retrieve` and — since a later run the same day — `synthesize`.**
+  `src/groundkit/telemetry.py` is the
   tracer accessor and the typed attribute helper (ADR-0022 decision 3),
   instrumenting `Indexer.index_source`, `Indexer.index_directory`,
   `Retriever.search` and `Synthesizer.synthesize`. `opentelemetry-api` is a base
@@ -548,11 +576,34 @@ was executed.
   `otel` extra installed — spans are simply non-recording. The verified run
   exercised a real `ingest` and `search` against the compose stack's collector,
   and a sweep of the exported payload confirmed the allowlist held: no query
-  text, no source path, no document content. **The `synthesize` span has never
-  been observed in a real trace** — it needs a chat provider that run had none
-  of, and it is covered by unit tests only. That is the sharpest of the three
-  spans (it sits next to prompt and completion text), so it is the one where an
-  observed trace would be worth the most, and it is the one still owed.
+  text, no source path, no document content. The `synthesize` span was then
+  observed too, from a `docker compose run … grk answer` against the running
+  stack: it carried `chat.model`, `chat.provider`, `duration_ms` and
+  `result_count` and nothing else, and a sweep for the question text, the
+  completion text, both citations' offsets, the corpus path and the source
+  filename found none of them. **Two caveats keep that from being a
+  self-contained stack test.** The chat model was the operator's *host* Ollama
+  via `host.docker.internal`, because the stack's own `ollama` volume holds
+  only the embedding model; and the first attempts, with a larger local model,
+  timed out against `ChatConfig.timeout_seconds`' 60-second default, which no
+  CLI flag can raise. Those timeouts were independently useful: the error-path
+  span carried `otel.status_code=ERROR` and `groundkit.failure_kind=ChatError`
+  and still leaked nothing, which is the harder half of the allowlist claim.
+- **FIXED 2026-08-16 — a provider timeout reported no reason at all.** Both
+  `providers/llm.py`'s `_raise_chat_error` and
+  `providers/embeddings.py`'s `_raise_embedding_error` rendered
+  `f"... failed: {detail}"` from `_scrub(str(exc), secret)`, and `str()` on
+  several `httpx` timeout types is the empty string — so a 60-second
+  `ReadTimeout` surfaced as `Chat request to <url> failed:` with nothing after
+  the colon. Found while verifying the `synthesize` span, where it cost three
+  runs to identify a plain timeout. A shared `_error_detail` helper now falls
+  back to the exception's class name; the scrubbing is unchanged. Recorded
+  rather than deleted for one reason worth keeping: **only the chat half was
+  reported**, and the embedding half had the identical defect, which is why the
+  fix went into a helper both call rather than into the reported call site.
+  A chat provider timeout still cannot be raised past
+  `ChatConfig.timeout_seconds`' 60-second default from the CLI — no flag
+  exposes it.
 - **Installing the `otel` extra and setting `OTEL_*` does not, on its own, make
   a span record — and this was shipped wrong before it was caught.** The
   variables in ADR-0022 decision 2 are read by
@@ -838,9 +889,20 @@ was executed.
   chat would be noise presented as a measurement. No gated synthesis
   workflow exists yet (the `eval-gated`/`rerank-gated` posture, but the
   workflow file itself is not written), so every echo result is a
-  point-in-time local measurement. `EvalReport.synthesis`
-  (`SynthesisReport`) is structure without a producer: `grk eval` does not
-  yet fold judge tallies over the golden corpus into the main artifact.
+  point-in-time local measurement.
+
+  **`EvalReport.synthesis` now has a producer** — it was "structure without a
+  producer" until `grk eval --judge` landed (2026-08-16), which requires
+  `--synthesis`, synthesizes over the golden corpus against the run's best
+  stage, and folds the judge tallies into the main artifact. Two limits
+  survive that change and are the reason this entry is not simply deleted.
+  The judge is **advisory only — it exits 0 and gates nothing** (SPEC.md §6)
+  until calibrated against human labels, so a falling faithfulness tally
+  fails no build. And the producer needs a live chat provider, so it does not
+  run in normal CI at all — which means the automatic re-measurement this
+  entry's title is about still does not exist. What changed is that the
+  number can now be produced on demand; what did not is that anything
+  produces it unprompted.
 - **`grk answer` is CLI-only; synthesis is off the service surface
   (ADR-0019).** Synthesis is a read, but it adds cost amplification and
   egress amplification that a loopback bind does not bound. Named

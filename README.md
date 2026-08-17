@@ -28,8 +28,8 @@ a named MCP server, and a retrieval eval harness — fully local by default.
 
 **Documentation: <https://tafreeman.github.io/groundkit/>**
 
-> **Status: Phases 0–3 done; Phase 7's docs and release machinery landed
-> early.** BM25 retrieval, a persisted index, citation-bearing search, and a
+> **Status: Phases 0–6 done; the v0.1.0 release itself is the only thing
+> left.** BM25 retrieval, a persisted index, citation-bearing search, and a
 > retrieval eval harness work end-to-end locally with no cloud credentials —
 > see the Quickstart below. Dense and hybrid (RRF) retrieval work too, opt-in
 > behind `--dense` / `--mode` and requiring a local embedding provider. A
@@ -38,15 +38,27 @@ a named MCP server, and a retrieval eval harness — fully local by default.
 > like every other retrieval feature ([ADR-0012](docs/adr/ADR-0012-rerank-eval-stage-reorders-upstream-stage.md));
 > it is not part of `grk search`.
 >
-> **The MCP server, the REST API, the synthesis/redaction boundary, and the
-> IaC are not built** — Phases 4–6. groundkit is not installable from PyPI
-> yet and is not released: the publish workflow exists, but the v0.1.0 tag
-> waits on the definition of done in [SPEC.md](SPEC.md) §10. See SPEC.md for
-> what is being built and in what order, and
-> [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for what is deliberately out
-> of scope or presently broken.
+> Since then: the **MCP server and REST API** ship over one runtime
+> (`grk serve`, `grk serve-mcp`), the **LLM boundary** is built — optional
+> query rewrite, cited synthesis that may cite only retrieved spans, a
+> redaction pass on cloud chat egress with no operator opt-out, and an
+> advisory faithfulness judge — and the **IaC** is real and exercised
+> (Dockerfile, compose with an OTel collector and Jaeger, Kubernetes
+> manifests, and a Terraform module that has been applied and destroyed
+> against a live account). OpenTelemetry spans cover ingest, retrieve and
+> synthesize.
+>
+> **groundkit is not on PyPI yet.** The publish workflow and its blocking
+> release gates exist and the version is at `0.1.0`; what remains is the tag
+> and the published release. Two v1 scope items are deliberately unbuilt and
+> named as such — **PDF/HTML ingestion and URL ingestion**, whose extractors
+> and citation re-verification landed but whose ingest-side loaders did not
+> (see [SPEC.md](SPEC.md) §4). See
+> [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for everything deliberately
+> out of scope or presently broken — it is honest and current, including
+> about defects.
 
-## What this will be
+## What this is
 
 - **Hybrid retrieval** — BM25 + dense embeddings + reciprocal-rank fusion +
   optional local cross-encoder rerank, over an index that survives restarts.
@@ -61,12 +73,14 @@ a named MCP server, and a retrieval eval harness — fully local by default.
 
 Deterministic core, LLM at the boundary: no LLM runs in the retrieval path.
 Where text can and cannot leave the process is written down in full —
-[docs/architecture/llm-boundary.md](docs/architecture/llm-boundary.md) — including
-the fact that the redaction pass named above is Phase 5 work that does not
-exist yet, so the opt-in cloud provider currently sends document text
-unredacted.
+[docs/architecture/llm-boundary.md](docs/architecture/llm-boundary.md). The
+redaction pass named above now exists and wraps **cloud chat egress with no
+operator opt-out** ([ADR-0017](docs/adr/ADR-0017-chat-seam-and-redaction-boundary.md));
+that document also records what it does *not* cover — the embedding boundary
+is a deliberate, named exception, so read it before pointing an embedding
+provider at a cloud endpoint.
 
-## Quickstart (Phase 1: BM25 + persisted index)
+## Quickstart
 
 ```bash
 uv sync
@@ -80,7 +94,7 @@ carries a citation — source path plus character offsets — that
 `groundkit.retrieval.verify_citation` can check against the source file.
 No cloud credentials are required for any of this.
 
-## Eval harness (Phase 2: BM25 baseline)
+## Eval harness
 
 ```bash
 uv run grk eval

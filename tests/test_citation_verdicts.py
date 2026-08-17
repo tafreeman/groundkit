@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+from groundkit import extraction
 from groundkit.contracts import Chunk, Citation
 from groundkit.errors import RetrievalError
 from groundkit.index.metadata import SQLiteMetadataStore
@@ -103,7 +104,13 @@ def test_extractor_identity_mismatch_is_unresolvable_and_names_both_identities(
         assert exc.verdict == "unresolvable"
         message = str(exc)
         assert "pdf-x/9" in message  # the recorded identity
-        assert "none registered" in message  # the (empty, pre-Wave-3) active set
+        # The active set, derived from the registry rather than hardcoded:
+        # Wave 3 populates it per extra installed, so a literal string here
+        # would assert the test environment's extras rather than the message
+        # contract ("name what is active"). Pre-Wave-3 this read
+        # "none registered", which the empty-registry branch still produces.
+        active = sorted(extraction.active_extractors())
+        assert (str(active) if active else "none registered") in message
         # This particular message never contained the retired phrase either --
         # it is not what distinguishes the old sniff from the new mechanism.
         # See test_fetch_chunk_classifies_by_verdict_not_by_message_text for

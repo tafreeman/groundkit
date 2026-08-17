@@ -147,6 +147,84 @@ APPLICATION_ID: Final[int] = 0x47524B31  # "GRK1"
 #: index is reproducible from ``grk ingest`` in seconds.
 SCHEMA_VERSION: Final[int] = 3
 
+#: Tables a groundkit store created before ``PRAGMA application_id`` was
+#: stamped (ADR-0004 decision 4) is recognized by instead. Both must be
+#: present: `documents` alone is a plausible table name in an unrelated
+#: database, and the pair is what makes the inference safe.
+_LEGACY_MARKER_TABLES: Final[frozenset[str]] = frozenset({"documents", "chunks"})
+
+
+def is_groundkit_store(db_path: Path) -> bool:
+    """True when ``db_path`` is a groundkit collection, checked without writing.
+
+    Exists because :meth:`SQLiteMetadataStore.open` applies ``_SCHEMA``
+    unconditionally: pointed at an unrelated SQLite file it would *create*
+    `documents`, `chunks`, `collection_manifest` and `collection_state` inside
+    it. That made two read-only operations mutate a stranger's database — a
+    `*.sqlite3` a user happened to leave in the index directory would be
+    advertised by `list_collections` and then written to by `index_status`.
+
+    The check opens the file with ``mode=ro&immutable=1``, and **both flags are
+    load-bearing.** ``mode=ro`` alone is not write-free against a WAL database:
+    SQLite needs the ``-shm`` shared-memory file to read one, and creates
+    ``-shm``/``-wal`` beside the store if they are absent — which is a write,
+    and exactly the write this function exists to avoid.
+    ``tests/test_service_tools.py::test_list_collections_opens_nothing``
+    catches it. ``immutable=1`` promises the file cannot change, so SQLite
+    skips the WAL machinery entirely and touches nothing.
+
+    The cost of ``immutable=1`` is that any uncheckpointed WAL content is
+    invisible. That does not matter here: ``application_id`` lives in the
+    database header, and the ``sqlite_master`` read below is only reached on
+    the unstamped path, where "no tables visible" and "tables visible" both
+    answer ``True``.
+
+    Recognized as groundkit:
+
+    - ``PRAGMA application_id`` equal to :data:`APPLICATION_ID` — the normal
+      case, whatever ``user_version`` says. Keying on the stamp alone is
+      deliberate: a pre-v3 store is still *ours* and must stay readable
+      (ADR-0016 refuses its writes, not its reads), so folding
+      ``user_version`` into this test would lock out the very stores that
+      guard was written to keep working.
+    - ``application_id`` of ``0`` with both :data:`_LEGACY_MARKER_TABLES`
+      present — a groundkit store predating the stamp.
+    - ``application_id`` of ``0`` with no tables at all — an empty file, which
+      :meth:`open` may legitimately adopt.
+
+    Anything else — including an unreadable or corrupt file — is not ours.
+    Returning ``False`` rather than raising keeps the caller's choice open:
+    listing skips it, opening refuses it.
+
+    Args:
+        db_path: The candidate file. Must already exist; a missing path is
+            not this function's question and returns ``False``.
+
+    Returns:
+        Whether the file may be treated as a groundkit collection.
+    """
+    if not db_path.is_file():
+        return False
+    try:
+        conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro&immutable=1", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        app_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
+        if app_id == APPLICATION_ID:
+            return True
+        if app_id != 0:
+            return False
+        tables = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+    return not tables or _LEGACY_MARKER_TABLES.issubset(tables)
+
 
 class SQLiteMetadataStore:
     """Durable store for documents, chunks, and ingest state, backed by SQLite.
@@ -229,6 +307,18 @@ class SQLiteMetadataStore:
             # connection, so this is the only point at which "did this file
             # already exist" is still observable.
             is_new_file = not db_path.exists()
+            # Refuse a stranger's database BEFORE the unconditional
+            # `executescript(_SCHEMA)` below, which would otherwise create
+            # groundkit's four tables inside it. The probe is read-only, so
+            # the guard cannot itself perform the write it prevents.
+            if not is_new_file and not is_groundkit_store(db_path):
+                raise StorageError(
+                    f"{db_path} is not a groundkit collection: its "
+                    "PRAGMA application_id does not match, and it holds tables that are "
+                    "not groundkit's. Refusing to open it, because opening applies "
+                    "groundkit's schema and would add tables to a database that is not "
+                    "ours. Move or rename the file, or choose another index directory."
+                )
             conn = sqlite3.connect(str(db_path), check_same_thread=False)
             try:
                 conn.execute("PRAGMA foreign_keys = ON")

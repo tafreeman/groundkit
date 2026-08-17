@@ -187,6 +187,30 @@ class FaithfulnessJudge:
         self._chat = chat
         self._prompt_template = prompt_template
 
+    @property
+    def provider(self) -> str:
+        """Provider identity of the chat this judge actually calls.
+
+        Exposed so an artifact can record the judge's *own* provenance rather
+        than inferring it from whatever chat the caller happened to use for
+        synthesis. Those are the same object on the `grk eval --judge` path
+        and need not be in general, and a report that records the wrong one
+        is worse than a report that records nothing: `judge_provider`,
+        `judge_model` and `judge_prompt_hash` exist precisely so a reader can
+        tell whether two runs are comparable.
+        """
+        return self._chat.provider
+
+    @property
+    def model_name(self) -> str:
+        """Model identity of the chat this judge actually calls."""
+        return self._chat.model_name
+
+    @property
+    def prompt_template(self) -> str:
+        """The template this judge actually renders, for provenance hashing."""
+        return self._prompt_template
+
     async def judge(
         self, *, query: str, answer: str, sources: Sequence[str]
     ) -> FaithfulnessVerdict:

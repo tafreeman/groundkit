@@ -27,7 +27,14 @@ egress amplification are not bounded by a loopback bind). ``grk eval
 --synthesis`` runs the planted-marker citation-echo check (SPEC.md §2)
 against a real chat provider, writing its own artifact — there is
 deliberately no offline double for it, because an echo number from one would
-be noise presented as a measurement.
+be noise presented as a measurement. ``grk eval --judge`` (requires
+``--synthesis``) is a separate pass over the same chat provider: it
+synthesizes an answer for every golden-corpus query against this run's best
+available retrieval stage and runs the advisory faithfulness judge over each
+one, folding the outcome counts into the main report's ``synthesis`` field
+(``groundkit.evals.synthesis_eval``, ADR-0018 decision 6) rather than into
+the echo check's own artifact — the two share a chat provider but measure
+different things and were structure without a producer until this landed.
 
 Phase 4 adds ``serve`` and ``serve-mcp``, the read-only service surface: one
 FastAPI app carrying both the REST routes and the mounted MCP streamable-HTTP
@@ -74,7 +81,7 @@ from groundkit.evals.echo import (
 )
 from groundkit.evals.judge import FaithfulnessJudge
 from groundkit.evals.runner import MIN_EVAL_TOP_K, run_eval, write_report
-from groundkit.evals.schema import EvalReport
+from groundkit.evals.schema import EvalReport, SynthesisReport
 from groundkit.index.dense import InMemoryVectorStore, LanceDBVectorStore
 from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.indexer import Indexer
@@ -316,6 +323,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "running chat provider: there is deliberately no offline double for this "
             "check, because an echo number from one would be noise presented as a "
             "measurement (SPEC.md §2)."
+        ),
+    )
+    eval_parser.add_argument(
+        "--judge",
+        action="store_true",
+        help=(
+            "Also synthesize an answer for every golden-corpus query, over this run's "
+            "best available retrieval stage, and run the advisory faithfulness judge "
+            "over each one — folding the result into the main report's 'synthesis' "
+            "field. Requires --synthesis. Advisory only: the verdict tallies are "
+            "reported and gate nothing — the exit code does not depend on them "
+            "(SPEC.md §6; uncalibrated against human labels)."
         ),
     )
     _add_embedding_args(eval_parser)
@@ -803,6 +822,15 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
             "--chat-provider/--chat-model/--chat-base-url/--chat-api-key-env require "
             "--synthesis; without --synthesis the eval never touches a chat provider"
         )
+    if args.judge and not args.synthesis:
+        # SynthesisReport's docstring (evals/schema.py) states this exact
+        # requirement: a report with half a judge record would describe a
+        # run that could not have happened, so --judge cannot run without
+        # --synthesis also being enabled.
+        raise ConfigurationError(
+            "--judge requires --synthesis; without --synthesis there is no "
+            "synthesized answer for the judge to evaluate"
+        )
 
     judgments_path = Path(args.judgments)
     if not judgments_path.is_file():
@@ -812,6 +840,7 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
         raise EvalError(f"judgments file not found: {judgments_path}")
 
     embedder: EmbeddingProtocol | None = None
+    chat: ChatProtocol | None = None
     try:
         vector_store: VectorStoreProtocol | None = None
         if args.dense:
@@ -824,6 +853,16 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
         reranker = (
             CrossEncoderReranker(args.rerank_model or DEFAULT_RERANK_MODEL) if args.rerank else None
         )
+        if args.synthesis:
+            # Built once, here, and reused below for the echo check too:
+            # both need the same configured chat provider, and constructing
+            # it is cheap (no network call happens at construction time).
+            chat = build_chat(_resolve_chat_config(args))
+        # `chat is not None` is always true here when args.judge is set — the
+        # "--judge requires --synthesis" check above already rejected the
+        # only case where it would not be — but it is spelled out so mypy
+        # can narrow `chat` from `ChatProtocol | None` without an assert.
+        judge = FaithfulnessJudge(chat) if args.judge and chat is not None else None
         report = await run_eval(
             Path(args.corpus_dir),
             judgments_path,
@@ -839,33 +878,40 @@ async def _cmd_eval(args: argparse.Namespace) -> int:
             # parameter for library callers, and RunConfig records whatever
             # was used either way.
             rerank_candidates=MAX_TOP_K,
+            # Only passed through when --judge is set: --synthesis alone
+            # still means exactly what it always has — the echo check below
+            # — and does not by itself fold anything into report.synthesis.
+            chat=chat if args.judge else None,
+            judge=judge,
         )
-    finally:
-        await _maybe_aclose(embedder)
 
-    output_path = Path(args.output)
-    write_report(report, output_path)
+        output_path = Path(args.output)
+        write_report(report, output_path)
 
-    echo_report: EchoReport | None = None
-    if args.synthesis:
-        # The echo check builds its own synthetic marker corpus per run in an
-        # OS temp directory (its markers are generated fresh, so nesting the
-        # result inside the golden-corpus report would claim a provenance the
-        # two runs do not share — ADR-0018). It writes its own artifact.
-        chat: ChatProtocol | None = None
-        try:
-            chat = build_chat(_resolve_chat_config(args))
+        echo_report: EchoReport | None = None
+        if chat is not None:
+            # chat is non-None exactly when args.synthesis was set (built
+            # above). The echo check builds its own synthetic marker corpus
+            # per run in an OS temp directory (its markers are generated
+            # fresh, so nesting the result inside the golden-corpus report
+            # would claim a provenance the two runs do not share —
+            # ADR-0018). It writes its own artifact, and reuses this same
+            # `chat` the judge pass above did rather than constructing a
+            # second provider.
             with tempfile.TemporaryDirectory() as tmp_dir:
                 echo_report = await run_echo_check(chat, corpus_dir=Path(tmp_dir))
-        finally:
-            await _maybe_aclose(chat)
-        write_echo_report(echo_report, DEFAULT_ECHO_REPORT_PATH)
+            write_echo_report(echo_report, DEFAULT_ECHO_REPORT_PATH)
+    finally:
+        await _maybe_aclose(embedder)
+        await _maybe_aclose(chat)
 
     if args.json:
         print(json.dumps(report.model_dump(), indent=2))
         return 0
 
     _print_eval_summary(report, output_path)
+    if report.synthesis is not None:
+        _print_synthesis_summary(report.synthesis)
     if echo_report is not None:
         _print_echo_summary(echo_report)
     return 0
@@ -886,6 +932,29 @@ def _print_echo_summary(report: EchoReport) -> None:
     )
     print(f"  chat: provider={report.chat_provider} model={report.chat_model}")
     print(f"  echo report written to {DEFAULT_ECHO_REPORT_PATH}")
+
+
+def _print_synthesis_summary(report: SynthesisReport) -> None:
+    """Print the golden-corpus synthesis pass's outcome counts and, if run, the judge's.
+
+    Every count is printed unconditionally, matching :func:`_print_echo_summary`
+    and :func:`_print_eval_summary`'s shared no-filtering rule. The judge
+    line is labeled "advisory" in the output itself and only appears when
+    ``report.judged_count`` is set — SynthesisReport's judge fields are
+    all-or-nothing, so checking one stands in for all seven.
+    """
+    print(
+        f"synthesis ({report.input_stage}): answered={report.answered_count} "
+        f"abstained={report.abstained_count} rejected={report.rejected_count}"
+    )
+    print(f"  chat: provider={report.synthesis_provider} model={report.synthesis_model}")
+    if report.judged_count is not None:
+        print(
+            f"judge (advisory, uncalibrated): judged={report.judged_count} "
+            f"faithful={report.faithful_count} unfaithful={report.unfaithful_count} "
+            f"errors={report.judge_error_count}"
+        )
+        print(f"  chat: provider={report.judge_provider} model={report.judge_model}")
 
 
 def _print_eval_summary(report: EvalReport, output_path: Path) -> None:

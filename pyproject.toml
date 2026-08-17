@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "groundkit"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "Grounded, citation-verifiable hybrid retrieval: persisted BM25 + dense index, MCP server, and a retrieval eval harness. Local-first."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -101,6 +101,24 @@ otel = [
   "opentelemetry-exporter-otlp-proto-http>=1.27,<2",
   "opentelemetry-exporter-otlp-proto-grpc>=1.27,<2",
 ]
+# PDF and HTML content extraction (ADR-0016 decisions 3, 5; Wave 3 of
+# docs/specs/loaders-extracted-and-remote-sources.md). ADR-0015's rule decides
+# this the same way it decided `dense`/`rerank` above: `grk ingest` itself
+# works without either -- a `.pdf`/`.html` file is an input the command may be
+# *given*, so its parser is an option, not the command. URL fetching needs
+# neither extra (`httpx` is already base). Mirrored into the dev group below,
+# unlike `rerank`: both pypdf and beautifulsoup4 are pure Python with no
+# compiled extension (no per-platform wheel risk, no multi-gigabyte install
+# the way torch is for rerank), so there is no reason CI's default job should
+# skip exercising either backend behind a separate gated suite -- the sole-
+# proof-non-continue-on-error rule (SPEC.md §3) is satisfied by the default
+# test suite itself.
+pdf = [
+  "pypdf>=6.15,<7",
+]
+html = [
+  "beautifulsoup4>=4.12,<5",
+]
 
 [project.scripts]
 grk = "groundkit.cli:main"
@@ -117,6 +135,8 @@ dev = [
   "opentelemetry-sdk>=1.27,<2",
   "opentelemetry-exporter-otlp-proto-http>=1.27,<2",
   "opentelemetry-exporter-otlp-proto-grpc>=1.27,<2",
+  "pypdf>=6.15,<7",
+  "beautifulsoup4>=4.12,<5",
 ]
 # Docs site (Phase 7). A separate group, not part of `dev`: the docs build is
 # its own CI job and its own gate, and every other job — lint, typecheck, the

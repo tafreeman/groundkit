@@ -902,6 +902,87 @@ def test_eval_rerank_model_without_rerank_fails_before_touching_corpus_or_judgme
     assert not output.exists()
 
 
+# --- --judge: argument validation. No end-to-end run through main() here —
+# --judge (like --synthesis) needs a live chat provider, and build_chat only
+# ever constructs "ollama" or "openai_compatible" (ScriptedChatProvider is
+# deliberately unreachable through it), so an end-to-end run would need a
+# real or reachable provider. The judge/synthesis LOGIC itself is exercised
+# directly, bypassing the CLI, in tests/test_synthesis_eval.py and
+# tests/test_runner.py's TestSynthesisPass.
+
+
+def test_eval_judge_flag_defaults_to_false_and_parses_when_supplied() -> None:
+    """The parser accepts --judge and it defaults to False when absent."""
+    assert _build_parser().parse_args(["eval"]).judge is False
+    assert _build_parser().parse_args(["eval", "--judge"]).judge is True
+
+
+def test_eval_judge_without_synthesis_fails_closed(
+    eval_corpus: Path,
+    eval_judgments: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--judge without --synthesis is an error, mirroring the --rerank-model rule.
+
+    SynthesisReport's docstring (evals/schema.py) states this exact
+    requirement literally: a report with half a judge record would describe
+    a run that could not have happened.
+    """
+    output = tmp_path / "results" / "latest.json"
+    assert (
+        main(
+            [
+                "eval",
+                "--corpus-dir",
+                str(eval_corpus),
+                "--judgments",
+                str(eval_judgments),
+                "--output",
+                str(output),
+                "--judge",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "--judge" in err
+    assert "requires --synthesis" in err
+
+
+def test_eval_judge_without_synthesis_fails_before_touching_corpus_or_judgments(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Flag validation runs before any corpus read, judgments load, or chat build.
+
+    Both the corpus dir and the judgments path are nonexistent, and no
+    --chat-* flags are supplied (so build_chat would fall back to its
+    Ollama default and could hang on a real connection attempt if this
+    check did not run first).
+    """
+    output = tmp_path / "results" / "latest.json"
+    assert (
+        main(
+            [
+                "eval",
+                "--corpus-dir",
+                str(tmp_path / "no-such-corpus"),
+                "--judgments",
+                str(tmp_path / "no-such-judgments.jsonl"),
+                "--output",
+                str(output),
+                "--judge",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "requires --synthesis" in err
+    assert "judgments file not found" not in err
+    assert not output.exists()
+
+
 # --- Rerank provenance and attribution printing, driven by a hand-built
 # EvalReport rather than a real CrossEncoderReranker. The 'rerank' extra
 # (torch, multi-gigabyte) is deliberately absent from the dev group, so these
@@ -1097,3 +1178,58 @@ def test_answer_citation_labels_preserve_source_numbers(
     out = capsys.readouterr().out
     assert "[3] doc-3.txt#0-13" in out
     assert "[1] doc-3.txt" not in out
+
+
+def test_print_synthesis_summary_without_judge(capsys: pytest.CaptureFixture[str]) -> None:
+    """No live chat provider needed: this drives the printer directly with a
+    hand-built ``SynthesisReport``, the same way
+    ``test_answer_citation_labels_preserve_source_numbers`` drives
+    ``_print_answer_report`` directly rather than through ``main()``.
+    """
+    from groundkit.cli import _print_synthesis_summary
+    from groundkit.evals.schema import SynthesisReport
+
+    report = SynthesisReport(
+        input_stage="bm25",
+        synthesis_provider="ollama",
+        synthesis_model="llama3",
+        synthesis_prompt_hash="a" * 64,
+        redacted=False,
+        answered_count=2,
+        abstained_count=1,
+        rejected_count=0,
+    )
+    _print_synthesis_summary(report)
+    out = capsys.readouterr().out
+    assert "synthesis (bm25): answered=2 abstained=1 rejected=0" in out
+    assert "provider=ollama model=llama3" in out
+    assert "judge" not in out
+
+
+def test_print_synthesis_summary_with_judge_labels_it_advisory(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from groundkit.cli import _print_synthesis_summary
+    from groundkit.evals.schema import SynthesisReport
+
+    report = SynthesisReport(
+        input_stage="fusion",
+        synthesis_provider="ollama",
+        synthesis_model="llama3",
+        synthesis_prompt_hash="a" * 64,
+        redacted=True,
+        answered_count=1,
+        abstained_count=0,
+        rejected_count=0,
+        judge_provider="ollama",
+        judge_model="llama3",
+        judge_prompt_hash="b" * 64,
+        judged_count=1,
+        faithful_count=1,
+        unfaithful_count=0,
+        judge_error_count=0,
+    )
+    _print_synthesis_summary(report)
+    out = capsys.readouterr().out
+    assert "synthesis (fusion): answered=1 abstained=0 rejected=0" in out
+    assert "judge (advisory, uncalibrated): judged=1 faithful=1 unfaithful=0 errors=0" in out

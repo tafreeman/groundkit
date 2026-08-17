@@ -31,7 +31,7 @@ from pydantic import BaseModel
 
 from groundkit.contracts import Citation, SearchResponse
 from groundkit.errors import ConfigurationError, RerankerNotConfiguredError, RetrievalError
-from groundkit.index.metadata import SCHEMA_VERSION
+from groundkit.index.metadata import SCHEMA_VERSION, is_groundkit_store
 from groundkit.retrieval.citations import resolve_citation
 from groundkit.retrieval.search import MAX_TOP_K
 from groundkit.service.schemas import (
@@ -315,9 +315,17 @@ async def handle_list_collections(
 ) -> list[str]:
     """Return the names of collections in the index directory.
 
-    Enumeration opens nothing. ``SQLiteMetadataStore.open`` applies the schema
-    and stamps PRAGMAs, so opening each candidate to confirm it is a groundkit
-    collection would make *listing* a write.
+    Enumeration writes nothing. ``SQLiteMetadataStore.open`` applies the schema
+    and stamps PRAGMAs, so confirming a candidate by *opening* it would make
+    listing a write — which is why each candidate is checked with
+    :func:`~groundkit.index.metadata.is_groundkit_store` instead, a read-only
+    (``mode=ro``) identity probe.
+
+    That check is not cosmetic. Advertising every ``*.sqlite3`` meant an
+    unrelated database a user happened to leave here was reported as a
+    collection, and a caller who then asked ``index_status`` for it had
+    groundkit's four tables written into it. Filtering here and refusing in
+    ``open`` close the two halves of that.
 
     Each candidate is checked for containment before its name is reported, so a
     planted symlink (``evil.sqlite3 -> /etc/passwd``) resolves outside the base
@@ -334,6 +342,9 @@ async def handle_list_collections(
     for path in sorted(ctx.index_dir.glob("*.sqlite3")):
         if not is_within_base(str(path), ctx.index_dir):
             logger.debug("Skipping %s: resolves outside the index directory", path.name)
+            continue
+        if not is_groundkit_store(path):
+            logger.debug("Skipping %s: not a groundkit collection", path.name)
             continue
         names.append(path.stem)
     return names

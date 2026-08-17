@@ -11,20 +11,34 @@ import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from groundkit.errors import RetrievalError
+from groundkit import extraction
+from groundkit.errors import IngestionError, RetrievalError
 from groundkit.utils.path_safety import ensure_within_base
 
 if TYPE_CHECKING:
     from groundkit.contracts import Citation
 
 
-#: Identity strings of every extractor this build can re-run a citation
-#: through. Empty in Waves 1-2 by design, not a TODO: no PDF/HTML extractor
-#: is wired in yet (Wave 3, ADR-0016 decisions 3/5), so no extractor
-#: identity is ever active, and every `extracted` citation correctly refuses
-#: regardless of what it recorded. Wave 3 populates this per extractor it
-#: ships; the membership check below does not change shape when it does.
-_ACTIVE_EXTRACTOR_IDENTITIES: frozenset[str] = frozenset()
+def _slice_verified_span(text: str, citation: Citation) -> str:
+    """Slice ``citation``'s offsets out of ``text``, or raise the drift verdict.
+
+    Shared by every branch that has *obtained* text by whatever means its
+    source class requires (a raw read or a fresh extraction) — once ``text``
+    exists, checking and slicing the offsets is identical regardless of how it
+    was produced. Wave 4's snapshot read becomes a third caller.
+
+    Raises:
+        RetrievalError: ``citation.end_offset`` exceeds ``len(text)`` —
+            ``verdict="drifted"``.
+    """
+    if citation.end_offset > len(text):
+        raise RetrievalError(
+            f"Cited span [{citation.start_offset}:{citation.end_offset}] exceeds "
+            f"source length ({len(text)}) for {citation.source!r} — source changed "
+            "since indexing",
+            verdict="drifted",
+        )
+    return text[citation.start_offset : citation.end_offset]
 
 
 async def resolve_citation(citation: Citation, allowed_base_dir: Path) -> str:
@@ -43,13 +57,16 @@ async def resolve_citation(citation: Citation, allowed_base_dir: Path) -> str:
       PDF as UTF-8 raises; reading an HTML file returns markup the offsets were
       never measured against. Resolving one needs the *same* extractor that
       produced it, and re-running a different version silently shifts every
-      offset after the first difference — so this compares the citation's
-      recorded extractor identity against :data:`_ACTIVE_EXTRACTOR_IDENTITIES`,
-      the set this build can actually re-run a citation through (ADR-0016
-      decision 2). That set is empty until Wave 3 ships a real extractor, so
-      every ``extracted`` citation refuses today regardless of what it
-      recorded — a correct answer for a build with zero extractors, not a
-      placeholder.
+      offset after the first difference — so this looks the citation's recorded
+      extractor identity up in
+      :func:`~groundkit.extraction.active_extractors` (ADR-0016 decision 2) and
+      refuses when it is absent. On a match the source is re-extracted through
+      that exact extractor and the result takes the same offset/drift check
+      ``text`` does — re-extract, slice, compare, per ADR-0016 decision 1's
+      table. A build with neither the ``pdf`` nor the ``html`` extra installed
+      has an empty registry, so every ``extracted`` citation refuses there —
+      still the correct answer, now for a reason the registry reports rather
+      than a constant nothing could ever populate.
     - ``snapshot`` — ``source`` is a URL. It is refused before it can reach
       :func:`~groundkit.utils.path_safety.ensure_within_base`, and that
       ordering is deliberate: ``ensure_within_base`` validates only that its
@@ -81,27 +98,13 @@ async def resolve_citation(citation: Citation, allowed_base_dir: Path) -> str:
 
     Raises:
         RetrievalError: The source escapes ``allowed_base_dir``, cannot be
-            read, is not valid UTF-8, is shorter than the cited offsets
-            (source changed since indexing — ``verdict="drifted"``), or
-            belongs to a source class or extractor identity this build cannot
-            resolve (``verdict="unresolvable"`` in every other case).
+            read, is not valid UTF-8, fails to re-extract under its recorded
+            extractor, is shorter than the cited offsets (source changed since
+            indexing — ``verdict="drifted"``), or belongs to a source class or
+            extractor identity this build cannot resolve
+            (``verdict="unresolvable"`` in every other case).
     """
-    if citation.source_class == "extracted":
-        if citation.extractor not in _ACTIVE_EXTRACTOR_IDENTITIES:
-            raise RetrievalError(
-                f"cannot resolve an 'extracted' citation for {citation.source!r}: "
-                f"the extractor identity recorded at ingest ({citation.extractor!r}) "
-                "is not active in this build "
-                f"({sorted(_ACTIVE_EXTRACTOR_IDENTITIES) or 'none registered'}). "
-                "Re-deriving these offsets needs the exact extractor that produced "
-                "them; refused rather than guessing (ADR-0016 decision 2).",
-                verdict="unresolvable",
-            )
-        # Unreachable while _ACTIVE_EXTRACTOR_IDENTITIES is empty (Waves 1-2).
-        # Wave 3 adds the re-extraction call here: re-run the active extractor
-        # over citation.source, slice [start_offset:end_offset], and return it
-        # — the same shape resolve_citation already has for `text` below.
-    elif citation.source_class == "snapshot":
+    if citation.source_class == "snapshot":
         raise RetrievalError(
             f"cannot resolve a 'snapshot' citation for {citation.source!r}: "
             "verification requires the local snapshot URL ingestion stores at "
@@ -113,29 +116,52 @@ async def resolve_citation(citation: Citation, allowed_base_dir: Path) -> str:
             verdict="unresolvable",
         )
 
+    # `text` and `extracted` share the containment check; they differ only in
+    # how text is obtained from the (already-contained) path.
     try:
         path = ensure_within_base(citation.source, allowed_base_dir)
     except ValueError as exc:
         raise RetrievalError(str(exc), verdict="unresolvable") from exc
 
-    try:
-        text = await asyncio.to_thread(path.read_text, "utf-8")
-    except OSError as exc:
-        raise RetrievalError(
-            f"Cannot read cited source {citation.source!r}: {exc}", verdict="unresolvable"
-        ) from exc
-    except UnicodeDecodeError as exc:
-        raise RetrievalError(
-            f"Cited source {citation.source!r} is not valid UTF-8: {exc}", verdict="unresolvable"
-        ) from exc
+    if citation.source_class == "extracted":
+        registry = extraction.active_extractors()
+        extractor = registry.get(citation.extractor) if citation.extractor else None
+        if extractor is None:
+            raise RetrievalError(
+                f"cannot resolve an 'extracted' citation for {citation.source!r}: "
+                f"the extractor identity recorded at ingest ({citation.extractor!r}) "
+                "is not active in this build "
+                f"({sorted(registry) or 'none registered'}). "
+                "Re-deriving these offsets needs the exact extractor that produced "
+                "them; refused rather than guessing (ADR-0016 decision 2).",
+                verdict="unresolvable",
+            )
+        try:
+            text = await extractor.extract(path)
+        except IngestionError as exc:
+            # Not `drifted`: nothing was successfully re-derived to disagree
+            # with what was indexed, so the check never got far enough to
+            # compare (ADR-0016 decision 6). Symmetric with the OSError /
+            # UnicodeDecodeError handling on the `text` branch below.
+            raise RetrievalError(
+                f"cannot resolve an 'extracted' citation for {citation.source!r}: "
+                f"re-extraction with {extractor.identity} failed: {exc}",
+                verdict="unresolvable",
+            ) from exc
+    else:  # "text"
+        try:
+            text = await asyncio.to_thread(path.read_text, "utf-8")
+        except OSError as exc:
+            raise RetrievalError(
+                f"Cannot read cited source {citation.source!r}: {exc}", verdict="unresolvable"
+            ) from exc
+        except UnicodeDecodeError as exc:
+            raise RetrievalError(
+                f"Cited source {citation.source!r} is not valid UTF-8: {exc}",
+                verdict="unresolvable",
+            ) from exc
 
-    if citation.end_offset > len(text):
-        raise RetrievalError(
-            f"Cited span [{citation.start_offset}:{citation.end_offset}] exceeds "
-            f"source length ({len(text)}) — source changed since indexing",
-            verdict="drifted",
-        )
-    return text[citation.start_offset : citation.end_offset]
+    return _slice_verified_span(text, citation)
 
 
 async def verify_citation(

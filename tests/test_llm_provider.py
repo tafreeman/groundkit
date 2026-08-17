@@ -220,6 +220,26 @@ class TestOllamaChat:
         with pytest.raises(ChatError):
             asyncio.run(chat.complete("x"))
 
+    def test_a_timeout_names_its_exception_type_rather_than_nothing(self) -> None:
+        """A timeout must not render as ``failed:`` with an empty reason.
+
+        ``str(httpx.ReadTimeout())`` is the empty string, so interpolating it
+        produced a message that named the URL and then stopped -- correct
+        scrubbing, zero diagnostic value. Encountered for real while verifying
+        the ``synthesize`` span: three runs went by before a plain 60-second
+        timeout was identifiable as one.
+        """
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("")
+
+        chat = OllamaChat(client=_chat_client(handler))
+        with pytest.raises(ChatError) as exc_info:
+            asyncio.run(chat.complete("x"))
+        message = str(exc_info.value)
+        assert "ReadTimeout" in message
+        assert not message.rstrip().endswith("failed:")
+
     def test_custom_base_url_and_model_are_honored(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content)
