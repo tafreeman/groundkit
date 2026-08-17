@@ -4,12 +4,20 @@
 # credential-free, and `InMemoryEmbedder`'s hash-derived vectors cannot
 # produce a retrieval-quality number without violating SPEC.md §2 — so the
 # only honest dense/fusion delta comes from a real embedding model, which
-# means a running Ollama, which cannot be a precondition of every PR.
+# means a running Ollama, which cannot be a precondition of every PR. The
+# same reasoning applies one level up: `grk eval --synthesis`'s
+# planted-marker citation-echo check has no offline double either (its own
+# help text says so) — a fake chat provider would produce an echo number
+# that is noise presented as a measurement (SPEC.md §2), exactly like a
+# hash-derived dense score. This job now provisions a chat model alongside
+# the embedding model, from the same Ollama service, so that check stops
+# being a point-in-time local measurement that nothing re-runs.
 #
 # This workflow is therefore opt-in and never blocks a PR: it runs on a
 # schedule, on demand, and on a PR only when explicitly labelled. Nothing
 # here is `continue-on-error` — SPEC.md §3 forbids that for a job that is the
-# sole proof of a backend, and this is the sole proof of the Ollama path.
+# sole proof of a backend, and this is the sole proof of the Ollama path —
+# both the embedding half and, now, the chat half.
 name: eval-gated
 
 # TRIGGERS — schedule + label, as SPEC.md §6 specifies.
@@ -46,7 +54,13 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'eval-gated')
-    timeout-minutes: 30
+    # Bumped from 30: the run now also synthesizes and judges an answer for
+    # every golden-corpus query (44 as of this writing) plus 5 echo-check
+    # cases, each a real chat-model call against a CPU-only runner. The
+    # dense/fusion pass alone fit comfortably in 30; the added chat calls
+    # are the reason for the headroom, not evidence the retrieval path got
+    # slower.
+    timeout-minutes: 60
 
     services:
       ollama:
@@ -58,6 +72,12 @@ jobs:
       GROUNDKIT_EVAL_EMBED_MODEL: nomic-embed-text
       GROUNDKIT_EVAL_EMBED_DIMENSIONS: "768"
       GROUNDKIT_EVAL_EMBED_BASE_URL: http://localhost:11434
+      # Chat provider for the --synthesis and --judge passes below. Same
+      # Ollama service as the embedding model above (same base URL,
+      # GROUNDKIT_EVAL_EMBED_BASE_URL) — one server, two models pulled into
+      # it — so there is no second endpoint to wait on or configure, and no
+      # API key or secret: 'ollama' is local by construction.
+      GROUNDKIT_EVAL_CHAT_MODEL: llama3.2:3b
 
     steps:
       - uses: actions/checkout@v7
@@ -90,26 +110,63 @@ jobs:
           curl -sf "$GROUNDKIT_EVAL_EMBED_BASE_URL/api/tags" \
             | grep -q "$GROUNDKIT_EVAL_EMBED_MODEL"
 
+      - name: Pull the chat model
+        run: |
+          curl -sf -X POST "$GROUNDKIT_EVAL_EMBED_BASE_URL/api/pull" \
+            -H 'Content-Type: application/json' \
+            -d "{\"name\": \"$GROUNDKIT_EVAL_CHAT_MODEL\"}" \
+            -o /dev/null
+          # Same "prove residency, don't trust the pull's exit code" reasoning
+          # as the embedding model above.
+          curl -sf "$GROUNDKIT_EVAL_EMBED_BASE_URL/api/tags" \
+            | grep -q "$GROUNDKIT_EVAL_CHAT_MODEL"
+
       - name: Run the gated eval tests
         env:
           EVAL_GATED: "1"
         run: uv run pytest tests/test_eval_gated.py -v
 
-      # Produces the artifact a human reads for the actual delta. The tests
-      # above assert the run is honest; this step is what makes the numbers
-      # available, since no metric value may be committed to a doc
-      # (SPEC.md §2) and `evals/results/` is gitignored.
+      # Produces the artifacts a human reads for the actual delta. The tests
+      # above assert the dense/fusion run is honest; this step is what makes
+      # the numbers available, since no metric value may be committed to a
+      # doc (SPEC.md §2) and `evals/results/` is gitignored.
+      #
+      # --synthesis adds the planted-marker citation-echo check, writing its
+      # own artifact (evals/results/echo-latest.json). --judge additionally
+      # synthesizes and judges an answer for every golden-corpus query,
+      # folding the verdicts into the main report's `synthesis` field.
+      # Both are included deliberately: the judge is schema-validated and
+      # exercises a real chat provider end-to-end, so a regression in its
+      # own plumbing (not just its verdicts) gets caught here rather than
+      # nowhere. It stays advisory exactly as SPEC.md §6 requires — nothing
+      # in this workflow inspects the verdict tallies, so only a hard
+      # failure (an unreachable provider, a malformed response) can fail
+      # this step, never a "the answer scored low" judgement. That is the
+      # same fail-loud-once-the-gate-is-open behavior the pull-and-verify
+      # steps above already follow, not a new pattern.
       - name: Generate the real-model eval report
         run: |
           uv run grk eval --dense \
             --embed-provider ollama \
             --embed-model "$GROUNDKIT_EVAL_EMBED_MODEL" \
             --embed-dimensions "$GROUNDKIT_EVAL_EMBED_DIMENSIONS" \
-            --embed-base-url "$GROUNDKIT_EVAL_EMBED_BASE_URL"
+            --embed-base-url "$GROUNDKIT_EVAL_EMBED_BASE_URL" \
+            --synthesis \
+            --judge \
+            --chat-provider ollama \
+            --chat-model "$GROUNDKIT_EVAL_CHAT_MODEL" \
+            --chat-base-url "$GROUNDKIT_EVAL_EMBED_BASE_URL"
 
       - name: Upload the eval report
         uses: actions/upload-artifact@v4
         with:
           name: eval-report-real-model
           path: evals/results/latest.json
+          if-no-files-found: error
+
+      - name: Upload the echo report
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-echo
+          path: evals/results/echo-latest.json
           if-no-files-found: error
