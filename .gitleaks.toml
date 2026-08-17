@@ -28,7 +28,20 @@
 # the failure this file exists to fix, so the extend is load-bearing.
 useDefault = true
 
-[[allowlists]]
+# SINGULAR `[allowlist]`, not the plural `[[allowlists]]` array-of-tables.
+# The plural form is the newer spelling and is what a current gitleaks release
+# documents, but `gitleaks-action@v3` pins 8.24.3, which parses the config
+# without complaint and then ignores a global `[[allowlists]]` block entirely:
+# the run logs "using existing gitleaks config" and "extending config with
+# default config", and still reports the finding. The singular table has been
+# the global-allowlist spelling since 8.0 and is still honoured by current
+# releases, so it is the form that works on both. Verified against a real
+# binary in both directions -- the commit-range scan that reproduced the CI
+# failure now reports no leaks, and a canary file is still caught
+# (aws-access-token, slack-bot-token) while a sentinel beside it is suppressed.
+#
+# If this ever regresses, check the action's pinned gitleaks version first.
+[allowlist]
 description = "Planted non-secret sentinels in tests/test_url_redaction.py"
 # Matched against the detected secret itself, and deliberately spelled as the
 # two exact literal values rather than as a path exemption. A path rule
