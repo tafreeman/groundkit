@@ -55,7 +55,11 @@ from groundkit import extraction
 from groundkit.contracts import Document
 from groundkit.errors import IngestionError
 from groundkit.utils.path_safety import ensure_within_base
-from groundkit.utils.url_safety import ensure_safe_endpoint, sanitize_url
+from groundkit.utils.url_safety import (
+    credential_query_params,
+    ensure_safe_endpoint,
+    sanitize_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,12 +139,22 @@ def _reject_unsafe_url_shape(source: str) -> None:
     then store a URL that never worked. Refusing names the problem at the point
     the caller can still fix it.
 
+    **A credential-shaped query parameter is refused for the same reason.**
+    Permitting query strings in general is still right — ``?id=42`` is ordinary
+    in a document URL — but ``?token=sk-live-…`` is the userinfo leak wearing a
+    different hat, and it reached storage for exactly as long as this function
+    checked only the authority. Which names count is
+    :data:`~groundkit.utils.url_safety.CREDENTIAL_QUERY_PARAMS`; why this is a
+    refusal rather than a redaction (``Document.source`` is a UNIQUE identity,
+    and ``sanitize_url`` would collapse ``?id=42`` with ``?id=43``) is argued on
+    :func:`~groundkit.utils.url_safety.credential_query_params`.
+
     Args:
         source: The URL to check.
 
     Raises:
-        IngestionError: The scheme is not http/https, the host is empty, or the
-            URL carries userinfo.
+        IngestionError: The scheme is not http/https, the host is empty, the
+            URL carries userinfo, or a query parameter names a credential.
     """
     parsed = urlsplit(source)
     if parsed.scheme not in ("http", "https"):
@@ -157,6 +171,16 @@ def _reject_unsafe_url_shape(source: str) -> None:
             "Document.source for provenance, so the credential would be persisted "
             "to the index and returned in every citation built from it. Supply "
             "credentials out of band rather than in the locator."
+        )
+    if offenders := credential_query_params(source):
+        named = ", ".join(repr(name) for name in offenders)
+        raise IngestionError(
+            f"refusing to fetch a URL carrying a credential in its query string "
+            f"({sanitize_url(source)!r}): the parameter(s) {named} name a secret, "
+            "and this loader records the URL verbatim as Document.source for "
+            "provenance — so the value would be persisted to the index, returned "
+            "in every citation built from it, and written to the ingest log. "
+            "Supply credentials out of band rather than in the locator."
         )
 
 
