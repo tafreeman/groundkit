@@ -323,16 +323,17 @@ rather than one being built under it.
   metric and loses another reports as `MIXED` instead of hiding half the
   result.
 - `EVAL_GATED=1` gates a real-model run (`tests/test_eval_gated.py`,
-  `.github/workflows/eval-gated.yml`). The workflow is **`workflow_dispatch`
-  only** during active development: every run pulls an embedding model, the
-  eval is run locally far more often than a weekly cron would add value, and
-  a schedule firing against a moving branch produces results nobody reads,
-  which is how a gate becomes noise. SPEC.md §6's "on schedule/label" wording
-  is therefore not yet satisfied by this workflow, deliberately and with the
-  reinstatement noted in the file itself — the schedule and the label trigger
-  are commented in place, and the job's label-gating condition is left inert
-  rather than deleted, so re-enabling in Phase 7 is a two-line change.
-  Skipping cleanly is the *default* outcome; the gated
+  `.github/workflows/eval-gated.yml`). At the time this wave landed, the
+  workflow was **`workflow_dispatch` only**: every run pulls an embedding
+  model, the eval was run locally far more often than a weekly cron would add
+  value, and a schedule firing against a moving branch produces results
+  nobody reads, which is how a gate becomes noise. SPEC.md §6's "on
+  schedule/label" wording was therefore deliberately not satisfied yet, with
+  the schedule and label trigger commented in place and the job's
+  label-gating condition left inert rather than deleted — re-enabling was
+  reserved for Phase 7, and has since happened: the workflow now runs on
+  schedule, on demand, and on a labelled PR. Skipping cleanly is the *default*
+  outcome; the gated
   tests assert the run reports honestly and deliberately **do not** assert
   that dense or fusion beats BM25, since a test that reddens on a loss would
   pressure the next person to grow the corpus until it passes.

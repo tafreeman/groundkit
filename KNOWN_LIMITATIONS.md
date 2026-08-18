@@ -420,8 +420,10 @@ per SPEC.md §9:
   Every Phase 4 response is unauthenticated by construction (ADR-0014
   decision 1): the shared-secret header SPEC.md §7 requires for mutating
   routes is not built, because the set of mutating operations is empty. The
-  loopback bind is therefore the service's only access control (decision 7),
-  and `--allow-remote-access` exposes an unauthenticated, content-bearing
+  loopback bind is therefore what decides who can reach the service at all
+  (decision 7) — `Host` validation (ADR-0024) decides which of the requests
+  that do arrive are answered, and neither is authentication — and
+  `--allow-remote-access` exposes an unauthenticated, content-bearing
   surface — document text and absolute source paths over `search`,
   collection topology over `index_status` and `list_collections` — to
   anyone who can reach the port.

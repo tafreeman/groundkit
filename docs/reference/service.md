@@ -11,9 +11,17 @@ is the mechanism by which "Phase 4 is read-only" is *enforced* rather than
 asserted: `ToolSpec.side_effect` is a closed `Literal` with one member, and
 widening it is a change `mypy --strict` blocks until someone makes it visibly.
 
-There is no authentication. The loopback bind is the only access control — see
-[Security](../security.md) and [Known limitations](../limitations.md), and
-[the MCP client guide](../guides/mcp-clients.md) for how to connect one.
+There is no authentication, on either transport. Two controls stand in its
+place and they stop different callers: the bind address decides who can reach
+the port at all, and `Host` validation (ADR-0024) decides which requests are
+answered once they arrive — the second exists because a browser can be walked
+onto a loopback socket by DNS rebinding without its owner ever routing to it.
+Neither is authentication, and a deliberately published bind
+(`--allow-remote-access`) turns the second off by design. See
+[Security](../security.md) and [Known limitations](../limitations.md) for what
+that leaves open, [the deployment guide](../guides/deployment.md) for choosing
+a bind, and [the MCP client guide](../guides/mcp-clients.md) for how to connect
+a client.
 
 ## Operations
 

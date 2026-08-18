@@ -190,6 +190,16 @@ streamable-HTTP-capable client at `http://<host>:<port>/mcp`, using whatever
 `--host` and `--port` you passed to `grk serve` (loopback by default — see
 below).
 
+Reach it by `127.0.0.1`, `localhost` or `[::1]` and nothing else is required.
+If you point a *custom* hostname at the service — a `hosts` entry, a local DNS
+alias, a tunnel that rewrites the `Host` header — the request is refused with
+400 (REST) or 421 (`/mcp`) unless that name resolves to loopback, because the
+service validates the `Host` header on both transports
+([ADR-0024](../adr/ADR-0024-host-header-validation-on-both-transports.md)). A
+deliberately published bind (`--allow-remote-access`) accepts any `Host`. Note
+the matcher is case-sensitive and does not strip a trailing root dot, so
+`LOCALHOST` and `localhost.` are refused where `localhost` is accepted.
+
 Both transports — stdio from `grk serve-mcp` and streamable HTTP from
 `grk serve` — dispatch through the same operation registry
 ([ADR-0014](../adr/ADR-0014-read-only-service-surface-and-outbound-endpoint-safety.md)
@@ -203,11 +213,17 @@ error rendering, and — only for the HTTP path — the socket it binds.
 
     Every operation above is read-only, and that emptiness is what lets the
     shared-secret header SPEC.md §7 asks for be skipped rather than built:
-    there is nothing mutating to guard. The **loopback bind is the only
-    access control this server has.** By default it binds `127.0.0.1` and
-    refuses to bind anything else unless you pass `--allow-remote-access` —
-    and that flag does exactly what it says: it publishes your document
-    content and absolute filesystem paths to anyone who can reach the port.
+    there is nothing mutating to guard. **Two controls stand in place of a
+    credential, and neither is one.** The bind decides who can open a
+    connection: by default `127.0.0.1`, and it refuses anything else unless
+    you pass `--allow-remote-access` — a flag that does exactly what it says,
+    publishing your document content and absolute filesystem paths to anyone
+    who can reach the port. `Host` validation decides which requests are
+    answered once a connection exists, which is what stops a web page using
+    your own browser to read a loopback port it could never route to
+    ([ADR-0024](../adr/ADR-0024-host-header-validation-on-both-transports.md)).
+    A published bind switches the second off deliberately, since it protects
+    nobody who could already connect directly.
     `search` responses carry source text; `index_status` and
     `list_collections` carry collection topology. None of it is behind a
     credential.

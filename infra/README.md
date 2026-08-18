@@ -24,6 +24,22 @@ spec, and they are worth reading before editing any file in this tree:
 vacuously, so the address the service is reachable at is its *entire* access
 control. A `search` response carries document text and absolute source paths.
 
+The service also validates the `Host` header on both transports now
+([ADR-0024](../docs/adr/ADR-0024-host-header-validation-on-both-transports.md)),
+but `derive_host_allow_list` turns that check off the moment the bind is
+routable, and every surface in this directory binds `0.0.0.0` deliberately —
+that is the whole point of the `--allow-remote-access` flag below. So `Host`
+validation does not apply to anything in `infra/`: it is not a second layer
+behind the network control each surface re-establishes, it is not present at
+all. Do not read the compose, Kubernetes or Terraform paths as gaining a
+defense they did not have before `b096a39` — the boundary here is, and stays,
+the network control in front of the bind: the loopback publish, the
+`ClusterIP` + `NetworkPolicy`, the security group with no ingress rules. Only
+a *host-side* `grk serve` (outside a container, on its default `127.0.0.1`
+bind) enforces `Host` — see
+[the deployment guide](../docs/guides/deployment.md) rather than this file for
+that path.
+
 Inside a container the process must bind `0.0.0.0` or nothing can reach it, so
 that guarantee moves one layer out and each surface here re-establishes it:
 

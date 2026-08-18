@@ -48,8 +48,9 @@ ADR-0014 rather than amend it.
 **The service discloses document content and absolute filesystem paths to
 anyone who can reach the port, with no authentication of any kind.** An
 operator passing `--allow-remote-access` has published their corpus. The
-127.0.0.1 default bind is therefore the service's only access control
-(ADR-0014 decision 7) and it is load-bearing, not a default one can safely
+127.0.0.1 default bind is therefore what decides who can reach the service at
+all (ADR-0014 decision 7; `Host` validation, below, decides which of those
+requests are answered) and it is load-bearing, not a default one can safely
 override without consequence: a non-loopback `--host` is refused unless
 `--allow-remote-access` is also passed, and passing it prints a warning
 naming what is exposed.
@@ -99,7 +100,7 @@ control of the DNS for the operator's *own* bind name plus
 `--allow-remote-access`, which is deeper access than the attack this closes
 needs. It does not apply to an address literal, and so not to the default bind.
 
-Three residuals of that fix, named rather than implied:
+Four residuals of that fix, named rather than implied:
 
 - **Starlette admits any `[::…]`-shaped `Host` on the REST surface.** It
   strips the port by splitting on the *first* colon, so `[::1]:8765` reduces
@@ -128,6 +129,15 @@ Three residuals of that fix, named rather than implied:
   A bind that stays on loopback — including a hostname that resolves there —
   keeps it enforced, and says so in the log rather than claiming a publication
   that did not happen.
+- **The library seam is fail-open.** `create_app` and `create_session_manager`
+  default to an unrestricted allow-list when constructed directly, so an
+  application embedding either of them in its own ASGI stack gets no `Host`
+  check unless it passes `host_allow_list=`. `grk serve` always passes the
+  derived list, and the regression tests assert the property against the
+  CLI-assembled app rather than against the defaults, so the shipped binary is
+  unaffected — but the default is a named constant
+  (`UNRESTRICTED_HOST_ALLOW_LIST`) rather than a safe one, which is a choice
+  ADR-0024 records under Consequences rather than one it hides.
 
 This does not change the **outbound** rebinding gap recorded further down;
 that is the opposite direction and remains open.
