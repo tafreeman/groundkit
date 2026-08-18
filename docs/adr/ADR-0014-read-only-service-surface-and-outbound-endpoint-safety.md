@@ -1,8 +1,20 @@
 # ADR-0014 — Phase 4 is a read-only service surface, and outbound endpoints are guarded
 
-- **Status:** Accepted (owner, 2026-08-15)
+- **Status:** Accepted (owner, 2026-08-15) — **decision 7 amended by
+  [ADR-0024](ADR-0024-host-header-validation-on-both-transports.md)**
 - **Date:** 2026-08-15
 - **Deciders:** Andy Freeman (owner)
+
+!!! warning "Decision 7's threat model was incomplete"
+
+    This ADR argues that the `127.0.0.1` bind *is* the access control, so no
+    authentication is needed. That holds against anyone who must route to the
+    port, and it does **not** hold against a browser: DNS rebinding walks a
+    victim's browser onto a loopback socket the attacker cannot reach directly.
+    ADR-0024 closes it by validating `Host` on both transports, and records why
+    the no-authentication position still stands once it is validated. Read the
+    two together; decision 7 below is retained as written so the amendment has
+    something to amend.
 
 ## Context
 

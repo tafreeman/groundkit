@@ -54,6 +54,84 @@ override without consequence: a non-loopback `--host` is refused unless
 `--allow-remote-access` is also passed, and passing it prints a warning
 naming what is exposed.
 
+**Inbound DNS rebinding is closed, on both transports** (ADR-0024). The bind
+alone was not a boundary against a browser: a page on any site the victim
+visits can re-point its own hostname at `127.0.0.1` with a short-TTL answer,
+after which the browser treats this service as same-origin — no CORS
+preflight, response fully readable — while the connection genuinely arrives
+from loopback. The `Host` header is the only part of such a request that
+still names the attacker, and nothing inspected it. Both surfaces now do,
+from **one** allow-list derived at serve time from the bind address:
+Starlette's `TrustedHostMiddleware` on the REST app (which also covers the
+mounted `/mcp` sub-path) and the MCP SDK's own
+`TransportSecuritySettings` on the streamable-HTTP transport, which the SDK
+defaults *off* for backwards compatibility and which the lower-level API
+groundkit uses does not auto-enable. Only this machine's own names —
+`127.0.0.1`, `localhost`, `[::1]`, with or without a port, **plus the address
+actually bound** if it is not one of those three — are accepted, and the MCP
+transport additionally refuses any `Origin` outside the same set (an absent
+`Origin`, which is what a non-browser client sends, is allowed). The bound
+address is on the list because loopback is a whole `/8`: `grk serve --host
+127.0.0.2` is a legal loopback bind that none of the three canonical spellings
+names, and a fixed list would start that server and then refuse every
+legitimate client on both transports. A forged `Host` is refused on the REST
+surface *and* on `/mcp`, shown to fail against unfixed source in both
+directions, in `tests/test_service_host_validation.py`.
+
+**Whether the check is enforced is decided by resolving the bind host, not by
+whether it was typed as a loopback literal.** Those are different questions
+for exactly one input — a hostname that resolves to loopback — and that one
+input is where the check matters most: `--host localhost
+--allow-remote-access` binds a socket nothing off-box can route to, which is
+precisely the situation DNS rebinding exists to attack. The derivation
+therefore resolves a name and keeps the check on when every answer is
+loopback, and keeps it on when the name does not resolve at all, since
+switching it off requires positive evidence that the socket is routable. An
+address literal is never resolved. The bind guard itself still refuses to
+resolve, and the asymmetry is deliberate: a wrong answer there would publish a
+corpus, while a wrong answer in the allow-list costs at most a refused client
+(ADR-0024 decision 3). Stated plainly rather than implied: this leaves the same
+kind of two-resolution window the **outbound** direction has below, since the
+ASGI server resolves the name again to bind it. Only one direction of it
+matters — a name answering routable to the derivation and loopback to the bind
+would leave an unrestricted list on a loopback socket — and reaching it takes
+control of the DNS for the operator's *own* bind name plus
+`--allow-remote-access`, which is deeper access than the attack this closes
+needs. It does not apply to an address literal, and so not to the default bind.
+
+Three residuals of that fix, named rather than implied:
+
+- **Starlette admits any `[::…]`-shaped `Host` on the REST surface.** It
+  strips the port by splitting on the *first* colon, so `[::1]:8765` reduces
+  to `"["` — which the allow-list must therefore contain for any IPv6
+  loopback client to be served at all, and which also matches other bracketed
+  literals. Not reachable by rebinding: a bracketed address literal is never
+  the product of a DNS answer, so no browser can be made to send one.
+- **Neither matcher normalises `Host` for letter case or a trailing root
+  dot.** `Host` is case-insensitive and the trailing-dot FQDN form is legal,
+  but Starlette compares with `==` and the MCP SDK with `in`, so `LOCALHOST`,
+  `LocalHost:8765` and `localhost.` are refused (400 and 421). This fails
+  **closed** — it is a compatibility gap, never a widening — and is left open
+  on purpose: the trailing dot is one extra entry, but case is not enumerable,
+  so covering the cheap half would read as normalisation while being none. The
+  fix, if a real client ever needs it, is a normalising matcher, which
+  ADR-0024 weighs and rejects. A test pins the current behaviour so a change
+  to it is deliberate.
+- **A bind that is genuinely routable disables the `Host` check entirely**,
+  together with the bind widening `--allow-remote-access` authorises, and logs
+  a warning saying so. This is deliberate (ADR-0024 decision 3): once the port
+  is routable, `Host` validation stops anyone who could not already connect
+  directly, and a restrictive list would break every reverse-proxy and
+  overlay-network deployment — including the one way an operator can put
+  authentication in front of a service that ships none. Note what this is
+  *not*: passing `--allow-remote-access` does not by itself disable the check.
+  A bind that stays on loopback — including a hostname that resolves there —
+  keeps it enforced, and says so in the log rather than claiming a publication
+  that did not happen.
+
+This does not change the **outbound** rebinding gap recorded further down;
+that is the opposite direction and remains open.
+
 **Outbound endpoint safety.** `utils/url_safety.py` validates every
 cloud-provider embedding endpoint in two parts (ADR-0014 decision 10):
 *shape*, checked once at embedder construction — a scheme allow-list, a
@@ -101,7 +179,7 @@ sanitized to `https://user:hunter2@api.example.com/v1/embeddings?api-key=***`
 **Two things this does not close, for either outbound caller, stated plainly
 rather than implied away:**
 
-- **DNS rebinding is not closed.** Between `url_safety`'s resolution and
+- **Outbound DNS rebinding is not closed.** Between `url_safety`'s resolution and
   httpx's own connect-time resolution, the answer can change — the window
   is two resolutions in one process, small, not zero. This applies equally
   to a cloud embedding endpoint and to a URL fetched by `UrlLoader`, since

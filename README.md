@@ -3,25 +3,16 @@
 <!-- Badges are live endpoints only, never hand-written values (SPEC.md §2:
      "Real data only ... numbers come from generated eval artifacts or dynamic
      badges, or are omitted"). A badge showing a stale value is the failure the
-     policy exists to prevent, so nothing here is a literal.
-
-     Only badges that resolve to real state TODAY are present. Three that a
-     released project would carry are deliberately absent until they have
-     something true to report, rather than shipped rendering "not found":
-
-       PyPI version / Python versions   — need the first published release
-                                          (.github/workflows/publish.yml).
-       License                          — shields' github/license endpoint
-                                          needs a public repo; a hand-written
-                                          MIT badge would be exactly the
-                                          literal this policy excludes. The
-                                          LICENSE file and the docs site's
-                                          license page carry it meanwhile.
-
-     Add each one when the thing it reports becomes true. -->
+     policy exists to prevent, so nothing here is a literal — every badge below
+     resolves against a live endpoint (GitHub Actions, PyPI, shields' license
+     lookup), never a hard-coded version, package-index string, or license name.
+     Apply the same rule to any badge added later. -->
 
 [![ci](https://github.com/tafreeman/groundkit/actions/workflows/ci.yml/badge.svg)](https://github.com/tafreeman/groundkit/actions/workflows/ci.yml)
 [![docs](https://github.com/tafreeman/groundkit/actions/workflows/docs.yml/badge.svg)](https://tafreeman.github.io/groundkit/)
+[![PyPI](https://img.shields.io/pypi/v/groundkit)](https://pypi.org/project/groundkit/)
+[![Python versions](https://img.shields.io/pypi/pyversions/groundkit)](https://pypi.org/project/groundkit/)
+[![License](https://img.shields.io/github/license/tafreeman/groundkit)](LICENSE)
 
 ## The problem
 
@@ -53,8 +44,8 @@ server you run yourself — not a hosted product or a chat UI. Today it
 ingests Markdown, plain text, and http(s) URLs; PDF and HTML support exists
 at the library level (extraction, citation re-verification) but isn't wired
 into `grk ingest` yet — see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
-And it isn't on PyPI yet: `pip install groundkit` doesn't work until the
-v0.1.0 release ships, so install from a clone until then.
+`groundkit` is on PyPI: `pip install groundkit`, or install from a clone for
+development — see the Quickstart below.
 
 **Documentation: <https://tafreeman.github.io/groundkit/>**
 
@@ -97,7 +88,8 @@ provider at a cloud endpoint.
 
 ## Status
 
-> **Phases 0–6 done; the v0.1.0 release itself is the only thing left.**
+> **v0.1.0 released 2026-08-18.** All seven phases are done: `pip install
+> groundkit` works.
 > BM25 retrieval, a persisted index, citation-bearing search, and a
 > retrieval eval harness work end-to-end locally with no cloud credentials —
 > see the Quickstart below. Dense and hybrid (RRF) retrieval work too, opt-in
@@ -117,9 +109,7 @@ provider at a cloud endpoint.
 > against a live account). OpenTelemetry spans cover ingest, retrieve and
 > synthesize.
 >
-> **groundkit is not on PyPI yet.** The publish workflow and its blocking
-> release gates exist and the version is at `0.1.0`; what remains is the tag
-> and the published release. One v1 scope item is deliberately unbuilt and
+> **groundkit is on PyPI.** One v1 scope item is deliberately unbuilt and
 > named as such — **PDF/HTML ingestion**, whose extractors and citation
 > re-verification landed but whose ingest-side loader did not (see
 > [SPEC.md](SPEC.md) §4.1). URL ingestion shipped: `grk ingest` fetches an
@@ -133,10 +123,13 @@ provider at a cloud endpoint.
 ## Quickstart
 
 ```bash
-uv sync
-uv run grk ingest ./docs
-uv run grk search "your query" --json
+pip install groundkit
+grk ingest ./docs
+grk search "your query" --json
 ```
+
+For development from a clone, use `uv sync` and prefix each command with
+`uv run` instead.
 
 Ingestion is incremental (unchanged files are skipped by content hash), the
 index persists under `.groundkit/` and survives restarts, and every result

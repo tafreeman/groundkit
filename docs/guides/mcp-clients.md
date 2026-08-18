@@ -23,16 +23,12 @@ repo. This page is that config.
 
 ## Prerequisites
 
-groundkit is not yet published to PyPI, so `pip install groundkit` does not
-work today — it arrives with the v0.1.0 release. Until then, install from a
-clone (see [Installation](../getting-started/installation.md) for the full
-walkthrough):
-
 ```bash
-git clone https://github.com/tafreeman/groundkit
-cd groundkit
-uv sync
+pip install groundkit
 ```
+
+(see [Installation](../getting-started/installation.md) for installing from
+a clone instead, e.g. for development).
 
 No extra is needed for the server. FastAPI, its ASGI server (the underlying
 process that actually speaks HTTP), and the MCP SDK are base runtime
@@ -40,8 +36,8 @@ dependencies, not an opt-in like `dense` or `rerank` —
 [ADR-0015](../adr/ADR-0015-service-dependencies-are-base-not-an-extra.md)
 draws the line as "an extra may gate an option on a command, never the
 command itself," and `serve-mcp` is the command SPEC.md §9 names as the
-phase's deliverable. A plain `uv sync` with no extras is enough for a client
-to launch the server.
+phase's deliverable. A plain base install is enough for a client to launch
+the server.
 
 A collection (a named, self-contained index — the unit `grk ingest` and
 `grk search` both operate on) has to exist before you point a client at it —

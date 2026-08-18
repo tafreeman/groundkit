@@ -11,10 +11,14 @@ way to check whether a change made search better or worse.
 Three commands, no credentials, no model server.
 
 ```bash
-uv sync
-uv run grk ingest ./docs
-uv run grk search "citation offsets" --json
+pip install groundkit
+grk ingest ./docs
+grk search "citation offsets" --json
 ```
+
+Working from a clone instead of the published package? The same three
+commands are `uv sync`, then `uv run grk ingest ./docs` and
+`uv run grk search "citation offsets" --json`.
 
 ## What just happened
 

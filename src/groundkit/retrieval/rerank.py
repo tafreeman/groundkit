@@ -173,6 +173,8 @@ def rerank_by_logits(
             document_id=result.document_id,
             chunk_id=result.chunk_id,
             source=result.source,
+            source_class=result.source_class,
+            extractor=result.extractor,
             start_offset=result.start_offset,
             end_offset=result.end_offset,
             metadata=result.metadata,

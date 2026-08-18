@@ -70,10 +70,12 @@ import mcp.types as types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ValidationError
 
 from groundkit import __version__
 from groundkit.errors import ConfigurationError, GroundkitError
+from groundkit.service.binding import UNRESTRICTED_HOST_ALLOW_LIST, HostAllowList
 from groundkit.service.errors import (
     check_collection,
     map_exception,
@@ -429,7 +431,11 @@ async def list_tool_definitions(ctx: ServiceContext) -> list[types.Tool]:
     )
 
 
-def create_session_manager(ctx: ServiceContext) -> StreamableHTTPSessionManager:
+def create_session_manager(
+    ctx: ServiceContext,
+    *,
+    host_allow_list: HostAllowList = UNRESTRICTED_HOST_ALLOW_LIST,
+) -> StreamableHTTPSessionManager:
     """Build the streamable-HTTP session manager to mount at :data:`MCP_HTTP_PATH`.
 
     The caller owns the lifecycle and must enter ``manager.run()`` for the app's
@@ -444,14 +450,41 @@ def create_session_manager(ctx: ServiceContext) -> StreamableHTTPSessionManager:
     exists for streams a client must not miss events from, and every response
     here is reproducible by asking again.
 
-    DNS-rebinding protection is left at the SDK's default (off, since no
-    ``security_settings`` are passed): the allowed ``Host`` values depend on the
-    bind address, which lives in the CLI. The loopback bind is the access
-    control ADR-0014 decision 7 names as load-bearing, and passing
-    ``--allow-remote-access`` is documented as publishing the corpus.
+    **DNS-rebinding protection is on, driven by the serve-time bind decision**
+    (ADR-0024). The SDK defaults ``security_settings`` to off for backwards
+    compatibility, and its own convenience server (``FastMCP``) overrides that
+    default for a loopback host precisely because the bind is not a boundary
+    against a browser: a page can re-point its own hostname at ``127.0.0.1``,
+    and every request the browser then makes is same-origin — no preflight, the
+    response readable. This module uses the lower-level ``Server`` /
+    ``StreamableHTTPSessionManager`` API, which bypasses that override, so the
+    settings are built here from
+    :class:`~groundkit.service.binding.HostAllowList` instead. Both the
+    ``Host`` and the ``Origin`` list come from that one object, so this
+    transport and the REST surface cannot drift into disagreeing about who may
+    connect.
+
+    This check is **not** the only one on the HTTP path: mounted under
+    :func:`groundkit.service.api.create_app`, Starlette's
+    ``TrustedHostMiddleware`` has already refused a forged ``Host`` before the
+    request reaches here. It is duplicated deliberately, because the manager is
+    a public constructor a caller may mount anywhere, and a transport whose
+    protection depends on the app someone wrapped it in has no protection of
+    its own. The two refusals differ in status code (Starlette answers 400, the
+    SDK 421/403) and that is left alone: each matcher renders its own refusal,
+    and wrapping them into one shape would mean re-implementing both.
+
+    The default is
+    :data:`~groundkit.service.binding.UNRESTRICTED_HOST_ALLOW_LIST` for the
+    reason :func:`groundkit.service.api.create_app` gives about its own: the
+    bind decision is made at serve time, and ``grk serve`` always passes the
+    derived list.
 
     Args:
         ctx: Serve-time context every handler is invoked with.
+        host_allow_list: The ``Host``/``Origin`` decision this transport
+            enforces, derived by
+            :func:`groundkit.service.binding.derive_host_allow_list`.
 
     Returns:
         A manager wrapping a server built from the same registry as stdio's.
@@ -462,6 +495,11 @@ def create_session_manager(ctx: ServiceContext) -> StreamableHTTPSessionManager:
         json_response=False,
         stateless=False,
         session_idle_timeout=_SESSION_IDLE_TIMEOUT_SECONDS,
+        security_settings=TransportSecuritySettings(
+            enable_dns_rebinding_protection=host_allow_list.enforced,
+            allowed_hosts=list(host_allow_list.mcp_allowed_hosts),
+            allowed_origins=list(host_allow_list.mcp_allowed_origins),
+        ),
     )
 
 

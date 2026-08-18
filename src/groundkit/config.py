@@ -217,7 +217,8 @@ class IndexConfig(BaseModel):
 
     Attributes:
         index_dir: Directory holding the collection's persisted state
-            (SQLite metadata store; LanceDB table arrives in Phase 3).
+            (SQLite metadata store; the LanceDB table backing
+            :class:`~groundkit.index.dense.LanceDBVectorStore`, when configured).
         collection: Collection name.
     """
 

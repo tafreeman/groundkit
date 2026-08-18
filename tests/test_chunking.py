@@ -102,6 +102,22 @@ class TestMetadataAndIdentity:
         assert chunks[0].metadata["source"] == "a.md"
         assert chunks[0].metadata["author"] == "test"
 
+    def test_colliding_source_key_does_not_overwrite_authoritative_source(self) -> None:
+        # GK-004 regression: a Document whose own metadata carries a "source"
+        # key must not let that value win over document.source in the
+        # resulting chunk metadata. document.source is the authoritative
+        # value joined against downstream (dense metadata_filter, SQLite);
+        # a caller-supplied "source" silently overwriting it produced wrong
+        # or zero filtered results with nothing raised anywhere.
+        doc = Document(
+            source="real/path.md",
+            content="Hello world",
+            metadata={"source": "ATTACKER-LABEL"},
+        )
+        chunks = RecursiveChunker().chunk(doc)
+
+        assert chunks[0].metadata["source"] == "real/path.md"
+
     def test_chunk_ids_unique(self) -> None:
         content = ("word " * 200).strip()
         doc = Document(source="a.md", content=content)

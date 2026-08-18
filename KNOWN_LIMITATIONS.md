@@ -404,6 +404,18 @@ per SPEC.md §9:
   later. No checksum closes that either.
 - Total ingestion size is unbounded: individual files cap at 10 MiB, but
   nothing caps file count or aggregate bytes for a directory run.
+- **A colliding `metadata["source"]` key on ingest is silently overwritten by
+  the authoritative path, not rejected.** `RecursiveChunker` seeds
+  `document.source` into every chunk's metadata *after* splatting
+  `document.metadata`, so a `Document` whose own metadata carries a `source` key
+  loses that value — last-write-wins, with the authoritative key winning, by
+  design. This is deliberate: `source` is never reserved by contract (neither
+  ingest loader auto-populates it), so treating a collision as a hard failure
+  would turn a benign round-trip — read a chunk's metadata back, re-ingest it —
+  into an error. The trade-off is that a caller who *intentionally* stores their
+  own `source` key in `Document.metadata` has it clobbered with no warning;
+  nothing currently surfaces that collision to the caller. Before this was
+  fixed the polarity was reversed, and the caller's value silently won.
 - **No authentication. The 127.0.0.1 bind is load-bearing, not a default.**
   Every Phase 4 response is unauthenticated by construction (ADR-0014
   decision 1): the shared-secret header SPEC.md §7 requires for mutating
@@ -413,6 +425,39 @@ per SPEC.md §9:
   surface — document text and absolute source paths over `search`,
   collection topology over `index_status` and `list_collections` — to
   anyone who can reach the port.
+- **The REST surface admits any `[::…]`-shaped `Host`.** Starlette's
+  `TrustedHostMiddleware` strips the port by splitting on the *first* colon, so
+  `[::1]:8765` and a bare `[::1]` both reduce to `"["` — which the allow-list
+  must therefore contain for any IPv6 loopback client to be served at all, and
+  which also matches other bracketed literals beginning `[::`. This is a real
+  widening, and it is not reachable by the DNS rebinding it sits next to: a
+  bracketed address literal is never the product of a DNS answer, so no
+  attacker-controlled zone can cause a browser to send one. Closing it would
+  mean this repo owning a hand-written `Host` matcher and keeping it correct
+  against IPv6 spellings, ports, trailing dots and case (weighed and rejected in
+  ADR-0024).
+- **`Host` matching is case-sensitive and does not strip a trailing root dot.**
+  Starlette compares with `==` and the MCP SDK with `in`, so `LOCALHOST`,
+  `LocalHost:8765` and `localhost.` are refused (400 / 421). It fails closed, so
+  this is a compatibility gap, never a widening. Left open deliberately: the
+  trailing dot is enumerable and letter case is not, so covering half would read
+  as normalisation while being none. The trigger is a real client that cannot be
+  configured around it.
+- **A hostname `--host` is resolved twice** — once to derive the `Host`
+  allow-list, once by the ASGI server to bind — and the answers can differ. The
+  dangerous direction (routable when derived, loopback when bound) needs control
+  of DNS for the operator's own bind name *plus* `--allow-remote-access`; the
+  other direction is an availability failure visible on the first request.
+  Address literals, including the default bind, are never resolved and are
+  unaffected.
+- **`create_app` and `create_session_manager` default to an unrestricted `Host`
+  allow-list.** The security decision is made at serve time and `grk serve`
+  always passes the derived list, but a third party constructing either object
+  without `host_allow_list=` gets no `Host` check. The default is a named
+  constant (`UNRESTRICTED_HOST_ALLOW_LIST`) rather than a bare `None`, and the
+  regression tests assert the property against the CLI-assembled app rather than
+  against the defaults — but the library seam itself is fail-open (ADR-0024,
+  Consequences).
 - **No mutating operation over either transport.** No ingest, no delete, on
   REST or MCP. Deliberate (ADR-0014 decision 1), not an omission: SPEC.md
   §1.2's four tools — `search`, `fetch_chunk`, `list_collections`,

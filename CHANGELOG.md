@@ -11,9 +11,61 @@ it scored.
 
 ## [Unreleased]
 
-Nothing yet.
+### Security
 
-## [0.1.0]
+- `Host` is now validated on both service transports, closing inbound DNS
+  rebinding against `grk serve` (ADR-0024, amending ADR-0014 decision 7's threat
+  model). The `127.0.0.1` bind was the service's only access control, and it is
+  not a boundary against a browser: a page on any site the victim visits can
+  re-point its own hostname at `127.0.0.1`, after which the browser treats the
+  service as same-origin — no CORS preflight, response fully readable — while
+  the connection genuinely arrives from loopback. Both surfaces now enforce one
+  allow-list derived at serve time from the bind address: Starlette's
+  `TrustedHostMiddleware` on the REST app (which also covers the mounted `/mcp`
+  sub-path) and the MCP SDK's `TransportSecuritySettings` on the
+  streamable-HTTP transport, which the SDK defaults *off* for backwards
+  compatibility and which the lower-level API groundkit uses does not
+  auto-enable. The MCP transport additionally refuses any cross-origin
+  `Origin`; an absent `Origin`, which is what a non-browser client sends, is
+  allowed.
+- The allow-list is decided by whether the bind is *routable*, not by whether it
+  was typed as a loopback literal, and it names the address actually bound. A
+  hostname is resolved at serve time and fails closed when it does not resolve;
+  address literals are never resolved. `--allow-remote-access` widens both
+  allow-lists together and logs a warning naming the address — once the port is
+  routable, `Host` validation stops nobody who could not already connect
+  directly, and a restrictive list would break every reverse-proxy and
+  overlay-network deployment (ADR-0024 decision 3). The container default
+  `--host 0.0.0.0 --allow-remote-access` (ADR-0021) is unaffected.
+
+### Fixed
+
+- `rerank_by_logits` now preserves a result's `source_class` and `extractor`
+  through cross-encoder reranking instead of silently reverting them to the
+  contract defaults (`"text"` / `None`). Previously every reranked citation from
+  a URL-ingested (`snapshot`) or extracted (`extracted`) document lost its
+  provenance with no error, routing it into the plain read-and-slice citation
+  path ADR-0016 exists to keep such content out of. Reachable from every REST
+  and MCP search request, which expose `rerank`.
+- Caller-supplied `Document.metadata["source"]` no longer silently overwrites
+  the authoritative `document.source` in emitted chunk metadata. `RecursiveChunker`
+  now seeds `source` *last* in the merge, so it wins a key collision instead of
+  losing to it — previously a colliding key made `metadata_filter={"source": ...}`
+  on dense search return zero or wrong results with nothing raised.
+
+### Documentation
+
+- `config.IndexConfig.index_dir` and `index.protocols.VectorStoreProtocol` no
+  longer claim dense vector storage "arrives in Phase 3"; both now name
+  `InMemoryVectorStore` and `LanceDBVectorStore`, which have existed since
+  2026-08-15. Both render on the published docs site via mkdocstrings, so the
+  site was telling a reader that a shipped capability did not exist.
+- `SPEC.md` §9, `README.md`, the docs-site homepage, the installation guide and
+  the MCP-clients guide no longer state that the release has not happened.
+  `pip install groundkit` is now the primary install path, and the PyPI version,
+  Python versions and License badges are present as live endpoints.
+
+## [0.1.0] - 2026-08-18
 
 First release. Everything below is initial, so this entry describes the
 surface as shipped rather than a diff against an earlier version.
@@ -27,6 +79,12 @@ surface as shipped rather than a diff against an earlier version.
 - Character-offset citations on every result. A citation is verified by
   re-reading the span from its source and byte-comparing it, not by asserting
   it — `groundkit.retrieval.verify_citation`.
+- `Citation` and `RetrievalResult` reject an inverted span (`end_offset <=
+  start_offset`) at construction, matching the ordering check `Chunk` has
+  enforced since Phase 1. `RetrievalResult`'s `content`-length arithmetic is
+  deliberately not held to the same check as `Chunk`'s, since a downstream
+  rendering (e.g. a provenance envelope) may wrap the original span's content
+  without changing its offsets.
 - `bm25`, `dense`, and `hybrid` retrieval modes; hybrid fuses with reciprocal
   rank. BM25 is the default and stays the default: unlike the dense-side
   modes it abstains when no indexed chunk shares a term with the query.
