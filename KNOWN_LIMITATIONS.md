@@ -28,11 +28,12 @@ per SPEC.md §9:
   single run over a 10-document corpus, which R2
   (`docs/specs/phase-3-hybrid-retrieval.md`) warns is small enough that a
   result may not survive corpus growth; and `.github/workflows/eval-gated.yml`
-  is `workflow_dispatch`-only during active development, so **nothing
-  re-measures this automatically** — the result above is a point-in-time
-  local measurement, and it will not be contradicted by CI if it stops being
-  true. Re-enabling the schedule is noted in the workflow file and slated for
-  Phase 7. The CI-default `InMemoryEmbedder` produces
+  now runs on a weekly cron (Mondays 06:00 UTC) alongside its label and
+  manual triggers — re-enabled in Phase 7, as the workflow file's own note
+  anticipated — so this **is** re-measured automatically now. The result
+  quoted above is still the single run described, not yet superseded by a
+  later one, but a regression would no longer go uncaught by CI. The
+  CI-default `InMemoryEmbedder` produces
   hash-derived vectors with no semantic signal and, on this same corpus,
   reports both stages as regressions instead — so a delta from it is noise
   with a sign, not a weak measurement. The CLI stamps an explicit warning on
@@ -234,8 +235,10 @@ per SPEC.md §9:
   (`tests/test_eval_rerank_gated.py`, the companion to `test_rerank_gated.py`
   that drives a real cross-encoder through `run_eval` itself rather than in
   isolation), and — like the Ollama eval gate above —
-  `.github/workflows/rerank-gated.yml` is `workflow_dispatch`-only during
-  active development, so **nothing re-measures this automatically**.
+  `.github/workflows/rerank-gated.yml` now runs on its own weekly cron
+  (Mondays 06:30 UTC, offset from `eval-gated.yml`'s so the two heavy jobs do
+  not contend for runners), alongside label and manual triggers, re-enabled
+  in Phase 7 — so this **is** now re-measured automatically.
 
   **The rerank row's meaning is configuration-dependent, and the artifact
   says so rather than leaving it implicit.** A reranker reorders whichever
@@ -360,12 +363,13 @@ per SPEC.md §9:
   so it can no longer produce a wrong citation, but the stale-on-re-ingest
   copy is still written and still exposed in `RetrievalResult.metadata`.
   Removing it is a separate change with its own migration cost.
-- PDF/HTML loaders and URL ingestion (with the SSRF guard) — v1 scope, not
-  yet scheduled into a phase; the loader currently reads `.md`/`.markdown`/
-  `.txt` only.
-- Synthesis, query rewrite, redaction (Phase 5); OTel observability (Phase 6's
-  second change — landed in code, not yet verified end-to-end in compose; see
-  the Phase 6 section below); docs site (Phase 7).
+- PDF/HTML loaders — v1 scope, not yet scheduled into a phase; `FileLoader`
+  still reads `.md`/`.markdown`/`.txt` only, so no ingest path can create a
+  document from a local PDF or HTML file (see the ADR-0016 section below for
+  the extractors that already exist to read one back). URL ingestion is no
+  longer on this list: `grk ingest` accepts an `http(s)` URL directly, behind
+  the SSRF guard described further down, and stores a verifiable local
+  snapshot.
 - BM25 rebuilds in memory at open — O(corpus) startup cost, accepted and
   bounded by ADR-0002's revisit trigger.
 - A UTF-8 BOM is not stripped at load (`utf-8`, not `utf-8-sig`), so a
@@ -476,23 +480,29 @@ per SPEC.md §9:
   `base_url` itself. The threat model is operator misconfiguration, not a
   hostile operator (ADR-0014 Consequences).
 
-## Loaders workstream (ADR-0016) — the plumbing landed, the loaders have not
+## Loaders workstream (ADR-0016) — URL ingestion landed (wave 4); the PDF/HTML ingest-side loaders have not
 
-ADR-0016 schedules PDF/HTML/URL support in four waves. **Waves 1, 2 and most of wave 3 have
-landed; the ingest-side loaders and wave 4 have not** — so the honest summary is still that
-groundkit *records, enforces and can now re-verify* a source class it cannot yet *produce*.
-This is item 1 of SPEC.md §4.1's v0.1.0 scope amendment.
+ADR-0016 schedules PDF/HTML/URL support in four waves. **Waves 1, 2 and 4 have landed, and
+wave 3 has landed except for its ingest-side `.pdf`/`.html` loaders** — so the honest summary
+is narrower than it used to be: groundkit *records, enforces and can re-verify* a source
+class, and can now *produce* a `snapshot`-class document from a URL, but still cannot produce
+an `extracted`-class document from a local PDF or HTML file. This is item 1 of SPEC.md §4.1's
+v0.1.0 scope amendment, narrowed to that one remaining gap.
 
-- **The extractors exist; the loaders that would use them do not.** `groundkit/extraction.py`
-  ships `PdfExtractor` and `HtmlExtractor` behind the `pdf` and `html` extras, with
-  deterministic pinned configuration (`extraction_mode="plain"`, `html.parser`) and an
-  identity string derived from distribution metadata. `resolve_citation` looks a citation's
-  recorded extractor up in `active_extractors()` and re-extracts on a match. What is missing is
-  the `.pdf`/`.html` **loader** reachable from `grk ingest`: that needs multi-loader dispatch,
-  which `docs/specs/loaders-extracted-and-remote-sources.md` §9.6 declines to design rather
-  than guess at. `FileLoader` still handles `.md`/`.txt` only, so every document a shipped code
-  path can create is `source_class="text"`, and the re-extraction path is exercised by tests
-  rather than by a live ingest.
+- **The PDF/HTML extractors exist; the local-file loaders that would use them still do
+  not.** `groundkit/extraction.py` ships `PdfExtractor` and `HtmlExtractor` behind the `pdf`
+  and `html` extras, with deterministic pinned configuration (`extraction_mode="plain"`,
+  `html.parser`) and an identity string derived from distribution metadata. `resolve_citation`
+  looks a citation's recorded extractor up in `active_extractors()` and re-extracts on a
+  match. What is missing is the `.pdf`/`.html` **file loader** reachable from `grk ingest`:
+  that needs multi-loader dispatch, which
+  `docs/specs/loaders-extracted-and-remote-sources.md` §9.6 declines to design rather than
+  guess at. `FileLoader` still handles `.md`/`.markdown`/`.txt` only, so no shipped path turns
+  a local PDF or HTML file into an `extracted`-class document, and the re-extraction path
+  stays exercised by tests rather than by a live file ingest. URL ingestion (below) is a
+  separate path: it already reuses `html_extractor()` at fetch time to strip tags from an
+  HTML-shaped response, but the resulting document is `source_class="snapshot"` either way —
+  the extractor identity is not recorded on it, and re-extraction never runs for it.
 - **A credential in a URL query string is refused by name, and the list of names is not
   exhaustive.** `_reject_unsafe_url_shape` refused userinfo (`user:pass@host`) from the start
   because this loader records the URL verbatim as `Document.source`; a `?token=…` reaches
@@ -505,13 +515,35 @@ This is item 1 of SPEC.md §4.1's v0.1.0 scope amendment.
   Redacting instead of refusing is not available: `documents.source` is `TEXT UNIQUE NOT
   NULL`, and `sanitize_url` redacts every query value unconditionally, so it would collapse
   `?id=42` and `?id=43` onto one identity. Supply credentials out of band.
-- **The extractor-identity check is correct code that is currently always-refusing.** An
-  `extracted` citation resolves only if the recorded extractor identity is active in this
-  build, and no extractor is registered — so every such citation is refused as
-  `unresolvable`, naming the recorded identity and reporting the active set as empty. That is
-  the intended pre-wave-3 behaviour (fail closed, ADR-0016 decision 2), not a stub, and it
-  becomes useful the moment wave 3 registers a real extractor. `snapshot` citations are
-  likewise refused pending wave 4's snapshot storage, with their own distinct reason.
+- **Snapshot cleanup is per-document; collection-level deletion is still owed.** ADR-0023
+  binds a snapshot's lifetime to its `documents` row — it is removed when that document is
+  skipped as unchanged, replaced, deleted or pruned — which closes the two defects that
+  existed before it (a re-ingest of an unchanged URL orphaned a full copy of the fetched
+  text on every run, and deleting a document left its text on disk indefinitely). Two gaps
+  remain. **Deleting a whole collection is not implemented at all**, so the third artifact
+  SPEC.md §7 now names (`<collection>.snapshots/`, alongside `.sqlite3` and `.lance`) has
+  no code to delete it; removing a collection today is a manual `rm` of all three. And
+  cleanup is **best-effort by design** — a snapshot that cannot be unlinked (permissions, a
+  Windows share violation) is a logged warning, not a failed ingest, because the durable
+  state is already correct by then. That leaves disk litter which the next ingest of the
+  same source retries, and which nothing else sweeps: there is no `grk gc`.
+  A backup must cover all three artifacts: a restore from the `.sqlite3` alone cannot
+  verify any `snapshot` citation, because the text it would compare against lives in the
+  sibling `.snapshots` directory. `docs/guides/deployment.md`'s backup-scope paragraph
+  says so.
+- **The extractor-identity check no longer always-refuses, and neither does a `snapshot`
+  citation.** An `extracted` citation still resolves only if its recorded extractor identity
+  is active in this build — `active_extractors()` naming the recorded identity and reporting
+  the active set when a match is missing — but that registry is no longer permanently empty.
+  Wave 3 landed `PdfExtractor`/`HtmlExtractor` behind the `pdf`/`html` extras, and both extras
+  are mirrored into the `dev` dependency group, so the default development and test
+  environment already exercises a real, non-empty registry rather than the constant-empty one
+  this entry used to describe. A build installed with neither extra still refuses every
+  `extracted` citation — correctly, and for the same reason as before — but that is now a fact
+  about which extras were installed, not a permanent pre-wave-3 state (fail closed either way,
+  ADR-0016 decision 2). `snapshot` citations no longer refuse at all, pending or otherwise:
+  wave 4's `UrlLoader` writes a local snapshot at ingest time, and `resolve_citation` reads it
+  back through `_resolve_snapshot` (`retrieval/citations.py`) instead of refusing.
 - **A pre-v3 store is now refused for *writes*, which is broader than the earlier promise.**
   `SCHEMA_VERSION` went 2→3 (ADR-0016 adds `source_class`/`extractor` to `documents`). Because
   `CREATE TABLE IF NOT EXISTS` never adds a column to a table that already exists, a store
@@ -818,7 +850,8 @@ was executed.
   settles exactly one of them. It is also a single instance: every AMI or
   instance-type change is downtime.
 - **The Terraform path has now been proved against a real AWS account
-  (2026-08-16); compose and Kubernetes have not.** SPEC.md §1.4 requires each
+  (2026-08-16); compose and Kubernetes were verified separately the same day
+  (see the entries above).** SPEC.md §1.4 requires each
   path be verified with the date recorded and SPEC.md §2 forbids recording a
   date no run produced, so some rows are still empty. The machine this tree
   was originally written on had a Docker CLI with **no running daemon**, a
@@ -858,9 +891,9 @@ was executed.
   did and did not exercise (BM25-only, no SSM VPC endpoints, one account, one
   region) — is in `infra/README.md`.
 
-  What remains unrun: no container has served a request over compose's
-  loopback publish, and no manifest has reached a Kubernetes cluster. A real
-  `compose up` and a cluster `apply -k` are the operator's to run.
+  Compose and Kubernetes are no longer unrun: the entries above record a
+  completed `compose up` cold start and a completed `apply -k` sequence, both
+  from 2026-08-16, with their own narrower caveats stated there.
 
 ## Phase 5 caveats (the LLM boundary)
 
@@ -891,28 +924,27 @@ was executed.
   required before gating could ever be proposed is documented in
   `evals/judge.py`'s module docstring; no human-labeled verdict set exists
   yet, and normal CI never runs the judge.
-- **Synthesis quality is unmeasured offline, and nothing re-measures it
-  automatically.** `grk eval --synthesis` runs the planted-marker
-  citation-echo check (SPEC.md §2) against a real chat provider and writes
-  its own artifact (`evals/results/echo-latest.json`); there is
-  deliberately no offline double for it — an echo number from a scripted
-  chat would be noise presented as a measurement. No gated synthesis
-  workflow exists yet (the `eval-gated`/`rerank-gated` posture, but the
-  workflow file itself is not written), so every echo result is a
-  point-in-time local measurement.
+- **Synthesis quality is unmeasured by the default `pytest` suite, but it is
+  no longer true that nothing re-measures it automatically.** `grk eval
+  --synthesis` runs the planted-marker citation-echo check (SPEC.md §2)
+  against a real chat provider and writes its own artifact
+  (`evals/results/echo-latest.json`); there is deliberately no offline double
+  for it — an echo number from a scripted chat would be noise presented as a
+  measurement. `eval-gated.yml` (see above) now runs `grk eval --dense
+  --synthesis --judge` on the same weekly cron as the dense/fusion gate, so
+  an echo/judge result is produced on a schedule rather than only when an
+  operator happens to run it locally — it still never runs in `ci.yml`
+  itself, since that job must stay offline and credential-free and this one
+  needs a live chat provider.
 
   **`EvalReport.synthesis` now has a producer** — it was "structure without a
   producer" until `grk eval --judge` landed (2026-08-16), which requires
   `--synthesis`, synthesizes over the golden corpus against the run's best
-  stage, and folds the judge tallies into the main artifact. Two limits
-  survive that change and are the reason this entry is not simply deleted.
-  The judge is **advisory only — it exits 0 and gates nothing** (SPEC.md §6)
+  stage, and folds the judge tallies into the main artifact. One limit
+  survives that change and is the reason this entry is not simply deleted:
+  the judge is **advisory only — it exits 0 and gates nothing** (SPEC.md §6)
   until calibrated against human labels, so a falling faithfulness tally
-  fails no build. And the producer needs a live chat provider, so it does not
-  run in normal CI at all — which means the automatic re-measurement this
-  entry's title is about still does not exist. What changed is that the
-  number can now be produced on demand; what did not is that anything
-  produces it unprompted.
+  fails no build even on the now-automatic weekly run.
 - **`grk answer` is CLI-only; synthesis is off the service surface
   (ADR-0019).** Synthesis is a read, but it adds cost amplification and
   egress amplification that a loopback bind does not bound. Named

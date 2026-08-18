@@ -374,9 +374,32 @@ class SQLiteMetadataStore:
         return cls(connection, db_path, schema_current=schema_current)
 
     async def close(self) -> None:
-        """Close the underlying connection."""
-        async with self._lock:
-            await asyncio.to_thread(self._conn.close)
+        """Close the underlying connection.
+
+        Routed through :meth:`_run` rather than a bare
+        ``async with self._lock: await asyncio.to_thread(self._conn.close)``,
+        for the same cancellation reason every other method on this class
+        goes through it: cancelling that plain ``async with`` block does not
+        stop the worker thread mid-``close()`` -- it only unwinds the
+        *awaiting* coroutine, and ``__aexit__`` would release the lock right
+        then, while the worker was still inside ``sqlite3.Connection.close()``
+        on a second thread. A coroutine that then acquired the lock could
+        touch the same ``check_same_thread=False`` connection concurrently --
+        exactly the undefined behaviour the lock exists to rule out (see this
+        module's header docstring: "the lock, not the flag, is what makes
+        concurrent awaits safe"). ``_run``'s ``add_done_callback``-gated
+        release ties the lock to the worker's actual completion instead, so
+        that race cannot open here either.
+
+        ``_run``'s rollback-on-exception wrapper is safe to run for a close:
+        the only way it fires is if ``self._conn.close()`` itself raises, and
+        if that leaves the connection already unusable, the follow-up
+        ``rollback()`` attempt is caught and logged rather than allowed to
+        replace the original exception (see ``_run``'s ``_guarded``) -- the
+        same guard that already covers "operation racing store teardown"
+        for every other method.
+        """
+        await self._run(self._conn.close)
         logger.debug("closed metadata store")
 
     async def upsert_document(

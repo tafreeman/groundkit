@@ -1,28 +1,51 @@
 # MCP clients
 
-groundkit ships a real MCP server, not a demo of one: `grk serve-mcp` speaks
-stdio and `grk serve` mounts the same operations over streamable HTTP,
-alongside a REST mirror. SPEC.md §9's Phase 4 done criterion is that
-`grk ingest ./docs && grk serve-mcp` connects from Claude Desktop or Claude
-Code using config someone else could follow without having seen this repo.
-This page is that config.
+This page is for anyone connecting groundkit to an AI assistant — Claude
+Desktop or Claude Code — so the assistant can search your documents itself
+and cite exactly where an answer came from, instead of answering from memory
+alone. MCP (Model Context Protocol) is the open standard that lets an
+assistant call an external tool like groundkit this way; you don't need to
+understand the protocol itself to use this page, just to follow the
+configuration below. By the end, your assistant will be able to run
+groundkit searches directly.
+
+groundkit ships a real MCP server, not a demo of one. `grk serve-mcp` speaks
+**stdio** — it exchanges messages over your computer's own standard
+input/output pipes rather than a network connection, which is how most
+desktop AI clients expect a local tool to work — and `grk serve` mounts the
+same four operations over **streamable HTTP** (those same operations,
+reachable as an ordinary network connection) alongside a **REST** mirror
+(the same four operations again, as plain HTTP endpoints for callers that
+would rather not speak MCP at all). SPEC.md §9's Phase 4 done criterion is
+that `grk ingest ./docs && grk serve-mcp` connects from Claude Desktop or
+Claude Code using config someone else could follow without having seen this
+repo. This page is that config.
 
 ## Prerequisites
 
+groundkit is not yet published to PyPI, so `pip install groundkit` does not
+work today — it arrives with the v0.1.0 release. Until then, install from a
+clone (see [Installation](../getting-started/installation.md) for the full
+walkthrough):
+
 ```bash
-pip install groundkit
+git clone https://github.com/tafreeman/groundkit
+cd groundkit
+uv sync
 ```
 
-No extra is needed for the server. FastAPI, its ASGI server, and the MCP SDK
-are base runtime dependencies, not an opt-in like `dense` or `rerank` —
+No extra is needed for the server. FastAPI, its ASGI server (the underlying
+process that actually speaks HTTP), and the MCP SDK are base runtime
+dependencies, not an opt-in like `dense` or `rerank` —
 [ADR-0015](../adr/ADR-0015-service-dependencies-are-base-not-an-extra.md)
 draws the line as "an extra may gate an option on a command, never the
 command itself," and `serve-mcp` is the command SPEC.md §9 names as the
-phase's deliverable. A `pip install groundkit` with no flags is enough for a
-client to launch the server.
+phase's deliverable. A plain `uv sync` with no extras is enough for a client
+to launch the server.
 
-A collection has to exist before you point a client at it — the server never
-creates one:
+A collection (a named, self-contained index — the unit `grk ingest` and
+`grk search` both operate on) has to exist before you point a client at it —
+the server never creates one:
 
 ```bash
 grk ingest ./docs --index-dir .groundkit
@@ -91,7 +114,10 @@ directory of its own choosing, not the directory you ingested from — a
 relative `--index-dir .groundkit` resolves against whatever that unpredictable
 working directory turns out to be, not against your project. `--base-dir` is
 required on both `serve` and `serve-mcp`: it is the containment root every
-citation is checked against before a chunk is returned, so an absolute path
+citation (a pointer to the exact character range in a source file a result
+came from) is checked against before a chunk (the passage of a document that
+range sits inside — documents are split into chunks so a result can point at
+something small enough to check precisely) is returned, so an absolute path
 there is not a style preference, it is the value the server refuses to start
 without.
 
@@ -141,8 +167,9 @@ machine runs it.
 
 ## The four tools
 
-SPEC.md §1.2 names exactly four operations, and the server exposes exactly
-those four — nothing more, nothing fewer:
+This is what your assistant can actually do once it's connected. SPEC.md
+§1.2 names exactly four operations, and the server exposes exactly those
+four — nothing more, nothing fewer:
 
 | Tool | What it does | Returns |
 |---|---|---|
@@ -242,3 +269,12 @@ problem is in the client config. Anything else — a traceback, a "not found", o
 silence — is the real error the client was hiding. Note that **stdout carries
 JSON-RPC frames and nothing else**: logs go to stderr, so any non-JSON line on
 stdout is itself a bug worth reporting.
+
+## Next
+
+[Deployment](deployment.md) covers running `grk serve` as a long-lived,
+network-reachable service instead of a client-launched local process — and
+the authentication gap this page's Security posture section names is the
+first thing to read before doing that. [Retrieval modes](retrieval-modes.md)
+covers which mode — bm25, dense, or hybrid — is right for what your
+assistant will be searching.

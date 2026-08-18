@@ -1020,6 +1020,82 @@ def test_cancellation_waits_for_the_worker_before_releasing_the_lock(tmp_path: P
     asyncio.run(run())
 
 
+class _SlowCloseConnection(sqlite3.Connection):
+    """A connection whose ``close()`` blocks until released.
+
+    ``sqlite3.Connection`` is an immutable C type: neither
+    ``conn.close = ...`` (instance attribute) nor
+    ``sqlite3.Connection.close = ...`` (class attribute) is legal --
+    both raise (``AttributeError`` / ``TypeError``) because the type has no
+    ``__dict__`` and forbids attribute assignment. Subclassing is the only
+    way to make ``close()`` itself block, which is what
+    ``test_cancelled_close_waits_for_the_worker_before_releasing_the_lock``
+    needs to reproduce C2: a worker genuinely still inside
+    ``Connection.close()`` when the awaiting coroutine is cancelled.
+    """
+
+    entered: threading.Event
+    may_finish: threading.Event
+
+    def close(self) -> None:
+        self.entered.set()
+        self.may_finish.wait(timeout=10)
+        super().close()
+
+
+def test_cancelled_close_waits_for_the_worker_before_releasing_the_lock(tmp_path: Path) -> None:
+    """C2 regression: ``close()`` must not release the lock before its worker finishes closing.
+
+    The original ``close()`` awaited ``asyncio.to_thread(self._conn.close)``
+    directly inside ``async with self._lock:``, bypassing the cancellation-safety
+    pattern every other method on this class uses. Cancelling that await does not
+    stop the worker thread -- ``Connection.close()`` keeps running regardless --
+    but the bare ``async with`` releases the lock the moment the *awaiting*
+    coroutine unwinds, not when the worker actually finishes. A second coroutine
+    could then acquire the lock and touch the same ``check_same_thread=False``
+    connection from a second thread while the first close was still in flight.
+
+    Mirrors ``test_cancellation_waits_for_the_worker_before_releasing_the_lock``'s
+    harness exactly (block a worker on a real ``threading.Event``, cancel the
+    outer task while it is genuinely still running, assert the lock survives
+    that cancellation), substituting a ``_SlowCloseConnection`` for the
+    plain-Python ``_op`` that harness uses -- there is no Python-level ``_op``
+    to block inside ``close()``, since ``self._conn.close`` is the callable
+    passed straight to ``_run``.
+    """
+
+    async def run() -> None:
+        db_path = tmp_path / "default.sqlite3"
+        conn = sqlite3.connect(str(db_path), factory=_SlowCloseConnection, check_same_thread=False)
+        conn.entered = threading.Event()
+        conn.may_finish = threading.Event()
+        store = SQLiteMetadataStore(conn, db_path, schema_current=True)
+
+        task = asyncio.create_task(store.close())
+        await asyncio.to_thread(conn.entered.wait, 10)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The worker is still inside Connection.close(). If the lock were
+        # already free here, a second coroutine could acquire it and touch
+        # the connection while this close() is still running on its thread --
+        # exactly the race C2 describes.
+        assert store._lock.locked()
+
+        conn.may_finish.set()
+        for _ in range(200):
+            if not store._lock.locked():
+                break
+            await asyncio.sleep(0.05)
+
+        # Released only once the worker actually finished closing the connection.
+        assert not store._lock.locked()
+
+    asyncio.run(run())
+
+
 # --------------------------------------------------------------------------
 # ADR-0013: the persisted staleness marker
 # --------------------------------------------------------------------------

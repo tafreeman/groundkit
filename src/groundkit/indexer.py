@@ -40,6 +40,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from groundkit import snapshots
 from groundkit.config import ChunkingConfig
 from groundkit.errors import ConfigurationError, IngestionError
 from groundkit.identity import identity_of, validate_dense_pair
@@ -219,6 +220,7 @@ class Indexer:
         embedder: EmbeddingProtocol | None = None,
         vector_store: VectorStoreProtocol | None = None,
         collection: str | None = None,
+        snapshot_dir: Path | None = None,
     ) -> None:
         # The dense pair is validated at construction, not discovered
         # mid-ingest: half a dense path is always a caller bug, and each
@@ -246,6 +248,13 @@ class Indexer:
         self._embedder = embedder
         self._vector_store = vector_store
         self._collection = collection
+        # Where this collection's URL snapshots live, or None when it stores
+        # none (every FileLoader caller). ADR-0023: the loader writes a
+        # snapshot because only it has the bytes, but only this class knows
+        # whether the document was stored, replaced, skipped or deleted --
+        # so cleanup is this class's job, and a collection that never
+        # ingested a URL pays nothing for it.
+        self._snapshot_dir = snapshot_dir
         # True once this instance has successfully bound the collection
         # manifest; see _ensure_manifest for why binding waits for the
         # first real dense write instead of happening here or at run start.
@@ -645,10 +654,18 @@ class Indexer:
         vectors_written = vectors_deleted = 0
         embedder = self._embedder
         vector_store = self._vector_store
+        dense = embedder is not None and vector_store is not None
+        # The prior id is what the dense path deletes vectors under and what
+        # snapshot cleanup unlinks (ADR-0023 decision 2), so it is resolved
+        # once and shared. Fetching it on the BM25-only path is new, and
+        # costs one extra query per document only for a collection that
+        # actually stores snapshots.
+        old_id: str | None = None
+        if dense or self._snapshot_dir is not None:
+            old_id = await self._store.get_document_id(doc.source)
         if embedder is not None and vector_store is not None:
             embeddings = await embedder.embed([chunk.content for chunk in chunks])
             await self._ensure_manifest(embedder)
-            old_id = await self._store.get_document_id(doc.source)
             if old_id is not None and old_id == doc.document_id:
                 # Ids collide, so rows added under the new id are
                 # indistinguishable from the old ones and the delete cannot
@@ -672,7 +689,55 @@ class Indexer:
             source_class=doc.source_class,
             extractor=doc.extractor,
         )
+        # After the replace commits, never before: the prior snapshot stops
+        # being referenced only once the new row is durable, so a failed
+        # replace can never strand a row pointing at a file this removed
+        # (ADR-0023 decision 2).
+        if old_id is not None and old_id != doc.document_id:
+            await self._remove_snapshot(old_id)
         return vectors_written, vectors_deleted
+
+    async def _remove_snapshot(self, document_id: str) -> None:
+        """Unlink one document's snapshot, if this collection stores any.
+
+        ADR-0023 decision 1: a snapshot exists if and only if a ``documents``
+        row references it, so every caller of this is a point where a
+        document stopped referencing one — skipped as unchanged, replaced,
+        deleted or pruned.
+
+        **Best-effort and never fatal** (ADR-0023 decision 3). Every call
+        site runs *after* the durable state is already correct, so a failed
+        unlink leaves disk litter that the next ingest of the same source
+        retries, never an index that disagrees with itself. Raising here
+        would fail an otherwise-complete ingest over cleanup of a file that
+        no longer matters.
+
+        **Containment-checked** (ADR-0023 decision 4).
+        :func:`~groundkit.snapshots.snapshot_path_for` performs no check and
+        says so: ``document_id`` is a plain string field with no character
+        class, so it is attacker-influenced in principle. The read side
+        already guards this (``resolve_citation`` runs the same path through
+        ``ensure_within_base``), and unlinking is strictly more dangerous
+        than reading. ``is_within_base`` rather than ``ensure_within_base``
+        so an escape is refused and logged rather than raised, matching this
+        method's non-fatal contract.
+        """
+        snapshot_dir = self._snapshot_dir
+        if snapshot_dir is None:
+            return
+        path = snapshots.snapshot_path_for(snapshot_dir, document_id)
+        if not is_within_base(path, snapshot_dir):
+            logger.warning(
+                "Refusing to remove a snapshot path outside %s for document %s",
+                snapshot_dir,
+                document_id,
+            )
+            return
+        try:
+            await asyncio.to_thread(path.unlink, missing_ok=True)
+        except OSError as exc:
+            # Litter, not corruption -- see the contract above.
+            logger.warning("Could not remove snapshot for document %s: %s", document_id, exc)
 
     async def _delete_document_everywhere(self, document_id: str) -> tuple[int, int]:
         """Delete one document's vectors, then its SQLite row, reconciling counts.
@@ -714,6 +779,13 @@ class Indexer:
                 vectors_deleted,
                 chunks_deleted,
             )
+        # Last, after the SQLite row is gone: the snapshot is this document's
+        # only copy of what was fetched, so it is removed once nothing can
+        # still cite it. Deleting it earlier would leave a live row pointing
+        # at a missing file if the row delete then failed. Without this, the
+        # full text of a fetched remote document survived an explicit delete
+        # indefinitely (ADR-0023, defect 2).
+        await self._remove_snapshot(document_id)
         return chunks_deleted, vectors_deleted
 
     async def _prune_missing(self, root: Path, files: list[Path]) -> tuple[int, int]:
@@ -793,6 +865,13 @@ class Indexer:
             stored = await self._store.get_document_hash(doc.source)
             if stored == doc_hash:
                 logger.debug("Unchanged, skipping: %s", doc.source)
+                # The loader has already written a snapshot under this
+                # document's throwaway id (Document.document_id is a fresh
+                # uuid4 per load), while the stored document keeps its own --
+                # still byte-correct, since the fingerprint just matched.
+                # Without this, every re-ingest of an unchanged URL orphaned
+                # a full copy of the fetched text (ADR-0023, defect 1).
+                await self._remove_snapshot(doc.document_id)
                 skipped += 1
                 continue
 

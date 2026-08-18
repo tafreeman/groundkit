@@ -23,13 +23,82 @@
 [![ci](https://github.com/tafreeman/groundkit/actions/workflows/ci.yml/badge.svg)](https://github.com/tafreeman/groundkit/actions/workflows/ci.yml)
 [![docs](https://github.com/tafreeman/groundkit/actions/workflows/docs.yml/badge.svg)](https://tafreeman.github.io/groundkit/)
 
-Grounded, citation-verifiable hybrid retrieval: a persisted BM25 + dense index,
-a named MCP server, and a retrieval eval harness — fully local by default.
+## The problem
+
+Ask a tool to answer questions from your documents, and it can sound
+completely confident while still being wrong — inventing a detail that
+isn't there, or pointing at a source that doesn't actually say what it
+claims. Most "chat with your docs" tools give you no way to catch that,
+short of reading the source yourself every time.
+
+groundkit is built around a stricter guarantee: every answer points at the
+exact passage it came from — a **citation**, meaning the precise range of
+characters in one source file — and that citation is *checked*, not just
+asserted. groundkit re-reads the source file and confirms the cited text is
+actually there before it hands back a result. Making a pointer that exact
+means splitting every document into small passages first (**chunks**), so a
+citation can name one paragraph instead of an entire file.
+
+**Who this is for:** engineers and teams building something that has to
+answer questions from a specific, known set of documents — internal docs, a
+support knowledge base, a corpus you'd point an AI coding assistant at — and
+need to show where an answer came from, not just claim it. That covers
+point-and-click use through an AI assistant such as Claude Desktop or Claude
+Code, programmatic use via the CLI or as a library, and teams that want a
+measurable way to tell whether a retrieval change actually helped instead of
+eyeballing it.
+
+**When not to reach for it:** groundkit is a retrieval engine, a CLI, and a
+server you run yourself — not a hosted product or a chat UI. Today it
+ingests Markdown, plain text, and http(s) URLs; PDF and HTML support exists
+at the library level (extraction, citation re-verification) but isn't wired
+into `grk ingest` yet — see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
+And it isn't on PyPI yet: `pip install groundkit` doesn't work until the
+v0.1.0 release ships, so install from a clone until then.
 
 **Documentation: <https://tafreeman.github.io/groundkit/>**
 
-> **Status: Phases 0–6 done; the v0.1.0 release itself is the only thing
-> left.** BM25 retrieval, a persisted index, citation-bearing search, and a
+## What this is
+
+Grounded, citation-verifiable hybrid retrieval: a persisted BM25 + dense
+index, a named MCP server, and a retrieval eval harness — fully local by
+default. Term by term:
+
+- **Hybrid retrieval** — combines two ways of finding relevant text: **BM25**
+  (keyword search — scores a document by the words it literally shares with
+  your query) and **dense embeddings** (matching by meaning rather than
+  exact words, so a query for "car" can find a document that only says
+  "automobile"). The two ranked lists are merged by **reciprocal-rank fusion
+  (RRF)**, and an optional local **cross-encoder rerank** — a slower, more
+  accurate model that re-scores just the top few results — can run as a
+  second pass. All of it runs over an index that survives restarts.
+- **A real MCP server** — **MCP (Model Context Protocol)** is the standard
+  AI assistants such as Claude use to call external tools; groundkit speaks
+  it over stdio + streamable HTTP, exposing `search`, `fetch_chunk`,
+  `list_collections`, `index_status`; installable and connectable from
+  Claude Desktop/Code.
+- **A retrieval eval harness** — a fixed set of test questions with
+  known-correct answers, scored by recall@k, MRR and nDCG@k computed by
+  deterministic, unit-tested code, so a change can be measured instead of
+  guessed at. BM25-only is the baseline every feature must beat (or the
+  report says it didn't).
+- **Local-first** — Ollama embeddings and a file-based index by default; cloud
+  providers are opt-in, and cloud chat egress sits behind a redaction
+  boundary (the embedding boundary deliberately does not — see below).
+
+Deterministic core, LLM at the boundary: no LLM runs in the retrieval path.
+Where text can and cannot leave the process is written down in full —
+[docs/architecture/llm-boundary.md](docs/architecture/llm-boundary.md). The
+redaction pass named above now exists and wraps **cloud chat egress with no
+operator opt-out** ([ADR-0017](docs/adr/ADR-0017-chat-seam-and-redaction-boundary.md));
+that document also records what it does *not* cover — the embedding boundary
+is a deliberate, named exception, so read it before pointing an embedding
+provider at a cloud endpoint.
+
+## Status
+
+> **Phases 0–6 done; the v0.1.0 release itself is the only thing left.**
+> BM25 retrieval, a persisted index, citation-bearing search, and a
 > retrieval eval harness work end-to-end locally with no cloud credentials —
 > see the Quickstart below. Dense and hybrid (RRF) retrieval work too, opt-in
 > behind `--dense` / `--mode` and requiring a local embedding provider. A
@@ -50,35 +119,16 @@ a named MCP server, and a retrieval eval harness — fully local by default.
 >
 > **groundkit is not on PyPI yet.** The publish workflow and its blocking
 > release gates exist and the version is at `0.1.0`; what remains is the tag
-> and the published release. Two v1 scope items are deliberately unbuilt and
-> named as such — **PDF/HTML ingestion and URL ingestion**, whose extractors
-> and citation re-verification landed but whose ingest-side loaders did not
-> (see [SPEC.md](SPEC.md) §4). See
+> and the published release. One v1 scope item is deliberately unbuilt and
+> named as such — **PDF/HTML ingestion**, whose extractors and citation
+> re-verification landed but whose ingest-side loader did not (see
+> [SPEC.md](SPEC.md) §4.1). URL ingestion shipped: `grk ingest` fetches an
+> http(s) URL into a verifiable local snapshot, behind the same SSRF guard as
+> cloud-provider endpoints, and refuses a URL carrying a credential in its
+> userinfo or query string rather than storing one. See
 > [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for everything deliberately
 > out of scope or presently broken — it is honest and current, including
 > about defects.
-
-## What this is
-
-- **Hybrid retrieval** — BM25 + dense embeddings + reciprocal-rank fusion +
-  optional local cross-encoder rerank, over an index that survives restarts.
-- **A real MCP server** — stdio + streamable HTTP, exposing `search`,
-  `fetch_chunk`, `list_collections`, `index_status`; installable and
-  connectable from Claude Desktop/Code.
-- **A retrieval eval harness** — labeled golden corpus with recall@k, MRR and
-  nDCG@k computed by deterministic, unit-tested code; BM25-only is the baseline
-  every feature must beat (or the report says it didn't).
-- **Local-first** — Ollama embeddings and a file-based index by default; cloud
-  providers are opt-in and sit behind a redaction boundary.
-
-Deterministic core, LLM at the boundary: no LLM runs in the retrieval path.
-Where text can and cannot leave the process is written down in full —
-[docs/architecture/llm-boundary.md](docs/architecture/llm-boundary.md). The
-redaction pass named above now exists and wraps **cloud chat egress with no
-operator opt-out** ([ADR-0017](docs/adr/ADR-0017-chat-seam-and-redaction-boundary.md));
-that document also records what it does *not* cover — the embedding boundary
-is a deliberate, named exception, so read it before pointing an embedding
-provider at a cloud endpoint.
 
 ## Quickstart
 
@@ -100,15 +150,16 @@ No cloud credentials are required for any of this.
 uv run grk eval
 ```
 
-Runs the retrieval-quality harness against the committed golden corpus and
-judgment set — `evals/corpus/` plus `evals/judgments.jsonl`, authored per
-the contract in [evals/README.md](evals/README.md) — and writes a full
-report to `evals/results/latest.json` (gitignored, regenerated per run,
-never committed). Fully offline and credential-free: the harness builds a
-throwaway index over the corpus and scores it with the same deterministic
-BM25 retrieval path `grk search` uses. BM25-only is the baseline every
-later retrieval feature (hybrid, rerank) reports its delta against, in the
-same report.
+Runs the retrieval-quality harness against the committed **golden corpus**
+and **judgment set** — a fixed set of documents (`evals/corpus/`) paired
+with known-correct answers to test questions (`evals/judgments.jsonl`),
+authored per the contract in [evals/README.md](evals/README.md) — and
+writes a full report to `evals/results/latest.json` (gitignored, regenerated
+per run, never committed). Fully offline and credential-free: the harness
+builds a throwaway index over the corpus and scores it with the same
+deterministic BM25 retrieval path `grk search` uses. BM25-only is the
+baseline every later retrieval feature (hybrid, rerank) reports its delta
+against, in the same report.
 
 ## Which retrieval mode should I use?
 
@@ -198,13 +249,13 @@ uv run pytest --cov && uv run coverage report
 CI enforces an 80% coverage floor twice, so neither gate can hide the other:
 once on the whole package, and again on the SPEC.md §8 core subset —
 `retrieval/` (retrieval + citation resolution), `ingestion/chunking.py`
-(chunking), `index/bm25.py` (lexical scoring), and `index/dense.py` (vector
-scoring). The core subset is the literal list in `pyproject.toml`'s
-`[tool.groundkit.coverage]` table; optional providers (e.g.
-`providers/embeddings.py`) are excluded from it. That table also records the
-one caveat this subset carries — `index/dense.py` is a mixed file, and gating
-it wholesale admits inside one file the offsetting the subset exists to
-prevent.
+(chunking), `index/bm25.py` (lexical scoring), `index/dense.py` (vector
+scoring), and `runtime.py` (collection lifecycle, ADR-0013). The core subset
+is the literal list in `pyproject.toml`'s `[tool.groundkit.coverage]` table;
+optional providers (e.g. `providers/embeddings.py`) are excluded from it.
+That table also records the one caveat this subset carries — `index/dense.py`
+is a mixed file, and gating it wholesale admits inside one file the
+offsetting the subset exists to prevent.
 
 To build the documentation site:
 

@@ -22,8 +22,21 @@ the boundary is not the one §9 implies at first reading: `groundkit/extraction.
 `resolve_citation`'s re-extraction branch are built and tested. The ingest-side
 PDF/HTML **loaders** are not — they need the multi-loader dispatch §9.6
 explicitly declines to design, so building them would have meant guessing at
-exactly the seam that section refuses to guess at. Wave 4 remains **designed**
-(§10) and **not built**. §3's status column carries the same split.
+exactly the seam that section refuses to guess at.
+
+**Wave 4 has now landed** (`5700056`): `ingestion/url_loader.py` fetches an
+http(s) source through the SSRF guard and the redirect refusal §10.3 designed,
+`snapshots.py` implements the path arithmetic §10.1 specified verbatim, and
+`retrieval/citations.py`'s `_resolve_snapshot` resolves a `snapshot` citation
+against the stored copy exactly as §10.2 designed it — a read-and-compare with
+no extractor dependency. `cli.py`'s `_is_url_source`/`_cmd_ingest_url` close
+the one thing §10.3 flagged as undecided (how `grk ingest` accepts a URL as
+its `path` argument). A follow-up (`73747d9`, PR #21) hardened the fetch
+further, closing a gap the original design did not anticipate: a
+credential-shaped query parameter (an API key or token embedded in the URL
+itself) is now refused before the request is made, rather than being fetched
+and potentially logged or snapshotted. §3's status column carries the same
+split — Wave 3's loaders still open, Wave 4 landed.
 
 Nothing here overrides SPEC.md or ADR-0016; where this document makes a
 decision neither already contains, it says so and states the alternatives
@@ -112,7 +125,7 @@ loader lands — silently, unless this spec's Wave 1 closes it first.
 | 1 | Persist `source_class`/`extractor`; join them back through `search` and `fetch_chunk` | **landed** (`0bcb417`) |
 | 2 | Extractor-identity check at resolve time; typed `fetch_chunk` verdict (§5) | **landed** (`0bcb417`, `4b41c12`) |
 | 3 | PDF/HTML extractors behind a `pdf`/`html` extra (ADR-0016 decisions 3, 5) | **landed**, except the ingest-side loaders |
-| 4 | URL fetching + local snapshot storage (ADR-0016 decision 4) | **designed (§10), not built** |
+| 4 | URL fetching + local snapshot storage (ADR-0016 decision 4) | **landed** (`5700056`) |
 
 Wave 3's exception is not a shortfall against §9 but a consequence of §9.6:
 `groundkit/extraction.py`, both extras and `resolve_citation`'s re-extraction
@@ -124,13 +137,15 @@ needs the multi-loader dispatch §9.6 declines to design. The practical shape
 of that gap: nothing in-tree yet *produces* an `extracted` document, so the
 re-extraction path is exercised by tests rather than by a live ingest.
 
-Wave 4 is named so a reader finds a scheduled gap, not a forgotten one. §10
-settles the seams ADR-0016 deliberately left open — precisely enough that an
-implementer should not need to make a judgment call this document doesn't
-already state and justify — but **building it is still someone else's job**:
-no URL fetching and no snapshot storage exist in `src/groundkit/` as of this
-revision. Wave 2 already had to *behave correctly* in their absence (§5.3),
-which was a smaller obligation than building them, and remains true.
+Wave 4 was named so a reader would find a scheduled gap, not a forgotten one,
+and it has since closed that gap: §10 settled the seams ADR-0016 deliberately
+left open — precisely enough that the implementation matches this section
+with no judgment call left to make — and `5700056` built it. URL fetching and
+snapshot storage now exist in `src/groundkit/` (`ingestion/url_loader.py`,
+`snapshots.py`), and `resolve_citation`'s `snapshot` branch resolves against
+the stored copy. Wave 2 had to *behave correctly* in their absence (§5.3);
+that was the smaller, temporary obligation, superseded now that the real
+branch is reachable.
 
 ## 4. Wave 1 — persistence and the join
 
@@ -530,8 +545,10 @@ extractor to register.
 - [ ] A regression test proves the extractor-identity-mismatch path returns
       `"unresolvable"` with a `detail` naming the recorded identity, not
       `"drifted"` and not the old generic refusal text.
-- [ ] Waves 3 and 4 remain unbuilt: no `pdf`/`html` extra, no PDF/HTML
-      extractor, no URL fetching, no snapshot storage.
+- [ ] Waves 3 and 4 were out of this wave's scope: true when Waves 1–2
+      shipped, not a durable claim about the current tree — both have since
+      landed (§3). The one piece of Wave 3 still open is the ingest-side
+      PDF/HTML loaders; Wave 4 (URL fetching, snapshot storage) is complete.
 
 ## 7. Risks and open questions
 
@@ -1195,6 +1212,22 @@ CLI-level per-extension routing decision, neither of which ADR-0016 or the
 four questions this section answers speaks to. Flagged explicitly rather
 than guessed at, per this document's own standing rule (§1's closing
 sentence) that an undecided question gets named, not silently resolved.
+
+Wave 4 (`5700056`) has since added a precedent worth noting, though it does
+not settle this question. `cli.py`'s `_cmd_ingest` now dispatches on source
+*shape* before constructing a loader — `_is_url_source` routes to
+`_cmd_ingest_url`, everything else to the existing `FileLoader` path — so a
+CLI-level two-way routing decision, made before any path-shaped operation
+touches `source`, already exists and already works. Extension-based routing
+for `.pdf`/`.html` is a narrower version of the same shape (dispatch on a
+string property of `source`, chosen before construction) rather than a
+mechanism this codebase has never built. That makes it a smaller increment
+than an unqualified "not designed" suggests — but it is still a smaller
+increment, not a decision: URL-vs-path is a two-way, mutually exclusive split
+resolved once at the top of `_cmd_ingest`, while `.pdf`/`.html`/`.md`/`.txt`
+routing has to answer what a *directory* ingest does with a mix of
+extensions in one run, which `_is_url_source` never has to, because a URL
+ingest is always single-source. That question is still open.
 
 ## 10. Wave 4 design — snapshot storage and reaching it from `resolve_citation`
 

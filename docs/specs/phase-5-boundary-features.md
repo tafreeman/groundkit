@@ -4,9 +4,9 @@ Feature spec for SPEC.md §9 Phase 5: *optional query rewrite + cited synthesis;
 redaction pass (names → tokens, configurable patterns); advisory faithfulness
 judge.*
 
-Status: **planned**. Nothing here overrides SPEC.md; where this document makes a
+Status: **done**. Nothing here overrides SPEC.md; where this document makes a
 decision SPEC.md does not already contain, it names the ADR that carries it.
-Three ADRs are proposed —
+Three ADRs carry it, all Accepted —
 [ADR-0017](../adr/ADR-0017-chat-seam-and-redaction-boundary.md),
 [ADR-0018](../adr/ADR-0018-llm-output-is-validated-never-trusted.md),
 [ADR-0019](../adr/ADR-0019-grk-answer-and-no-synthesis-on-the-service-surface.md).
@@ -401,14 +401,18 @@ sides it checks.
 **Gating.** The default suite drives everything through `ScriptedChatProvider`:
 the plumbing, every failure path, the marker-collision regression, and the echo
 checker's own ability to catch a scripted leak. It proves the *checker*, never a
-*model*. A real measurement needs `SYNTHESIS_GATED=1` with a chat model pulled
-into local Ollama, in `tests/test_synthesis_gated.py` and
-`.github/workflows/synthesis-gated.yml` — its own gate rather than an extension
-of `EVAL_GATED`, because a chat-model pull is a different and much larger cost
-than an embedding model's and folding them together would slow an existing gate
-to measure something unrelated to it. `workflow_dispatch`-only during active
-development, matching the two existing gates and carrying the same reinstatement
-note. It is the sole proof of that backend, so it is not `continue-on-error`
+*model*. A real measurement needs a chat model pulled into local Ollama — this
+section originally proposed a dedicated `SYNTHESIS_GATED=1` gate
+(`tests/test_synthesis_gated.py`, `.github/workflows/synthesis-gated.yml`),
+kept separate from `EVAL_GATED` on the reasoning that a chat-model pull is a
+different and much larger cost than an embedding model's. That is not what was
+built: `eval-gated.yml` was extended instead, provisioning a chat model
+alongside the embedding model from the same Ollama service and running
+`grk eval --dense --synthesis --judge` directly as a workflow step, so the
+echo check and the judge are exercised on the same weekly cron as the
+dense/fusion delta rather than through a second gate and a second env var. No
+`synthesis-gated.yml` and no `SYNTHESIS_GATED` exist in the tree; `eval-gated.yml`
+is the sole proof of this backend, and it is not `continue-on-error`
 (SPEC.md §3).
 
 ## 12. Coverage

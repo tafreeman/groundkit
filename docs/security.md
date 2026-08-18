@@ -13,5 +13,9 @@ The security policy above covers disclosure and operational scope. For the
 data-flow question — which paths transmit your document text, to where, and
 what is redacted before they do — see
 [The LLM boundary](architecture/llm-boundary.md). It is an exhaustive
-inventory, and it is explicit about the redaction pass that does not exist
-yet.
+inventory, and it is explicit about which boundary the redaction pass
+covers: cloud **chat** egress, and only that one. The cloud **embedding**
+boundary is deliberately unredacted — a recorded deviation, not an
+unfinished feature (ADR-0017 decision 5) — so a cloud embedding provider
+sees your document and query text in the clear regardless of redaction
+configuration.

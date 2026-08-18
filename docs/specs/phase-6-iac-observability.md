@@ -4,11 +4,12 @@ Feature spec for SPEC.md §9 Phase 6: *multi-stage non-root Dockerfile; compose
 (service+Ollama+collector+Jaeger); k8s (deployment, service, PVC, probes);
 Terraform module for one concrete provider; OTel verified end-to-end in compose.*
 
-Status: **in progress — change 1 landed 2026-08-15; change 2 (OTel
-instrumentation, JSON logs) implemented on this branch, not yet verified
-end-to-end in compose.** Nothing here overrides SPEC.md; where this document
-makes a decision SPEC.md does not already contain, it names the ADR that
-holds it.
+Status: **done** — change 1 landed 2026-08-15; change 2 (OTel instrumentation,
+JSON logs) has since landed too and been verified end-to-end in compose, with
+`ingest`, `retrieve`, and `synthesize` spans all observed in Jaeger (see
+`infra/README.md`'s dated "Verification status" table). Nothing here overrides
+SPEC.md; where this document makes a decision SPEC.md does not already
+contain, it names the ADR that holds it.
 
 `infra/` is created by this phase and by no earlier one. SPEC.md §3 is explicit
 that empty IaC directories are decoration, which is why the directory arrives
