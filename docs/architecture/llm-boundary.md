@@ -1,5 +1,19 @@
 # The LLM boundary
 
+**In plain terms, this page answers one question: when does anything you've
+indexed, or anything you type into a query, leave this machine — and what,
+if anything, gets stripped out first?** If you're about to index sensitive
+material, or turn on a cloud embedding or chat provider, this is the page
+to read first, not after the fact. New to terms like *embedding*,
+*reranker*, or what "the LLM boundary" even means? [Concepts](../concepts.md)
+explains each of those in plain language; this page assumes you know them
+and gives the complete, current — and occasionally uncomfortable — inventory
+built on top of them. One term this page introduces itself: **redaction**
+means a pattern-based pass that swaps things like email addresses and phone
+numbers for placeholder tokens before text reaches a cloud provider — not a
+promise that everything sensitive is caught, as the sections below make
+precise.
+
 SPEC.md §2 makes two promises that only mean something if the boundary they
 describe is written down: *"Deterministic core, LLM at the boundary"* and
 *"Anonymization at the LLM boundary."* The second one names this document as
@@ -109,10 +123,12 @@ provider.**
 
 ### 3. Cross-encoder rerank — model download, not content upload
 
-`CrossEncoderReranker` is a *local* model. It scores query/passage pairs
-in-process, and SPEC.md §2's "no LLM in the retrieval path" holds: a
-cross-encoder is a scoring model, not a generative one, and no chunk text is
-transmitted anywhere to rerank it.
+`CrossEncoderReranker` is a *local* model (see
+[Concepts](../concepts.md#reranking-a-slower-more-careful-second-pass) for
+what a cross-encoder is and why it counts as deterministic rather than as an
+LLM). It scores query/passage pairs in-process, and SPEC.md §2's "no LLM in
+the retrieval path" holds: a cross-encoder is a scoring model, not a
+generative one, and no chunk text is transmitted anywhere to rerank it.
 
 The one network event is the first load. `sentence_transformers.CrossEncoder`
 resolves the configured model name against a model host and downloads weights

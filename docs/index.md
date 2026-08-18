@@ -1,10 +1,55 @@
 # groundkit
 
+If you point an AI assistant at a folder of documents and ask it questions,
+it will answer — confidently — whether or not the documents actually
+support that answer. It might summarize them faithfully. It might also
+invent a detail, or attribute a claim to a document that doesn't contain
+it, and nothing about how the answer sounds tells you which one happened.
+
+groundkit is a retrieval system built to close that specific gap: finding
+the right passage, and proving it is the right passage. Every result names
+the exact source file and character range it came from — a **citation** —
+and groundkit re-reads that file and checks the text is actually there
+before returning the result, rather than trusting its own pointer. Getting
+a pointer that precise starts with splitting every document into small,
+bounded passages (**chunks**) before anything is indexed or searched.
+
+**Who this documentation is for:** engineers and technical evaluators
+looking at a retrieval component to sit underneath an AI assistant, a
+support tool, or a search feature — including by connecting an assistant
+like Claude to it directly over **MCP** (Model Context Protocol — the
+standard AI assistants use to call external tools). If you want something
+you can point at a folder of Markdown/text files or a URL and get back
+verifiable, checkable search results today, groundkit already does that. If
+you need PDF/HTML ingestion or a hosted service, neither is built yet — see
+[Known limitations](limitations.md).
+
+## What it does today
+
 Grounded, citation-verifiable hybrid retrieval: a persisted BM25 + dense
 index, a named MCP server, and a retrieval eval harness — fully local by
-default.
+default. Term by term:
 
-!!! note "Status: Phases 0–6 of 7 done; Phase 7 is the release itself"
+- **Hybrid retrieval** — combines **BM25** (keyword search: scores
+  documents by the words they literally share with the query) with **dense
+  embeddings** (matching by meaning, so a query for "car" can match a
+  document that only says "automobile"), merged by **reciprocal-rank fusion
+  (RRF)**, over an index that survives restarts, with an optional local
+  **cross-encoder reranker** — a slower, more accurate second pass over the
+  top few results.
+- **Verifiable citations** — every passage carries document ID, chunk ID and
+  character offsets that resolve back to source, and a function that checks
+  them.
+- **A retrieval eval harness** — a fixed set of test questions with
+  known-correct answers, scored against a labelled golden corpus by
+  deterministic, unit-tested metric code. BM25-only is the baseline every
+  feature reports a delta against, including when the delta is negative.
+- **Local by default** — Ollama embeddings and a file-based index. `grk` works
+  end to end with zero cloud credentials.
+
+## Status
+
+!!! note "Phases 0–6 of 7 done; Phase 7 is the release itself"
 
     The deterministic core, the persisted index, hybrid retrieval, the eval
     harness, the LLM boundary (query rewrite, synthesis, redaction), the MCP
@@ -14,20 +59,6 @@ default.
     the authoritative status, and
     [Known limitations](limitations.md) is the authoritative list of what
     does not work.
-
-## What it does today
-
-- **Hybrid retrieval** — BM25, dense embeddings, and reciprocal-rank fusion
-  over an index that survives restarts, with an optional local cross-encoder
-  reranker.
-- **Verifiable citations** — every passage carries document ID, chunk ID and
-  character offsets that resolve back to source, and a function that checks
-  them.
-- **A retrieval eval harness** — a labelled golden corpus scored by
-  deterministic, unit-tested metric code. BM25-only is the baseline every
-  feature reports a delta against, including when the delta is negative.
-- **Local by default** — Ollama embeddings and a file-based index. `grk` works
-  end to end with zero cloud credentials.
 
 ## What makes it different from a RAG demo
 
@@ -57,6 +88,8 @@ semantic spaces corrupts an index quietly.
   optional extras cost you.
 - **[Quickstart](getting-started/quickstart.md)** — ingest a directory and
   search it, in three commands.
+- **[MCP clients](guides/mcp-clients.md)** — connect Claude Desktop or Claude
+  Code to a running collection.
 - **[Retrieval modes](guides/retrieval-modes.md)** — which mode to use, and
   the one thing hybrid cannot do.
 - **[The LLM boundary](architecture/llm-boundary.md)** — exactly where text
@@ -66,11 +99,12 @@ semantic spaces corrupts an index quietly.
 
 ## No numbers here
 
-You will not find a recall or nDCG figure written into this site. SPEC.md §2
-permits a number in a document only when it comes from a generated eval
-artifact or a live badge — a hand-copied metric is a number that was true
-once. The [eval harness guide](guides/evals.md) shows how to generate the
-report yourself; it takes two commands from a clean clone.
+You will not find a recall or nDCG figure (standard retrieval-quality
+metrics) written into this site. SPEC.md §2 permits a number in a document
+only when it comes from a generated eval artifact or a live badge — a
+hand-copied metric is a number that was true once. The [eval harness
+guide](guides/evals.md) shows how to generate the report yourself; it takes
+two commands from a clean clone.
 
 ## Provenance
 

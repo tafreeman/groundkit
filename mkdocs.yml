@@ -104,6 +104,11 @@ markdown_extensions:
 
 nav:
   - Home: index.md
+  # Second, deliberately, and before the how-to pages: every guide below
+  # assumes BM25, embeddings, RRF, reranking, chunks, citations and MCP.
+  # A reader who does not already know those needs one page that explains
+  # them in plain language, not a glossary buried under the reference.
+  - Concepts: concepts.md
   - Getting started:
       - Installation: getting-started/installation.md
       - Quickstart: getting-started/quickstart.md

@@ -527,9 +527,10 @@ v0.1.0 scope amendment, narrowed to that one remaining gap.
   Windows share violation) is a logged warning, not a failed ingest, because the durable
   state is already correct by then. That leaves disk litter which the next ingest of the
   same source retries, and which nothing else sweeps: there is no `grk gc`.
-- **`docs/guides/deployment.md`'s backup-scope paragraph names only the SQLite store.** With
-  snapshots on disk, a backup that copies `.sqlite3` alone cannot verify any `snapshot`
-  citation after a restore — the text it would compare against is in the sibling directory.
+  A backup must cover all three artifacts: a restore from the `.sqlite3` alone cannot
+  verify any `snapshot` citation, because the text it would compare against lives in the
+  sibling `.snapshots` directory. `docs/guides/deployment.md`'s backup-scope paragraph
+  says so.
 - **The extractor-identity check no longer always-refuses, and neither does a `snapshot`
   citation.** An `extracted` citation still resolves only if its recorded extractor identity
   is active in this build — `active_extractors()` naming the recorded identity and reporting

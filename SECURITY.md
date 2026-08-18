@@ -1,5 +1,19 @@
 # Security
 
+**What this page is:** groundkit's honest, current statement of what is and
+isn't guarded, plus how to report a problem. **Who needs it:** anyone
+deploying groundkit anywhere other than their own laptop, anyone about to
+expose its network surface beyond `127.0.0.1`, or anyone who wants the
+precise boundary of what "local-first" and "read-only" actually guarantee
+before relying on either. Below is a security policy in the ordinary sense
+— how to report a vulnerability — and then this project's most exacting
+document: every claim after that is either enforced by a test or explicitly
+marked as not yet closed, never left implied. If terms like *MCP*,
+*citation*, or *local-first* are unfamiliar,
+[Concepts](https://tafreeman.github.io/groundkit/concepts/) explains each
+in plain language; this page assumes you know what groundkit does and is
+precise about what it does not guard.
+
 ## Reporting
 
 Report suspected vulnerabilities via GitHub private vulnerability reporting on
@@ -8,9 +22,12 @@ this repository. Please do not open public issues for security reports.
 ## Operational scope — honest statement (Phase 6)
 
 BM25 and hybrid retrieval, a persisted SQLite (+ optional LanceDB) index, and
-citation-bearing search work end-to-end locally against file/directory
+[citation-bearing search](https://tafreeman.github.io/groundkit/concepts/#grounding-and-why-verified-beats-asserted)
+work end-to-end locally against file/directory
 input, contained to an allowed base directory via ported `path_safety`
-(`ensure_within_base`). The REST API and MCP server are real and
+(`ensure_within_base`). The REST API and
+[MCP server](https://tafreeman.github.io/groundkit/concepts/#mcp-how-an-assistant-like-claude-searches-your-documents)
+are real and
 installable, not stubs: `grk serve` runs a FastAPI REST surface and the MCP
 streamable-HTTP transport on one process, and `grk serve-mcp` runs the
 stdio transport. Both mirror the same four tools SPEC.md §1.2 names —

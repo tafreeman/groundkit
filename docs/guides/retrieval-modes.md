@@ -1,15 +1,33 @@
 # Retrieval modes
 
+This page is for anyone who has to pick how groundkit searches — including if
+you will never type the command yourself and just need to understand the
+tradeoff someone else is choosing on your behalf. groundkit can find results
+three ways: by matching the literal words in a query, by matching what the
+query *means*, or by combining both. Which one is right depends on what you're
+indexing and on whether "I don't know" needs to be an answer groundkit is
+allowed to give. By the end of this page you'll be able to make that call
+yourself, without needing to run anything.
+
 `grk search` takes `--mode bm25` (the default), `--mode dense`, or
 `--mode hybrid`.
 
 ## The short answer
 
-Use **hybrid** if you have an embedding provider configured and your users ask
-open-ended questions. Stay on **BM25** if "I found nothing" needs to be a
-possible answer.
+Use **hybrid** if you have an embedding provider configured (a running
+service that turns text into a searchable representation of its meaning —
+setup cost below) and your users ask open-ended questions. Stay on **BM25**
+if "I found nothing" needs to be a possible answer.
 
-Measured against the golden corpus with a real embedding model, hybrid beat
+| Mode | What it is | What it buys you | What it costs | Can it say "I don't know"? |
+|---|---|---|---|---|
+| **BM25** (the default) | Keyword matching — ranks a chunk by how many words it literally shares with your query, the scored version of a Ctrl+F search | Works instantly, everywhere, on anything you can already install | Nothing beyond the base install — no extra setup, no model download | **Yes.** Returns nothing when no indexed chunk shares a term with the query |
+| **Dense** | Meaning-based matching — text is converted to a vector (a list of numbers standing in for its meaning) by an embedding model, so a query about "cars" can find a chunk about "automobiles" | Finds relevant results that don't share any words with the query | An embedding provider must be running (a local model download via Ollama, or a cloud endpoint), and your documents must be re-ingested with `--dense` — see below | In principle, yes — but no safe default cutoff has been measured yet, so it ships off |
+| **Hybrid** | BM25 and dense search run together and their two ranked lists are merged into one (a technique called reciprocal rank fusion, or RRF) | Combines literal-word and meaning-based matches; measured better than BM25 alone on every retrieval-quality metric | Same setup as dense, plus noticeably more time per query | **No.** Always returns its top results, however irrelevant — see the warning below |
+
+Measured against the golden corpus (a small, fixed set of documents and
+questions with known-correct answers — see the
+[eval harness guide](evals.md)) with a real embedding model, hybrid beat
 the BM25 baseline on every retrieval-quality metric, with no metric
 regressing. No figure for that is written here on purpose — SPEC.md §2 allows
 a number in a document only when it is generated or live, and this one is
@@ -41,17 +59,20 @@ Two costs sit outside every quality number:
 
     Ask a question your corpus cannot answer and BM25 says nothing while
     hybrid answers confidently. `--mode dense` *does* honour
-    `score_threshold`, but no defensible default value for it has been
-    measured yet, so it is off.
+    `score_threshold` (a minimum relevance score below which a mode returns
+    nothing at all — the mechanism that lets a mode say "I don't know"), but
+    no defensible default value for it has been measured yet, so it is off.
 
 **Hybrid needs a running embedding provider** and costs substantially more
 latency per query. BM25 needs neither.
 
 ## Building a dense collection
 
-This is the part that catches people, so it is worth being blunt about:
-**`--mode hybrid` only works against a collection ingested with `--dense`, and
-you cannot upgrade a collection in place.**
+A collection is a named, self-contained index — `--collection NAME` lets you
+keep more than one side by side, each searched independently. This is the
+part that catches people, so it is worth being blunt about: **`--mode hybrid`
+only works against a collection ingested with `--dense`, and you cannot
+upgrade a collection in place.**
 
 ```bash
 uv run grk ingest ./docs                       # BM25-only collection
@@ -95,7 +116,10 @@ hazard — a BM25-only ingest over a dense collection, which orphans its vectors
 
 ## Rerank
 
-The optional local cross-encoder reranker reorders the best available upstream
+A reranker is an optional, slower, more accurate second pass that re-scores
+just the top few search results before they're returned — it does not
+replace BM25, dense, or hybrid, it refines whichever one already ran. The
+optional local cross-encoder reranker reorders the best available upstream
 stage ([ADR-0012](../adr/ADR-0012-rerank-eval-stage-reorders-upstream-stage.md)).
 It runs entirely in-process — no text is transmitted anywhere to rerank it —
 behind the `rerank` extra, whose install cost is covered in
@@ -106,3 +130,10 @@ sigmoid-normalizes them before they reach a `RetrievalResult`, whose score
 contract is non-negative. That normalization is
 [ADR-0005](../adr/ADR-0005-fusion-and-rerank-scoring.md) decision 4, and it
 exists because ADR-0001 hazard 2 is the case where it was missing.
+
+## Next
+
+[Eval harness](evals.md) shows how the hybrid-beats-BM25 numbers referenced
+above are produced, and how to reproduce them on your own corpus.
+[Deployment](deployment.md) covers running any of these modes as a service
+rather than from a terminal.

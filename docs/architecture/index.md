@@ -1,13 +1,23 @@
 # Architecture
 
+**What this page covers:** how groundkit's moving parts fit together, and
+which mechanism enforces each of the project's non-negotiable principles —
+not just what they claim. **Who needs it:** anyone about to change code
+here, or anyone who wants the shape of the system before diving into one
+component. If a term below — chunk, BM25, hybrid, eval harness, ADR — is
+new to you, [Concepts](../concepts.md) explains each one in plain language
+first; this page assumes you already know what those words mean and goes
+straight to how groundkit's version of each is wired together.
+
 groundkit is a retrieval service built around one structural commitment, from
-which most of the rest follows: **the core is deterministic, and the LLM sits
-at the boundary.** Ingestion, chunking, indexing, scoring, fusion, and citation
+which most of the rest follows: **[the core is deterministic, and the LLM
+sits at the boundary](../concepts.md#deterministic-core-llm-at-the-boundary).**
+Ingestion, chunking, indexing, scoring, fusion, and citation
 resolution are pure, typed, tested code. No model runs in the retrieval path.
 
 The corollary is that retrieval quality is *measurable* rather than
-impressionistic — which is why the eval harness landed in Phase 2, before
-hybrid retrieval and rerank, instead of after them.
+impressionistic — which is why the [eval harness](../concepts.md#measuring-quality-the-eval-harness)
+landed in Phase 2, before hybrid retrieval and rerank, instead of after them.
 
 ## Components
 
@@ -68,8 +78,11 @@ Two consequences worth knowing before you deploy anything:
 
 ## Where the decisions are recorded
 
-The [ADR index](../adr/index.md) is the authoritative list. The ones that
-explain the most about how retrieval behaves:
+Every irreversible decision behind this page gets an **ADR** — a short
+record of what was decided, what alternatives were rejected, and why (see
+[Concepts](../concepts.md#adrs-recording-a-decision-so-it-stays-one) if
+that's a new term). The [ADR index](../adr/index.md) is the authoritative
+list. The ones that explain the most about how retrieval behaves:
 
 - [ADR-0002](../adr/ADR-0002-index-persistence.md) — why SQLite is the truth
   and BM25 rebuilds at open.
