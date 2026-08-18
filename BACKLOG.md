@@ -230,9 +230,14 @@ verification mechanism is silently gone.
 - **Severity** HIGH · **Effort** S · **ADR** no · **Verified**
 - **Where** `src/groundkit/ingestion/chunking.py:92`
 
-```python
+```text
 metadata={"source": document.source, **document.metadata},
 ```
+
+(Fenced as `text`, not `python`: `ruff format` formats Python blocks inside Markdown, and
+this line is a keyword-argument fragment rather than a statement. Ruff parses it as a
+tuple assignment and rewrites it into something that means something else entirely, which
+fails the `lint` job's `ruff format --check` step. Quote source fragments as `text`.)
 
 Dict-literal ordering applies the caller's keys *after* the seeded one. Confirmed by
 execution: a `Document` carrying `metadata={"source": "..."}` produces chunks whose
