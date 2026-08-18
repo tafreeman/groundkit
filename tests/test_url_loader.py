@@ -816,3 +816,60 @@ class TestUrlLoaderNeverLeaksFetchedBodyIntoMessages:
         with pytest.raises(ConfigurationError) as excinfo:
             _load(loader, "http://127.0.0.1/doc")
         assert self._SENTINEL not in str(excinfo.value)
+
+
+class TestUrlLoaderRefusesQueryStringCredentials:
+    """The persisted half of the credential leak `tests/test_url_redaction.py`
+    documents.
+
+    `_reject_unsafe_url_shape` refused *userinfo* from the start, and its
+    docstring gave the reason: this loader records the URL verbatim as
+    `Document.source`, so a credential there is persisted to the index and
+    returned in every citation built from it. That reasoning applies unchanged
+    to `?token=...`, which the same function permitted -- so the pre-fix loader
+    fetched these URLs and returned a Document carrying the secret in `source`.
+
+    Both assertions matter, per this file's established discipline: the
+    refusal's own message, and that the transport was never invoked. A test
+    asserting only "an error was raised" could pass for the wrong reason.
+    """
+
+    @staticmethod
+    def _boom(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("transport must not be invoked when the URL carries a credential")
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://internal.example.com/export?token=sk-live-1",
+            "https://internal.example.com/export?api-key=sk-live-1",
+            "https://internal.example.com/export?id=42&access_token=sk-live-1",
+            "https://internal.example.com/x?password=hunter2",
+        ],
+    )
+    def test_a_credential_bearing_url_is_refused(self, tmp_path: Path, url: str) -> None:
+        loader = UrlLoader(tmp_path, client=_client(self._boom))
+        with pytest.raises(IngestionError, match="credential in its query string"):
+            _load(loader, url)
+
+    def test_the_refusal_does_not_echo_the_credential(self, tmp_path: Path) -> None:
+        """The message names the offending *parameter*, never its value -- a
+        refusal that quoted the secret back would move the leak from the index
+        into the operator's terminal rather than closing it."""
+        secret = "sk-live-must-not-appear"  # noqa: S105  # gitleaks:allow
+        loader = UrlLoader(tmp_path, client=_client(self._boom))
+        with pytest.raises(IngestionError) as excinfo:
+            _load(loader, f"https://internal.example.com/export?token={secret}")
+        rendered = str(excinfo.value)
+        assert secret not in rendered
+        assert "'token'" in rendered
+        assert "internal.example.com" in rendered
+
+    def test_no_snapshot_is_written_for_a_refused_url(self, tmp_path: Path) -> None:
+        """The refusal happens before any fetch, so it must also happen before
+        any disk write -- otherwise the URL is refused while its content is
+        left on the volume."""
+        loader = UrlLoader(tmp_path, client=_client(self._boom))
+        with pytest.raises(IngestionError):
+            _load(loader, "https://internal.example.com/export?token=sk-live-1")
+        assert list(tmp_path.rglob("*")) == []

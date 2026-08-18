@@ -493,8 +493,18 @@ This is item 1 of SPEC.md §4.1's v0.1.0 scope amendment.
   than guess at. `FileLoader` still handles `.md`/`.txt` only, so every document a shipped code
   path can create is `source_class="text"`, and the re-extraction path is exercised by tests
   rather than by a live ingest.
-- **There is still no URL ingestion** (wave 4, ADR-0016 decision 4). `grk ingest` accepts no
-  URL, and a `snapshot`-class citation is refused with that specific reason.
+- **A credential in a URL query string is refused by name, and the list of names is not
+  exhaustive.** `_reject_unsafe_url_shape` refused userinfo (`user:pass@host`) from the start
+  because this loader records the URL verbatim as `Document.source`; a `?token=…` reaches
+  exactly the same places (SQLite, every `RetrievalResult` and `Citation`, the ingest log) and
+  was permitted until it was refused too. The check is a denylist of unambiguous parameter
+  names (`utils/url_safety.CREDENTIAL_QUERY_PARAMS`), compared after folding case and
+  `-`/`_`. **A credential under a name not on that list still gets persisted.** `code` and
+  `state` are deliberately absent — they are OAuth credentials in one context and a country
+  code or a US state in another, and refusing them would reject ordinary document URLs.
+  Redacting instead of refusing is not available: `documents.source` is `TEXT UNIQUE NOT
+  NULL`, and `sanitize_url` redacts every query value unconditionally, so it would collapse
+  `?id=42` and `?id=43` onto one identity. Supply credentials out of band.
 - **The extractor-identity check is correct code that is currently always-refusing.** An
   `extracted` citation resolves only if the recorded extractor identity is active in this
   build, and no extractor is registered — so every such citation is refused as

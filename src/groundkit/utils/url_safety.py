@@ -181,6 +181,88 @@ def validate_endpoint_shape(
 REDACTED_PLACEHOLDER: Final[str] = "***"
 
 
+#: Query-parameter names that carry a credential rather than a document
+#: locator, compared after :func:`_normalize_param_name` folds case and drops
+#: ``-``/``_`` (so ``api-key``, ``api_key`` and ``apikey`` are one entry).
+#:
+#: The three exemplars :func:`sanitize_url` names in its own docstring — an
+#: Azure-style ``api-key``, a Google-style ``key``, an ordinary ``token`` — are
+#: all here, because this set and that function guard the same threat at two
+#: different moments: it redacts what reaches a *message*, this refuses what
+#: would reach *storage*.
+#:
+#: Deliberately a denylist of unambiguous names, not a heuristic. ``code`` and
+#: ``state`` are OAuth credentials in one context and a country code or a US
+#: state in another; refusing them would reject ordinary document URLs, which
+#: is the failure mode :func:`_reject_unsafe_url_shape` exists to avoid. A
+#: credential under an unlisted name still gets through — this narrows a
+#: documented leak, it does not claim to close every spelling of one.
+CREDENTIAL_QUERY_PARAMS: Final[frozenset[str]] = frozenset(
+    {
+        "accesstoken",
+        "apikey",
+        "auth",
+        "authorization",
+        "clientsecret",
+        "credential",
+        "credentials",
+        "idtoken",
+        "key",
+        "password",
+        "passwd",
+        "privatekey",
+        "pwd",
+        "refreshtoken",
+        "sastoken",
+        "secret",
+        "sessionid",
+        "sig",
+        "signature",
+        "token",
+    }
+)
+
+
+def _normalize_param_name(name: str) -> str:
+    """Fold *name* to the form :data:`CREDENTIAL_QUERY_PARAMS` is keyed on."""
+    return name.lower().replace("-", "").replace("_", "")
+
+
+def credential_query_params(url: str) -> tuple[str, ...]:
+    """Return the query-parameter names in *url* that carry a credential.
+
+    **Why this is a refusal helper and not a redaction one.** The obvious fix
+    for a credential in a query string is to run it through
+    :func:`sanitize_url` before storing it. That is wrong here, and the reason
+    is structural rather than stylistic: ``documents.source`` is
+    ``TEXT UNIQUE NOT NULL`` — the identity a re-ingest matches on — while
+    ``sanitize_url`` redacts *every* query value unconditionally. It maps
+    ``?id=42`` and ``?id=43`` to one string, so sanitizing before storage
+    would collapse two genuinely different documents onto one identity and
+    the second ingest would overwrite the first. Redaction is right for a
+    message, which has no identity to preserve, and wrong for the stored
+    locator.
+
+    So the caller refuses instead, which is also what
+    ``_reject_unsafe_url_shape`` already does one line earlier for userinfo,
+    and for the same stated reason: naming the problem while the caller can
+    still fix it beats silently storing something that will surprise them.
+
+    Args:
+        url: The URL to inspect.
+
+    Returns:
+        The offending parameter names, in the order they appear, spelled as
+        the caller spelled them (not normalized) so a message can quote them
+        back recognizably. Empty when the query carries no credential.
+    """
+    return tuple(
+        name
+        for name, _ in parse_qsl(urlsplit(url).query, keep_blank_values=True)
+        if _normalize_param_name(name) in CREDENTIAL_QUERY_PARAMS
+    )
+
+
 def sanitize_url(url: str, secret: str | None = None) -> str:
     """Return *url* with any userinfo and every query-parameter value redacted.
 
