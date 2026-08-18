@@ -223,8 +223,18 @@ it is now true because the surface exists and is tested.
 
 This section is rewritten as each phase lands real surface, per SPEC.md §7:
 
-- Rate limiting, when it arrives, is process-local — not a distributed or
-  DoS-grade control, and it will be documented as such.
+- **A concurrency cap exists; rate limiting does not.** `grk serve` starts
+  uvicorn with `limit_concurrency` set to `cli.SERVE_MAX_CONCURRENT_REQUESTS`,
+  so requests past that ceiling are answered 503 rather than accepted. That
+  bounds how much work is in flight at once, which is what a single replica
+  under a hard memory limit actually needs — every operation on this surface
+  is O(corpus) and none of it is authenticated, so without a cap arrival rate
+  alone decided peak memory. It is *not* rate limiting: it counts concurrent
+  requests, not requests per caller per interval, so a client that waits for
+  each response is unbounded, and nothing attributes load to a caller. Rate
+  limiting, when it arrives, will be process-local — not a distributed or
+  DoS-grade control — and will be documented as such. Neither control is a
+  substitute for not exposing this surface to untrusted callers.
 - Redaction at the LLM boundary (structural patterns by default, names only
   via configured patterns) shipped in Phase 5 and runs on every cloud **chat**
   call (`build_chat` wraps it in `RedactingChat`, no operator opt-out); local

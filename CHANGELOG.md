@@ -38,8 +38,37 @@ it scored.
   overlay-network deployment (ADR-0024 decision 3). The container default
   `--host 0.0.0.0 --allow-remote-access` (ADR-0021) is unaffected.
 
+### Changed
+
+- `grk serve` bounds how many requests it holds in flight. uvicorn is started
+  with `limit_concurrency` set to `cli.SERVE_MAX_CONCURRENT_REQUESTS`, so
+  requests past that ceiling are answered 503 rather than accepted. Every
+  operation on this unauthenticated surface is O(corpus), so arrival rate alone
+  previously decided peak memory — an OOMKill on the single-replica Kubernetes
+  deployment was traffic, not corpus growth, while the manifest's own comment
+  said otherwise. This is a concurrency cap, not rate limiting; `SECURITY.md`
+  states the difference.
+- `SQLiteMetadataStore` sets `PRAGMA busy_timeout` explicitly, to
+  `metadata.BUSY_TIMEOUT_MS`. The value it had was already five seconds,
+  inherited from `sqlite3.connect`'s `timeout=5.0` default rather than chosen;
+  nothing named it, stated it, or tested it. Behaviour is unchanged and the
+  value now belongs to the module, guarded by a test that forces the connect
+  default to 0 and requires the pragma to hold.
+
 ### Fixed
 
+- BM25 scoring no longer runs on the event loop. `BM25Index.search` scores the
+  whole corpus in pure Python and was called inline from `Retriever.search`'s
+  `async def`, so on `grk serve` — one uvicorn worker, one loop — a single
+  query stalled every other in-flight request, `index_status` and `fetch_chunk`
+  included. Both call sites now dispatch through `asyncio.to_thread`, as does
+  `InMemoryVectorStore.search`, which was `async def` with no `await` in its
+  body. This moves the stall, not the cost: the scan is still linear in corpus
+  size.
+- `index_status` no longer reads the entire corpus to count it.
+  `CollectionRuntime.chunk_count` materialized every chunk's full text as
+  re-validated models to return one integer; it now runs an aggregate through
+  `SQLiteMetadataStore.count_chunks`. `MetadataStoreProtocol` is unchanged.
 - `rerank_by_logits` now preserves a result's `source_class` and `extractor`
   through cross-encoder reranking instead of silently reverting them to the
   contract defaults (`"text"` / `None`). Previously every reranked citation from

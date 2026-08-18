@@ -129,6 +129,26 @@ if TYPE_CHECKING:
     from groundkit.providers.protocols import ChatProtocol, EmbeddingProtocol
     from groundkit.service.api import McpMount
 
+#: Requests ``grk serve`` will hold in flight before uvicorn answers 503
+#: instead of accepting more (``uvicorn.Config(limit_concurrency=...)``).
+#:
+#: The surface is unauthenticated and read-only, and every operation on it is
+#: O(corpus): ``search`` scores the whole corpus regardless of ``top_k``, and
+#: ``index_status`` reads an aggregate over every chunk row. Without a cap,
+#: arrival rate alone decides peak memory — each accepted request holds its own
+#: working set — so a single replica under a hard memory limit is OOMKilled
+#: rather than slowed, and ``infra/k8s/deployment.yaml`` runs exactly that with
+#: ``strategy: Recreate`` and nothing to fail over to. Refusing the excess turns
+#: an unbounded pile-up into a load-shedding signal a client can retry.
+#:
+#: Twice the ceiling of the default ``asyncio.to_thread`` executor, which is
+#: ``min(32, cpu_count + 4)``. Every blocking step on the read path — each
+#: store operation, and BM25's whole-corpus scan — is dispatched to that pool,
+#: so concurrency meaningfully above its ceiling buys queued memory rather than
+#: throughput. The doubling leaves headroom for a burst to be absorbed and
+#: served instead of shed at the first queued request.
+SERVE_MAX_CONCURRENT_REQUESTS: int = 64
+
 #: Characters of chunk content shown per result in text output.
 _SNIPPET_CHARS: int = 160
 
@@ -1393,7 +1413,15 @@ async def _serve_http(ctx: ServiceContext, *, host: str, port: int) -> None:
         mcp_mount=_build_mcp_mount(ctx, host_allow_list=host_allow_list),
         host_allow_list=host_allow_list,
     )
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="info",
+            limit_concurrency=SERVE_MAX_CONCURRENT_REQUESTS,
+        )
+    )
     await server.serve()
 
 

@@ -368,6 +368,24 @@ class InMemoryVectorStore:
     ) -> list[tuple[Chunk, float]]:
         """Return the most similar chunks, most similar first.
 
+        The exhaustive scan runs in a worker thread, not on the caller's
+        event loop. This method was ``async def`` with no ``await`` in its
+        body: an ``await`` on it therefore never yielded, and a pure-Python
+        cosine over every stored vector ran to completion before any other
+        coroutine got the loop back. That is the same defect
+        :meth:`~groundkit.retrieval.search.Retriever._bm25_search` documents,
+        on the other always-in-process store.
+
+        The ``(chunk, vector)`` pairing is materialized *here*, on the
+        calling thread, and only the scoring is dispatched. :meth:`add`
+        extends the two backing lists in two separate statements, so a
+        worker thread that zipped them itself could observe the first
+        extended and the second not — turning a benign interleaving into a
+        ``strict=True`` length mismatch. Pairing before dispatch keeps the
+        snapshot exactly as consistent as the fully-inline version was,
+        and it is cheap next to what moves: tuple construction per chunk
+        versus a full-width dot product per chunk.
+
         Args:
             query_embedding: The query vector.
             top_k: Maximum number of results.
@@ -394,8 +412,27 @@ class InMemoryVectorStore:
                 "query embedding", len(query_embedding), self._dimensions
             )
 
+        entries = list(zip(self._chunks, self._vectors, strict=True))
+        return await asyncio.to_thread(
+            self._score_sync, entries, query_embedding, top_k, metadata_filter
+        )
+
+    @staticmethod
+    def _score_sync(
+        entries: list[tuple[Chunk, list[float]]],
+        query_embedding: list[float],
+        top_k: int,
+        metadata_filter: dict[str, Any] | None,
+    ) -> list[tuple[Chunk, float]]:
+        """Blocking filter-score-sort over a pre-paired snapshot.
+
+        Run only via ``asyncio.to_thread`` from :meth:`search`, matching the
+        ``_sync`` convention :class:`LanceDBVectorStore` uses below. Static
+        and snapshot-taking rather than reading ``self``, so nothing it
+        touches can be mutated by the loop thread while it runs.
+        """
         scored: list[tuple[Chunk, float]] = []
-        for chunk, vector in zip(self._chunks, self._vectors, strict=True):
+        for chunk, vector in entries:
             if not _matches_filter(chunk.metadata, metadata_filter):
                 continue
             scored.append((chunk, _clamp_score(_cosine_similarity(query_embedding, vector))))

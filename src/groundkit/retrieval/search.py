@@ -8,6 +8,7 @@ the surviving results (ADR-0006). Rerank arrives in Wave D.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import TYPE_CHECKING, Final, Literal
@@ -324,7 +325,7 @@ class Retriever:
                 metadata: dict[str, object]
                 stage: Stage
                 if mode == "bm25":
-                    pairs = self._bm25.search(query, top_k=k)
+                    pairs = await self._bm25_search(query, k)
                     results = self._resolve(pairs, records, apply_threshold=True)
                     stage = "bm25"
                     metadata = {"stage": stage, "top_k": k}
@@ -336,7 +337,7 @@ class Retriever:
                     metadata = {"stage": stage, "top_k": k}
                 elif mode == "hybrid":
                     embedder, vector_store = self._require_dense(mode)
-                    bm25_pairs = self._bm25.search(query, top_k=k)
+                    bm25_pairs = await self._bm25_search(query, k)
                     dense_pairs = await self._dense_candidates(
                         query, k, records, embedder, vector_store
                     )
@@ -429,6 +430,42 @@ class Retriever:
                 "fresh collection with `grk ingest --dense`."
             )
         return self._embedder, self._vector_store
+
+    async def _bm25_search(self, query: str, k: int) -> list[tuple[Chunk, float]]:
+        """Score the whole corpus off the event loop.
+
+        :meth:`~groundkit.index.bm25.BM25Index.search` is synchronous and
+        CPU-bound: it scores *every* indexed chunk before truncating to
+        ``top_k`` (ADR-0002's accepted O(corpus) trade), so its cost tracks
+        corpus size rather than ``k``. Called inline from this ``async def``,
+        that arithmetic runs on the one event loop ``grk serve`` has — a
+        single uvicorn worker — and stalls every other in-flight request for
+        its duration, ``index_status`` and ``fetch_chunk`` included.
+
+        Every other CPU- or IO-bound step on this path is already dispatched
+        to a worker thread for exactly this reason
+        (:mod:`groundkit.index.dense`, ``retrieval/rerank.py``'s
+        ``model.predict`` call, and every ``SQLiteMetadataStore`` operation).
+        BM25 was the omission, and it is the *default* retrieval mode — the
+        one always available with no optional extra installed.
+
+        This moves the stall, not the work: total CPU is unchanged and a
+        concurrent caller still contends for the GIL, which pure-Python
+        scoring holds for most of its run. What changes is that the loop
+        keeps turning, so unrelated requests are served rather than queued
+        behind a whole-corpus scan. Recorded as a residual in
+        ``KNOWN_LIMITATIONS.md``; the standing fix is a postings list that
+        scores only candidate chunks.
+
+        Args:
+            query: The raw query string, tokenized by the index itself.
+            k: Already-validated ``top_k`` for this search.
+
+        Returns:
+            ``(chunk, score)`` pairs exactly as
+            :meth:`~groundkit.index.bm25.BM25Index.search` returns them.
+        """
+        return await asyncio.to_thread(self._bm25.search, query, top_k=k)
 
     async def _document_records(self) -> dict[str, DocumentRecord]:
         """Read every stored document's provenance for this search's one join.
