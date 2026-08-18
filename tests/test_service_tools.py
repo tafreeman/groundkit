@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import sqlite3
+import threading
 import typing
 from pathlib import Path
 
@@ -362,6 +363,53 @@ def test_list_collections_opens_nothing(tmp_path: Path) -> None:
             names = await tools_module.handle_list_collections(ctx, ListCollectionsRequest())
             assert names == ["default"]
             assert sorted(p.name for p in index_dir.iterdir()) == before
+        finally:
+            await ctx.registry.aclose()
+
+    asyncio.run(run())
+
+
+def test_list_collections_does_not_block_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe must run off the loop thread, not on it.
+
+    ``is_groundkit_store`` opens a real ``sqlite3`` connection and reads a
+    pragma for every candidate file. Called inline from an ``async def``, that
+    is blocking work on the single event loop, in the discovery tool a client
+    typically calls first -- so it stalls every other in-flight coroutine for N
+    sequential sqlite opens.
+
+    Correctness is unchanged either way, so this asserts the concurrency
+    property directly rather than an observable output: the identity of the
+    thread the blocking probe runs on. That is deterministic, not timing-based
+    -- ``asyncio.to_thread`` always dispatches to an executor worker, and
+    running inline always reports the loop's own thread -- so there is no
+    sleep, no timeout and nothing to make it flaky.
+    """
+    probe_threads: list[int] = []
+
+    def _recording_probe(_db_path: Path) -> bool:
+        probe_threads.append(threading.get_ident())
+        return True
+
+    monkeypatch.setattr(tools_module, "is_groundkit_store", _recording_probe)
+
+    async def run() -> None:
+        index_dir, corpus, _ = await _seed(tmp_path)
+        (index_dir / "second.sqlite3").write_bytes(b"")
+        ctx = _context(index_dir, corpus)
+        try:
+            loop_thread = threading.get_ident()
+            names = await tools_module.handle_list_collections(ctx, ListCollectionsRequest())
+
+            assert len(probe_threads) >= 2, "the probe never ran over both candidates"
+            assert sorted(names) == ["default", "second"]
+            offenders = [t for t in probe_threads if t == loop_thread]
+            assert not offenders, (
+                f"is_groundkit_store ran on the event loop thread ({loop_thread}) "
+                f"for {len(offenders)} of {len(probe_threads)} candidates"
+            )
         finally:
             await ctx.registry.aclose()
 
