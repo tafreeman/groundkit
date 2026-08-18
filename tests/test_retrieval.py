@@ -9,6 +9,7 @@ any pre-existing test.
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -1293,5 +1294,63 @@ def test_unknown_search_mode_raises_instead_of_silently_fusing(tmp_path: Path) -
 
         # The three real modes still dispatch.
         assert (await retriever.search("ranking", mode="bm25")).metadata["stage"] == "bm25"
+
+    asyncio.run(run())
+
+
+def test_bm25_scoring_does_not_run_on_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whole-corpus BM25 scoring must run off the loop thread, on both call sites.
+
+    ``BM25Index.search`` scores every indexed chunk before truncating to
+    ``top_k``, in pure Python. Called inline from ``Retriever.search``'s
+    ``async def``, that ran on the single event loop ``grk serve`` has -- so
+    one query stalled every other in-flight request, ``index_status`` and
+    ``fetch_chunk`` included, for the length of a full corpus scan. It was
+    the only CPU-bound step on this path never dispatched to a worker, and
+    it is the *default* retrieval mode.
+
+    Correctness is unchanged either way, so this asserts the concurrency
+    property directly: the identity of the thread the scoring runs on.
+    Deterministic, not timing-based -- ``asyncio.to_thread`` always
+    dispatches to an executor worker and running inline always reports the
+    loop's own thread -- so there is no sleep, no timeout and nothing to
+    make it flaky. Mirrors
+    ``test_service_tools.test_list_collections_does_not_block_the_event_loop``.
+
+    Both modes that reach BM25 are driven, because the defect had two
+    independent call sites: the ``bm25`` branch and the ``hybrid`` branch's
+    lexical half.
+    """
+    scoring_threads: list[int] = []
+    original = BM25Index._score_document
+
+    def _recording_score(self: BM25Index, query_tokens: list[str], doc_idx: int) -> float:
+        scoring_threads.append(threading.get_ident())
+        return original(self, query_tokens, doc_idx)
+
+    monkeypatch.setattr(BM25Index, "_score_document", _recording_score)
+
+    async def run() -> None:
+        # A dense-bound collection, so the hybrid branch's lexical half is
+        # reachable in the same test as the bm25 branch.
+        store, retriever, _embedder, _vector_store = await _open_scripted_hybrid_retriever(tmp_path)
+        loop_thread = threading.get_ident()
+
+        for mode in ("bm25", "hybrid"):
+            scoring_threads.clear()
+            await retriever.search(_HYBRID_QUERY, top_k=2, mode=mode)
+
+            assert len(scoring_threads) >= 2, (
+                f"mode {mode!r} never scored the corpus; the hook did not run"
+            )
+            offenders = [t for t in scoring_threads if t == loop_thread]
+            assert not offenders, (
+                f"mode {mode!r}: BM25 scored on the event loop thread ({loop_thread}) "
+                f"for {len(offenders)} of {len(scoring_threads)} chunks"
+            )
+
+        await store.close()
 
     asyncio.run(run())

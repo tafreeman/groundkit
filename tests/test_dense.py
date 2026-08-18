@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ import pytest
 
 from groundkit.contracts import Chunk
 from groundkit.errors import StorageError
+from groundkit.index import dense as dense_module
 from groundkit.index.dense import InMemoryVectorStore, LanceDBVectorStore
 from groundkit.index.protocols import VectorStoreProtocol
 from test_protocol_conformance import assert_signature_parity
@@ -800,5 +802,111 @@ def test_empty_metadata_filter_does_not_trigger_the_over_fetch_path(tmp_path: Pa
         # A real filter still takes the over-fetch path.
         await store.search([1.0, 0.0, 0.0, 0.0], top_k=2, metadata_filter={"source": "doc.md"})
         assert counted == [1]
+
+    asyncio.run(run())
+
+
+def test_in_memory_search_does_not_score_on_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exhaustive scan must run off the loop thread.
+
+    ``InMemoryVectorStore.search`` was ``async def`` with no ``await`` in
+    its body: awaiting it never yielded, so a pure-Python cosine over every
+    stored vector ran to completion on the one event loop before any other
+    coroutine got it back. Same defect as the BM25 side
+    (``test_retrieval.test_bm25_scoring_does_not_run_on_the_event_loop``),
+    on the other always-in-process store -- ``LanceDBVectorStore`` already
+    dispatched every call.
+
+    Asserts thread identity, not timing: ``asyncio.to_thread`` always
+    dispatches to an executor worker and running inline always reports the
+    loop's own thread, so there is nothing here to make flaky.
+    """
+    scoring_threads: list[int] = []
+    original = dense_module._cosine_similarity
+
+    def _recording_cosine(a: list[float], b: list[float]) -> float:
+        scoring_threads.append(threading.get_ident())
+        return original(a, b)
+
+    monkeypatch.setattr(dense_module, "_cosine_similarity", _recording_cosine)
+
+    async def run() -> None:
+        store = InMemoryVectorStore()
+        await store.add(
+            [
+                _make_chunk("c0", "d0", "alpha", chunk_index=0),
+                _make_chunk("c1", "d0", "beta", chunk_index=1),
+            ],
+            [_unit_vector(0), _unit_vector(1)],
+        )
+        loop_thread = threading.get_ident()
+
+        results = await store.search(_unit_vector(0), top_k=2)
+
+        assert len(results) == 2
+        assert len(scoring_threads) >= 2, "the scan never ran over both vectors"
+        offenders = [t for t in scoring_threads if t == loop_thread]
+        assert not offenders, (
+            f"cosine scoring ran on the event loop thread ({loop_thread}) "
+            f"for {len(offenders)} of {len(scoring_threads)} vectors"
+        )
+
+    asyncio.run(run())
+
+
+def test_in_memory_search_snapshots_the_pairing_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A store mutated mid-scan cannot tear the snapshot the scan iterates.
+
+    A guard on the fix's own hazard, not a regression test for the original
+    defect, and it must not be reported as one: moving the scan into a
+    worker thread is what created something to guard. ``add`` extends the
+    two backing lists in two separate statements, so a worker that zipped
+    them itself could observe the first extended and the second not, and
+    ``zip(strict=True)`` would raise ``ValueError`` -- a new failure mode
+    introduced by the fix rather than closed by it. ``search`` therefore
+    materializes the pairing on the calling thread and dispatches only the
+    scoring.
+
+    Driven without threads or timing: the scan's own entry point mutates
+    the store exactly as a half-applied ``add`` would, so the invariant is
+    asserted on observable output alone.
+    """
+    store = InMemoryVectorStore()
+    original = InMemoryVectorStore._score_sync
+
+    def _mutating_score(
+        entries: list[tuple[Chunk, list[float]]],
+        query_embedding: list[float],
+        top_k: int,
+        metadata_filter: dict[str, Any] | None,
+    ) -> list[tuple[Chunk, float]]:
+        # Exactly what a concurrent add looks like between its two extends.
+        store._chunks.append(_make_chunk("late", "d0", "gamma", chunk_index=2))
+        return original(entries, query_embedding, top_k, metadata_filter)
+
+    monkeypatch.setattr(InMemoryVectorStore, "_score_sync", staticmethod(_mutating_score))
+
+    async def run() -> None:
+        await store.add(
+            [
+                _make_chunk("c0", "d0", "alpha", chunk_index=0),
+                _make_chunk("c1", "d0", "beta", chunk_index=1),
+            ],
+            [_unit_vector(0), _unit_vector(1)],
+        )
+
+        results = await store.search(_unit_vector(0), top_k=_PROBE_TOP_K)
+
+        assert [chunk.chunk_id for chunk, _ in results] == ["c0", "c1"], (
+            "the scan saw a chunk appended after it began -- the pairing was not "
+            "materialized before dispatch"
+        )
+        # The torn state really was in place, so the assertion above is not vacuous.
+        assert len(store._chunks) == 3
+        assert len(store._vectors) == 2
 
     asyncio.run(run())

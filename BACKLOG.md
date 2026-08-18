@@ -78,9 +78,6 @@ Declined section with the reason)
 
 | ID | Item | Sev | Phase | Effort | Status | Depends on |
 |---|---|---|---|---|---|---|
-| GK-008 | BM25 scoring blocks the event loop | HIGH | D | S | todo | — |
-| GK-009 | Unauthenticated O(corpus) work, no concurrency cap | HIGH | D | S | todo | — |
-| GK-010 | `busy_timeout` unset; a concurrent writer fails instead of waiting | MED | D | S | todo | — |
 | GK-011 | `grk answer` has no end-to-end test | HIGH | E | S | todo | — |
 | GK-012 | `resolve_chat_config` has no test | MED | E | S | todo | — |
 | GK-013 | The unauthenticated error boundary is never driven over HTTP | MED | E | S | todo | — |
@@ -122,93 +119,29 @@ predicate differ passes every test written against the predicate.
 
 ---
 
-## Phase D — Harden the service under concurrency
+## Phase D — closed 2026-08-18
 
-**Goal:** the service degrades rather than collapses under concurrent or hostile load.
-**Exit:** no single request can stall every other; a concurrent writer waits rather than
-failing.
+GK-008, GK-009 and GK-010 landed together on `fix/backlog-phase-d` and are deleted from
+this file per the rule above. Their consequences live in `CHANGELOG.md` under
+`[Unreleased]`, `KNOWN_LIMITATIONS.md` for the residuals each leaves standing,
+`SECURITY.md` for the concurrency cap's scope, and `infra/k8s/deployment.yaml`, whose
+memory-limit comment depended on the cap that did not exist.
 
-### GK-008 — BM25 scoring runs synchronously on the event loop
+Both exit criteria were met, one of them differently than expected. "No single request can
+stall every other" holds: BM25's whole-corpus scan and `InMemoryVectorStore`'s were the
+last CPU-bound steps still running on the loop, and both now dispatch to a worker. "A
+concurrent writer waits rather than failing" was **already true** — GK-010 asserted
+SQLite's own `busy_timeout` default of 0 was in force, but `sqlite3.connect` passes
+`timeout=5.0` unless told otherwise and `_connect` never told it otherwise. Measured, a
+contending write waited five seconds and then raised. The real defect was provenance, not
+behaviour: the value was inherited from a stdlib default, named nowhere, tested nowhere,
+and one keyword away from being replaced by an unrelated edit. It is now a module constant
+with an injection test. What still does not exist is a retry, and that is recorded in
+`KNOWN_LIMITATIONS.md` rather than quietly closed.
 
-- **Severity** HIGH · **Effort** S · **ADR** no · **Verified**
-- **Where** `src/groundkit/retrieval/search.py:327` and `:339`; no `asyncio.to_thread`
-  anywhere in `src/groundkit/index/bm25.py`
-
-`self._bm25.search(...)` is a synchronous, CPU-bound, whole-corpus scan invoked directly
-from the async handler. The same codebase applies `asyncio.to_thread` for exactly this
-reason at `retrieval/rerank.py:504` and throughout `index/dense.py` — so the one CPU-bound
-path never moved off the loop is the default, always-available retrieval mode.
-`grk serve` runs a single uvicorn worker on one loop, so one slow query stalls every other
-in-flight request, including `index_status` and `fetch_chunk`.
-
-This is a multiplier on GK-018 rather than an independent limit, and it appears in no ADR
-and no limitations entry.
-
-**Acceptance criteria**
-
-- [ ] Both call sites wrapped in `asyncio.to_thread`.
-- [ ] `InMemoryVectorStore.search`'s scoring loop likewise — it is `async def` today with
-      no `await` in its body.
-- [ ] Regression test, shown to fail first: a search does not block a concurrently issued
-      second request. Assert on thread identity, as
-      `test_list_collections_does_not_block_the_event_loop` does, not on timing.
-- [ ] `KNOWN_LIMITATIONS.md` records the residual: total CPU cost is unchanged, only the
-      stalling is.
-
-### GK-009 — Unauthenticated O(corpus) operations with no concurrency cap
-
-- **Severity** HIGH · **Effort** S · **ADR** no
-- **Where** `src/groundkit/runtime.py:357` (`chunk_count`);
-  `src/groundkit/index/metadata.py:664` (`get_chunks`); `src/groundkit/cli.py:1361`
-  (uvicorn config); `infra/k8s/deployment.yaml`
-
-`index_status` reads as a cheap status call and is wired to `get_chunks()`, which
-materializes every chunk's full text to call `len()` on the list. `search` is whole-corpus
-per call regardless of `top_k`. uvicorn is started with no `limit_concurrency` and there
-is no per-request semaphore. The Kubernetes manifest sets a hard memory limit on a single
-replica with `strategy: Recreate` — no capacity to fail over to — and its comment assumes
-an OOMKill would mean the corpus outgrew the limit, which concurrent callers invalidate.
-Combined with GK-001, the caller need not even be on the network.
-
-**Acceptance criteria**
-
-- [ ] `limit_concurrency` set on the uvicorn config, value as a named constant.
-- [ ] `chunk_count` no longer materializes every chunk. `runtime.py`'s docstring declines
-      to widen `MetadataStoreProtocol` with a `COUNT(*)` on conformance-test grounds —
-      that argument does not require using the slowest available internal implementation.
-      Put the count on the optional `DocumentRecordStoreProtocol`, or run the aggregate
-      inside a dedicated `_op` without widening the shared protocol.
-- [ ] Regression test that `chunk_count` does not read chunk content.
-- [ ] `SECURITY.md`'s rate-limiting paragraph updated to say what now exists.
-
-### GK-010 — `busy_timeout` is unset, so a concurrent writer fails instead of waiting
-
-- **Severity** MEDIUM · **Effort** S · **ADR** no · **Verified**
-- **Where** `src/groundkit/index/metadata.py` `_connect` — sets `foreign_keys` and
-  `journal_mode`, nothing else
-
-The string `busy_timeout` occurs exactly once in the repository: in ADR-0013's own note
-flagging it *for* ADR-0014. ADR-0014 never took it up, and Phase 4 then shipped the
-concurrent surface the note anticipated. SQLite's default busy timeout is 0, so the losing
-writer fails immediately rather than retrying.
-
-The trigger is ordinary: an operator runs `grk ingest` while the service is up, a client
-makes its first request for that collection, and the store-open's own `commit()` collides
-with the ingest's write transaction. The request fails with a `StorageError` and surfaces
-as a 5xx. Retrying works; nothing retries.
-
-This is the second instance of the same failure mode as the (now closed) snapshot
-retention deferral: a named, dated obligation handed to a later ADR that never picked it
-up. Worth a moment's thought about whether deferrals need a tracked home rather than a
-sentence inside a record nobody re-reads.
-
-**Acceptance criteria**
-
-- [ ] `PRAGMA busy_timeout` set in `_connect`, value a named module constant.
-- [ ] Regression test, shown to fail first: hold a write transaction on a second
-      connection and assert `open` succeeds rather than raising.
-- [ ] The chosen value and its reasoning recorded — a `KNOWN_LIMITATIONS.md` entry is
-      enough; an ADR is not required for a pragma.
+The reusable lesson repeats Phase A's, from the other direction: there, a fix's predicate
+disagreed with its own stated premise; here, a finding's premise disagreed with the running
+code. Both were only visible by executing the thing rather than reading about it.
 
 ---
 

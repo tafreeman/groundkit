@@ -147,6 +147,24 @@ APPLICATION_ID: Final[int] = 0x47524B31  # "GRK1"
 #: index is reproducible from ``grk ingest`` in seconds.
 SCHEMA_VERSION: Final[int] = 3
 
+#: Milliseconds a connection waits for a lock held by another writer before
+#: giving up with "database is locked" (``PRAGMA busy_timeout``). SQLite's own
+#: default is 0 — fail on contact — but Python's ``sqlite3.connect`` has always
+#: passed ``timeout=5.0`` unless told otherwise, so this connection was already
+#: waiting five seconds. Stating it here changes no behaviour and is not
+#: cosmetic: the value now belongs to this module rather than to an undeclared
+#: stdlib default that a later edit to the ``connect`` call could silently
+#: replace (``timeout=0`` is one keyword away), and
+#: ``tests/test_metadata_store.py`` pins it by injection.
+#:
+#: Five seconds is kept rather than re-derived because it fits the write shape
+#: this store actually has: every mutating operation commits within a single
+#: ``_op`` — one document and its chunks — so a contending writer waits out one
+#: short transaction, not a batch. The residual it does *not* close is recorded
+#: in ``KNOWN_LIMITATIONS.md``: past the timeout the operation raises
+#: :class:`~groundkit.errors.StorageError` and nothing retries it.
+BUSY_TIMEOUT_MS: Final[int] = 5000
+
 #: Tables a groundkit store created before ``PRAGMA application_id`` was
 #: stamped (ADR-0004 decision 4) is recognized by instead. Both must be
 #: present: `documents` alone is a plausible table name in an unrelated
@@ -321,6 +339,12 @@ class SQLiteMetadataStore:
                 )
             conn = sqlite3.connect(str(db_path), check_same_thread=False)
             try:
+                # First, before any statement that can contend: journal_mode
+                # and the schema application below are both writes, and a
+                # busy_timeout set after them would not have covered them.
+                # PRAGMA takes no bound parameters; the value is a module
+                # constant, never externally supplied.
+                conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
                 conn.execute("PRAGMA foreign_keys = ON")
                 conn.execute("PRAGMA journal_mode = WAL")
                 conn.executescript(_SCHEMA)
@@ -699,6 +723,40 @@ class SQLiteMetadataStore:
             )
             row = cur.fetchone()
             return _row_to_chunk(row) if row is not None else None
+
+        return await self._run(_op)
+
+    async def count_chunks(self) -> int:
+        """Return how many chunks are persisted, without reading any of them.
+
+        Deliberately **not** a :class:`~groundkit.index.protocols.MetadataStoreProtocol`
+        member. That protocol is held to exact signature parity by
+        ``tests/test_protocol_conformance.py`` and implemented by several
+        hand-built doubles across the suite; widening it for a reporting
+        convenience is the trade ADR-0012 decision 3 already refused for
+        ``model_name``. This is a concrete capability of the SQLite store,
+        reached by :meth:`~groundkit.runtime.CollectionRuntime.chunk_count`,
+        which holds a concrete :class:`SQLiteMetadataStore` rather than the
+        protocol.
+
+        What it replaces: ``len(await store.get_chunks())``, which
+        materialized every chunk's full text — the entire corpus, in memory,
+        as :class:`~groundkit.contracts.Chunk` models, each re-validated on
+        construction — to produce one integer. That is the read behind
+        ``index_status``, the cheapest-looking call on an unauthenticated
+        service surface, so its cost was both the largest on that surface
+        and the least apparent from its name.
+
+        Returns:
+            The number of rows in ``chunks``.
+
+        Raises:
+            StorageError: On a backend failure.
+        """
+
+        def _op() -> int:
+            cur = self._conn.execute("SELECT COUNT(*) FROM chunks")
+            return int(cur.fetchone()[0])
 
         return await self._run(_op)
 

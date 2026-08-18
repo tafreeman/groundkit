@@ -451,6 +451,44 @@ def test_serve_assembles_one_app_carrying_both_transports(
     assert mcp_server.MCP_HTTP_PATH in mounted
 
 
+def test_serve_caps_in_flight_requests(
+    index_dir: Path, base_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """uvicorn is configured to shed load rather than accept unbounded work.
+
+    Every operation on this surface is O(corpus) and none of it is
+    authenticated: ``search`` scores the whole corpus regardless of
+    ``top_k``, and ``index_status`` aggregates over every chunk row. With
+    ``limit_concurrency`` unset, arrival rate alone decided peak memory,
+    because each accepted request holds its own working set. On the single
+    replica ``infra/k8s/deployment.yaml`` describes -- hard memory limit,
+    ``strategy: Recreate``, nothing to fail over to -- that is an OOMKill
+    rather than a slowdown, and the manifest's own comment reads the kill as
+    the corpus having outgrown the limit.
+
+    Asserted against the constant, not a literal, so the value and the
+    reasoning recorded beside it cannot drift apart.
+    """
+    import uvicorn
+
+    configs: list[uvicorn.Config] = []
+
+    class _RecordingServer:
+        def __init__(self, config: uvicorn.Config) -> None:
+            self._config = config
+
+        async def serve(self) -> None:
+            configs.append(self._config)
+
+    monkeypatch.setattr(uvicorn, "Server", _RecordingServer)
+
+    assert cli.main(_argv("serve", index_dir, base_dir)) == 0
+
+    assert len(configs) == 1
+    assert configs[0].limit_concurrency == cli.SERVE_MAX_CONCURRENT_REQUESTS
+    assert configs[0].limit_concurrency is not None
+
+
 def test_mcp_mount_wraps_the_session_manager_rather_than_passing_it_as_an_app(
     index_dir: Path, base_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

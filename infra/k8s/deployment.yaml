@@ -141,8 +141,17 @@ spec:
               # Memory, not CPU, is the one to watch: `BM25Index.from_store()`
               # rebuilds postings in memory at every `Retriever.open()`
               # (ADR-0002), so the working set scales with corpus size rather
-              # than with request rate. An OOMKill here means the corpus
-              # outgrew this limit, not that traffic did.
+              # than with request rate.
+              #
+              # That holds only because request rate is now bounded: uvicorn is
+              # started with `limit_concurrency` (`cli.SERVE_MAX_CONCURRENT_REQUESTS`)
+              # and sheds the excess with 503. Without it, arrival rate alone
+              # decided peak memory — every accepted request holds its own
+              # working set — and an OOMKill on this single `Recreate` replica,
+              # which has nothing to fail over to, would have been traffic
+              # rather than corpus growth while this comment said otherwise.
+              # Read a kill here as the corpus outgrowing the limit; if the cap
+              # is ever raised, this comment must be re-earned.
               cpu: "1"
               memory: 1Gi
       volumes:

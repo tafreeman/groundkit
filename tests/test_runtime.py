@@ -519,3 +519,42 @@ def test_each_collection_gets_its_own_vector_store(tmp_path: Path) -> None:
         "each collection must get a vector store built for ITS OWN name; "
         f"the factory was asked for {requested!r}"
     )
+
+
+def test_chunk_count_does_not_read_chunk_content(tmp_path: Path) -> None:
+    """The status count must be an aggregate, not a materialized corpus.
+
+    ``chunk_count`` backs ``index_status`` -- the cheapest-*looking* call on
+    an unauthenticated, read-only service surface. It was implemented as
+    ``len(await store.get_chunks())``, which selects every chunk's full text
+    and rebuilds each one as a re-validated ``Chunk`` model in order to
+    return one integer. The name is what makes that dangerous: nothing about
+    "status" suggests it pulls the whole corpus into memory, so nothing
+    about a status endpoint suggests it needs a concurrency cap.
+
+    Asserted on the SQL the store actually executes rather than on which
+    method was called, via ``sqlite3``'s trace callback: a later refactor
+    that materialized the corpus by some other route would still be caught.
+    """
+
+    async def run() -> None:
+        index_dir = tmp_path / "idx"
+        await _write(index_dir, "default", "a.md", "d1", "alpha content here")
+        await _write(index_dir, "default", "b.md", "d2", "beta content here")
+
+        runtime = await CollectionRuntime.open(index_dir, "default")
+        try:
+            statements: list[str] = []
+            runtime._store._conn.set_trace_callback(statements.append)
+            try:
+                assert await runtime.chunk_count() == 2
+            finally:
+                runtime._store._conn.set_trace_callback(None)
+
+            executed = " ".join(statements).lower()
+            assert "count(" in executed, f"no aggregate ran; statements were {statements!r}"
+            assert "content" not in executed, f"chunk_count read chunk content: {statements!r}"
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())

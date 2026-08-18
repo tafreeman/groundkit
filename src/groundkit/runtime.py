@@ -357,17 +357,27 @@ class CollectionRuntime:
     async def chunk_count(self) -> int:
         """Return the number of persisted chunks.
 
-        O(corpus): the store exposes no count, so this materializes the chunk
-        list and measures it. Adding ``COUNT(*)`` to
-        :class:`~groundkit.index.protocols.MetadataStoreProtocol` would be
-        cheaper and is deliberately not done — that protocol is held to exact
-        signature parity by conformance tests, and widening it for a reporting
-        convenience is the trade ADR-0012 decision 3 already refused for
-        ``model_name``. Recorded in ``KNOWN_LIMITATIONS.md`` rather than
-        hidden: this is a status call, not a hot path.
+        Answered by an aggregate —
+        :meth:`~groundkit.index.metadata.SQLiteMetadataStore.count_chunks` — not by
+        materializing the corpus. It previously read
+        ``len(await self._store.get_chunks())``, which pulled every chunk's
+        full text into memory as re-validated
+        :class:`~groundkit.contracts.Chunk` models in order to return one
+        integer. ``index_status`` is the call behind it: the cheapest-looking
+        operation on an unauthenticated, read-only service surface, and so the
+        one whose real cost was least apparent from its name.
+
+        The earlier note declining to widen
+        :class:`~groundkit.index.protocols.MetadataStoreProtocol` with a
+        ``COUNT(*)`` still stands, and is why this is not that. The protocol is
+        held to exact signature parity by conformance tests and implemented by
+        several hand-built doubles; the count lives on the concrete store
+        instead, which is what this runtime is constructed with. Declining to
+        widen a shared protocol never required using the slowest
+        implementation available behind it.
         """
         self._require_open()
-        return len(await self._store.get_chunks())
+        return await self._store.count_chunks()
 
     def _require_open(self) -> None:
         if self._closed:

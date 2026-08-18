@@ -372,6 +372,30 @@ per SPEC.md §9:
   snapshot.
 - BM25 rebuilds in memory at open — O(corpus) startup cost, accepted and
   bounded by ADR-0002's revisit trigger.
+- **BM25 scoring no longer stalls the event loop, but it still costs
+  O(corpus).** `BM25Index.search` scores every indexed chunk before
+  truncating to `top_k`; it was called inline from `Retriever.search`'s `async
+  def`, so on `grk serve`'s single uvicorn worker one query blocked every
+  other in-flight request for a full corpus scan. Both call sites — the
+  `bm25` branch and the `hybrid` branch's lexical half — now dispatch through
+  `asyncio.to_thread`, as does `InMemoryVectorStore.search`'s equivalent scan.
+  What that changes is the *stalling*, not the *cost*: total CPU is unchanged,
+  the pure-Python scoring loop holds the GIL for most of its run so a
+  concurrent caller still contends for it, and the scan is still linear in
+  corpus size. The standing fix is a postings list that scores only candidate
+  chunks. Pinned by
+  `tests/test_retrieval.py::test_bm25_scoring_does_not_run_on_the_event_loop`
+  and its dense counterpart in `tests/test_dense.py`, both asserting thread
+  identity rather than timing.
+- **A writer that loses a lock race waits, then fails; nothing retries it.**
+  `SQLiteMetadataStore` sets `PRAGMA busy_timeout` explicitly, to
+  `metadata.BUSY_TIMEOUT_MS`. Past that window the operation raises
+  `StorageError: database is locked` and no layer above retries, so an
+  ordinary collision — an operator running `grk ingest` against a collection
+  the service is writing to — surfaces as a 5xx that would have succeeded on
+  a second attempt. The timeout was previously inherited, unnamed, from
+  `sqlite3.connect`'s `timeout=5.0` default; setting it here changes no
+  behaviour and makes the value this module's rather than the stdlib's.
 - A UTF-8 BOM is not stripped at load (`utf-8`, not `utf-8-sig`), so a
   leading byte-order-mark character (U+FEFF) appears in the first chunk's
   content and in citations resolved from it. Cosmetic — offsets stay
@@ -475,14 +499,28 @@ per SPEC.md §9:
   precondition before any handler runs, which is a boundary check rather
   than an exception path (ADR-0014 decision 3; see
   `src/groundkit/service/errors.py`).
-- **`chunk_count()` is O(corpus).** The store exposes no `COUNT(*)`, so
-  `index_status` materializes the full chunk list to measure it
-  (`CollectionRuntime.chunk_count`, `src/groundkit/runtime.py`). Adding
-  `COUNT(*)` to `MetadataStoreProtocol` would be cheaper and is deliberately
-  not done: that protocol is held to exact signature parity by conformance
-  tests, and widening it for a reporting convenience is the trade
-  ADR-0012 decision 3 already refused for `model_name`. This is a status
-  call, not a hot path.
+- **FIXED 2026-08-18 — `chunk_count()` materialized the corpus to return an
+  integer.** `index_status` read `len(await store.get_chunks())`, which
+  selected every chunk's full text and rebuilt each as a re-validated `Chunk`
+  model. It now runs an aggregate: `SQLiteMetadataStore.count_chunks()`, a
+  concrete capability of the SQLite store rather than a new
+  `MetadataStoreProtocol` member. That protocol stays exactly as wide as it
+  was — it is held to exact signature parity by conformance tests, and
+  widening it for a reporting convenience is the trade ADR-0012 decision 3
+  refused for `model_name` — but declining to widen it never required using
+  the slowest implementation behind it. `CollectionRuntime` holds a concrete
+  store, so it can ask. Pinned by
+  `tests/test_runtime.py::test_chunk_count_does_not_read_chunk_content`,
+  which asserts on the SQL the store executes rather than on which method was
+  called.
+- **`grk serve` caps concurrent requests; it does not rate-limit.** uvicorn is
+  started with `limit_concurrency = cli.SERVE_MAX_CONCURRENT_REQUESTS`, so
+  requests past that ceiling are answered 503 rather than accepted and held.
+  That bounds in-flight work, which is what a single replica under a hard
+  memory limit needs. It counts concurrent requests, not requests per caller
+  per interval: a client that waits for each response is unbounded, nothing
+  attributes load to a caller, and the surface is still unauthenticated. See
+  `SECURITY.md` for the full statement.
 - **Read-only does not mean the process writes no bytes.** Opening a WAL
   database updates its `-shm`/`-wal` sidecars, and `SQLiteMetadataStore.open`
   runs `CREATE TABLE IF NOT EXISTS` and a best-effort chmod on every open

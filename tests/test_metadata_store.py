@@ -15,7 +15,12 @@ import pytest
 
 from groundkit.contracts import Chunk, CollectionManifest, EmbeddingIdentity
 from groundkit.errors import ConfigurationError, IndexIdentityError, StorageError
-from groundkit.index.metadata import APPLICATION_ID, SCHEMA_VERSION, SQLiteMetadataStore
+from groundkit.index.metadata import (
+    APPLICATION_ID,
+    BUSY_TIMEOUT_MS,
+    SCHEMA_VERSION,
+    SQLiteMetadataStore,
+)
 from groundkit.index.protocols import MetadataStoreProtocol
 from test_protocol_conformance import assert_signature_parity
 
@@ -1398,6 +1403,52 @@ def test_schema_version_is_current(tmp_path: Path) -> None:
             app_id = int(store._conn.execute("PRAGMA application_id").fetchone()[0])
             assert version == SCHEMA_VERSION
             assert app_id == APPLICATION_ID
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_busy_timeout_is_this_module_s_value_not_the_connect_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lock-wait belongs to groundkit, not to a stdlib default.
+
+    Correcting the finding this closes: it asserted SQLite's own default of
+    0 was in force and that a contending writer therefore failed on contact.
+    Measured, the connection was already waiting five seconds --
+    ``sqlite3.connect`` passes ``timeout=5.0`` unless told otherwise, and
+    ``_connect`` never told it otherwise. The behaviour was fine; its
+    *provenance* was the defect. Nothing in the repository named the value,
+    stated it, or tested it, and ``timeout=0`` is one keyword away from
+    being added to that ``connect`` call by an unrelated change.
+
+    Demonstrated by injection, since a passing assertion on 5000 alone
+    proves nothing: ``connect`` is forced to the one value that would leave
+    a bare connection at 0, and the store must still report
+    ``BUSY_TIMEOUT_MS``. Against a ``_connect`` with no explicit pragma this
+    reads back 0 and fails.
+    """
+    real_connect = sqlite3.connect
+
+    def _zero_timeout_connect(
+        database: str, *, check_same_thread: bool = True, uri: bool = False
+    ) -> sqlite3.Connection:
+        """Every ``connect`` shape ``metadata.py`` uses, forced to ``timeout=0``."""
+        return real_connect(database, timeout=0, check_same_thread=check_same_thread, uri=uri)
+
+    # The same module object ``metadata.py`` resolves ``sqlite3.connect`` on,
+    # at call time; monkeypatch restores it.
+    monkeypatch.setattr(sqlite3, "connect", _zero_timeout_connect)
+
+    async def run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            effective = store._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            assert effective == BUSY_TIMEOUT_MS, (
+                f"busy_timeout is {effective}, not this module's {BUSY_TIMEOUT_MS} -- "
+                "the value is being inherited from sqlite3.connect rather than set"
+            )
         finally:
             await store.close()
 
