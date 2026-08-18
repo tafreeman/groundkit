@@ -114,6 +114,25 @@ uv run coverage report                # whole-package 80% gate — see below
   "installing a group you don't have yet" case in the [setup gotcha](#setup)
   above — use `uv lock` + `uv pip install` from the exported requirements,
   then `uv run --no-sync mkdocs build --strict`.
+
+  Two things `--strict` does **not** protect you from, both learned the hard
+  way on 2026-08-18:
+
+  1. **It only governs Markdown pages.** MkDocs copies every *non-Markdown*
+     file in `docs_dir` into the built site verbatim, and
+     `validation.omitted_files` never sees them. A PDF dropped under `docs/`
+     raises no warning, survives the strict build, and is published to the
+     public site. Review output and working artifacts belong in the
+     gitignored `_audit/` at the repo root, never under `docs/`.
+  2. **The site's deploy path is repository state, not repo content.**
+     GitHub Pages must have its source set to **"GitHub Actions"**
+     (`build_type: workflow`), because `docs.yml` publishes with
+     `actions/deploy-pages`. If it is set to a branch instead, the build job
+     still passes and the deploy job fails with a bare
+     `HttpError: Not Found`, *and* GitHub re-arms its own Jekyll builder to
+     race the real deploy. Nothing in the tree can assert this, so if the
+     `docs` workflow starts failing only in its `deploy` job, check
+     `gh api repos/tafreeman/groundkit/pages --jq .build_type` first.
 - **infra** — validates the Dockerfile builds and runs as uid 10001, that
   Kubernetes manifests render via `kubectl kustomize`, and that the Terraform
   module is formatted and `validate`s. Needs Docker, `kubectl` and Terraform
@@ -274,6 +293,30 @@ PR within one) ends with CI green and any docs it touches updated in the
 same change, not a follow-up. Branch off `main`, open a PR back to it; this
 repo does not currently maintain a long-lived integration branch separate
 from `main` for day-to-day feature work.
+
+### What `main` enforces
+
+Since 2026-08-18 a repository ruleset makes this mechanical rather than a
+convention, because until then every gate below was advisory — nothing stopped
+a merge on red or a direct push:
+
+- **No direct pushes, no force-pushes, no deletion.** Changes reach `main`
+  through a pull request.
+- **Nine required status checks**, all from `ci.yml`: `lint`, `typecheck`,
+  `test (3.11)`, `test (3.12)`, `test (3.13)`, `docs`, `infra`, `audit`,
+  `secrets`. The gated suites (`gated-eval`, `gated-rerank`) are deliberately
+  **not** required — they skip by design without their env gate, and requiring
+  a check that normally skips is how a branch becomes unmergeable.
+- **Zero required approvals.** Deliberate, not an oversight: GitHub does not
+  let you approve your own pull request, so on a single-maintainer repo any
+  higher number locks the only maintainer out of their own `main`. Raise it
+  the moment there is a second reviewer.
+- **No bypass actors**, including administrators.
+
+Two consequences worth knowing. Adding, renaming or removing a job in `ci.yml`
+means updating the required-checks list in the same change, or `main` starts
+requiring a check that no longer reports and nothing can merge. And the ruleset
+targets `~DEFAULT_BRANCH` only — any other long-lived branch is unprotected.
 
 ## Where things live
 
