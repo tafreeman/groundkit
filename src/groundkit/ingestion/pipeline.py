@@ -32,6 +32,7 @@ from groundkit.contracts import Chunk
 from groundkit.errors import IngestionError
 from groundkit.ingestion.chunking import RecursiveChunker
 from groundkit.ingestion.protocols import ChunkerProtocol, LoaderProtocol
+from groundkit.utils.url_safety import sanitize_url
 
 logger = logging.getLogger(__name__)
 
@@ -89,17 +90,33 @@ class IngestionPipeline:
             IngestionError: If loading or chunking fails. Loader-raised
                 :class:`IngestionError` propagates unchanged; any other
                 exception from the loader or chunker is wrapped with the
-                source (loader failures) or document ID (chunking failures)
-                for context.
+                sanitized source (loader failures) or document ID (chunking
+                failures) for context.
+
+        Notes:
+            ``source`` is caller-supplied and reaches this method *before* any
+            loader has looked at it, so every log line and exception message
+            below carries ``safe_source`` rather than the raw value. This class
+            is exported public API: ``IngestionPipeline(UrlLoader(...))`` is a
+            supported construction, and it used to log an unredacted
+            ``https://user:password@host/...`` at INFO before ``UrlLoader``
+            reached its own userinfo and credential-query refusals -- ADR-0001
+            hazard 6 in the one call site of this module family that had not
+            adopted the discipline. ``sanitize_url`` also redacts every query
+            *value* unconditionally, which the loader's credential-shaped-key
+            refusal deliberately does not, so the sanitized form stays the
+            right thing to log even after validation has passed. It leaves a
+            filesystem path intact, which is the other thing ``source`` can be.
         """
-        logger.info("Ingesting source: %s", source)
+        safe_source = sanitize_url(source)
+        logger.info("Ingesting source: %s", safe_source)
 
         try:
             documents = await self._loader.load(source)
         except IngestionError:
             raise
         except Exception as exc:
-            raise IngestionError(f"Loader failed for {source!r}: {exc}") from exc
+            raise IngestionError(f"Loader failed for {safe_source!r}: {exc}") from exc
 
         all_chunks: list[Chunk] = []
         for doc in documents:
@@ -111,12 +128,15 @@ class IngestionPipeline:
                 ) from exc
             all_chunks.extend(chunks)
             logger.debug(
-                "Chunked %s: %d chunks from document %s", source, len(chunks), doc.document_id
+                "Chunked %s: %d chunks from document %s",
+                safe_source,
+                len(chunks),
+                doc.document_id,
             )
 
         logger.info(
             "Ingestion complete: %s -> %d documents -> %d chunks",
-            source,
+            safe_source,
             len(documents),
             len(all_chunks),
         )
