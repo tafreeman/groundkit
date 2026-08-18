@@ -49,12 +49,12 @@ default. Term by term:
 
 ## Status
 
-!!! note "Phases 0–6 of 7 done; Phase 7 is the release itself"
+!!! note "All seven phases done; v0.1.0 released 2026-08-18"
 
     The deterministic core, the persisted index, hybrid retrieval, the eval
     harness, the LLM boundary (query rewrite, synthesis, redaction), the MCP
-    server, the REST API, and the IaC are all built and gated. What remains
-    is cutting the release. The phase plan in
+    server, the REST API, and the IaC are all built and gated, and the release
+    itself has shipped — `pip install groundkit` works. The phase plan in
     [SPEC.md](https://github.com/tafreeman/groundkit/blob/main/SPEC.md) §9 is
     the authoritative status, and
     [Known limitations](limitations.md) is the authoritative list of what

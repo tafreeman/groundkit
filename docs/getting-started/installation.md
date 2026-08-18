@@ -12,7 +12,31 @@ running.
 groundkit targets Python 3.11+ and uses [uv](https://docs.astral.sh/uv/) — a
 Python package and environment manager — for environments and locking.
 
+## From PyPI
+
+```bash
+pip install groundkit
+```
+
+That gives you the base install: BM25 retrieval (keyword search — it ranks
+results by how many words they literally have in common with your query,
+the same idea a library card catalog or Ctrl+F uses), the persisted index
+(the index is saved to disk and survives a restart — nothing lives only in
+memory), citation-resolving search (every result points at an exact,
+checkable location in a source file, not just a paraphrase of it), and the
+`grk` CLI. It pulls groundkit's runtime dependencies — `pydantic`, `httpx`,
+`fastapi`, `uvicorn`, `mcp` (the SDK for MCP, the Model Context Protocol — a
+standard way for AI assistants such as Claude to call external tools; see
+[MCP clients](../guides/mcp-clients.md)), and `opentelemetry-api` (hooks for
+optional tracing, inert until you configure a destination for the traces) —
+and needs no credentials.
+
 ## From a clone
+
+Use a clone instead of PyPI if you want to develop against groundkit itself
+(see [Development install](#development-install) below) or run the eval
+harness against the golden corpus, which ships in the repo rather than the
+package:
 
 ```bash
 git clone https://github.com/tafreeman/groundkit
@@ -20,7 +44,7 @@ cd groundkit
 uv sync
 ```
 
-That gives you the base install: BM25 retrieval (keyword search — it ranks
+That gives you the same base install: BM25 retrieval (keyword search — it ranks
 results by how many words they literally have in common with your query,
 the same idea a library card catalog or Ctrl+F uses), the persisted index
 (the index is saved to disk and survives a restart — nothing lives only in

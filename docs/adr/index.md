@@ -5,7 +5,7 @@ decision per record. ADRs record irreversible decisions with the alternatives
 that were considered; deviating from SPEC.md requires an ADR proposal first.
 
 Grouped by theme below so you can find the record that governs the part of
-the codebase you're touching, rather than scanning 23 titles in commit order.
+the codebase you're touching, rather than scanning every title in commit order.
 Within a group, order is ADR number (roughly chronological).
 
 ## Foundational
@@ -74,6 +74,7 @@ requirements rather than an extra.
 | --- | ----- | ------ |
 | [ADR-0014](ADR-0014-read-only-service-surface-and-outbound-endpoint-safety.md) | Phase 4 is a read-only service surface, and outbound endpoints are guarded | Accepted |
 | [ADR-0015](ADR-0015-service-dependencies-are-base-not-an-extra.md) | Service dependencies are base requirements, not an optional extra | Accepted |
+| [ADR-0024](ADR-0024-host-header-validation-on-both-transports.md) | The loopback bind is not a boundary against a browser, so `Host` is validated on both transports | Accepted |
 
 ## LLM boundary
 

@@ -109,7 +109,14 @@ from groundkit.runtime import CollectionRegistry
 # instead. They are base dependencies (ADR-0015), so the deferral is about
 # startup cost — `grk search` must not pay to import a server it never runs —
 # and never about availability.
-from groundkit.service.binding import DEFAULT_SERVE_HOST, DEFAULT_SERVE_PORT, ensure_bindable_host
+from groundkit.service.binding import (
+    DEFAULT_SERVE_HOST,
+    DEFAULT_SERVE_PORT,
+    LOOPBACK_HOST_ALLOW_LIST,
+    HostAllowList,
+    derive_host_allow_list,
+    ensure_bindable_host,
+)
 from groundkit.service.tools import ServiceContext
 from groundkit.telemetry import configure_logging, configure_tracing
 
@@ -1319,7 +1326,9 @@ def _build_service_context(
     return replace(ctx, default_top_k=args.top_k), embedder
 
 
-def _build_mcp_mount(ctx: ServiceContext) -> McpMount:
+def _build_mcp_mount(
+    ctx: ServiceContext, *, host_allow_list: HostAllowList = LOOPBACK_HOST_ALLOW_LIST
+) -> McpMount:
     """Adapt the MCP session manager into the mount :func:`create_app` accepts.
 
     ``StreamableHTTPSessionManager`` exposes two halves that ASGI keeps apart:
@@ -1329,11 +1338,24 @@ def _build_mcp_mount(ctx: ServiceContext) -> McpMount:
     for exactly that reason — the app's lifespan drives the first, the router
     the second — so the method is wrapped in an ASGI callable here rather than
     the manager being handed over as though it were an app.
+
+    Unlike the two service constructors, this one defaults to
+    :data:`~groundkit.service.binding.LOOPBACK_HOST_ALLOW_LIST` rather than the
+    unrestricted list, and the asymmetry is the point: this function is CLI
+    plumbing, not a library seam, so the default that belongs here is the
+    default ``grk serve`` has — never publishing a corpus because an argument
+    was omitted.
+
+    Args:
+        ctx: Serve-time context every handler is invoked with.
+        host_allow_list: The ``Host`` decision the transport enforces, derived
+            from the bind address by
+            :func:`~groundkit.service.binding.derive_host_allow_list`.
     """
     from groundkit.service.api import McpMount
     from groundkit.service.mcp_server import MCP_HTTP_PATH, create_session_manager
 
-    manager = create_session_manager(ctx)
+    manager = create_session_manager(ctx, host_allow_list=host_allow_list)
 
     async def mcp_app(scope: Scope, receive: Receive, send: Send) -> None:
         await manager.handle_request(scope, receive, send)
@@ -1352,12 +1374,25 @@ async def _serve_http(ctx: ServiceContext, *, host: str, port: int) -> None:
     A named module-level coroutine rather than an inline block, so the CLI's
     own tests can substitute it and exercise every startup guard without
     binding a socket.
+
+    The ``Host`` allow-list is derived **here**, from the same ``host`` that is
+    about to be bound, and handed to both transports as one object (ADR-0024).
+    Deriving it from the bind rather than plumbing ``--allow-remote-access``
+    through is what makes the two impossible to contradict: ``ensure_bindable_host``
+    has already refused every non-loopback address the operator did not
+    acknowledge, so by the time this runs the address itself carries the flag's
+    answer.
     """
     import uvicorn
 
     from groundkit.service.api import create_app
 
-    app = create_app(ctx, mcp_mount=_build_mcp_mount(ctx))
+    host_allow_list = derive_host_allow_list(host)
+    app = create_app(
+        ctx,
+        mcp_mount=_build_mcp_mount(ctx, host_allow_list=host_allow_list),
+        host_allow_list=host_allow_list,
+    )
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
     await server.serve()
 

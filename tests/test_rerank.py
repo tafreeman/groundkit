@@ -14,14 +14,16 @@ case but the ordinary path.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import math
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
-from groundkit.contracts import RetrievalResult
+from groundkit.contracts import RetrievalResult, SourceClass
 from groundkit.errors import RerankerNotConfiguredError, RetrievalError
 from groundkit.retrieval.rerank import (
     DEFAULT_RERANK_MODEL,
@@ -32,7 +34,14 @@ from groundkit.retrieval.rerank import (
 )
 
 
-def _result(chunk_id: str, *, source: str = "doc.md", start: int = 0) -> RetrievalResult:
+def _result(
+    chunk_id: str,
+    *,
+    source: str = "doc.md",
+    start: int = 0,
+    source_class: SourceClass = "text",
+    extractor: str | None = None,
+) -> RetrievalResult:
     """A minimal valid result; only the fields rerank actually reads vary."""
     return RetrievalResult(
         content=f"content of {chunk_id}",
@@ -40,6 +49,8 @@ def _result(chunk_id: str, *, source: str = "doc.md", start: int = 0) -> Retriev
         document_id="doc-1",
         chunk_id=chunk_id,
         source=source,
+        source_class=source_class,
+        extractor=extractor,
         start_offset=start,
         end_offset=start + 10,
     )
@@ -186,6 +197,31 @@ class TestRerankByLogits:
         assert reranked.end_offset == original.end_offset
         assert reranked.metadata == original.metadata
         assert reranked.score != original.score
+
+    def test_preserves_source_class_and_extractor(self) -> None:
+        """GK-003: a reranked result must keep the document's real provenance.
+
+        ``rerank_by_logits`` rebuilds every result through the
+        :class:`RetrievalResult` constructor (see the module docstring, and
+        ``test_contract_is_genuinely_revalidated`` above). Omitting
+        ``source_class``/``extractor`` from that rebuild does not raise —
+        both fields default — so a reranked ``snapshot`` or ``extracted``
+        result silently reverts to ``("text", None)``. Against a collection
+        holding URL-ingested documents that routes every reranked citation
+        into the plain read-and-slice resolver path ADR-0016 exists to keep
+        snapshots out of, without ever raising an error.
+        """
+        snapshot_result = _result("snap-1", source_class="snapshot", extractor=None, start=0)
+        extracted_result = _result(
+            "ext-1", source_class="extracted", extractor="pdfminer-six==20240706", start=10
+        )
+
+        reranked = rerank_by_logits([snapshot_result, extracted_result], [1.0, 2.0], top_k=2)
+        by_id = {r.chunk_id: r for r in reranked}
+
+        assert by_id["snap-1"].source_class == "snapshot"
+        assert by_id["ext-1"].source_class == "extracted"
+        assert by_id["ext-1"].extractor == "pdfminer-six==20240706"
 
     def test_ties_break_on_source_then_offset_deterministically(self) -> None:
         results = [
@@ -879,3 +915,78 @@ class TestCrossEncoderRerankerFailsClosed:
             assert all(r.score >= 0.0 for r in reranked)
 
         asyncio.run(run())
+
+
+#: Source root the fourth-rebuild-site scan walks. Derived, not hardcoded, so a
+#: package move does not silently make the scan walk nothing and pass vacuously.
+_SRC_DIR = Path(__file__).resolve().parents[1] / "src" / "groundkit"
+
+#: ``evals/`` is excluded, deliberately. Its two ``RetrievalResult(...)`` calls
+#: (``evals/echo.py``) build synthetic fixtures for the eval harness's own
+#: golden-corpus stages, not results that ever crossed a real ``source_class``
+#: boundary — there is no ingested document, extractor, or snapshot upstream of
+#: them to drop in the first place. Provenance in that module is invented for
+#: the test, not carried through from a store record, so the failure mode this
+#: guard exists to catch (GK-003: a real field silently reverting to a
+#: contract default) cannot occur there. Folding it into the guard would only
+#: force every future synthetic fixture to carry two dead keyword arguments.
+_EXCLUDED_DIRS = {"evals"}
+
+
+class TestNoFourthRebuildSite:
+    """GK-003: guard against a *fifth* silent ``RetrievalResult`` rebuild site.
+
+    ``rerank.py:170`` omitted ``source_class``/``extractor`` for over a phase
+    without a type error, a test failure, or a runtime exception — both fields
+    default, so the omission was invisible until ADR-0016 grew the contract
+    underneath already-shipped code that rebuilds it. Two call sites already
+    pass both fields explicitly (``retrieval/search.py``,
+    ``providers/context_assembly.py``); this asserts every current and future
+    provenance-bearing site does too, walking source rather than trusting a
+    hand-maintained list that the next rebuild site would not update itself.
+
+    Guard, demonstrated by injection (matching
+    ``test_service_package_imports_no_write_path``'s idiom in
+    ``tests/test_service_tools.py``): add a bare
+    ``RetrievalResult(content=..., score=..., document_id=..., chunk_id=...,
+    source=..., start_offset=..., end_offset=...)`` anywhere under
+    ``src/groundkit/`` outside ``evals/`` and this fails.
+    """
+
+    def test_every_retrieval_result_construction_passes_source_class_and_extractor(
+        self,
+    ) -> None:
+        offenders: list[str] = []
+        py_files = [
+            path
+            for path in _SRC_DIR.rglob("*.py")
+            if not (set(path.relative_to(_SRC_DIR).parts[:-1]) & _EXCLUDED_DIRS)
+        ]
+        assert py_files, f"scan found no source files under {_SRC_DIR}; path is wrong"
+
+        for path in py_files:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and _is_retrieval_result_call(node)):
+                    continue
+                passed_kwargs = {kw.arg for kw in node.keywords if kw.arg is not None}
+                missing = {"source_class", "extractor"} - passed_kwargs
+                if missing:
+                    offenders.append(
+                        f"{path.relative_to(_SRC_DIR)}:{node.lineno} missing {sorted(missing)}"
+                    )
+
+        assert not offenders, (
+            "RetrievalResult constructed without explicit source_class/extractor "
+            f"(GK-003 fourth-rebuild-site guard): {offenders}"
+        )
+
+
+def _is_retrieval_result_call(node: ast.Call) -> bool:
+    """True for ``RetrievalResult(...)`` and ``contracts.RetrievalResult(...)`` alike."""
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id == "RetrievalResult"
+    if isinstance(func, ast.Attribute):
+        return func.attr == "RetrievalResult"
+    return False

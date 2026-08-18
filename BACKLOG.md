@@ -78,12 +78,6 @@ Declined section with the reason)
 
 | ID | Item | Sev | Phase | Effort | Status | Depends on |
 |---|---|---|---|---|---|---|
-| GK-001 | DNS rebinding defeats the loopback bind | CRIT | A | S | todo | — |
-| GK-003 | Rerank drops `source_class` / `extractor` | HIGH | B | S | todo | — |
-| GK-004 | Caller metadata overwrites the authoritative `source` | HIGH | B | S | todo | — |
-| GK-005 | Docs state a live package is unpublished | HIGH | C | M | todo | — |
-| GK-006 | Two rendered docstrings claim Phase 3 is unbuilt | MED | C | XS | todo | — |
-| GK-007 | `CLAUDE.md` is frozen at end-of-Phase-2 | MED | C | M | todo | GK-005 |
 | GK-008 | BM25 scoring blocks the event loop | HIGH | D | S | todo | — |
 | GK-009 | Unauthenticated O(corpus) work, no concurrency cap | HIGH | D | S | todo | — |
 | GK-010 | `busy_timeout` unset; a concurrent writer fails instead of waiting | MED | D | S | todo | — |
@@ -107,204 +101,24 @@ Declined section with the reason)
 
 ---
 
-## Phase A — Contain what shipped
+## Phases A, B and C — closed 2026-08-18
 
-**Goal:** close the findings that are exploitable or that govern everything else.
-**Exit:** GK-001 done; `SECURITY.md` accurate about what the bind does and does not
-protect.
+All six items (GK-001, GK-003, GK-004, GK-005, GK-006, GK-007) landed together on
+`fix/backlog-phase-abc` and are deleted from this file per the rule above. Their
+consequences now live where those documents own them: ADR-0024 and `SECURITY.md` for the
+`Host` validation that closed GK-001, `CHANGELOG.md` under `[Unreleased]` for every
+behaviour change, `KNOWN_LIMITATIONS.md` for the five residuals the work exposed, and
+`SPEC.md` §9 for the Phase 7 status GK-005 corrected.
 
-> The governance half of this phase has landed: `main` is now enforced by a repository
-> ruleset requiring nine status checks, with no direct pushes and no bypass actors. What
-> it enforces, and why zero approvals is deliberate rather than an oversight, is recorded
-> in `CONTRIBUTING.md`. Note the ruleset targets the default branch only — any other
-> long-lived branch is unprotected.
-
-### GK-001 — DNS rebinding defeats the loopback bind on both transports
-
-- **Severity** CRITICAL · **Effort** S · **ADR** yes (amends ADR-0014's threat model) ·
-  **Verified**
-- **Where** `src/groundkit/service/mcp_server.py:459` (`create_session_manager`);
-  `src/groundkit/service/api.py` (`create_app`)
-
-ADR-0014's access-control argument is that the `127.0.0.1` bind *is* the control, so no
-authentication is needed. That holds only if the bind cannot be reached from off-box. It
-can: a page on any site the victim visits can re-point its own hostname at `127.0.0.1`
-with a short-TTL DNS answer; the browser still treats the request as same-origin, so no
-CORS preflight applies and the response is fully readable. Nothing in groundkit inspects
-`Host`.
-
-The MCP SDK ships the mechanism and defaults it off for backwards compatibility
-(`TransportSecurityMiddleware.__init__`), but its own convenience server auto-enables it
-for exactly this case:
-
-```python
-# mcp/server/fastmcp/server.py — the SDK's own default
-if transport_security is None and host in ("127.0.0.1", "localhost", "::1"):
-    transport_security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"], ...
-    )
-```
-
-groundkit uses the lower-level `Server` / `StreamableHTTPSessionManager` API, which
-bypasses that, and passes no `security_settings`. The REST half has no
-`TrustedHostMiddleware` and no `Host` check at all. The module docstring defers this
-because "the allowed `Host` values depend on the bind address, which lives in the CLI" —
-that is plumbing, and the CLI already computes `--host` and `--allow-remote-access`.
-
-**Acceptance criteria**
-
-- [ ] `create_session_manager` receives a `TransportSecuritySettings` derived from the
-      serve-time host decision, not a constant.
-- [ ] `create_app` installs `TrustedHostMiddleware` with the same derived allow-list.
-- [ ] `--allow-remote-access` widens both allow-lists consistently; without it, both
-      refuse a non-loopback `Host`.
-- [ ] Regression test, shown to fail first: a request carrying a forged `Host` is refused
-      on the REST surface **and** on `/mcp`, and a loopback `Host` still succeeds.
-- [ ] ADR amending ADR-0014 records that the bind alone was insufficient and why the
-      no-authentication position still holds once `Host` is validated.
-- [ ] `SECURITY.md` lists inbound rebinding as closed, or as a named residual until it is.
-
----
-
-## Phase B — Correct the shipped defects
-
-**Goal:** fix the two silent-wrong-answer defects in the published artifact.
-**Exit:** both fixed with must-fail-first regression tests; a `0.1.1` is releasable.
-
-### GK-003 — `rerank_by_logits` drops `source_class` and `extractor`
-
-- **Severity** HIGH · **Effort** S · **ADR** no · **Verified**
-- **Where** `src/groundkit/retrieval/rerank.py:170`
-
-Three places in production rebuild a `RetrievalResult`. Two pass both fields explicitly —
-`retrieval/search.py:594`, whose docstring calls the omission "the fail-open defect this
-closes", and `providers/context_assembly.py:294`. This one does not, so every reranked
-result silently reverts to the contract defaults `"text"` / `None`.
-
-Phase 3 code that was never revisited when ADR-0016 grew the contract underneath it. It is
-reachable today: `service/schemas.py:61` exposes `rerank` on every REST and MCP search
-request and `service/tools.py:197` applies it. Against a collection holding URL-ingested
-documents, every citation returns labelled `"text"` when it is actually `"snapshot"`,
-routing later verification down the plain read-and-slice path ADR-0016 exists to keep
-snapshots out of. It fails closed rather than returning wrong content, but the snapshot
-verification mechanism is silently gone.
-
-**Acceptance criteria**
-
-- [ ] `rerank_by_logits` passes `source_class=result.source_class` and
-      `extractor=result.extractor`.
-- [ ] `tests/test_rerank.py`'s `_result()` helper accepts both fields.
-- [ ] Regression test, shown to fail first: a `snapshot`-class result survives rerank with
-      its class intact; likewise an `extracted` result with its extractor identity.
-- [ ] A check that no *fourth* rebuild site can reappear silently — either a test that
-      enumerates `RetrievalResult(` construction sites in `src/`, or the field made
-      non-defaulting so omission is a type error. Prefer the latter if it does not break
-      `evals/echo.py`'s synthetic fixtures.
-
-### GK-004 — Caller metadata silently overwrites the authoritative `source`
-
-- **Severity** HIGH · **Effort** S · **ADR** no · **Verified**
-- **Where** `src/groundkit/ingestion/chunking.py:92`
-
-```text
-metadata={"source": document.source, **document.metadata},
-```
-
-(Fenced as `text`, not `python`: `ruff format` formats Python blocks inside Markdown, and
-this line is a keyword-argument fragment rather than a statement. Ruff parses it as a
-tuple assignment and rewrites it into something that means something else entirely, which
-fails the `lint` job's `ruff format --check` step. Quote source fragments as `text`.)
-
-Dict-literal ordering applies the caller's keys *after* the seeded one. Confirmed by
-execution: a `Document` carrying `metadata={"source": "..."}` produces chunks whose
-`metadata["source"]` is the caller's value, not the real path.
-
-Citations are unaffected — they join through `documents.source` in SQLite, which is why
-this is HIGH and not CRITICAL. But `metadata_filter={"source": ...}` on dense search is a
-real, tested capability (`tests/test_dense.py:801`), and against such a document it
-returns zero or wrong results with nothing raised anywhere.
-
-**Acceptance criteria**
-
-- [ ] Merge order reversed to `{**document.metadata, "source": document.source}`.
-- [ ] Regression test, shown to fail first: a `Document` whose metadata carries a
-      colliding `source` key still produces chunks whose `metadata["source"]` equals
-      `document.source`.
-- [ ] Decide and record whether a colliding key should instead be rejected at ingest —
-      silently winning and silently losing are both defensible, silently *swapping* is
-      not. A `KNOWN_LIMITATIONS.md` line is sufficient if the answer is "last write wins,
-      deliberately".
-
----
-
-## Phase C — Make the documentation true
-
-**Goal:** a live package whose own documentation describes it accurately.
-**Exit:** no document claims groundkit is unpublished; `SPEC.md` §9 shows Phase 7 done.
-
-### GK-005 — Documentation states that a published package is unpublished
-
-- **Severity** HIGH · **Effort** M · **ADR** no · **Verified**
-- **Where** `SPEC.md:288`; `README.md:120`; `docs/guides/mcp-clients.md:26`;
-  `CHANGELOG.md` (`[0.1.0]` heading undated)
-
-v0.1.0 published to PyPI and GitHub Releases on 2026-08-18; tag `v0.1.0` points at
-`c9647eb`. All of the above still say the release has not happened and that
-`pip install groundkit` does not work. This is worse than ordinary doc lag — it steers
-real users away from the correct install path on the project's most-read pages, and
-`SPEC.md` §9 is the document this repo designates as the phase authority over every other
-statement of status.
-
-**Acceptance criteria**
-
-- [ ] `SPEC.md` §9 Phase 7 row reads done, with the release date.
-- [ ] `README.md`'s status block and install guidance make `pip install groundkit` the
-      primary path.
-- [ ] `docs/guides/mcp-clients.md` drops the not-on-PyPI caveat.
-- [ ] `docs/getting-started/installation.md` leads with the PyPI install.
-- [ ] `CHANGELOG.md`'s `[0.1.0]` heading carries its date, per the Keep a Changelog format
-      the file says it follows. Add the inverted-span rejection landed in `04384db` under
-      Retrieval — a contract behaviour change currently with no changelog trace.
-- [ ] The three badges `README.md`'s own comment block reserves — PyPI version, Python
-      versions, License — added now that each reports something true. No hand-written
-      values; live endpoints only.
-
-### GK-006 — Two rendered docstrings claim Phase 3 is unbuilt
-
-- **Severity** MEDIUM · **Effort** XS · **ADR** no
-- **Where** `src/groundkit/config.py:220`; `src/groundkit/index/protocols.py:235`
-
-"LanceDB table arrives in Phase 3" and "implementations arrive in Phase 3". Both shipped
-on 2026-08-15 (`InMemoryVectorStore`, `LanceDBVectorStore`). These render on the published
-docs site via mkdocstrings, so a site reader is told an existing capability does not exist.
-
-**Acceptance criteria**
-
-- [ ] Both docstrings describe what exists, naming the classes.
-- [ ] Grep for other `arrives in Phase`/`Phase N` futures in source docstrings; fix any
-      whose phase has closed.
-
-### GK-007 — `CLAUDE.md` is frozen at end-of-Phase-2
-
-- **Severity** MEDIUM · **Effort** M · **ADR** no · **Depends on** GK-005
-- **Where** `CLAUDE.md` (gitignored at `.gitignore:40`)
-
-Because it is gitignored it is invisible to CI, absent from a fresh clone, and unreachable
-by any doc sweep — and it is what every future agent session reads as ground truth. Its
-stale claims include: three CLI verbs (there are six — `ingest, search, answer, eval,
-serve, serve-mcp`); six modules described as docstring-only stubs (all implemented); a
-three-entry coverage core subset (there are five); five CI jobs (there are seven); and an
-"open Phase 3 decision" that is closed.
-
-**Acceptance criteria**
-
-- [ ] Regenerated against `cli.py`, `pyproject.toml`, `ci.yml` and the actual module set.
-- [ ] States near the top that `SPEC.md` §9 is the phase authority and that this file is
-      gitignored and therefore unverifiable by CI.
-- [ ] Decide whether it should stay gitignored at all. If it stays, note in
-      `CONTRIBUTING.md` that it exists and is untracked, so its absence in a fresh clone
-      is not mistaken for a missing file.
+Two of the three exit criteria were met as written. The third — Phase A's "`SECURITY.md`
+accurate about what the bind does and does not protect" — was met only after adversarial
+re-verification: the first `Host` fix branched on *is a loopback literal* while its own ADR
+and `SECURITY.md` justified the unrestricted branch with *once the socket is routable*, so
+`grk serve --host localhost --allow-remote-access` bound a non-routable socket with
+validation disabled, reinstating the CRITICAL on the one bind where it is exploitable. The
+predicate now resolves the host and fails closed. Recorded here because the lesson is
+reusable and outlives the items: a security control whose stated premise and actual
+predicate differ passes every test written against the predicate.
 
 ---
 

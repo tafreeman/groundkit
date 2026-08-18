@@ -108,6 +108,19 @@ paths. So this module gives the service no reachable address:
   choice;
 - there is no key pair and no SSH.
 
+`bootstrap.sh.tftpl` starts the container with `--host=0.0.0.0
+--allow-remote-access`, because inside the container `127.0.0.1` would be
+unreachable even from the instance's own SSM agent. That means the service's
+`Host`-header check
+([ADR-0024](../../../docs/adr/ADR-0024-host-header-validation-on-both-transports.md))
+is **off** on this instance — `derive_host_allow_list` disables it the moment
+the bind is routable, and `0.0.0.0` always is. Nothing in this module relies
+on it. The access model above — no ingress rule, no key pair, SSM port
+forwarding only — is the entire boundary, exactly as it was before ADR-0024,
+and it has to be: a security group with no ingress rules is what makes the
+instance unreachable in the first place, and `Host` validation only matters
+once a request already arrives.
+
 The way in is a Session Manager port-forwarding session, which connects to
 `localhost` *on the instance* over the SSM agent's outbound channel:
 

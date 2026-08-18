@@ -11,4 +11,14 @@ carries document ID + chunk ID + offsets. Together they are what makes
 re-reads the source file and confirms the span still says what the citation
 says it says.
 
+`RetrievalResult` carries `source_class` and `extractor` (ADR-0016), which
+route citation verification to the right re-derivation path. Their defaults
+— `"text"` and `None` — exist for backward compatibility with a published
+contract, not as a value any construction site should take implicitly: an
+AST-level test asserts that every `RetrievalResult(...)` in `src/groundkit/`
+passes both fields explicitly. `evals/` is exempt, and deliberately — the two
+sites there build synthetic fixtures whose provenance is invented for the
+harness rather than carried through from a store record, so there is nothing
+upstream of them for a default to silently replace.
+
 ::: groundkit.contracts

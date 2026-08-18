@@ -10,6 +10,12 @@ convenience, not repo content — see the comment above its entry in
 agent attached would otherwise learn these rules only by reading `SPEC.md`
 end to end or by breaking a CI gate. This file exists so neither is required.
 
+`CLAUDE.md` is agent instruction, not contributor guidance, which is why it's
+untracked rather than merely undocumented: a fresh clone will not have it at
+all, and that absence is expected, not a missing file. The contract you're
+bound by either way is [`SPEC.md`](SPEC.md), whose §9 is the phase authority
+regardless of what any agent-instruction file claims.
+
 ## Setup
 
 Python 3.11+, [`uv`](https://docs.astral.sh/uv/) for the environment and

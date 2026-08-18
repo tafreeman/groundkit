@@ -49,8 +49,8 @@ narrower promise than it sounds, and its limits are stated below.
 
 Every point at which bytes derived from your content can leave the process,
 plus the one path where the process reaches out based on content you gave it
-(URL ingestion, row 6). This list is exhaustive as of Phase 6; nothing is
-queued to extend it before the Phase 7 release.
+(URL ingestion, row 6). This list is exhaustive as of the v0.1.0 release
+(SPEC.md §9); nothing is queued to extend it.
 
 | # | Path | What leaves | Default | Redacted? |
 |---|------|-------------|---------|-----------|

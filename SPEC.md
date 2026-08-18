@@ -276,37 +276,34 @@ alike. Revert the source (not the test), run, restore, run.
 | 4 | Service + MCP | FastAPI + MCP server + CLI; `grk ingest ./docs && grk serve-mcp` connectable from Claude Desktop/Code with documented client config | done 2026-08-15 |
 | 5 | Boundary features | optional query rewrite + cited synthesis; redaction pass (names → tokens, configurable patterns); advisory faithfulness judge | done 2026-08-15 (redaction covers cloud **chat** egress only — the embedding boundary is a recorded deviation, ADR-0017; the gated synthesis workflow now exists — `eval-gated.yml` runs `--synthesis --judge` against a real chat model on a weekly cron) |
 | 6 | IaC + observability | multi-stage non-root Dockerfile; compose (service+Ollama+collector+Jaeger); k8s (deployment, service, PVC, probes); Terraform module for one concrete provider; OTel verified end-to-end in compose | done 2026-08-16 — `infra/` landed 2026-08-15 (ADR-0020/0021/0022, `docs/specs/phase-6-iac-observability.md`); OTel instrumentation and JSON logs implemented (Phase 6 change 2: `telemetry.py`, spans on `Indexer.index_source`/`Indexer.index_directory`, `Retriever.search`, `Synthesizer.synthesize`) and verified in compose 2026-08-16: `ingest` and `retrieve` spans observed in Jaeger with the ADR-0022 attribute allowlist holding (no query text, source path or document content in the exported payload), plus the collector→Jaeger leg and the Terraform security-group preconditions. Also 2026-08-16: `terraform plan`/`apply` against a real AWS account (`us-east-1`, personal sandbox) — instance provisioned, image pulled from a real private ECR repo, a document ingested, and a real search served over an SSM port-forward tunnel; `terraform destroy` ran in the same session. Also 2026-08-16: the full documented compose cold-start — `ollama-pull`, the `ingest` one-shot (43 files, 1299 chunks, 1299 vectors), `up -d`, and `GET /v1/collections` plus a citation-bearing `POST /v1/search` over the `127.0.0.1:8765` publish; the loopback-only binding was demonstrated host-side (a `0.0.0.0` control port answered on this host's LAN address while `:8765` was refused on the same address), and the from-another-host leg was attempted and **could not complete** because the only available Wi-Fi is a guest SSID with client isolation. And 2026-08-16: the documented Kubernetes sequence verbatim on a **single-node** Docker Desktop (kind mode, v1.36.1) — `apply -k`, corpus load, ingest Job complete (43 files, 1299 chunks), Deployment 1/1 Ready, and a citation-bearing search over `kubectl port-forward`. **Every IaC path in this row has now been exercised at least once.** Two qualifiers remain rather than gaps in coverage: the multi-node `ReadWriteOnce` path a single node cannot produce, and the from-another-host half of the compose bind check, which could not run because the only Wi-Fi available is a guest SSID with client isolation. And 2026-08-16: the **`synthesize` span in a real trace**, completing SPEC.md §3's three-site list — a `docker compose run … grk answer` against the running four-service stack returned a cited answer over 2 BM25 results and produced `groundkit.synthesize.synthesize` in Jaeger carrying only `chat.model`, `chat.provider`, `duration_ms` and `result_count`; a sweep of the exported payload for the question text, the completion text, both citations' offsets, the corpus path and the source filename found none of them, and an error-path span from an earlier timed-out attempt leaked nothing either. Scope: the chat model was the operator's host Ollama rather than the stack's own (which holds only the embedding model). **Every span site and every IaC path in this row has now been exercised.** What remains is not unverified work but two limits of the available hardware, accepted and recorded rather than left open: the multi-node `ReadWriteOnce` path a single node cannot produce, and the from-another-host half of the compose bind check, blocked by a guest SSID with client isolation. `infra/README.md` is the status board and records the exact scope of each run |
-| 7 | Docs + release | MkDocs site, README live badges only, MIT, v0.1.0 tag, PyPI publish workflow | machinery done 2026-08-15; **Phases 4–6 are now closed, so the release is unblocked** — version bumped to `0.1.0` on 2026-08-16 in both `pyproject.toml` and `groundkit.__version__`; PyPI pending publisher registered 2026-08-16 (trusted publishing has no token path, so this had to precede the first upload); what remains is the tag and the published GitHub release itself |
+| 7 | Docs + release | MkDocs site, README live badges only, MIT, v0.1.0 tag, PyPI publish workflow | done 2026-08-18 — tag `v0.1.0` and the GitHub release published 2026-08-18T11:27:32Z (commit `c9647eb`), PyPI `groundkit` 0.1.0 uploaded 2026-08-18T11:29:20Z via trusted publishing; `pip install groundkit` works |
 
-Phase 7 ran out of order, deliberately and partially. Everything in it that
-does not describe Phases 4–6 has landed: the MkDocs site (strict build, gated
-in CI and as a release gate), the LLM-boundary document §2 assigns to this
-phase, live-badge-only README, the PyPI trusted-publishing workflow, the
-release-gate suite that blocks it, and the re-enabled `eval-gated` /
-`rerank-gated` schedules those workflows reserved for "end of development".
-
-What has **not** happened is the release itself. No v0.1.0 tag, no GitHub
-release, nothing published to PyPI. The reason that paragraph used to give —
-that the MCP server, the service surface and the IaC did not exist, so a 0.1.0
-on PyPI would be a version number that could not be withdrawn and reused — has
-expired: Phases 4, 5 and 6 are all closed. The version was bumped off
-`0.1.0.dev0` on 2026-08-16, in both `pyproject.toml` and
-`groundkit.__version__` (two independent declarations that nothing but
+Phase 7 landed in full, out of order and in two parts. The machinery landed
+first: the MkDocs site (strict build, gated in CI and as a release gate), the
+LLM-boundary document §2 assigns to this phase, live-badge-only README, the
+PyPI trusted-publishing workflow, the release-gate suite that blocks it, and
+the re-enabled `eval-gated` / `rerank-gated` schedules those workflows
+reserved for "end of development". The version was bumped off `0.1.0.dev0` on
+2026-08-16, in both `pyproject.toml` and `groundkit.__version__` (two
+independent declarations that nothing but
 `tests/test_smoke.py::test_version_matches_pyproject` holds together — the
-release gate's parity step reads `pyproject.toml` alone).
+release gate's parity step reads `pyproject.toml` alone), and the PyPI
+*pending publisher* was registered by the owner the same day — required
+because `publish.yml` is **trusted-publishing only**, with no token input
+wired, against a project that did not yet exist on PyPI.
 
-The PyPI *pending publisher* — required because `publish.yml` is
-**trusted-publishing only**, with no token input wired, against a project that
-does not exist on PyPI yet — was registered by the owner on 2026-08-16. What
-remains is the release event itself: the publish workflow is inert until a
-GitHub release is published, and the tag it carries must match
-`pyproject.toml`'s version or the parity gate refuses it.
+The release event itself followed on 2026-08-18: a GitHub release published
+against tag `v0.1.0` (commit `c9647eb`), which triggered the publish workflow
+and put `groundkit` 0.1.0 on PyPI two minutes later. The tag matched
+`pyproject.toml`'s version, so the parity gate passed it through.
 
 The docs site describes only what is built, and states the gaps where they
 fall. Phase 4's service/MCP pages and Phase 5's LLM-boundary update have
 landed — the egress inventory now documents the redaction pass where it
 actually runs (cloud chat, ADR-0017), not the embedding row this paragraph
-originally predicted. Still owed with Phase 6: the IaC verification dates.
+originally predicted. The Phase 6 IaC verification dates this paragraph once
+still owed are now carried in the Phase 6 row above, with `infra/README.md` as
+the status board recording the exact scope of each run.
 
 ## 10. Definition of done (v1)
 

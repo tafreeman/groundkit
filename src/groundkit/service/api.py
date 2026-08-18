@@ -60,10 +60,12 @@ from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp
 
 from groundkit import __version__
 from groundkit.errors import ConfigurationError, GroundkitError
+from groundkit.service.binding import UNRESTRICTED_HOST_ALLOW_LIST, HostAllowList
 from groundkit.service.errors import (
     ErrorRendering,
     check_collection,
@@ -135,7 +137,12 @@ class McpMount:
     lifespan: Callable[[], AbstractAsyncContextManager[None]]
 
 
-def create_app(ctx: ServiceContext, *, mcp_mount: McpMount | None = None) -> FastAPI:
+def create_app(
+    ctx: ServiceContext,
+    *,
+    mcp_mount: McpMount | None = None,
+    host_allow_list: HostAllowList = UNRESTRICTED_HOST_ALLOW_LIST,
+) -> FastAPI:
     """Build the read-only REST app, one route per registered tool.
 
     With ``mcp_mount`` omitted the app is pure REST and pulls in nothing from
@@ -143,6 +150,27 @@ def create_app(ctx: ServiceContext, *, mcp_mount: McpMount | None = None) -> Fas
     lifespan is entered inside the app's own lifespan, which is the only place
     a streamable-HTTP session manager can be started and stopped in step with
     the server process.
+
+    ## ``Host`` is validated, because the loopback bind alone is not a boundary
+
+    ``TrustedHostMiddleware`` is installed **unconditionally** — it is
+    middleware, so it also covers ``mcp_mount``'s sub-path, and the MCP
+    transport's own check (``create_session_manager``) is a second, independent
+    refusal rather than the only one. What varies is the list it is given, and
+    that is a serve-time decision derived once by
+    :func:`groundkit.service.binding.derive_host_allow_list` (ADR-0024): a page
+    on any site the victim visits can re-point its own hostname at
+    ``127.0.0.1``, and the browser will then treat this service as same-origin.
+    ``Host`` is the only part of such a request that still names the attacker.
+
+    The default is :data:`~groundkit.service.binding.UNRESTRICTED_HOST_ALLOW_LIST`
+    and that is a deliberate, named library default rather than an oversight:
+    ``create_app`` builds an app object, while *serving* it is what makes a
+    ``Host`` decision meaningful, and ``grk serve`` always passes the derived
+    list. A caller that constructs the app for an in-process client, a test, or
+    behind its own front door is not helped by a check keyed to an address it
+    never binds. The security property is asserted against the CLI-assembled
+    app in ``tests/test_service_host_validation.py``, not against this default.
 
     The context's registry is closed on shutdown. The app does not *own* the
     :class:`~groundkit.service.tools.ServiceContext` — it is assembled at serve
@@ -156,6 +184,8 @@ def create_app(ctx: ServiceContext, *, mcp_mount: McpMount | None = None) -> Fas
         ctx: Serve-time context. Everything a handler may reach lives here;
             no request model carries any of it (ADR-0014 decision 6).
         mcp_mount: Optional MCP transport to mount alongside the REST routes.
+        host_allow_list: The ``Host`` decision both transports enforce.
+            Defaults to unrestricted; ``grk serve`` derives a real one.
 
     Returns:
         A FastAPI application exposing exactly the operations in
@@ -182,6 +212,16 @@ def create_app(ctx: ServiceContext, *, mcp_mount: McpMount | None = None) -> Fas
         lifespan=lifespan,
     )
     app.add_exception_handler(RequestValidationError, _handle_validation_error)
+    # `www_redirect=False`: the default answers an unmatched `Host` whose
+    # `www.`-prefixed form IS on the list with a 307 to that name. No entry this
+    # repo produces starts with `www.`, so the branch is unreachable — but it is
+    # a redirect built from a caller-supplied header, and turning it off costs a
+    # keyword rather than an argument about whether it can be reached.
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=list(host_allow_list.trusted_hosts),
+        www_redirect=False,
+    )
 
     for spec in TOOLS:
         _register(app, spec, ctx)

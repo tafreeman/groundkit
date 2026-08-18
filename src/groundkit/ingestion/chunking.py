@@ -89,7 +89,15 @@ class RecursiveChunker:
                         content=text[start:end],
                         start_offset=start,
                         end_offset=end,
-                        metadata={"source": document.source, **document.metadata},
+                        # `source` is seeded LAST so it always wins a key collision with
+                        # caller-supplied metadata. `document.source` is the authoritative
+                        # value used downstream (e.g. `metadata_filter={"source": ...}` on
+                        # dense search); a caller-splatted `source` overwriting it here
+                        # would make that filter, and any other metadata["source"] read,
+                        # silently return wrong or zero results. Do not reorder this to
+                        # `{"source": document.source, **document.metadata}` — that lets
+                        # `Document.metadata` clobber the seeded value (GK-004).
+                        metadata={**document.metadata, "source": document.source},
                     )
                 )
             except ValidationError as exc:

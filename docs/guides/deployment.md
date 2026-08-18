@@ -35,14 +35,39 @@ mutating operations is empty, so the set requiring a secret is empty. The
 consequence is stated in
 [ADR-0014](../adr/ADR-0014-read-only-service-surface-and-outbound-endpoint-safety.md)
 decision 7 and it governs everything on this page: **the address the service is
-reachable at is its entire access control.** A `search` response carries
+reachable at is what decides who can talk to it at all.** A `search` response carries
 document text and absolute source paths; `index_status` and `list_collections`
 carry collection topology.
 
-Locally that is enforced in the process — `grk serve` refuses a non-loopback
-`--host` unless you acknowledge it. **In a container it cannot be**, because a
-process bound to `127.0.0.1` inside a container is reachable from nothing: not
-the host, not a sibling container, not a published port. So the guarantee moves
+Locally that is enforced in the process twice over, against two different
+callers. `grk serve` refuses a non-loopback `--host` unless you acknowledge it
+with `--allow-remote-access` — that decides who can open a connection at all.
+And when the bind stays private, the service validates the `Host` header on
+both transports
+([ADR-0024](../adr/ADR-0024-host-header-validation-on-both-transports.md)) —
+that decides which requests are answered once a connection exists, and it
+closes a path the bind never did: a page on any site you visit can point its
+own hostname at `127.0.0.1` with a short-TTL DNS answer, and your browser will
+then talk to the service as same-origin, reading every response. The packet
+arrives from loopback; the attacker never routed to your machine. Only the
+`Host` header distinguishes such a request, so only checking it refuses one.
+
+Neither control is authentication, and the second is decided by whether the
+bind is *routable*, not by how you typed it. `grk serve --host localhost`
+resolves to loopback, so validation stays on; `--host 127.0.0.2` stays on and
+the allow-list names that address; `--host 0.0.0.0 --allow-remote-access`
+turns it off, deliberately, because once the port is routable a `Host` check
+stops nobody who could not already connect directly — and a restrictive list
+would break every reverse-proxy deployment, which is the one way you can put
+authentication in front of a service that ships none. A hostname that does not
+resolve fails closed. Each case logs which way it went.
+
+**In a container none of that applies**, because a process bound to
+`127.0.0.1` inside a container is reachable from nothing: not the host, not a
+sibling container, not a published port. Every surface below therefore binds
+`0.0.0.0 --allow-remote-access`, which means `Host` validation is off there by
+design — the table's middle column is the whole boundary, exactly as it was
+before ADR-0024. So the guarantee moves
 one layer out, and each deployment surface re-establishes it in its own terms
 ([ADR-0021](../adr/ADR-0021-container-exposure-and-filesystem-hardening.md)
 decision 1):

@@ -232,7 +232,13 @@ class DocumentRecordStoreProtocol(Protocol):
 
 @runtime_checkable
 class VectorStoreProtocol(Protocol):
-    """Dense vector store (implementations arrive in Phase 3)."""
+    """Dense vector store.
+
+    Implemented by :class:`~groundkit.index.dense.InMemoryVectorStore` (the
+    dev/test double; no ``lancedb`` import, safe for a BM25-only install) and
+    :class:`~groundkit.index.dense.LanceDBVectorStore` (the persisted backend,
+    constructed via its ``open`` classmethod).
+    """
 
     async def add(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
         """Store chunks with their embeddings.
