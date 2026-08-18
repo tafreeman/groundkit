@@ -33,9 +33,10 @@ narrower promise than it sounds, and its limits are stated below.
 
 ## Egress inventory
 
-Every point at which bytes derived from your content can leave the process.
-This list is exhaustive as of Phase 5; the "not built yet" section below names
-the paths that will extend it.
+Every point at which bytes derived from your content can leave the process,
+plus the one path where the process reaches out based on content you gave it
+(URL ingestion, row 6). This list is exhaustive as of Phase 6; nothing is
+queued to extend it before the Phase 7 release.
 
 | # | Path | What leaves | Default | Redacted? |
 |---|------|-------------|---------|-----------|
@@ -44,6 +45,7 @@ the paths that will extend it.
 | 3 | `CrossEncoderReranker` model load | Model *name* only, to a model host | Off (`rerank` extra) | N/A — no content in the request |
 | 4 | `OllamaChat` (`grk answer`, `grk eval --synthesis`) | Query, retrieved chunk text, candidate answers — whatever the rewrite/synthesis/judge prompt carries | Off (opt-in commands) — loopback only | No — and it does not leave the machine |
 | 5 | `OpenAICompatChat`, always inside `RedactingChat` | The same prompt text, after the pattern pass | Off (opt-in) | **Pattern-based** — structural values by default, person names only via configured patterns |
+| 6 | `UrlLoader` (`grk ingest <url>`, ADR-0016 Wave 4) | The URL itself — host, path, query string — to whatever endpoint it resolves to. Inbound fetch, not content egress: nothing from your existing corpus is sent | On whenever a URL is ingested (opt-in per invocation) | N/A — no content to redact; guarded by the SSRF checks in section 6 below instead |
 
 ### 1. Ollama embeddings — the default, and the reason the default is safe
 
@@ -151,15 +153,49 @@ a false promise. SPEC.md §2's "names → tokens" is met through its own
 "configurable patterns" clause, and an operator who configures none should
 assume names cross the wire.
 
+### 6. URL ingestion — an inbound fetch, guarded like the outbound ones
+
+`UrlLoader` (`grk ingest <url>`, ADR-0016 Wave 4) is not an egress path for
+your existing content — it fetches a *new* document in, and stores a local
+snapshot of what it read. It is listed here anyway because "the process
+opens a socket to an address derived from user input" is exactly the shape
+SPEC.md §7's SSRF guard exists for, and this loader shares the guard's
+implementation (`utils/url_safety.py`) with the cloud-provider embedding
+path in row 2 rather than reinventing it.
+
+Every fetch is checked immediately before the request, not once at
+construction — DNS can change in between — via
+`ensure_safe_endpoint(..., allow_private_endpoint=False)`, unconditionally:
+unlike `OllamaEmbedder`, `UrlLoader` has no named private-endpoint exception.
+Redirects are refused rather than followed (`follow_redirects=False` per
+request; a 3xx status raises instead of being chased). A URL carrying
+userinfo (`user:pass@host`) is refused before the fetch. A URL whose query
+string contains a credential-shaped parameter name — `token`, `key`,
+`secret`, `password`, and the rest of `url_safety.CREDENTIAL_QUERY_PARAMS` —
+is refused for the same reason, rather than redacted: `documents.source` is
+`TEXT UNIQUE NOT NULL`, and redacting the query would collapse two distinct
+URLs onto one stored identity. That denylist is deliberately non-exhaustive
+(`code` and `state` are excluded as ambiguous — OAuth credentials in one
+context, an ordinary country or US-state code in another), so a credential
+under an unlisted parameter name still gets through; this narrows a
+documented leak, it does not close every spelling of one. The response body
+is bounded by a byte cap and refused, never truncated, past it.
+
+What this does *not* close: DNS rebinding between `url_safety`'s resolution
+and the connection `httpx` actually makes, and the general proxy-bypass
+residual risk `trust_env` carries. Both are shared with the embedding-egress
+path and are stated plainly in [SECURITY.md](../security.md) rather than
+implied closed.
+
 ## What is *not* on the list
 
 Stating the negative space explicitly, because "it isn't in the table" is
 easy to misread as "nobody checked":
 
-- **Ingestion never fetches.** `FileSystemLoader.load` reads from disk, inside
-  an `allowed_base_dir` containment check. SPEC.md §4 puts URL ingestion in
-  v1 scope, but it is not built — there is no HTTP client on the ingestion
-  path at all today, and so no inbound-fetch surface to guard yet.
+- **File ingestion never fetches.** `FileLoader.load` reads from disk, inside
+  an `allowed_base_dir` containment check, and opens no socket. URL ingestion
+  does fetch, and is not a gap in this inventory — it is row 6 above, guarded
+  on every request.
 - **The index is local files.** SQLite metadata and the LanceDB table are
   written to `index_dir`. Nothing in the persistence layer opens a socket.
 - **The retrieval path is pure.** BM25 scoring, RRF fusion, and citation
@@ -167,20 +203,15 @@ easy to misread as "nobody checked":
 - **Logging never carries content.** SPEC.md §3: document content and queries
   are never logged at info level.
 
-## Paths that will extend this boundary
+## Paths that used to extend this boundary
 
-These do not exist yet. Listed so this page can be checked against them when
-they land, rather than quietly falling out of date:
-
-| Path | Phase | Boundary obligation |
-|---|---|---|
-| URL ingestion | v1, unscheduled (ADR-0016 opened the design) | Inbound fetch — SSRF guard with `redirect: error` (SPEC.md §7) |
-
-The Phase 5 rows this table used to carry — the redaction pass, query
-rewrite, synthesis, the judge — have landed and moved up into the inventory.
-The REST + MCP surfaces landed read-only with **no mutating operation on
-either transport** (ADR-0014), so SPEC.md §7's shared-secret obligation is
-dormant until a mutating operation exists.
+Nothing is currently queued to extend this boundary further — the table this
+section used to carry is empty because everything in it has landed. The
+Phase 5 rows — the redaction pass, query rewrite, synthesis, the judge — have
+moved up into the inventory as rows 4–5. URL ingestion (ADR-0016 Wave 4) has
+moved up as row 6. The REST + MCP surfaces landed read-only with **no
+mutating operation on either transport** (ADR-0014), so SPEC.md §7's
+shared-secret obligation is dormant until a mutating operation exists.
 
 Phase 5 changed row 5, not row 2. SPEC.md §9 expected the embedding row to
 be the cell that stopped saying **No**; ADR-0017 decision 5 records why it
@@ -204,3 +235,8 @@ your corpus to a third party in the clear, because that is what it does.
   content's substance, your questions, and — unless you configure name
   patterns — every person name in them. Redaction narrows what crosses the
   boundary; it does not make cloud synthesis private.
+- **Ingesting a URL?** The fetch is guarded (SSRF checks, refused redirects,
+  refused userinfo and credential-shaped query parameters, a byte cap), but
+  the credential-parameter check is a denylist, not a closed set, and DNS
+  rebinding between the safety check and the actual connection is not
+  closed. Don't rely on it against a URL you don't trust the operator of.

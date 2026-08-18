@@ -50,10 +50,13 @@ a named MCP server, and a retrieval eval harness — fully local by default.
 >
 > **groundkit is not on PyPI yet.** The publish workflow and its blocking
 > release gates exist and the version is at `0.1.0`; what remains is the tag
-> and the published release. Two v1 scope items are deliberately unbuilt and
-> named as such — **PDF/HTML ingestion and URL ingestion**, whose extractors
-> and citation re-verification landed but whose ingest-side loaders did not
-> (see [SPEC.md](SPEC.md) §4). See
+> and the published release. One v1 scope item is deliberately unbuilt and
+> named as such — **PDF/HTML ingestion**, whose extractors and citation
+> re-verification landed but whose ingest-side loader did not (see
+> [SPEC.md](SPEC.md) §4.1). URL ingestion shipped: `grk ingest` fetches an
+> http(s) URL into a verifiable local snapshot, behind the same SSRF guard as
+> cloud-provider endpoints, and refuses a URL carrying a credential in its
+> userinfo or query string rather than storing one. See
 > [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for everything deliberately
 > out of scope or presently broken — it is honest and current, including
 > about defects.
@@ -69,7 +72,8 @@ a named MCP server, and a retrieval eval harness — fully local by default.
   nDCG@k computed by deterministic, unit-tested code; BM25-only is the baseline
   every feature must beat (or the report says it didn't).
 - **Local-first** — Ollama embeddings and a file-based index by default; cloud
-  providers are opt-in and sit behind a redaction boundary.
+  providers are opt-in, and cloud chat egress sits behind a redaction
+  boundary (the embedding boundary deliberately does not — see below).
 
 Deterministic core, LLM at the boundary: no LLM runs in the retrieval path.
 Where text can and cannot leave the process is written down in full —
@@ -198,13 +202,13 @@ uv run pytest --cov && uv run coverage report
 CI enforces an 80% coverage floor twice, so neither gate can hide the other:
 once on the whole package, and again on the SPEC.md §8 core subset —
 `retrieval/` (retrieval + citation resolution), `ingestion/chunking.py`
-(chunking), `index/bm25.py` (lexical scoring), and `index/dense.py` (vector
-scoring). The core subset is the literal list in `pyproject.toml`'s
-`[tool.groundkit.coverage]` table; optional providers (e.g.
-`providers/embeddings.py`) are excluded from it. That table also records the
-one caveat this subset carries — `index/dense.py` is a mixed file, and gating
-it wholesale admits inside one file the offsetting the subset exists to
-prevent.
+(chunking), `index/bm25.py` (lexical scoring), `index/dense.py` (vector
+scoring), and `runtime.py` (collection lifecycle, ADR-0013). The core subset
+is the literal list in `pyproject.toml`'s `[tool.groundkit.coverage]` table;
+optional providers (e.g. `providers/embeddings.py`) are excluded from it.
+That table also records the one caveat this subset carries — `index/dense.py`
+is a mixed file, and gating it wholesale admits inside one file the
+offsetting the subset exists to prevent.
 
 To build the documentation site:
 

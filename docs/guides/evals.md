@@ -62,6 +62,28 @@ uv run grk eval --dense --embed-model nomic-embed-text
     a number, which is why the runner warns on it and the CLI stamps a caveat
     onto any report generated with it.
 
+## Rerank, synthesis, and the judge
+
+Three more flags extend the same report:
+
+- **`--rerank`** adds a cross-encoder reranking stage on top of whichever
+  retrieval stage precedes it, scored the same way `--dense` is: as a delta
+  against the BM25 baseline within one report.
+- **`--synthesis`** runs the planted-marker citation-echo check (SPEC.md §2)
+  against a real chat provider and writes its own artifact
+  (`evals/results/echo-latest.json`) — there is deliberately no offline
+  double for it, because an echo number from a scripted provider would be
+  noise presented as a measurement, exactly like a hash-derived dense score.
+- **`--judge`** (requires `--synthesis`) synthesizes an answer for every
+  golden-corpus query against the run's best available retrieval stage and
+  runs the advisory faithfulness judge over each one, folding the outcome
+  counts into the report's `synthesis` field.
+
+```bash
+uv run grk eval --rerank --rerank-model <cross-encoder-model>
+uv run grk eval --synthesis --judge --chat-model <chat-model>
+```
+
 ## The gated workflows
 
 Two paths cannot be proved by an offline job, and each has its own workflow
@@ -69,7 +91,7 @@ that runs weekly and on an opt-in PR label:
 
 | Workflow | Proves | Why it is separate |
 |---|---|---|
-| `eval-gated.yml` | The real-model dense/fusion delta | Needs a running Ollama and pulls an embedding model |
+| `eval-gated.yml` | The real-model dense/fusion delta, and — now provisioning a chat model from the same Ollama service — the `--synthesis --judge` echo check and faithfulness judge | Needs a running Ollama, and pulls both an embedding model and a chat model |
 | `rerank-gated.yml` | That a real cross-encoder emits raw unbounded logits — the premise the sigmoid exists for | Pulls torch, a multi-gigabyte install CI's default job must never carry |
 
 Neither is `continue-on-error`. SPEC.md §3 forbids that for any job that is
@@ -79,9 +101,11 @@ indistinguishable from one that passed.
 
 ## The faithfulness judge
 
-Synthesis mode (Phase 5) will ship an LLM-as-judge faithfulness check with a
+Synthesis mode (Phase 5) ships an LLM-as-judge faithfulness check with a
 schema-validated verdict and an injectable model call, so unit tests never
-touch the network.
+touch the network. `grk eval --judge` runs it across the whole golden corpus;
+`grk answer --judge` runs the identical judge over one query outside the eval
+harness.
 
 It is **advisory only — it exits 0 and gates nothing** — until it has been
 calibrated against human labels. The calibration procedure required to ever

@@ -4,9 +4,9 @@ Feature spec for SPEC.md §9 Phase 3: *dense (LanceDB w/ metadata filtering),
 RRF, optional cross-encoder (normalized scores); each with eval delta vs
 baseline.*
 
-Status: **planned**. Nothing here overrides SPEC.md; where this document makes
-a decision that SPEC.md does not already contain, it names the ADR that must
-land first.
+Status: **done**. Nothing here overrides SPEC.md; where this document makes
+a decision that SPEC.md does not already contain, it names the ADR that
+carries it.
 
 ## 1. What Phases 1–2 already provide
 

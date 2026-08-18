@@ -93,13 +93,17 @@ optional non-LLM local cross-encoder rerank; persisted index with incremental
 re-index; MCP server (four tools above); FastAPI REST mirroring the MCP tools;
 eval harness; CLI (`grk ingest | search | eval | serve | serve-mcp`); IaC.
 
-### 4.1 Scope amendment for v0.1.0 (2026-08-16)
+### 4.1 Scope amendment for v0.1.0 (2026-08-16, item 2 closed 2026-08-17)
 
-**Three items in the "In" list above did not ship in v0.1.0, and this section
-is the explicit amendment rather than a silent shortfall.** §9 calls the
-release unblocked; that was inconsistent with the list above until this
+**Three items in the "In" list above did not ship as of 2026-08-16, and this
+section is the explicit amendment rather than a silent shortfall.** §9 calls
+the release unblocked; that was inconsistent with the list above until this
 section existed, and the inconsistency is the kind §2's "real data only" rule
-exists to prevent — a scope claim is a claim like any other.
+exists to prevent — a scope claim is a claim like any other. One of the three
+— item 2 — shipped the day after this section was first dated. It stays
+numbered and in place rather than being quietly deleted: an amendment that
+disappears once it stops being convenient would be the same kind of silent
+shortfall this section exists to prevent.
 
 1. **PDF/HTML ingestion is not reachable from `grk ingest`.** The
    deterministic extractors, the extractor-identity binding, and resolve-time
@@ -110,16 +114,33 @@ exists to prevent — a scope claim is a claim like any other.
    deliberately declines to design rather than guess at. Consequence, stated
    plainly: nothing in-tree yet *produces* an `extracted` document, so that
    verification path is proven by tests rather than by a live ingest.
-2. **URL ingestion and snapshot storage are not built.** Designed (§10 of the
-   same spec), unbuilt. A `snapshot`-class citation is refused with that
-   reason rather than resolved against a source that is not there.
+2. **URL ingestion and snapshot storage shipped 2026-08-17 (commit
+   `5700056`), one day after this section's original date — no longer a
+   gap.** `grk ingest` now accepts an http(s) URL: `UrlLoader` fetches it
+   behind the same SSRF guard applied to cloud-provider endpoints (redirects
+   refused rather than followed, an oversized body refused rather than
+   truncated, `allow_private_endpoint=False` unconditionally), and writes the
+   fetched text to a per-collection snapshot file rather than trusting a
+   later re-fetch to reproduce what was indexed — a re-fetch is a different
+   observation at a different time and cannot verify anything (§10 of the
+   same spec). `retrieval/citations.py`'s `_resolve_snapshot` reads that file
+   back; it no longer refuses a `snapshot`-class citation. A same-wave
+   follow-up (commit `73747d9`) closed a related gap found while reviewing
+   the above: a URL whose query string carries a credential-shaped parameter
+   (`?token=`, `?api-key=`, ...) is now refused before the fetch, for the
+   reason the userinfo check already stated — `Document.source` stores the
+   URL verbatim, so anything in it is durable and re-served in every
+   citation.
 3. **No generated HTML eval report.** §6 asks for one alongside
    `evals/results/latest.json`; `grk eval` writes the JSON artifact only. The
    JSON is the machine-readable contract and the thing every gate and delta
    reads, so this is a presentation gap, not a measurement one.
 
-These stay v1 scope and stay in the list above — the amendment narrows
-**v0.1.0**, not v1. Each is recorded in `KNOWN_LIMITATIONS.md` and in
+Items 1 and 3 stay v1 scope and stay in the "In" list above — the amendment
+narrows **v0.1.0**, not v1. Item 2 is recorded here rather than deleted
+because this section's job is to be the honest paper trail of what the
+release claim meant on the date it was made, not just a current shortfall
+list. Each open item is recorded in `KNOWN_LIMITATIONS.md` and in
 `CHANGELOG.md`'s release entry, so a reader arriving from PyPI meets the gap
 before the feature list. §10's definition of done is read against this
 section.
@@ -208,8 +229,13 @@ tests on both paths.
   document text, so deletion behavior, file permissions, backup scope, and
   retention are product decisions owed before any deployment that is not a
   single user's local machine — not operational details to settle afterwards.
-  Deleting a collection means deleting its `.sqlite3` *and* its `.lance`
-  sibling; neither is inferable from the other's absence.
+  Deleting a collection means deleting its `.sqlite3`, its `.lance` sibling
+  *and* its `.snapshots` directory; none is inferable from another's absence.
+  The third artifact arrived with URL ingestion (ADR-0016 decision 4) and
+  carries the heaviest version of this argument, because a snapshot is the
+  only copy of what was fetched — ADR-0023 binds an individual snapshot's
+  lifetime to its `documents` row, but collection-level deletion is still
+  owed, since there is no `delete_collection` to attach it to yet.
 - Loader path containment via ported `path_safety` (`allowed_base_dir`), with
   the traversal test ARP never wrote.
 - Credential scrubbing covers exception messages **and** `__cause__` chains
@@ -248,7 +274,7 @@ alike. Revert the source (not the test), run, restore, run.
 | 2 | Eval harness | golden corpus + metrics engine + BM25 baseline report as reference artifact | done 2026-08-11 |
 | 3 | Hybrid + rerank | dense (LanceDB w/ metadata filtering), RRF, optional cross-encoder (normalized scores); each with eval delta vs baseline | done 2026-08-15 |
 | 4 | Service + MCP | FastAPI + MCP server + CLI; `grk ingest ./docs && grk serve-mcp` connectable from Claude Desktop/Code with documented client config | done 2026-08-15 |
-| 5 | Boundary features | optional query rewrite + cited synthesis; redaction pass (names → tokens, configurable patterns); advisory faithfulness judge | done 2026-08-15 (redaction covers cloud **chat** egress only — the embedding boundary is a recorded deviation, ADR-0017; no gated synthesis workflow yet) |
+| 5 | Boundary features | optional query rewrite + cited synthesis; redaction pass (names → tokens, configurable patterns); advisory faithfulness judge | done 2026-08-15 (redaction covers cloud **chat** egress only — the embedding boundary is a recorded deviation, ADR-0017; the gated synthesis workflow now exists — `eval-gated.yml` runs `--synthesis --judge` against a real chat model on a weekly cron) |
 | 6 | IaC + observability | multi-stage non-root Dockerfile; compose (service+Ollama+collector+Jaeger); k8s (deployment, service, PVC, probes); Terraform module for one concrete provider; OTel verified end-to-end in compose | done 2026-08-16 — `infra/` landed 2026-08-15 (ADR-0020/0021/0022, `docs/specs/phase-6-iac-observability.md`); OTel instrumentation and JSON logs implemented (Phase 6 change 2: `telemetry.py`, spans on `Indexer.index_source`/`Indexer.index_directory`, `Retriever.search`, `Synthesizer.synthesize`) and verified in compose 2026-08-16: `ingest` and `retrieve` spans observed in Jaeger with the ADR-0022 attribute allowlist holding (no query text, source path or document content in the exported payload), plus the collector→Jaeger leg and the Terraform security-group preconditions. Also 2026-08-16: `terraform plan`/`apply` against a real AWS account (`us-east-1`, personal sandbox) — instance provisioned, image pulled from a real private ECR repo, a document ingested, and a real search served over an SSM port-forward tunnel; `terraform destroy` ran in the same session. Also 2026-08-16: the full documented compose cold-start — `ollama-pull`, the `ingest` one-shot (43 files, 1299 chunks, 1299 vectors), `up -d`, and `GET /v1/collections` plus a citation-bearing `POST /v1/search` over the `127.0.0.1:8765` publish; the loopback-only binding was demonstrated host-side (a `0.0.0.0` control port answered on this host's LAN address while `:8765` was refused on the same address), and the from-another-host leg was attempted and **could not complete** because the only available Wi-Fi is a guest SSID with client isolation. And 2026-08-16: the documented Kubernetes sequence verbatim on a **single-node** Docker Desktop (kind mode, v1.36.1) — `apply -k`, corpus load, ingest Job complete (43 files, 1299 chunks), Deployment 1/1 Ready, and a citation-bearing search over `kubectl port-forward`. **Every IaC path in this row has now been exercised at least once.** Two qualifiers remain rather than gaps in coverage: the multi-node `ReadWriteOnce` path a single node cannot produce, and the from-another-host half of the compose bind check, which could not run because the only Wi-Fi available is a guest SSID with client isolation. And 2026-08-16: the **`synthesize` span in a real trace**, completing SPEC.md §3's three-site list — a `docker compose run … grk answer` against the running four-service stack returned a cited answer over 2 BM25 results and produced `groundkit.synthesize.synthesize` in Jaeger carrying only `chat.model`, `chat.provider`, `duration_ms` and `result_count`; a sweep of the exported payload for the question text, the completion text, both citations' offsets, the corpus path and the source filename found none of them, and an error-path span from an earlier timed-out attempt leaked nothing either. Scope: the chat model was the operator's host Ollama rather than the stack's own (which holds only the embedding model). **Every span site and every IaC path in this row has now been exercised.** What remains is not unverified work but two limits of the available hardware, accepted and recorded rather than left open: the multi-node `ReadWriteOnce` path a single node cannot produce, and the from-another-host half of the compose bind check, blocked by a guest SSID with client isolation. `infra/README.md` is the status board and records the exact scope of each run |
 | 7 | Docs + release | MkDocs site, README live badges only, MIT, v0.1.0 tag, PyPI publish workflow | machinery done 2026-08-15; **Phases 4–6 are now closed, so the release is unblocked** — version bumped to `0.1.0` on 2026-08-16 in both `pyproject.toml` and `groundkit.__version__`; PyPI pending publisher registered 2026-08-16 (trusted publishing has no token path, so this had to precede the first upload); what remains is the tag and the published GitHub release itself |
 
@@ -293,7 +319,7 @@ date recorded · KNOWN_LIMITATIONS.md honest and current · no number in any
 doc that wasn't generated.
 
 Read against **§4.1**, which narrows what v0.1.0 claims to have built. "Works
-end-to-end" therefore means md/txt ingestion, not the pdf/html/URL loaders
+end-to-end" therefore means md/txt/URL ingestion, not the pdf/html loaders
 §4.1 defers; "eval report" means the JSON artifact, not the HTML rendering.
 Amending the scope in the open is the honest way to meet a definition of done;
 quietly reading these clauses loosely is not, and is why §4.1 exists as a

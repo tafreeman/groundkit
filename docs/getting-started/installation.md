@@ -12,13 +12,18 @@ uv sync
 ```
 
 That gives you the base install: BM25 retrieval, the persisted index,
-citation-resolving search, and the eval harness. It pulls two runtime
-dependencies (`pydantic`, `httpx`) and needs no credentials.
+citation-resolving search, and the eval harness. It pulls groundkit's runtime
+dependencies — `pydantic`, `httpx`, `fastapi`, `uvicorn`, `mcp`, and
+`opentelemetry-api` — and needs no credentials.
 
 ## Extras
 
-Both extras exist because their cost is real enough that a default install
-should not pay it.
+Five extras exist because their cost is real enough that a default install
+should not pay it. The two below back retrieval; `otel` (the tracing SDK and
+OTLP exporters — see [Deployment](../guides/deployment.md)) and `pdf`/`html`
+(the extraction libraries behind PDF/HTML citation verification — see
+[Extracted and remote source loaders](../specs/loaders-extracted-and-remote-sources.md))
+are documented where they're used.
 
 === "Dense retrieval"
 
@@ -54,9 +59,12 @@ Nothing leaves the machine on this path.
 
 An OpenAI-compatible endpoint is supported as an opt-in alternative. Before
 you enable it, read [The LLM boundary](../architecture/llm-boundary.md):
-your full document text and every query go to that endpoint, and the redaction
-pass that is supposed to sit in front of it is Phase 5 work that does not
-exist yet.
+your full document text and every query go to that endpoint. groundkit's
+redaction pass (`providers/redaction.py`) is scoped to chat egress only — the
+embedding boundary deliberately has no redaction pass in front of it. That is
+a recorded deviation
+([ADR-0017](../adr/ADR-0017-chat-seam-and-redaction-boundary.md) decision 5),
+not work still owed.
 
 ## Development install
 

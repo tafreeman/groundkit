@@ -36,6 +36,22 @@ surface as shipped rather than a diff against an earlier version.
 - Embedding identity is bound to a collection on its first dense write, and
   verified at both the ingest and retrieval boundaries. A mismatch is a typed
   error — never a re-embed, and never a cross-provider fallback.
+- `Document.source_class` and `.extractor` are persisted and propagated onto
+  `RetrievalResult` and `Citation`, and resolving a citation dispatches on the
+  recorded class. Behind the `pdf` and `html` extras, an `extracted`-class
+  citation is re-verified by re-running the same extractor that produced it
+  and slicing the result, rather than a plain read-and-slice of the source.
+- `grk ingest` accepts an http(s) URL alongside a path. `UrlLoader` fetches it
+  behind the same SSRF guard as cloud-provider endpoints — redirects refused
+  rather than followed, an oversized body refused rather than truncated,
+  private endpoints refused unconditionally — and writes the fetched text to
+  a per-collection snapshot file. A `snapshot`-class citation resolves by
+  reading that file back, never by re-fetching, because a re-fetch is a
+  different observation at a different time and cannot verify anything. A URL
+  carrying a credential in its userinfo or in a credential-shaped query
+  parameter (`?token=`, `?api-key=`, ...) is refused before the fetch rather
+  than stored, since the URL is kept verbatim as `Document.source` and would
+  otherwise be re-served in every citation built from it.
 
 ### Service surface
 
@@ -109,8 +125,6 @@ Named here because they are v1 scope that did not ship, not oversights.
   extractors and resolve-time citation re-verification exist behind the `pdf`
   and `html` extras, but the ingest-side loaders need multi-loader dispatch
   that is deliberately undesigned.
-- **URL ingestion and snapshot storage are not built.** Designed, unbuilt; a
-  `snapshot`-class citation is refused rather than guessed at.
 - **No HTML eval report.** `grk eval` writes JSON only.
 - No authentication, no rate limiting, and no multi-tenancy on the service
   surface.

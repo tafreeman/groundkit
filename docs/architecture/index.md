@@ -16,8 +16,8 @@ ingestion/          loaders (path-contained), chunking (offset-preserving)
 index/              bm25 (persisted), dense (LanceDB), metadata (SQLite)
 retrieval/          search orchestration, RRF fusion, rerank, citations
 providers/          embeddings (Ollama | OpenAI-compat), redaction,
-                    optional query-rewrite/synthesis (Phase 5)
-service/            FastAPI api, MCP server (Phase 4)
+                    optional query-rewrite/synthesis
+service/            FastAPI api, MCP server
 evals/ (package)    deterministic metrics engine
 cli                 grk
 ```

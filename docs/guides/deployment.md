@@ -92,14 +92,18 @@ not to loopback. That works because `OllamaEmbedder` sets
 (ADR-0014 decision 10) — not because the guard is relaxed. An OpenAI-compatible
 endpoint pointed at a private address is still refused.
 
-### Traces: wired, not yet emitting
+### Traces: instrumented and verified
 
-Phase 6 lands in two changes. The first is purely additive infrastructure and
-changes nothing under `src/`; the second adds the OpenTelemetry instrumentation
-and the JSON log formatter. **Between the two, the collector and Jaeger are real
-and correctly wired, and groundkit emits no spans** — so the Jaeger UI is empty
-and that is expected rather than a misconfiguration. The collector→Jaeger leg is
-provable on its own with a synthetic OTLP payload in the meantime.
+Phase 6 landed in two changes. The first was purely additive infrastructure and
+changed nothing under `src/`; the second added the OpenTelemetry instrumentation
+and the JSON log formatter. Both have landed: the collector and Jaeger are real
+and correctly wired, and groundkit emits spans on `Indexer.index_source`/
+`index_directory`, `Retriever.search`, and `Synthesizer.synthesize`. **If the
+Jaeger UI is empty against a running stack, treat that as a fault to
+investigate, not as an expected state** — `infra/README.md`'s dated
+"Verification status" table records exactly what was run and when, and its
+"Traces" section walks the collector→Jaeger synthetic-payload check that
+isolates a receive problem from an export one.
 
 When instrumentation does land, what a span may carry is an allowlist rather
 than a denylist
@@ -208,8 +212,12 @@ deployment.
 
 SPEC.md §1.4 requires each IaC path be verified with the verification date
 recorded, and SPEC.md §2 forbids publishing a date no run produced. Both apply,
-so the table in `infra/README.md` has filled and empty rows — the Terraform
-module's `fmt`/`validate` and template rendering, the compose file's parse, and
-the Kubernetes render are all checked and dated; a real `docker compose up`, a
-cluster apply and a Terraform apply are not. That table is the authority and it
+and the table in `infra/README.md` now carries a dated row for every path
+listed above — the Terraform module's `fmt`/`validate` and template rendering,
+the compose file's parse, a real `docker compose up` with an ingested search
+served over the loopback publish, a Kubernetes `apply -k` reaching Ready, and a
+Terraform `plan`/`apply` against a real AWS account. Several rows carry a scope
+note rather than a blanket pass — the multi-node `ReadWriteOnce` path, for one,
+is explicitly called out as still unverified — so read those notes before
+treating a green row as broader than it is. That table is the authority and it
 is updated only by someone who ran the thing.

@@ -122,8 +122,12 @@ nav:
   - API reference:
       - Contracts: reference/contracts.md
       - Configuration: reference/config.md
+      - Index: reference/indexing.md
       - Retrieval: reference/retrieval.md
+      - Extraction & snapshots: reference/extraction.md
+      - Answer: reference/answer.md
       - Service: reference/service.md
+      - Telemetry: reference/telemetry.md
       - Errors: reference/errors.md
   - Decisions:
       - Overview: adr/index.md
@@ -149,6 +153,7 @@ nav:
       - "ADR-0020 — Terraform target: one host with block storage": adr/ADR-0020-terraform-target-single-host-with-block-storage.md
       - "ADR-0021 — Container exposure and filesystem hardening": adr/ADR-0021-container-exposure-and-filesystem-hardening.md
       - "ADR-0022 — Observability dependency shape and span attributes": adr/ADR-0022-observability-dependency-shape-and-span-attribute-allowlist.md
+      - "ADR-0023 — Snapshot lifecycle is bound to the document row": adr/ADR-0023-snapshot-lifecycle-is-bound-to-the-document-row.md
   - Project:
       - Security: security.md
       - Known limitations: limitations.md

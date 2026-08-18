@@ -4,11 +4,12 @@ Grounded, citation-verifiable hybrid retrieval: a persisted BM25 + dense
 index, a named MCP server, and a retrieval eval harness — fully local by
 default.
 
-!!! warning "Status: Phase 3 of 7"
+!!! note "Status: Phases 0–6 of 7 done; Phase 7 is the release itself"
 
-    The deterministic core, the persisted index, hybrid retrieval and the eval
-    harness are built and gated. **The MCP server, the REST API, the synthesis
-    boundary and the IaC are not.** The phase plan in
+    The deterministic core, the persisted index, hybrid retrieval, the eval
+    harness, the LLM boundary (query rewrite, synthesis, redaction), the MCP
+    server, the REST API, and the IaC are all built and gated. What remains
+    is cutting the release. The phase plan in
     [SPEC.md](https://github.com/tafreeman/groundkit/blob/main/SPEC.md) §9 is
     the authoritative status, and
     [Known limitations](limitations.md) is the authoritative list of what
