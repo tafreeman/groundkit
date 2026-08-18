@@ -45,6 +45,7 @@ from groundkit.index.protocols import MetadataStoreProtocol, VectorStoreProtocol
 from groundkit.ingestion.chunking import RecursiveChunker
 from groundkit.ingestion.loaders import FileLoader
 from groundkit.ingestion.protocols import ChunkerProtocol, LoaderProtocol
+from groundkit.ingestion.url_loader import UrlLoader
 from groundkit.providers.embeddings import (
     InMemoryEmbedder,
     OllamaEmbedder,
@@ -292,6 +293,16 @@ class TestAssertSignatureParityHelper:
 class TestLoaderProtocolConformance:
     def test_file_loader_matches_loader_protocol(self) -> None:
         assert_signature_parity(LoaderProtocol, FileLoader)
+
+    def test_url_loader_matches_loader_protocol(self) -> None:
+        """``UrlLoader`` (Wave 4) had only an ``isinstance`` check, in its own
+        test file, until this entry — ``isinstance`` on a ``runtime_checkable``
+        Protocol only confirms member names exist, exactly the gap CLAUDE.md
+        calls out (it "would pass through the exact ``query`` -> ``_query``
+        rename that caused ARP's signature drift"). ``assert_signature_parity``
+        would catch, for example, ``UrlLoader.load`` losing its ``async``, or
+        gaining/losing a parameter relative to ``LoaderProtocol.load``."""
+        assert_signature_parity(LoaderProtocol, UrlLoader)
 
 
 # ── ChunkerProtocol <- RecursiveChunker ────────────────────────────────────

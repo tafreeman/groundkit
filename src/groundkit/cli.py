@@ -59,8 +59,9 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
-from groundkit import __version__
+from groundkit import __version__, snapshots
 from groundkit.answer import AnswerPipeline, AnswerReport
 from groundkit.config import (
     DEFAULT_CHAT_MODEL,
@@ -84,8 +85,9 @@ from groundkit.evals.runner import MIN_EVAL_TOP_K, run_eval, write_report
 from groundkit.evals.schema import EvalReport, SynthesisReport
 from groundkit.index.dense import InMemoryVectorStore, LanceDBVectorStore
 from groundkit.index.metadata import SQLiteMetadataStore
-from groundkit.indexer import Indexer
+from groundkit.indexer import Indexer, IndexReport
 from groundkit.ingestion.loaders import FileLoader
+from groundkit.ingestion.url_loader import UrlLoader
 from groundkit.providers.embeddings import INMEMORY_PROVIDER, build_embedder
 from groundkit.providers.llm import build_chat
 from groundkit.providers.query_rewrite import QueryRewriter
@@ -183,14 +185,28 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"grk {__version__}")
     sub = parser.add_subparsers(dest="command")
 
-    ingest = sub.add_parser("ingest", help="Ingest a file or directory into the local index.")
-    ingest.add_argument("path", help="File or directory to ingest.")
+    ingest = sub.add_parser(
+        "ingest", help="Ingest a file, a directory, or an http(s) URL into the local index."
+    )
+    ingest.add_argument(
+        "path",
+        help=(
+            "File or directory to ingest, or an http(s) URL to fetch and store a local "
+            "snapshot of (ADR-0016 decision 4). Classified by shape (scheme) before any "
+            "path handling runs, so a URL is never treated as a filesystem path."
+        ),
+    )
     ingest.add_argument("--index-dir", default=".groundkit", help="Index directory.")
     ingest.add_argument("--collection", default="default", help="Collection name.")
     ingest.add_argument(
         "--base-dir",
         default=None,
-        help="Containment root for loads (default: the ingested directory, or the file's parent).",
+        help=(
+            "Containment root for loads (default: the ingested directory, or the file's "
+            "parent). Not meaningful for a URL source: a fetched document has no local "
+            "file for this to bound, and its snapshot is contained under --index-dir "
+            "instead."
+        ),
     )
     ingest.add_argument(
         "--dense",
@@ -606,6 +622,48 @@ async def _maybe_aclose(provider: object | None) -> None:
         await aclose()
 
 
+#: Schemes that route ``grk ingest``'s ``path`` argument to
+#: :class:`~groundkit.ingestion.url_loader.UrlLoader` instead of
+#: :class:`~groundkit.ingestion.loaders.FileLoader`. Matches the schemes
+#: ADR-0016 decision 4 scopes URL ingestion to (SPEC.md §7's SSRF guard is
+#: HTTP-only); anything else — including a bare relative path, an absolute
+#: Windows path, or a Windows drive letter (``urlsplit`` would otherwise
+#: parse ``C:\...``'s leading ``C`` as a one-letter "scheme", which is why
+#: this is an explicit membership check against exactly these two, never a
+#: "has any scheme at all" test) — is a filesystem path.
+_URL_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+
+
+def _is_url_source(source: str) -> bool:
+    """True when ``source`` is shaped like an http(s) URL, not a filesystem path.
+
+    Classification by shape (scheme) only — no DNS, no filesystem access —
+    so it is safe to call before anything else touches ``source``. That
+    ordering is ADR-0016 decision 4's third constraint applied at the CLI
+    layer: a URL must be classified as such before any path-shaped operation
+    (``Path()``, ``.is_dir()``, ``ensure_within_base``) is asked to make
+    sense of it, even though none of those would raise on one — the whole
+    point of classifying first is that no path-shaped operation is ever
+    handed a URL in the first place.
+    """
+    return urlsplit(source).scheme in _URL_SCHEMES
+
+
+def _format_ingest_report(report: IndexReport, *, dense: bool) -> str:
+    """Render one ``grk ingest`` report line, shared by the file/directory and URL paths."""
+    line = (
+        f"ingested: {report.files_seen} files seen, "
+        f"{report.documents_indexed} indexed, "
+        f"{report.documents_skipped} unchanged, "
+        f"{report.chunks_written} chunks written"
+    )
+    if dense:
+        line += (
+            f", {report.vectors_written} vectors written, {report.vectors_deleted} vectors deleted"
+        )
+    return line
+
+
 async def _cmd_ingest(args: argparse.Namespace) -> int:
     if not args.dense and _embed_flags_supplied(args):
         raise ConfigurationError(
@@ -613,7 +671,20 @@ async def _cmd_ingest(args: argparse.Namespace) -> int:
             "--dense; without --dense there is no dense path for them to configure"
         )
 
-    path = Path(args.path)
+    source = args.path
+    # Classified before `source` is ever wrapped in a Path() or asked
+    # .is_dir() — see _is_url_source's docstring for why the ordering
+    # itself, not just the branch, is the point (ADR-0016 decision 4).
+    if _is_url_source(source):
+        if args.base_dir is not None:
+            raise ConfigurationError(
+                "--base-dir has no meaning for a URL source: there is no local file "
+                "for it to bound, and the fetched snapshot is contained under "
+                "--index-dir instead (ADR-0016 decision 4)"
+            )
+        return await _cmd_ingest_url(args, source)
+
+    path = Path(source)
     if args.base_dir is not None:
         base_dir = Path(args.base_dir)
     elif path.is_dir():
@@ -644,17 +715,46 @@ async def _cmd_ingest(args: argparse.Namespace) -> int:
         await store.close()
         await _maybe_aclose(embedder)
 
-    line = (
-        f"ingested: {report.files_seen} files seen, "
-        f"{report.documents_indexed} indexed, "
-        f"{report.documents_skipped} unchanged, "
-        f"{report.chunks_written} chunks written"
-    )
-    if args.dense:
-        line += (
-            f", {report.vectors_written} vectors written, {report.vectors_deleted} vectors deleted"
+    print(_format_ingest_report(report, dense=args.dense))
+    return 0
+
+
+async def _cmd_ingest_url(args: argparse.Namespace, source: str) -> int:
+    """Ingest one URL as a ``source_class="snapshot"`` document (ADR-0016 decision 4).
+
+    Always a single-source ingest via :meth:`~groundkit.indexer.Indexer.index_source`
+    — there is no directory-walk equivalent for a URL — so this shares only
+    the dense-path setup with :func:`_cmd_ingest`'s file/directory branch,
+    not the ``path.is_dir()`` dispatch above it.
+
+    The snapshot containment root is computed once, here, from the same
+    ``(index_dir, collection)`` pair the service surface later derives it
+    from (:func:`groundkit.service.tools.handle_fetch_chunk`) — both call
+    :func:`groundkit.snapshots.snapshot_dir_for`, so the write side (this
+    function's :class:`~groundkit.ingestion.url_loader.UrlLoader`) and every
+    read side agree on the directory without either recomputing the other's
+    convention.
+    """
+    store = await SQLiteMetadataStore.open(Path(args.index_dir), args.collection)
+    embedder: EmbeddingProtocol | None = None
+    try:
+        vector_store: VectorStoreProtocol | None = None
+        if args.dense:
+            embedder, vector_store = await _open_dense_deps(args)
+        snapshot_dir = snapshots.snapshot_dir_for(Path(args.index_dir), args.collection)
+        indexer = Indexer(
+            store,
+            UrlLoader(snapshot_dir),
+            embedder=embedder,
+            vector_store=vector_store,
+            collection=args.collection,
         )
-    print(line)
+        report = await indexer.index_source(source)
+    finally:
+        await store.close()
+        await _maybe_aclose(embedder)
+
+    print(_format_ingest_report(report, dense=args.dense))
     return 0
 
 
@@ -1094,7 +1194,9 @@ def _delta_verdict(delta: StageDelta) -> str:
 # --- Phase 4: the read-only service surface (ADR-0014, ADR-0015) -----------
 
 
-def _build_service_context(args: argparse.Namespace) -> ServiceContext:
+def _build_service_context(
+    args: argparse.Namespace,
+) -> tuple[ServiceContext, EmbeddingProtocol | None]:
     """Assemble the serve-time context both transports share.
 
     Every setting a handler can reach is resolved *here*, once, from the
@@ -1109,6 +1211,19 @@ def _build_service_context(args: argparse.Namespace) -> ServiceContext:
     copy of it living here — the same single-source-of-truth rule
     :func:`groundkit.config.resolve_embedding_config` follows for
     ``EmbeddingConfig``.
+
+    Returns:
+        ``(context, embedder)``. The embedder is handed back rather than left
+        reachable only through the registry because **nothing else will close
+        it**: :meth:`CollectionRuntime.aclose` documents that it deliberately
+        does not close an embedder it was merely handed, and the registry
+        follows suit. An ``OllamaEmbedder`` owns an ``httpx.AsyncClient`` and a
+        connection pool, so with ``--dense`` the serve commands were leaving a
+        live client open at shutdown. Returning it makes the CLI the owner in
+        the same explicit way ``_open_dense_deps`` already does for
+        ``ingest``/``search`` — every one of which pairs its embedder with a
+        ``_maybe_aclose`` in a ``finally``. ``None`` without ``--dense``, where
+        no embedder is built at all.
 
     Raises:
         ConfigurationError: ``--rerank-model`` without ``--rerank``; any
@@ -1196,8 +1311,8 @@ def _build_service_context(args: argparse.Namespace) -> ServiceContext:
         reranker=reranker,
     )
     if args.top_k is None:
-        return ctx
-    return replace(ctx, default_top_k=args.top_k)
+        return ctx, embedder
+    return replace(ctx, default_top_k=args.top_k), embedder
 
 
 def _build_mcp_mount(ctx: ServiceContext) -> McpMount:
@@ -1252,11 +1367,16 @@ async def _cmd_serve(args: argparse.Namespace) -> int:
     its test assert the refusal without a valid index on disk.
     """
     ensure_bindable_host(args.host, allow_remote_access=args.allow_remote_access)
-    ctx = _build_service_context(args)
+    ctx, embedder = _build_service_context(args)
     try:
         await _serve_http(ctx, host=args.host, port=args.port)
     finally:
+        # Registry first, embedder second, matching every other embedder-owning
+        # command here: the runtimes are what might still be mid-embed, and
+        # closing the client out from under one would surface as a transport
+        # error on the way down rather than a clean shutdown.
         await ctx.registry.aclose()
+        await _maybe_aclose(embedder)
     return 0
 
 
@@ -1271,9 +1391,10 @@ async def _cmd_serve_mcp(args: argparse.Namespace) -> int:
     """
     from groundkit.service.mcp_server import run_stdio
 
-    ctx = _build_service_context(args)
+    ctx, embedder = _build_service_context(args)
     try:
         await run_stdio(ctx)
     finally:
         await ctx.registry.aclose()
+        await _maybe_aclose(embedder)
     return 0

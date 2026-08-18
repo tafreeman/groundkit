@@ -11,9 +11,10 @@ import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from groundkit import extraction
+from groundkit import extraction, snapshots
 from groundkit.errors import IngestionError, RetrievalError
 from groundkit.utils.path_safety import ensure_within_base
+from groundkit.utils.url_safety import sanitize_url
 
 if TYPE_CHECKING:
     from groundkit.contracts import Citation
@@ -41,7 +42,9 @@ def _slice_verified_span(text: str, citation: Citation) -> str:
     return text[citation.start_offset : citation.end_offset]
 
 
-async def resolve_citation(citation: Citation, allowed_base_dir: Path) -> str:
+async def resolve_citation(
+    citation: Citation, allowed_base_dir: Path, *, snapshot_dir: Path | None = None
+) -> str:
     """Return the exact text span a citation points at, read from its source.
 
     Dispatches on ``citation.source_class`` (ADR-0016), because "read the
@@ -50,8 +53,8 @@ async def resolve_citation(citation: Citation, allowed_base_dir: Path) -> str:
     ``Document.content`` the file's decoded bytes, so offsets into content are
     offsets into the file.
 
-    For the other two it is wrong rather than merely incomplete, which is why
-    they are refused here instead of falling through:
+    For the other two, a plain read-and-slice is wrong rather than merely
+    incomplete:
 
     - ``extracted`` — offsets index deterministic extractor output. Reading a
       PDF as UTF-8 raises; reading an HTML file returns markup the offsets were
@@ -67,17 +70,25 @@ async def resolve_citation(citation: Citation, allowed_base_dir: Path) -> str:
       has an empty registry, so every ``extracted`` citation refuses there —
       still the correct answer, now for a reason the registry reports rather
       than a constant nothing could ever populate.
-    - ``snapshot`` — ``source`` is a URL. It is refused before it can reach
-      :func:`~groundkit.utils.path_safety.ensure_within_base`, and that
-      ordering is deliberate: ``ensure_within_base`` validates only that its
-      input is non-empty and null-byte-free, then hands it to
-      ``os.path.realpath``, which resolves ``"https://example.com/x"`` as a
-      *relative path* under the current directory. The containment check can
-      therefore pass and the failure surfaces later as a confusing
-      file-not-found. A URL is not a path, and the class — not a URL-sniffing
-      path helper — is what keeps that boundary sharp. Wave 4 builds the local
-      snapshot this class verifies against; until then the refusal states that
-      reason specifically rather than sharing wording with ``extracted``.
+    - ``snapshot`` — ``source`` is a URL, and it never reaches
+      :func:`~groundkit.utils.path_safety.ensure_within_base`: that function
+      validates only that its input is non-empty and null-byte-free, then
+      hands it to ``os.path.realpath``, which resolves
+      ``"https://example.com/x"`` as a *relative path* under the current
+      directory rather than rejecting it as not-a-path. The class — not a
+      URL-sniffing path helper — is what keeps that boundary sharp
+      (``test_source_class.py``'s
+      ``test_a_url_passes_path_containment_which_is_why_class_is_checked_first``
+      pins the hazard this dispatch exists to route around). Resolution
+      instead reads the local copy
+      :class:`~groundkit.ingestion.url_loader.UrlLoader` wrote at ingest time
+      (ADR-0016 decision 4) — never a re-fetch, since a re-fetch is a
+      different observation at a different time and a mismatch against it
+      could not distinguish a stale index from a changed server — from
+      ``snapshot_dir/document_id`` (:mod:`groundkit.snapshots`), itself
+      containment-checked against ``snapshot_dir`` before it is ever opened.
+      A caller that omits ``snapshot_dir`` gets ``verdict="unresolvable"``
+      naming the parameter it needed to supply, not a crash.
 
     Every failure here sets :attr:`~groundkit.errors.RetrievalError.verdict`
     explicitly, at the raise site that already knows it best, so
@@ -85,36 +96,37 @@ async def resolve_citation(citation: Citation, allowed_base_dir: Path) -> str:
     an attribute instead of pattern-matching the message (ADR-0016 decision
     6). ``drifted`` means the source was read and no longer matches;
     ``unresolvable`` means it could not be checked at all — a distinction an
-    extractor-identity mismatch falls on the ``unresolvable`` side of, because
-    nothing was re-read to disagree with.
+    extractor-identity mismatch, and a missing ``snapshot_dir`` or snapshot
+    file, both fall on the ``unresolvable`` side of, because nothing was
+    re-read to disagree with.
 
     Args:
         citation: The citation to resolve.
         allowed_base_dir: Containment root the citation's source must
-            resolve within (same path-safety barrier as ingestion).
+            resolve within (same path-safety barrier as ingestion). Unused
+            for a ``snapshot`` citation, which is contained against
+            ``snapshot_dir`` instead.
+        snapshot_dir: The per-collection snapshot containment root
+            (:func:`~groundkit.snapshots.snapshot_dir_for`), required only to
+            resolve a ``snapshot`` citation. ``None`` for every caller that
+            never resolves one — keyword-only and defaulted so no existing
+            caller breaks (spec §10.1).
 
     Returns:
         ``source_text[start_offset:end_offset]``.
 
     Raises:
-        RetrievalError: The source escapes ``allowed_base_dir``, cannot be
-            read, is not valid UTF-8, fails to re-extract under its recorded
-            extractor, is shorter than the cited offsets (source changed since
-            indexing — ``verdict="drifted"``), or belongs to a source class or
-            extractor identity this build cannot resolve
-            (``verdict="unresolvable"`` in every other case).
+        RetrievalError: The source escapes ``allowed_base_dir`` (or the
+            snapshot escapes ``snapshot_dir``), cannot be read, is not valid
+            UTF-8, fails to re-extract under its recorded extractor, is
+            shorter than the cited offsets (source changed since indexing —
+            ``verdict="drifted"``), or belongs to a source class or extractor
+            identity this build cannot resolve, or a ``snapshot`` citation
+            was given no ``snapshot_dir`` (``verdict="unresolvable"`` in every
+            other case).
     """
     if citation.source_class == "snapshot":
-        raise RetrievalError(
-            f"cannot resolve a 'snapshot' citation for {citation.source!r}: "
-            "verification requires the local snapshot URL ingestion stores at "
-            "ingest time (ADR-0016 decision 4), and no loader that builds one "
-            "is wired into this build yet (Wave 4). source is a URL, not a "
-            "path, so it is refused here before it could reach "
-            "ensure_within_base, which would resolve it as a relative path "
-            "under the current directory rather than reject it as not-a-path.",
-            verdict="unresolvable",
-        )
+        return await _resolve_snapshot(citation, snapshot_dir)
 
     # `text` and `extracted` share the containment check; they differ only in
     # how text is obtained from the (already-contained) path.
@@ -164,12 +176,76 @@ async def resolve_citation(citation: Citation, allowed_base_dir: Path) -> str:
     return _slice_verified_span(text, citation)
 
 
+async def _resolve_snapshot(citation: Citation, snapshot_dir: Path | None) -> str:
+    """Read a ``snapshot`` citation's local copy and slice it (ADR-0016 decision 4).
+
+    Never a re-fetch: a re-fetch is a different observation at a different
+    time, so a mismatch against it could not distinguish "the index is
+    stale" from "the server changed" from "the network lied". The only thing
+    this reads is the local file
+    :class:`~groundkit.ingestion.url_loader.UrlLoader` wrote at ingest time,
+    under ``snapshot_dir/document_id`` — no network call happens here, ever.
+
+    Args:
+        citation: The ``snapshot``-class citation to resolve.
+        snapshot_dir: The per-collection snapshot containment root, or
+            ``None`` when the caller never supplied one.
+
+    Raises:
+        RetrievalError: ``snapshot_dir`` is ``None``, the resolved snapshot
+            path escapes it, the file cannot be read, or is not valid UTF-8
+            (``verdict="unresolvable"`` in every case) — or the file no
+            longer covers the cited offsets (``verdict="drifted"``).
+    """
+    if snapshot_dir is None:
+        raise RetrievalError(
+            f"cannot resolve a 'snapshot' citation for {sanitize_url(citation.source)!r}: no "
+            "snapshot_dir was supplied to resolve_citation. A snapshot citation "
+            "verifies against the local copy URL ingestion stores at ingest time "
+            "(ADR-0016 decision 4), under <index_dir>/<collection>.snapshots/ — "
+            "the caller must compute that directory (snapshots.snapshot_dir_for) "
+            "and pass it. source is a URL, not a path, so it is never passed to "
+            "ensure_within_base, which would resolve it as a relative path under "
+            "the current directory rather than reject it as not-a-path.",
+            verdict="unresolvable",
+        )
+
+    try:
+        snapshot_path = ensure_within_base(
+            snapshots.snapshot_path_for(snapshot_dir, citation.document_id), snapshot_dir
+        )
+    except ValueError as exc:
+        raise RetrievalError(str(exc), verdict="unresolvable") from exc
+
+    try:
+        text = await asyncio.to_thread(snapshot_path.read_text, "utf-8")
+    except OSError as exc:
+        raise RetrievalError(
+            f"cannot read the local snapshot for {sanitize_url(citation.source)!r}: {exc}",
+            verdict="unresolvable",
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise RetrievalError(
+            f"the local snapshot for {sanitize_url(citation.source)!r} is not valid UTF-8: {exc}",
+            verdict="unresolvable",
+        ) from exc
+
+    return _slice_verified_span(text, citation)
+
+
 async def verify_citation(
-    citation: Citation, expected_content: str, allowed_base_dir: Path
+    citation: Citation,
+    expected_content: str,
+    allowed_base_dir: Path,
+    *,
+    snapshot_dir: Path | None = None,
 ) -> bool:
     """True when the cited span in the source equals ``expected_content``.
 
     Raises:
         RetrievalError: As :func:`resolve_citation`.
     """
-    return await resolve_citation(citation, allowed_base_dir) == expected_content
+    return (
+        await resolve_citation(citation, allowed_base_dir, snapshot_dir=snapshot_dir)
+        == expected_content
+    )

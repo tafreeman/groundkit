@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 from pydantic import BaseModel
 
+from groundkit import snapshots
 from groundkit.contracts import Citation, SearchResponse
 from groundkit.errors import ConfigurationError, RerankerNotConfiguredError, RetrievalError
 from groundkit.index.metadata import SCHEMA_VERSION, is_groundkit_store
@@ -275,11 +276,18 @@ async def handle_fetch_chunk(ctx: ServiceContext, request: FetchChunkRequest) ->
         end_offset=chunk.end_offset,
     )
 
+    # The per-collection snapshot containment root (ADR-0016 decision 4,
+    # spec §10.1) — computed here rather than recomputed by resolve_citation
+    # itself, mirroring how ctx.base_dir is already resolved once by the
+    # caller. Harmless to compute unconditionally even for a non-snapshot
+    # citation: resolve_citation only ever reads it on the "snapshot" branch.
+    snapshot_dir = snapshots.snapshot_dir_for(ctx.index_dir, request.collection)
+
     verification: VerificationVerdict
     content: str | None = None
     detail: str | None = None
     try:
-        resolved = await resolve_citation(citation, ctx.base_dir)
+        resolved = await resolve_citation(citation, ctx.base_dir, snapshot_dir=snapshot_dir)
     except RetrievalError as exc:
         # resolve_citation sets `verdict` explicitly at every one of its raise
         # sites (ADR-0016 decision 6), so this reads a typed attribute instead

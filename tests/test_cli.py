@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
-from groundkit.cli import _build_parser, _print_eval_summary, main
+from groundkit import snapshots
+from groundkit.cli import _build_parser, _is_url_source, _print_eval_summary, main
+from groundkit.contracts import Document
 from groundkit.evals.schema import (
     EvalReport,
     MetricSet,
@@ -1233,3 +1236,179 @@ def test_print_synthesis_summary_with_judge_labels_it_advisory(
     out = capsys.readouterr().out
     assert "synthesis (fusion): answered=1 abstained=0 rejected=0" in out
     assert "judge (advisory, uncalibrated): judged=1 faithful=1 unfaithful=0 errors=0" in out
+
+
+# --- URL ingestion: classification, dispatch, and snapshot_dir wiring -------
+#
+# ADR-0016 decision 4 / spec §10. Before this section, `cli.py`'s
+# `_is_url_source`, its routing inside `_cmd_ingest`, and `_cmd_ingest_url`
+# itself had zero test coverage — this is the command a user actually runs
+# to ingest a URL, and the only place that wires `index_dir`/`collection`
+# into `snapshots.snapshot_dir_for(...)` for the WRITE side, mirroring how
+# `handle_fetch_chunk` (service/tools.py) independently computes the same
+# directory for the READ side. If the two ever disagreed, every URL
+# citation would resolve as unresolvable and nothing else in this suite
+# would catch it — `tests/test_snapshot_integration.py` constructs the
+# pieces directly and never goes through `cli.py`.
+#
+# No test below makes a real network call. `groundkit.cli.UrlLoader` (the
+# name `cli.py` imports and calls) is monkeypatched to a fake that never
+# touches httpx, following this file's existing style of driving `main()`
+# end-to-end and asserting on its observable effects.
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("http://example.com/doc", True),
+        ("https://example.com/doc", True),
+        ("HTTPS://Example.com/Doc", True),  # scheme comparison is case-insensitive
+        ("ftp://example.com/doc", False),  # a URL, but not one of the two schemes accepted
+        ("file:///C:/Users/x/file.txt", False),
+        ("www.example.com/doc", False),  # no scheme at all, despite looking URL-ish
+        ("docs/notes.md", False),
+        ("/home/user/file.txt", False),
+        (r"C:\Users\tandf\file.txt", False),  # a Windows drive letter, not a one-letter scheme
+        ("./relative/path.md", False),
+    ],
+)
+def test_is_url_source_classifies_by_scheme_only(source: str, expected: bool) -> None:
+    """Pins `_is_url_source`'s exact classification rule: membership in
+    {"http", "https"}, nothing broader and nothing narrower. Would FAIL if
+    the check were loosened to "has any scheme" (which would misroute
+    `file://` and a Windows drive letter — `urlsplit(r"C:\\Users\\...")`
+    parses the leading `C` as a one-letter scheme, per the function's own
+    docstring) or narrowed to reject a valid but differently-cased scheme.
+    """
+    assert _is_url_source(source) is expected
+
+
+class _RecordingUrlLoader:
+    """Stand-in for `UrlLoader` that records its `snapshot_dir` and returns
+    one canned Document, with no httpx and no network I/O. Used to prove
+    `_cmd_ingest_url` actually constructs the real `UrlLoader` (via the name
+    `groundkit.cli.UrlLoader`) with the containment root `_cmd_ingest`
+    computed, rather than some other path.
+    """
+
+    last_snapshot_dir: ClassVar[Path | None] = None
+
+    def __init__(self, snapshot_dir: Path, **_kwargs: object) -> None:
+        self.snapshot_dir = snapshot_dir
+        _RecordingUrlLoader.last_snapshot_dir = snapshot_dir
+
+    @property
+    def supported_extensions(self) -> list[str]:
+        return []
+
+    async def load(self, source: str) -> list[Document]:
+        return [Document(source=source, content="fetched body", source_class="snapshot")]
+
+
+class _ExplodingUrlLoader:
+    """Stand-in for `UrlLoader` that fails the test the instant it is
+    constructed — used to prove a code path never reaches `UrlLoader` at all
+    (a plain path source, or a URL source whose `--base-dir` rejection must
+    fire before any loader is built).
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            "UrlLoader must not have been constructed on this path — "
+            f"got args={args!r} kwargs={kwargs!r}"
+        )
+
+
+@pytest.mark.parametrize("collection", ["default", "custom-collection"])
+def test_ingest_url_source_dispatches_with_matching_snapshot_dir(
+    collection: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A URL `path` argument is routed to the URL ingestion path, and the
+    `snapshot_dir` it is given is exactly what
+    `snapshots.snapshot_dir_for(index_dir, collection)` produces for the
+    SAME `--index-dir`/`--collection` the command was given — parametrized
+    over both the default and an explicit collection so this cannot pass by
+    `_cmd_ingest_url` merely hardcoding `"default"`.
+
+    Would FAIL if `_is_url_source` stopped routing `https://...` to
+    `_cmd_ingest_url` at all (`_RecordingUrlLoader.last_snapshot_dir` would
+    stay `None` and the ingest report would never show "1 indexed"), or if
+    `_cmd_ingest_url` computed `snapshot_dir` from the wrong collection, or
+    stopped calling `snapshots.snapshot_dir_for` and hand-built the path
+    some other way that happened to disagree with it.
+    """
+    monkeypatch.setattr("groundkit.cli.UrlLoader", _RecordingUrlLoader)
+
+    idx = str(tmp_path / "idx")
+    args = ["ingest", "https://example.com/doc", "--index-dir", idx]
+    if collection != "default":
+        args += ["--collection", collection]
+
+    assert main(args) == 0
+    out = capsys.readouterr().out
+    assert "1 indexed" in out
+
+    expected = snapshots.snapshot_dir_for(Path(idx), collection)
+    assert _RecordingUrlLoader.last_snapshot_dir == expected
+
+
+def test_ingest_path_source_never_constructs_url_loader(
+    corpus: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The inverse of the dispatch test above: an ordinary filesystem path
+    must never reach `UrlLoader`. `groundkit.cli.UrlLoader` is replaced with
+    a stand-in that raises `AssertionError` the instant it is constructed,
+    so this would FAIL if `_is_url_source` (or the branch reading it) ever
+    misclassified a plain path as a URL and routed it to the URL path.
+    """
+    monkeypatch.setattr("groundkit.cli.UrlLoader", _ExplodingUrlLoader)
+
+    idx = str(tmp_path / "idx")
+    assert main(["ingest", str(corpus), "--index-dir", idx]) == 0
+    assert "2 indexed" in capsys.readouterr().out
+
+
+def test_ingest_url_source_rejects_base_dir_before_constructing_url_loader(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--base-dir` has no meaning for a URL source (there is no local file
+    for it to bound — the fetched snapshot is contained under `--index-dir`
+    instead) and the reviewer flagged this as unverified: check what the
+    code actually does rather than assume. `groundkit.cli.UrlLoader` is
+    replaced with a stand-in that raises if constructed, so this pins BOTH
+    that the combination is rejected AND that the rejection happens before
+    any loader (real or otherwise) is built — a rejection that fired only
+    after already constructing `UrlLoader` would still raise
+    `ConfigurationError` here, but `_ExplodingUrlLoader.__init__` would have
+    fired first with its own `AssertionError`, which this test would also
+    report as a failure, just for the wrong reason. Would FAIL if the
+    `--base-dir`-for-a-URL check were removed, reordered to after
+    `UrlLoader` construction, or its message stopped naming `--base-dir`.
+    """
+    monkeypatch.setattr("groundkit.cli.UrlLoader", _ExplodingUrlLoader)
+
+    idx = str(tmp_path / "idx")
+    assert (
+        main(
+            [
+                "ingest",
+                "https://example.com/doc",
+                "--index-dir",
+                idx,
+                "--base-dir",
+                str(tmp_path),
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "--base-dir" in err
