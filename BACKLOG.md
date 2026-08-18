@@ -100,7 +100,6 @@ Declined section with the reason)
 | GK-020 | The staleness cache stops working during an ingest | MED | G | L | todo | GK-016, GK-019 |
 | GK-021 | `answer.py` imports the eval harness | MED | H | S | todo | — |
 | GK-022 | `extraction.py` omitted from the coverage core subset | MED | H | XS | todo | — |
-| GK-023 | GitHub Pages is on the legacy builder | MED | H | XS | todo | — |
 | GK-024 | Blocking filesystem I/O inside `async def` | MED | H | XS | todo | — |
 | GK-025 | `metadata_filter` has no caller | LOW | H | XS | todo | — |
 | GK-026 | ADR-0013 decision 7 was never implemented | LOW | H | S | todo | — |
@@ -713,21 +712,6 @@ one-line exclusion note may be the right answer for it.
 - [ ] `snapshots.py` given a note either way, so the convention holds with no silent
       omissions left.
 - [ ] `README.md`'s core-subset list kept in step.
-
-### GK-023 — GitHub Pages is on the legacy builder
-
-- **Severity** MEDIUM · **Effort** XS · **Verified** ·
-  **Needs owner action** (repository settings)
-
-`repos/tafreeman/groundkit/pages` reports `build_type: "legacy"` with source `main:/docs`,
-so GitHub re-arms its own Jekyll builder on every push and races the MkDocs deploy in
-`docs.yml`. The `docs` workflow has failed on a majority of its recent runs. Commit
-`ba26974` deleted the sample Jekyll *workflow file*, but the root cause is the Pages
-**Source** setting, which regenerates it. Recurring red CI unrelated to any defect trains a
-maintainer to ignore failing checks, which is worse than any single bug.
-
-- [ ] Settings → Pages → Build and deployment → Source set to "GitHub Actions".
-- [ ] Confirm the next `docs` run is green and no ghost Jekyll run appears.
 
 ### GK-024 — Blocking filesystem I/O inside `async def`
 

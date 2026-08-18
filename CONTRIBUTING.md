@@ -114,6 +114,25 @@ uv run coverage report                # whole-package 80% gate — see below
   "installing a group you don't have yet" case in the [setup gotcha](#setup)
   above — use `uv lock` + `uv pip install` from the exported requirements,
   then `uv run --no-sync mkdocs build --strict`.
+
+  Two things `--strict` does **not** protect you from, both learned the hard
+  way on 2026-08-18:
+
+  1. **It only governs Markdown pages.** MkDocs copies every *non-Markdown*
+     file in `docs_dir` into the built site verbatim, and
+     `validation.omitted_files` never sees them. A PDF dropped under `docs/`
+     raises no warning, survives the strict build, and is published to the
+     public site. Review output and working artifacts belong in the
+     gitignored `_audit/` at the repo root, never under `docs/`.
+  2. **The site's deploy path is repository state, not repo content.**
+     GitHub Pages must have its source set to **"GitHub Actions"**
+     (`build_type: workflow`), because `docs.yml` publishes with
+     `actions/deploy-pages`. If it is set to a branch instead, the build job
+     still passes and the deploy job fails with a bare
+     `HttpError: Not Found`, *and* GitHub re-arms its own Jekyll builder to
+     race the real deploy. Nothing in the tree can assert this, so if the
+     `docs` workflow starts failing only in its `deploy` job, check
+     `gh api repos/tafreeman/groundkit/pages --jq .build_type` first.
 - **infra** — validates the Dockerfile builds and runs as uid 10001, that
   Kubernetes manifests render via `kubectl kustomize`, and that the Terraform
   module is formatted and `validate`s. Needs Docker, `kubectl` and Terraform
