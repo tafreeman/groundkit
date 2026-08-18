@@ -748,6 +748,10 @@ async def _cmd_ingest_url(args: argparse.Namespace, source: str) -> int:
             embedder=embedder,
             vector_store=vector_store,
             collection=args.collection,
+            # The same directory the loader writes into, so the write side
+            # and the cleanup side cannot disagree about where snapshots
+            # live (ADR-0023 decision 2).
+            snapshot_dir=snapshot_dir,
         )
         report = await indexer.index_source(source)
     finally:

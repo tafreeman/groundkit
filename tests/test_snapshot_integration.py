@@ -89,7 +89,12 @@ async def _ingest_url(index_dir: Path, collection: str, url: str, handler: Handl
     try:
         snapshot_dir = snapshots.snapshot_dir_for(index_dir, collection)
         loader = UrlLoader(snapshot_dir, client=_client(handler))
-        indexer = Indexer(store, loader, collection=collection)
+        # ``snapshot_dir`` goes to the Indexer as well as the loader, exactly
+        # as ``_cmd_ingest_url`` wires it (ADR-0023 decision 2): the loader
+        # writes snapshots, the Indexer removes the ones no document
+        # references any more. Omitting it here would leave every lifecycle
+        # test below silently exercising a cleanup-disabled indexer.
+        indexer = Indexer(store, loader, collection=collection, snapshot_dir=snapshot_dir)
         await indexer.index_source(url)
     finally:
         await store.close()
@@ -382,3 +387,169 @@ def test_markdown_ingestion_and_citation_are_byte_identical_to_before(tmp_path: 
         assert resolved_without == resolved_with == expected
 
     asyncio.run(run())
+
+
+# -- Snapshot lifecycle: a snapshot exists iff a documents row references it
+# -- (ADR-0023). ------------------------------------------------------------
+#
+# ADR-0016 decision 4 deferred retention and cleanup for these files. In the
+# absence of a decision the implementation defaulted to the worst answer:
+# `UrlLoader.load()` wrote a snapshot on every load, named after a
+# `document_id` that is a fresh uuid4 each time, and no code path anywhere in
+# `src/` ever removed one. These pin both halves of the fix.
+
+
+def _snapshot_files(index_dir: Path, collection: str = "default") -> list[Path]:
+    """Every snapshot file this collection currently has on disk."""
+    snapshot_dir = snapshots.snapshot_dir_for(index_dir, collection)
+    if not snapshot_dir.exists():
+        return []
+    return sorted(p for p in snapshot_dir.iterdir() if p.is_file())
+
+
+def test_reingesting_an_unchanged_url_does_not_accumulate_snapshots(tmp_path: Path) -> None:
+    """ADR-0023 defect 1, and the reason it was invisible.
+
+    Re-running `grk ingest <url>` is the documented incremental workflow, and
+    the one an operator is most likely to automate. The second run hits
+    `Indexer._process`'s fingerprint gate and skips -- but the loader has
+    already written a *second* snapshot under a fresh uuid4 by then, which
+    nothing references and nothing reports. The ingest report counts
+    `documents_skipped`, not bytes written, so this grew silently forever.
+    """
+    index_dir = tmp_path / ".groundkit"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"Stable content that never changes.")
+
+    asyncio.run(_ingest_url(index_dir, "default", "https://example.com/doc", handler))
+    after_first = _snapshot_files(index_dir)
+    assert len(after_first) == 1
+
+    asyncio.run(_ingest_url(index_dir, "default", "https://example.com/doc", handler))
+    after_second = _snapshot_files(index_dir)
+
+    assert len(after_second) == 1
+    # The surviving file is the one the stored document actually points at --
+    # the original -- not the throwaway the second load wrote.
+    assert after_second[0].name == after_first[0].name
+    assert after_second[0].read_text(encoding="utf-8") == "Stable content that never changes."
+
+
+def test_reingesting_changed_content_leaves_only_the_new_snapshot(tmp_path: Path) -> None:
+    """The replace path. The prior document's snapshot stops being referenced
+    the moment `replace_document` commits, so it must not survive -- otherwise
+    every edit to a remote document leaves its previous text on disk."""
+    index_dir = tmp_path / ".groundkit"
+    bodies = iter([b"First version of the document.", b"Second version of the document."])
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=next(bodies))
+
+    asyncio.run(_ingest_url(index_dir, "default", "https://example.com/doc", handler))
+    asyncio.run(_ingest_url(index_dir, "default", "https://example.com/doc", handler))
+
+    remaining = _snapshot_files(index_dir)
+    assert len(remaining) == 1
+    assert remaining[0].read_text(encoding="utf-8") == "Second version of the document."
+
+    async def check_row_points_at_it() -> None:
+        store = await SQLiteMetadataStore.open(index_dir, "default")
+        try:
+            records = await store.get_document_records()
+        finally:
+            await store.close()
+        assert len(records) == 1
+        assert next(iter(records)) == remaining[0].name
+
+    asyncio.run(check_row_points_at_it())
+
+
+def test_pruning_a_document_removes_its_snapshot(tmp_path: Path) -> None:
+    """ADR-0023 defect 2, the sharper half.
+
+    A user who deletes a document has stated an intent about *content*.
+    Honouring it in SQLite while the fetched text stays in a sibling
+    directory makes the retention story a false statement. Here the second
+    fetch returns an empty body, which makes `UrlLoader` yield no documents
+    and `Indexer._prune_emptied_source` delete the stored one.
+    """
+    index_dir = tmp_path / ".groundkit"
+    bodies = iter([b"Content that will later be pruned.", b"   "])
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=next(bodies))
+
+    asyncio.run(_ingest_url(index_dir, "default", "https://example.com/doc", handler))
+    assert len(_snapshot_files(index_dir)) == 1
+
+    asyncio.run(_ingest_url(index_dir, "default", "https://example.com/doc", handler))
+
+    async def check_document_is_gone() -> None:
+        store = await SQLiteMetadataStore.open(index_dir, "default")
+        try:
+            records = await store.get_document_records()
+        finally:
+            await store.close()
+        assert records == {}
+
+    asyncio.run(check_document_is_gone())
+    assert _snapshot_files(index_dir) == []
+
+
+def test_a_document_id_escaping_the_snapshot_dir_is_never_unlinked(tmp_path: Path) -> None:
+    """ADR-0023 decision 4.
+
+    `snapshots.snapshot_path_for` performs no containment check and says so:
+    `document_id` is a plain string field with no character class. The read
+    side already guards this; unlinking is strictly more dangerous than
+    reading, so it takes the same guard. Without it, a crafted `document_id`
+    turns ordinary cleanup into an arbitrary file delete.
+    """
+    index_dir = tmp_path / ".groundkit"
+    snapshot_dir = snapshots.snapshot_dir_for(index_dir, "default")
+    snapshot_dir.mkdir(parents=True)
+    # The sentinel sits exactly where ``../outside.txt`` lands from inside
+    # snapshot_dir -- one level up, in index_dir. Getting this wrong is not a
+    # cosmetic slip: an escape aimed at a path that happens not to exist is
+    # absorbed by ``unlink(missing_ok=True)``, so the test passes whether or
+    # not the containment check is there. An earlier draft of this test put
+    # the sentinel in tmp_path and was decorative for exactly that reason.
+    outsider = index_dir / "outside.txt"
+    outsider.write_text("must survive", encoding="utf-8")
+    assert (snapshot_dir / "../outside.txt").resolve() == outsider.resolve()
+
+    async def attempt() -> None:
+        store = await SQLiteMetadataStore.open(index_dir, "default")
+        try:
+            indexer = Indexer(
+                store,
+                UrlLoader(snapshot_dir, client=_client(lambda _r: httpx.Response(200))),
+                collection="default",
+                snapshot_dir=snapshot_dir,
+            )
+            await indexer._remove_snapshot("../outside.txt")
+        finally:
+            await store.close()
+
+    asyncio.run(attempt())
+
+    assert outsider.exists()
+    assert outsider.read_text(encoding="utf-8") == "must survive"
+
+
+def test_snapshot_cleanup_is_inert_when_no_snapshot_dir_is_configured(tmp_path: Path) -> None:
+    """Every `FileLoader` caller passes no `snapshot_dir`, so the cleanup path
+    must be a no-op rather than an error -- a collection that never ingested a
+    URL has no snapshot directory and pays nothing (ADR-0023 decision 2)."""
+    index_dir = tmp_path / ".groundkit"
+
+    async def attempt() -> None:
+        store = await SQLiteMetadataStore.open(index_dir, "default")
+        try:
+            indexer = Indexer(store, FileLoader(allowed_base_dir=tmp_path), collection="default")
+            await indexer._remove_snapshot("anything-at-all")
+        finally:
+            await store.close()
+
+    asyncio.run(attempt())
