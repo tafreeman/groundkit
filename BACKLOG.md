@@ -79,7 +79,6 @@ Declined section with the reason)
 | ID | Item | Sev | Phase | Effort | Status | Depends on |
 |---|---|---|---|---|---|---|
 | GK-001 | DNS rebinding defeats the loopback bind | CRIT | A | S | todo | — |
-| GK-002 | `main` has no branch protection; gates are advisory | CRIT | A | XS | todo | — |
 | GK-003 | Rerank drops `source_class` / `extractor` | HIGH | B | S | todo | — |
 | GK-004 | Caller metadata overwrites the authoritative `source` | HIGH | B | S | todo | — |
 | GK-005 | Docs state a live package is unpublished | HIGH | C | M | todo | — |
@@ -110,9 +109,15 @@ Declined section with the reason)
 
 ## Phase A — Contain what shipped
 
-**Goal:** close the two findings that are exploitable or that govern everything else.
-**Exit:** GK-001 and GK-002 done; `SECURITY.md` accurate about what the bind does and does
-not protect.
+**Goal:** close the findings that are exploitable or that govern everything else.
+**Exit:** GK-001 done; `SECURITY.md` accurate about what the bind does and does not
+protect.
+
+> The governance half of this phase has landed: `main` is now enforced by a repository
+> ruleset requiring nine status checks, with no direct pushes and no bypass actors. What
+> it enforces, and why zero approvals is deliberate rather than an oversight, is recorded
+> in `CONTRIBUTING.md`. Note the ruleset targets the default branch only — any other
+> long-lived branch is unprotected.
 
 ### GK-001 — DNS rebinding defeats the loopback bind on both transports
 
@@ -159,34 +164,6 @@ that is plumbing, and the CLI already computes `--host` and `--allow-remote-acce
 - [ ] ADR amending ADR-0014 records that the bind alone was insufficient and why the
       no-authentication position still holds once `Host` is validated.
 - [ ] `SECURITY.md` lists inbound rebinding as closed, or as a named residual until it is.
-
-### GK-002 — `main` has no branch protection, so every gate is advisory
-
-- **Severity** CRITICAL · **Effort** XS · **ADR** no · **Verified** ·
-  **Needs owner authorization** (repository governance)
-- **Where** GitHub ruleset `20923035`; `repos/tafreeman/groundkit/branches/main/protection`
-  returns `404 Branch not protected`
-
-The ruleset named `main` exists but is `enforcement: "disabled"`, and its rules are
-`deletion, non_fast_forward, update, pull_request, creation` — there is **no
-`required_status_checks` rule at all**, so enabling it as written still would not require
-CI. Nothing prevents a merge on red or a direct push to `main`. Confirmed against the API
-with admin permissions, so this is the real state and not a visibility artifact.
-
-This is the largest gap between what this repo designs and what it enforces: two coverage
-gates parsed from `pyproject.toml` so they cannot drift, `mypy --strict` over source and
-tests, a release-gate chain wired as a blocking `needs:` — all currently held in place by
-human discipline recorded in a gitignored file.
-
-**Acceptance criteria**
-
-- [ ] Ruleset `20923035` set to `enforcement: active`.
-- [ ] A `required_status_checks` rule added naming every blocking job in `ci.yml`:
-      `lint`, `typecheck`, `test` (each Python version), `docs`, `infra`, `audit`,
-      `secrets`.
-- [ ] `required_approving_review_count` set deliberately rather than left at its default.
-- [ ] `CONTRIBUTING.md` states the enforced rules, so the expectation lives somewhere
-      tracked rather than only in a gitignored instructions file.
 
 ---
 

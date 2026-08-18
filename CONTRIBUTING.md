@@ -294,6 +294,30 @@ same change, not a follow-up. Branch off `main`, open a PR back to it; this
 repo does not currently maintain a long-lived integration branch separate
 from `main` for day-to-day feature work.
 
+### What `main` enforces
+
+Since 2026-08-18 a repository ruleset makes this mechanical rather than a
+convention, because until then every gate below was advisory — nothing stopped
+a merge on red or a direct push:
+
+- **No direct pushes, no force-pushes, no deletion.** Changes reach `main`
+  through a pull request.
+- **Nine required status checks**, all from `ci.yml`: `lint`, `typecheck`,
+  `test (3.11)`, `test (3.12)`, `test (3.13)`, `docs`, `infra`, `audit`,
+  `secrets`. The gated suites (`gated-eval`, `gated-rerank`) are deliberately
+  **not** required — they skip by design without their env gate, and requiring
+  a check that normally skips is how a branch becomes unmergeable.
+- **Zero required approvals.** Deliberate, not an oversight: GitHub does not
+  let you approve your own pull request, so on a single-maintainer repo any
+  higher number locks the only maintainer out of their own `main`. Raise it
+  the moment there is a second reviewer.
+- **No bypass actors**, including administrators.
+
+Two consequences worth knowing. Adding, renaming or removing a job in `ci.yml`
+means updating the required-checks list in the same change, or `main` starts
+requiring a check that no longer reports and nothing can merge. And the ruleset
+targets `~DEFAULT_BRANCH` only — any other long-lived branch is unprotected.
+
 ## Where things live
 
 - `src/groundkit/` — the package (src-layout; `pyproject.toml`'s
