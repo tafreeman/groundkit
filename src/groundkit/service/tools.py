@@ -23,6 +23,7 @@ cited authority, so a later reader finds a decision rather than an omission.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Literal
@@ -341,21 +342,34 @@ async def handle_list_collections(
     with a debug log, not an error: a hand-placed file in the index directory
     is not a groundkit collection, and refusing to list anything because of one
     would be a denial of the whole operation.
+
+    The whole scan runs in **one** :func:`asyncio.to_thread` hop. Every step of
+    it blocks: ``glob`` and ``is_within_base`` hit the filesystem, and
+    ``is_groundkit_store`` opens a real ``sqlite3`` connection and reads a
+    pragma per candidate. Run inline, that stalled the single event loop for N
+    sequential sqlite opens -- in the tool an MCP or REST client typically
+    calls *first*, so the stall lands on every other in-flight request. One hop
+    rather than one per candidate because the thread-switch cost would
+    otherwise dominate a scan whose individual steps are each tiny.
     """
     del request  # the operation takes no parameters; the signature is uniform
-    if not ctx.index_dir.is_dir():
-        return []
 
-    names: list[str] = []
-    for path in sorted(ctx.index_dir.glob("*.sqlite3")):
-        if not is_within_base(str(path), ctx.index_dir):
-            logger.debug("Skipping %s: resolves outside the index directory", path.name)
-            continue
-        if not is_groundkit_store(path):
-            logger.debug("Skipping %s: not a groundkit collection", path.name)
-            continue
-        names.append(path.stem)
-    return names
+    def _enumerate() -> list[str]:
+        if not ctx.index_dir.is_dir():
+            return []
+
+        names: list[str] = []
+        for path in sorted(ctx.index_dir.glob("*.sqlite3")):
+            if not is_within_base(str(path), ctx.index_dir):
+                logger.debug("Skipping %s: resolves outside the index directory", path.name)
+                continue
+            if not is_groundkit_store(path):
+                logger.debug("Skipping %s: not a groundkit collection", path.name)
+                continue
+            names.append(path.stem)
+        return names
+
+    return await asyncio.to_thread(_enumerate)
 
 
 async def handle_index_status(

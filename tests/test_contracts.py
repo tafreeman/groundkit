@@ -115,6 +115,77 @@ class TestRetrievalResult:
         assert isinstance(cit, Citation)
         assert (cit.source, cit.start_offset, cit.end_offset) == ("a.md", 0, 4)
 
+    def test_inverted_offsets_rejected(self) -> None:
+        """An inverted span used to construct cleanly, and the damage was
+        silent downstream: ``"hello world"[100:5]`` is ``""``, not an error, so
+        a caller slicing source text with these offsets reads an empty
+        verification as a successful one."""
+        with pytest.raises(ValidationError, match="must be greater"):
+            RetrievalResult(
+                content="text",
+                score=1.0,
+                document_id="d",
+                chunk_id="c",
+                source="a.md",
+                start_offset=100,
+                end_offset=5,
+            )
+
+    def test_equal_offsets_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="must be greater"):
+            RetrievalResult(
+                content="text",
+                score=1.0,
+                document_id="d",
+                chunk_id="c",
+                source="a.md",
+                start_offset=4,
+                end_offset=4,
+            )
+
+    def test_content_longer_than_span_is_allowed(self) -> None:
+        """The deliberate asymmetry with ``Chunk``: a result's offsets address
+        the source-document span while its content may be a rendering of that
+        span. ``ContextAssembler`` wraps content in a provenance envelope and
+        keeps the original offsets, so enforcing the length arithmetic here
+        would reject a shipped path. Pinned so a future "make it match
+        ``Chunk``" tightening has to confront the reason."""
+        result = RetrievalResult(
+            content="<retrieved_context>text</retrieved_context>",
+            score=1.0,
+            document_id="d",
+            chunk_id="c",
+            source="a.md",
+            start_offset=0,
+            end_offset=4,
+        )
+        assert len(result.content) != result.end_offset - result.start_offset
+
+
+class TestCitationOffsets:
+    def make(self, start: int, end: int) -> Citation:
+        return Citation(
+            document_id="d",
+            chunk_id="c",
+            source="a.md",
+            start_offset=start,
+            end_offset=end,
+        )
+
+    def test_inverted_offsets_rejected(self) -> None:
+        """``Citation`` is the model a resolver slices source text with, so an
+        inverted span here is the one that reaches disk."""
+        with pytest.raises(ValidationError, match="must be greater"):
+            self.make(100, 5)
+
+    def test_equal_offsets_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="must be greater"):
+            self.make(4, 4)
+
+    def test_valid_span_accepted(self) -> None:
+        cit = self.make(10, 20)
+        assert (cit.start_offset, cit.end_offset) == (10, 20)
+
 
 class TestEmbeddingIdentity:
     def make(self, dimensions: int = 768) -> EmbeddingIdentity:

@@ -38,6 +38,7 @@ from typing import Any, Protocol, get_type_hints, runtime_checkable
 
 import pytest
 
+from groundkit.answer import SearchCallable
 from groundkit.extraction import ExtractorProtocol, HtmlExtractor, PdfExtractor
 from groundkit.index.dense import InMemoryVectorStore, LanceDBVectorStore
 from groundkit.index.metadata import SQLiteMetadataStore
@@ -60,6 +61,7 @@ from groundkit.providers.llm import (
 from groundkit.providers.protocols import ChatProtocol, EmbeddingProtocol
 from groundkit.retrieval.protocols import RerankerProtocol
 from groundkit.retrieval.rerank import CrossEncoderReranker
+from groundkit.retrieval.search import Retriever
 
 # ── The signature-parity helper ────────────────────────────────────────────
 
@@ -146,8 +148,19 @@ def _assert_member_parity(
     implementation: type,
     name: str,
     proto_raw: property | Callable[..., object],
+    impl_name: str | None = None,
 ) -> None:
-    """Assert *implementation* has a same-shaped member *name* as *protocol* declares.
+    """Assert *implementation* has a same-shaped member as *protocol* declares.
+
+    Args:
+        protocol: The Protocol declaring *name*.
+        implementation: The class expected to satisfy it.
+        name: The member as the Protocol declares it.
+        proto_raw: The Protocol's raw member object.
+        impl_name: The member on *implementation* that satisfies *name*, when
+            it is spelled differently — a ``__call__``-shaped Protocol is
+            satisfied by a bound method, so the two names genuinely differ.
+            Defaults to *name*.
 
     Raises:
         AssertionError: On a missing member, a property/method kind
@@ -156,11 +169,12 @@ def _assert_member_parity(
             resolved-type-hints mismatch. Every message names the protocol,
             the implementation, the member, and the concrete diff.
     """
-    impl_raw = inspect.getattr_static(implementation, name, None)
+    impl_name = impl_name if impl_name is not None else name
+    impl_raw = inspect.getattr_static(implementation, impl_name, None)
     if impl_raw is None:
         raise AssertionError(
-            f"{implementation.__qualname__} is missing member {name!r} "
-            f"declared by {protocol.__qualname__}"
+            f"{implementation.__qualname__} is missing member {impl_name!r} "
+            f"satisfying {protocol.__qualname__}.{name}"
         )
 
     proto_is_property = isinstance(proto_raw, property)
@@ -169,7 +183,7 @@ def _assert_member_parity(
         raise AssertionError(
             f"{protocol.__qualname__}.{name} is a "
             f"{'property' if proto_is_property else 'method'}, but "
-            f"{implementation.__qualname__}.{name} is a "
+            f"{implementation.__qualname__}.{impl_name} is a "
             f"{'property' if impl_is_property else 'method'}"
         )
 
@@ -182,7 +196,7 @@ def _assert_member_parity(
         raise AssertionError(
             f"{protocol.__qualname__}.{name} is "
             f"{'async' if proto_async else 'sync'}, but "
-            f"{implementation.__qualname__}.{name} is "
+            f"{implementation.__qualname__}.{impl_name} is "
             f"{'async' if impl_async else 'sync'}"
         )
 
@@ -194,7 +208,7 @@ def _assert_member_parity(
     if proto_params != impl_params:
         raise AssertionError(
             f"{protocol.__qualname__}.{name} parameters do not match "
-            f"{implementation.__qualname__}.{name}:\n"
+            f"{implementation.__qualname__}.{impl_name}:\n"
             f"  protocol:       {proto_params}\n"
             f"  implementation: {impl_params}"
         )
@@ -204,7 +218,7 @@ def _assert_member_parity(
     if proto_return != impl_return:
         raise AssertionError(
             f"{protocol.__qualname__}.{name} return annotation {proto_return!r} does not "
-            f"match {implementation.__qualname__}.{name} return annotation {impl_return!r}"
+            f"match {implementation.__qualname__}.{impl_name} return annotation {impl_return!r}"
         )
 
     proto_hints = _resolved_hints(proto_target)
@@ -212,11 +226,27 @@ def _assert_member_parity(
     if proto_hints is not None and impl_hints is not None and proto_hints != impl_hints:
         raise AssertionError(
             f"{protocol.__qualname__}.{name} resolved type hints {proto_hints} do not "
-            f"match {implementation.__qualname__}.{name} resolved type hints {impl_hints}"
+            f"match {implementation.__qualname__}.{impl_name} resolved type hints {impl_hints}"
         )
 
 
-def assert_signature_parity(protocol: type, implementation: type) -> None:
+#: Dunder members this helper checks despite the ``_``-prefix filter below.
+#:
+#: The filter exists to skip everything ``Protocol`` and ``object`` contribute
+#: (``__init__``, ``__subclasshook__``, ``__protocol_attrs__``, ...), none of
+#: which describes the seam. ``__call__`` is the one dunder that *is* the seam:
+#: a callable-shaped Protocol declares its entire contract there. Before it was
+#: allowlisted, such a Protocol yielded zero checked members and every call
+#: against it passed vacuously — a mismatched implementation included.
+_CHECKED_DUNDERS: frozenset[str] = frozenset({"__call__"})
+
+
+def assert_signature_parity(
+    protocol: type,
+    implementation: type,
+    *,
+    member_map: dict[str, str] | None = None,
+) -> None:
     """Assert *implementation* has exact signature parity with *protocol*.
 
     For every public member declared directly in *protocol*'s own class
@@ -227,22 +257,43 @@ def assert_signature_parity(protocol: type, implementation: type) -> None:
     annotation text, and — whenever both sides can resolve their forward
     references — the same resolved type hints.
 
+    ``__call__`` counts as public here (see :data:`_CHECKED_DUNDERS`), so a
+    callable-shaped Protocol is checked rather than skipped.
+
     Members *implementation* defines beyond what *protocol* declares are
     never inspected and never fail this check; conformance is one-directional.
 
     Args:
         protocol: A ``@runtime_checkable`` Protocol class.
         implementation: A concrete class expected to satisfy *protocol*.
+        member_map: Protocol-member name -> implementation-member name, for
+            the case where the two are legitimately spelled differently. A
+            ``__call__``-shaped Protocol is satisfied by a *bound method*
+            (``retriever.search``), so its implementing member has that
+            method's name, not ``__call__``.
 
     Raises:
-        AssertionError: On any missing member or signature mismatch.
+        AssertionError: On any missing member, any signature mismatch, or a
+            *protocol* that declares nothing this helper can check — the last
+            because a check that inspects zero members reports success while
+            proving nothing, which is worse than no check at all.
     """
+    member_map = member_map or {}
+    checked = 0
     for name, proto_member in vars(protocol).items():
-        if name.startswith("_"):
+        if name.startswith("_") and name not in _CHECKED_DUNDERS:
             continue
         if not (isinstance(proto_member, property) or inspect.isfunction(proto_member)):
             continue
-        _assert_member_parity(protocol, implementation, name, proto_member)
+        _assert_member_parity(protocol, implementation, name, proto_member, member_map.get(name))
+        checked += 1
+
+    if checked == 0:
+        raise AssertionError(
+            f"{protocol.__qualname__} declares no members this helper can check, so "
+            f"parity against {implementation.__qualname__} would pass vacuously. If the "
+            f"seam is shaped around a dunder, add it to _CHECKED_DUNDERS."
+        )
 
 
 # ── Self-test: the helper must actually catch what isinstance() misses ────
@@ -268,6 +319,55 @@ class _FakeRenamedParamImpl:
         return "ok"
 
 
+@runtime_checkable
+class _FakeCallableProtocol(Protocol):
+    """A ``__call__``-shaped Protocol — the shape the helper could not see.
+
+    Until ``__call__`` was allowlisted past the ``_``-prefix filter, iterating
+    this class's ``vars()`` yielded no checkable member, so parity against
+    *any* implementation passed without comparing anything."""
+
+    async def __call__(self, query: str, top_k: int | None = None) -> str: ...
+
+
+class _FakeConformingCallableImpl:
+    async def __call__(self, query: str, top_k: int | None = None) -> str:
+        return "ok"
+
+
+class _FakeMismatchedCallableImpl:
+    """Mismatched on parameter name, default, and return type at once — a
+    single one of those is enough to fail, so a helper that reports parity
+    here is not comparing signatures at all."""
+
+    async def __call__(self, renamed_query: str, top_k: int = 5) -> bytes:
+        return b"ok"
+
+
+class _FakeMappedImpl:
+    """Satisfies ``_FakeCallableProtocol`` through a differently-named member,
+    the way ``Retriever.search`` satisfies ``SearchCallable.__call__``."""
+
+    async def run(self, query: str, top_k: int | None = None) -> str:
+        return "ok"
+
+
+class _FakeMappedMismatchImpl:
+    async def run(self, renamed_query: str, top_k: int | None = None) -> str:
+        return "ok"
+
+
+@runtime_checkable
+class _FakeUncheckableProtocol(Protocol):
+    """Declares only an attribute, so the helper can compare no member.
+
+    Guards the general case behind the ``__call__`` bug: any future seam whose
+    whole contract sits somewhere the filter skips must fail loudly rather than
+    report a pass it never earned."""
+
+    some_attribute: int
+
+
 class _FakeIncompleteImpl:
     """isinstance(..., _FakeProtocol) would already reject this one; kept as
     the baseline "missing member" case for the helper's own error message."""
@@ -285,6 +385,33 @@ class TestAssertSignatureParityHelper:
     def test_missing_member_fails(self) -> None:
         with pytest.raises(AssertionError, match="missing member"):
             assert_signature_parity(_FakeProtocol, _FakeIncompleteImpl)
+
+    def test_matching_call_shaped_protocol_passes(self) -> None:
+        assert_signature_parity(_FakeCallableProtocol, _FakeConformingCallableImpl)
+
+    def test_mismatched_call_shaped_protocol_fails(self) -> None:
+        """The H2 regression: this pair disagrees on parameter name, default and
+        return type, and the helper reported parity anyway because ``__call__``
+        starts with an underscore and was filtered out before comparison."""
+        assert isinstance(_FakeMismatchedCallableImpl(), _FakeCallableProtocol)
+        with pytest.raises(AssertionError, match="__call__"):
+            assert_signature_parity(_FakeCallableProtocol, _FakeMismatchedCallableImpl)
+
+    def test_member_map_compares_a_differently_named_member(self) -> None:
+        """A ``__call__``-shaped Protocol is satisfied by a bound method, whose
+        name is not ``__call__`` — so the mapping has to carry real comparison,
+        not just suppress the missing-member error."""
+        assert_signature_parity(
+            _FakeCallableProtocol, _FakeMappedImpl, member_map={"__call__": "run"}
+        )
+        with pytest.raises(AssertionError, match="__call__"):
+            assert_signature_parity(
+                _FakeCallableProtocol, _FakeMappedMismatchImpl, member_map={"__call__": "run"}
+            )
+
+    def test_protocol_with_no_checkable_members_fails(self) -> None:
+        with pytest.raises(AssertionError, match="vacuously"):
+            assert_signature_parity(_FakeUncheckableProtocol, _FakeConformingImpl)
 
 
 # ── LoaderProtocol <- FileLoader ───────────────────────────────────────────
@@ -413,3 +540,27 @@ class TestChatProtocolConformance:
         ADR-0001 hazard 4 with an extra frame, and plain ``isinstance``
         would not catch it."""
         assert_signature_parity(ChatProtocol, RedactingChat)
+
+
+# ── SearchCallable <- Retriever.search ─────────────────────────────────────
+
+
+class TestSearchCallableConformance:
+    """``SearchCallable`` (``answer.py``) against the method it is shaped after.
+
+    ADR-0013 decision 10 and ADR-0014 decision 13 require a conformance entry
+    for every Protocol; this one was missing, and could not have been written
+    usefully before ``__call__`` was allowlisted — the helper would have
+    inspected zero members and passed no matter what ``Retriever.search`` said.
+
+    The mapping is the point rather than a workaround: ``AnswerPipeline`` is
+    handed ``retriever.search``, a *bound method*, so what must match
+    ``SearchCallable.__call__`` is ``Retriever.search``. The docstring on
+    ``SearchCallable`` claims it "matches ``Retriever.search``'s exact
+    positional/keyword shape"; this is the test that makes the claim hold —
+    ``mode`` losing its keyword-only marker, ``top_k`` changing default, or
+    ``search`` losing its ``async`` all fail here now.
+    """
+
+    def test_retriever_search_matches_search_callable(self) -> None:
+        assert_signature_parity(SearchCallable, Retriever, member_map={"__call__": "search"})

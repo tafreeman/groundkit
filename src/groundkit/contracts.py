@@ -172,6 +172,27 @@ class Citation(BaseModel):
     start_offset: int = Field(ge=0)
     end_offset: int = Field(gt=0)
 
+    @model_validator(mode="after")
+    def _validate_offsets(self) -> Citation:
+        """Reject an inverted or empty span.
+
+        ``Chunk`` has enforced this since Phase 1; the two models that carry
+        the same pair of fields did not, so ``Citation(start_offset=100,
+        end_offset=5)`` constructed cleanly and a resolver's
+        ``source_text[100:5]`` yielded ``""`` — an empty verification that is
+        indistinguishable from a successful one at the call site.
+
+        Only the ordering half of :meth:`Chunk._validate_offsets` applies here:
+        a citation is a *pointer*, carrying no content whose length the span
+        could be checked against.
+        """
+        if self.end_offset <= self.start_offset:
+            raise ValueError(
+                f"end_offset ({self.end_offset}) must be greater than "
+                f"start_offset ({self.start_offset})"
+            )
+        return self
+
 
 class RetrievalResult(BaseModel):
     """A single retrieval result, always citation-bearing.
@@ -203,6 +224,33 @@ class RetrievalResult(BaseModel):
     start_offset: int = Field(ge=0)
     end_offset: int = Field(gt=0)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_offsets(self) -> RetrievalResult:
+        """Reject an inverted or empty span.
+
+        ``retrieval/rerank.py`` rebuilds every reranked result through this
+        constructor specifically so the contract is re-checked; before this
+        validator existed, what it re-checked did not include the one
+        invariant that makes the offsets usable.
+
+        **The length half of :meth:`Chunk._validate_offsets` is deliberately
+        not enforced here.** On a ``Chunk``, ``content`` *is* the span, so
+        ``end_offset - start_offset == len(content)`` is definitional. On a
+        result, the offsets address the span in the *source document* while
+        ``content`` is free to be a rendering of it:
+        :class:`~groundkit.providers.context_assembly.ContextAssembler`
+        constructs results whose content is the chunk wrapped in a provenance
+        envelope, necessarily longer than the span, and asserting equality
+        here would reject that shipped, correct path. The arithmetic belongs
+        where content and span are the same object, and that is ``Chunk``.
+        """
+        if self.end_offset <= self.start_offset:
+            raise ValueError(
+                f"end_offset ({self.end_offset}) must be greater than "
+                f"start_offset ({self.start_offset})"
+            )
+        return self
 
     @computed_field  # type: ignore[prop-decorator]
     @property

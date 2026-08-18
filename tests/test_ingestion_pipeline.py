@@ -4,6 +4,7 @@ wrapping shape, and the directory-scale entry point ARP never had."""
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -131,6 +132,83 @@ class TestExceptionWrapping:
 
         with pytest.raises(IngestionError, match="Chunking failed for document"):
             asyncio.run(pipeline.ingest("source.txt"))
+
+
+# The two sentinels tests/test_url_redaction.py already uses, and for the same
+# reason: they are fake by construction, their own text says so, and
+# .gitleaks.toml allowlists these exact literals rather than exempting a path.
+# A shorter invented value trips gitleaks' generic-api-key rule on shape.
+_CREDENTIAL_URL = (
+    "https://alice:hunter2-must-never-be-logged@example.com"
+    "/doc.txt?api-key=sk-live-must-never-be-logged"
+)
+_SECRETS = ("hunter2-must-never-be-logged", "sk-live-must-never-be-logged")
+
+
+class TestCredentialRedaction:
+    """``IngestionPipeline`` is exported public API, so a credential-bearing URL
+    can reach ``ingest()`` directly -- ``IngestionPipeline(UrlLoader(...))`` is a
+    supported construction. The INFO log fired *before* the loader ran, so the
+    loader's own userinfo and credential-query refusals could not protect it.
+    """
+
+    def test_credential_url_not_logged_before_the_loader_validates(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The H6 regression. ``_RaisingLoader`` stands in for a loader that
+        refuses: the point is that the leak happened before any loader opinion,
+        so the log must already be clean at the moment the loader is called."""
+        pipeline = IngestionPipeline(loader=_RaisingLoader(IngestionError("refused")))
+
+        with caplog.at_level(logging.DEBUG), pytest.raises(IngestionError):
+            asyncio.run(pipeline.ingest(_CREDENTIAL_URL))
+
+        logged = caplog.text
+        assert "Ingesting source" in logged, "the log line under test never fired"
+        for secret in _SECRETS:
+            assert secret not in logged, f"{secret!r} leaked into the log: {logged!r}"
+        assert "example.com" in logged, "redaction must not cost the endpoint's identity"
+
+    def test_credential_url_not_leaked_into_the_wrapped_exception(self) -> None:
+        """The same raw ``source`` also reached the ``Loader failed for ...``
+        message, which travels further than a log line -- it is raised to the
+        caller and may be rendered anywhere."""
+        pipeline = IngestionPipeline(loader=_RaisingLoader(ValueError("boom")))
+
+        with pytest.raises(IngestionError) as excinfo:
+            asyncio.run(pipeline.ingest(_CREDENTIAL_URL))
+
+        message = str(excinfo.value)
+        for secret in _SECRETS:
+            assert secret not in message, f"{secret!r} leaked into the exception: {message!r}"
+
+    def test_completion_logs_are_also_sanitized(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The success path logs the source twice more. A URL that passes the
+        loader's credential-shaped-key check can still carry a secret in a query
+        value the heuristic does not name, which is why ``sanitize_url`` redacts
+        every value unconditionally."""
+        pipeline = IngestionPipeline(loader=_SingleDocLoader())
+
+        with caplog.at_level(logging.DEBUG):
+            asyncio.run(pipeline.ingest(_CREDENTIAL_URL))
+
+        logged = caplog.text
+        assert "Ingestion complete" in logged, "the log line under test never fired"
+        for secret in _SECRETS:
+            assert secret not in logged, f"{secret!r} leaked into the log: {logged!r}"
+
+    def test_filesystem_paths_survive_sanitization(
+        self, caplog: pytest.LogCaptureFixture, tmp_path: Path
+    ) -> None:
+        """``source`` is a path far more often than a URL, and a log line that
+        no longer names the file it ingested is a regression of its own."""
+        pipeline = IngestionPipeline(loader=_SingleDocLoader())
+        source = str(tmp_path / "notes" / "meeting.txt")
+
+        with caplog.at_level(logging.DEBUG):
+            asyncio.run(pipeline.ingest(source))
+
+        assert "meeting.txt" in caplog.text
 
 
 class TestIngestDirectory:
