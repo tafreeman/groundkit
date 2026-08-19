@@ -129,25 +129,26 @@ if TYPE_CHECKING:
     from groundkit.providers.protocols import ChatProtocol, EmbeddingProtocol
     from groundkit.service.api import McpMount
 
-#: Requests ``grk serve`` will hold in flight before uvicorn answers 503
-#: instead of accepting more (``uvicorn.Config(limit_concurrency=...)``).
+#: Open connections ``grk serve`` tolerates before uvicorn answers 503
+#: (``uvicorn.Config(limit_concurrency=...)``). A backstop against connection
+#: exhaustion — **not** the bound on work, which is
+#: :data:`~groundkit.service.tools.MAX_CONCURRENT_CORPUS_SCANS`.
 #:
-#: The surface is unauthenticated and read-only, and every operation on it is
-#: O(corpus): ``search`` scores the whole corpus regardless of ``top_k``, and
-#: ``index_status`` reads an aggregate over every chunk row. Without a cap,
-#: arrival rate alone decides peak memory — each accepted request holds its own
-#: working set — so a single replica under a hard memory limit is OOMKilled
-#: rather than slowed, and ``infra/k8s/deployment.yaml`` runs exactly that with
-#: ``strategy: Recreate`` and nothing to fail over to. Refusing the excess turns
-#: an unbounded pile-up into a load-shedding signal a client can retry.
+#: Named for connections because that is what the setting counts. uvicorn trips
+#: on ``len(connections) >= limit or len(tasks) >= limit``, where ``connections``
+#: is server-wide and includes idle keep-alive, and it substitutes a 503 app
+#: *before* routing — so every route answers 503, the Kubernetes probes in
+#: ``infra/k8s/deployment.yaml`` included. The first version of this control set
+#: it to a small number and described it as bounding in-flight requests, which
+#: it does not: `grk serve` mounts a stateful MCP transport whose clients hold
+#: an SSE stream open for up to half an hour, so idle sessions alone could have
+#: 503-ed a server doing no work and restart-looped the pod through its liveness
+#: probe.
 #:
-#: Twice the ceiling of the default ``asyncio.to_thread`` executor, which is
-#: ``min(32, cpu_count + 4)``. Every blocking step on the read path — each
-#: store operation, and BM25's whole-corpus scan — is dispatched to that pool,
-#: so concurrency meaningfully above its ceiling buys queued memory rather than
-#: throughput. The doubling leaves headroom for a burst to be absorbed and
-#: served instead of shed at the first queued request.
-SERVE_MAX_CONCURRENT_REQUESTS: int = 64
+#: The value is therefore deliberately generous. It exists to stop a socket
+#: flood from exhausting file descriptors, and nothing else; memory is bounded
+#: at the operation instead, where the expensive work actually is.
+SERVE_MAX_CONNECTIONS: int = 512
 
 #: Characters of chunk content shown per result in text output.
 _SNIPPET_CHARS: int = 160
@@ -395,8 +396,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             f"Address to bind (default: {DEFAULT_SERVE_HOST}). A non-loopback address is "
             "refused unless --allow-remote-access is also passed; a hostname such as "
-            "'localhost' is refused too, because only an address literal can be "
-            "classified without a resolver whose answer can change."
+            "'localhost' is refused without it too, because only an address literal can "
+            "be classified without a resolver whose answer can change. With the flag, "
+            "either kind is accepted and they are not equivalent: a routable address "
+            "publishes the corpus and turns Host validation off, while a hostname is "
+            "resolved at serve time and keeps it enforced if every answer is loopback."
         ),
     )
     serve.add_argument(
@@ -1419,7 +1423,7 @@ async def _serve_http(ctx: ServiceContext, *, host: str, port: int) -> None:
             host=host,
             port=port,
             log_level="info",
-            limit_concurrency=SERVE_MAX_CONCURRENT_REQUESTS,
+            limit_concurrency=SERVE_MAX_CONNECTIONS,
         )
     )
     await server.serve()

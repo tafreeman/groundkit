@@ -512,15 +512,43 @@ per SPEC.md §9:
   store, so it can ask. Pinned by
   `tests/test_runtime.py::test_chunk_count_does_not_read_chunk_content`,
   which asserts on the SQL the store executes rather than on which method was
-  called.
-- **`grk serve` caps concurrent requests; it does not rate-limit.** uvicorn is
-  started with `limit_concurrency = cli.SERVE_MAX_CONCURRENT_REQUESTS`, so
-  requests past that ceiling are answered 503 rather than accepted and held.
-  That bounds in-flight work, which is what a single replica under a hard
-  memory limit needs. It counts concurrent requests, not requests per caller
-  per interval: a client that waits for each response is unbounded, nothing
-  attributes load to a caller, and the surface is still unauthenticated. See
-  `SECURITY.md` for the full statement.
+  called. The document half of the same call was missed on the first pass and
+  closed the same way afterwards: `count_documents()` replaced
+  `len(await runtime.get_document_sources())`, which built the whole
+  `{document_id: source}` mapping one line above the chunk count to take its
+  length.
+- **`grk serve` bounds concurrent corpus-scale work; it does not rate-limit.**
+  `search` and `index_status` acquire a semaphore admitting
+  `service.tools.MAX_CONCURRENT_CORPUS_SCANS` at a time, so peak memory tracks
+  that bound rather than arrival rate. It counts concurrent operations, not
+  requests per caller per interval: a client that waits for each response is
+  unbounded, nothing attributes load to a caller, and the surface is still
+  unauthenticated. Waiters queue rather than being shed, so a sustained
+  overload shows up as latency, not as refusals — a caller cannot distinguish
+  a slow corpus from a busy server. Connection exhaustion is bounded
+  separately and generously by `cli.SERVE_MAX_CONNECTIONS`; see `SECURITY.md`.
+- **`--host ''` is classified by resolving the empty string, which is
+  platform-dependent.** `asyncio.create_server` maps `host == ""` to all
+  interfaces, so the bind is routable either way, but the classification is
+  not: on Windows `getaddrinfo("", None)` returns the machine's routable
+  addresses and the allow-list is correctly unrestricted, while on glibc the
+  same call raises and the fail-closed branch produces a loopback-only list on
+  an all-interfaces bind — refusing every legitimate client. Both directions
+  are safe; it is an availability inconsistency, and it requires
+  `--allow-remote-access` either way. Found by a post-merge security review.
+- **The first version of that bound used the wrong mechanism, and every
+  document describing it was wrong with it.** uvicorn's `limit_concurrency` was
+  set to a small number and described as bounding in-flight requests. It trips
+  on `len(connections) >= limit or len(tasks) >= limit` — connections
+  server-wide, idle keep-alive included — and substitutes a 503 app *before*
+  routing, so a trip answers every route, the Kubernetes liveness and readiness
+  probes included. `grk serve` mounts a stateful MCP transport whose clients
+  hold an SSE stream open for up to half an hour, so idle sessions alone could
+  have 503-ed a server doing no work and restart-looped the single replica.
+  Recorded rather than quietly corrected because the failure class is the one
+  this repo keeps meeting: a control whose documented semantics and actual
+  mechanism differ, where every test written against the documented semantics
+  passes.
 - **Read-only does not mean the process writes no bytes.** Opening a WAL
   database updates its `-shm`/`-wal` sidecars, and `SQLiteMetadataStore.open`
   runs `CREATE TABLE IF NOT EXISTS` and a best-effort chmod on every open

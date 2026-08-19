@@ -32,7 +32,7 @@ from groundkit.service.binding import (
     DEFAULT_SERVE_PORT,
     ensure_bindable_host,
 )
-from groundkit.service.tools import ServiceContext
+from groundkit.service.tools import MAX_CONCURRENT_CORPUS_SCANS, ServiceContext
 
 #: A routable, non-loopback literal. RFC 5737 TEST-NET-1: documentation-only,
 #: so it can never be a real host anyone reading this test might try to reach.
@@ -451,23 +451,25 @@ def test_serve_assembles_one_app_carrying_both_transports(
     assert mcp_server.MCP_HTTP_PATH in mounted
 
 
-def test_serve_caps_in_flight_requests(
+def test_serve_sets_a_connection_backstop(
     index_dir: Path, base_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """uvicorn is configured to shed load rather than accept unbounded work.
+    """uvicorn is given a connection ceiling, and it is only that.
 
-    Every operation on this surface is O(corpus) and none of it is
-    authenticated: ``search`` scores the whole corpus regardless of
-    ``top_k``, and ``index_status`` aggregates over every chunk row. With
-    ``limit_concurrency`` unset, arrival rate alone decided peak memory,
-    because each accepted request holds its own working set. On the single
-    replica ``infra/k8s/deployment.yaml`` describes -- hard memory limit,
-    ``strategy: Recreate``, nothing to fail over to -- that is an OOMKill
-    rather than a slowdown, and the manifest's own comment reads the kill as
-    the corpus having outgrown the limit.
+    ``limit_concurrency`` trips on ``len(connections) >= limit or len(tasks) >=
+    limit`` -- connections server-wide, idle keep-alive included -- and
+    substitutes a 503 app *before* routing, so a trip answers every route, the
+    Kubernetes probes included. An earlier version of this test asserted the
+    same field while the constant was named for in-flight requests and set
+    small, which is exactly the reading that made a stateful MCP transport's
+    idle SSE sessions able to 503 a server doing no work.
 
-    Asserted against the constant, not a literal, so the value and the
-    reasoning recorded beside it cannot drift apart.
+    So this asserts only what the setting can actually promise -- that a
+    connection ceiling exists and is generous. The bound on *work* is a
+    semaphore inside the handlers, driven directly by
+    ``tests/test_service_tools.py::test_concurrent_corpus_scans_are_bounded``,
+    because a test that reads back a configured number cannot tell you what the
+    number means.
     """
     import uvicorn
 
@@ -485,8 +487,11 @@ def test_serve_caps_in_flight_requests(
     assert cli.main(_argv("serve", index_dir, base_dir)) == 0
 
     assert len(configs) == 1
-    assert configs[0].limit_concurrency == cli.SERVE_MAX_CONCURRENT_REQUESTS
-    assert configs[0].limit_concurrency is not None
+    assert configs[0].limit_concurrency == cli.SERVE_MAX_CONNECTIONS
+    # Generous relative to the work bound, and deliberately so: the two control
+    # different resources, and sizing this one like a work bound is the defect
+    # it replaced.
+    assert cli.SERVE_MAX_CONNECTIONS > MAX_CONCURRENT_CORPUS_SCANS
 
 
 def test_mcp_mount_wraps_the_session_manager_rather_than_passing_it_as_an_app(

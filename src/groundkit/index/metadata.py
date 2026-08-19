@@ -726,6 +726,30 @@ class SQLiteMetadataStore:
 
         return await self._run(_op)
 
+    async def count_documents(self) -> int:
+        """Return how many documents are persisted, without reading their sources.
+
+        The sibling of :meth:`count_chunks`, and off
+        :class:`~groundkit.index.protocols.MetadataStoreProtocol` for the same
+        reason. It replaces ``len(await store.get_document_sources())``, which
+        built a full ``{document_id: source}`` dict so that ``index_status``
+        could take its length — the same materialize-to-measure shape as the
+        chunk half, one line above it in ``service/tools.py`` and missed when
+        that half was fixed.
+
+        Returns:
+            The number of rows in ``documents``.
+
+        Raises:
+            StorageError: On a backend failure.
+        """
+
+        def _op() -> int:
+            cur = self._conn.execute("SELECT COUNT(*) FROM documents")
+            return int(cur.fetchone()[0])
+
+        return await self._run(_op)
+
     async def count_chunks(self) -> int:
         """Return how many chunks are persisted, without reading any of them.
 

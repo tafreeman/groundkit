@@ -95,6 +95,7 @@ Declined section with the reason)
 | GK-026 | ADR-0013 decision 7 was never implemented | LOW | H | S | todo | — |
 | GK-027 | `run_eval` is one long, deeply nested function | LOW | H | M | todo | — |
 | GK-028 | Assorted small correctness debt | LOW | H | S | todo | — |
+| GK-029 | The service's library constructors default `Host` validation off | MED | F | S | todo | — |
 
 ---
 
@@ -273,6 +274,44 @@ would otherwise mean editing `Retriever.open` directly.
 - [ ] A `tests/test_protocol_conformance.py` entry using `assert_signature_parity`.
 - [ ] `Retriever`'s annotation changed; no behaviour change, no test changes beyond the
       new conformance entry.
+
+### GK-029 — The service's library constructors default `Host` validation off
+
+- **Severity** MEDIUM · **Effort** S · **ADR** yes · **Verified**
+- **Where** `src/groundkit/service/api.py` (`create_app`) and
+  `src/groundkit/service/mcp_server.py` (`create_session_manager`), both defaulting
+  `host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST`
+
+Found by a post-merge security review of PR #26, and confirmed by execution. The shipped
+binary is unaffected: `grk serve` always passes the list derived from the bind, and the
+regression tests assert the property against the CLI-assembled app rather than against
+these defaults. So the blast radius is third-party embedders only.
+
+The finding is about the *shape of the default*, not the reachable behaviour. ADR-0024
+records it as a residual and justifies it: "a caller embedding the app behind its own front
+door is not helped by a check keyed to an address it never binds." That argument supports
+letting such a caller **opt out**; it does not support opting them out by default. A caller
+who does not know the parameter exists gets no `Host` check, in a codebase whose stated rule
+is that an unconfigured provider raises rather than falls back (`errors.py`). `cli._build_mcp_mount`
+already demonstrates the safe shape — it defaults to `LOOPBACK_HOST_ALLOW_LIST`, and its own
+docstring calls the asymmetry deliberate.
+
+Marked `ADR: yes` because ADR-0024's Consequences section argues the current default
+explicitly. Flipping it contradicts a recorded position, so it needs ADR-0025 amending
+ADR-0024, not a silent change — which is also why it was not folded into the review-findings
+PR that produced this item.
+
+**Acceptance criteria**
+
+- [ ] ADR-0025 written, amending ADR-0024's residual, one decision, alternatives recorded,
+      added to **both** `docs/adr/index.md` and `mkdocs.yml`'s `nav`.
+- [ ] Both constructors default to `LOOPBACK_HOST_ALLOW_LIST`; the public signature is
+      unchanged, so an embedder passing `UNRESTRICTED_HOST_ALLOW_LIST` explicitly keeps
+      exactly today's behaviour.
+- [ ] Regression test, shown to fail first: `create_app(ctx)` with no `host_allow_list`
+      refuses a forged `Host`.
+- [ ] `SECURITY.md` and `KNOWN_LIMITATIONS.md` updated — this closes one of the four named
+      `Host` residuals, so neither may keep listing it.
 
 ### GK-017 — Frozen models alias nested caller metadata
 
