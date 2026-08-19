@@ -354,6 +354,19 @@ class CollectionRuntime:
         self._require_open()
         return await self._store.get_generation()
 
+    async def document_count(self) -> int:
+        """Return the number of persisted documents.
+
+        The sibling of :meth:`chunk_count`, added for the same reason and
+        missed when that one was fixed: ``index_status`` computed
+        ``len(await runtime.get_document_sources())`` on the line above,
+        building the whole ``{document_id: source}`` mapping to take its
+        length. Cheaper than the chunk version was — source strings, not full
+        text — but the same shape, on the same unauthenticated call.
+        """
+        self._require_open()
+        return await self._store.count_documents()
+
     async def chunk_count(self) -> int:
         """Return the number of persisted chunks.
 

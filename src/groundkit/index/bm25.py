@@ -40,6 +40,17 @@ class BM25Index:
     Builds an inverted index from chunks, tokenizes on lowercased word
     characters, and scores candidates with Okapi BM25.
 
+    **Not safe to mutate while a search is running.**
+    :class:`~groundkit.retrieval.search.Retriever` dispatches :meth:`search` to
+    a worker thread, where it reads the five parallel lists below live;
+    :meth:`index_chunks` appends to three of them in separate statements, so an
+    append landing mid-scan would be observed torn — ``len(self._chunks)`` past
+    the matching ``_doc_lengths`` entry, raising ``IndexError`` from
+    :meth:`_score_document`. Build the index fully (normally via
+    :meth:`from_store`) and treat it as frozen thereafter; rebuilding means
+    constructing a new instance, which is what
+    :class:`~groundkit.runtime.CollectionRuntime` does.
+
     Args:
         k1: Term-frequency saturation parameter.
         b: Length-normalization parameter.

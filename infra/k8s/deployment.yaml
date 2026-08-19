@@ -143,15 +143,27 @@ spec:
               # (ADR-0002), so the working set scales with corpus size rather
               # than with request rate.
               #
-              # That holds only because request rate is now bounded: uvicorn is
-              # started with `limit_concurrency` (`cli.SERVE_MAX_CONCURRENT_REQUESTS`)
-              # and sheds the excess with 503. Without it, arrival rate alone
-              # decided peak memory — every accepted request holds its own
-              # working set — and an OOMKill on this single `Recreate` replica,
-              # which has nothing to fail over to, would have been traffic
-              # rather than corpus growth while this comment said otherwise.
-              # Read a kill here as the corpus outgrowing the limit; if the cap
-              # is ever raised, this comment must be re-earned.
+              # That holds only because concurrent corpus-scale work is now
+              # bounded: `search` and `index_status` acquire a semaphore
+              # admitting `service.tools.MAX_CONCURRENT_CORPUS_SCANS` at a
+              # time. Without it, arrival rate alone decided peak memory —
+              # every accepted request holds its own working set — and an
+              # OOMKill on this single `Recreate` replica, which has nothing to
+              # fail over to, would have been traffic rather than corpus growth
+              # while this comment said otherwise.
+              #
+              # Bounded, not established: each admitted operation still holds a
+              # corpus-scale working set, so the ceiling is that bound times a
+              # corpus, not one corpus. Read a kill here as the corpus having
+              # outgrown the limit *divided by* that bound; raising either the
+              # bound or the corpus means re-earning this comment.
+              #
+              # The bound is deliberately NOT uvicorn's `limit_concurrency`,
+              # which counts open connections (idle keep-alive included) and
+              # answers 503 before routing — including to the probes below,
+              # which would turn a load spike into a restart loop on the one
+              # replica. That setting is set generously, as a connection
+              # backstop only (`cli.SERVE_MAX_CONNECTIONS`).
               cpu: "1"
               memory: 1Gi
       volumes:

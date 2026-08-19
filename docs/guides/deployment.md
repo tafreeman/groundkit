@@ -53,8 +53,11 @@ arrives from loopback; the attacker never routed to your machine. Only the
 `Host` header distinguishes such a request, so only checking it refuses one.
 
 Neither control is authentication, and the second is decided by whether the
-bind is *routable*, not by how you typed it. `grk serve --host localhost`
-resolves to loopback, so validation stays on; `--host 127.0.0.2` stays on and
+bind is *routable*, not by how you typed it. `grk serve --host localhost
+--allow-remote-access` resolves to loopback, so validation stays on — the flag
+is required because a hostname is not an address literal and cannot be
+classified without a resolver, which is a separate question from whether the
+answer turns out to be routable; `--host 127.0.0.2` stays on and
 the allow-list names that address; `--host 0.0.0.0 --allow-remote-access`
 turns it off, deliberately, because once the port is routable a `Host` check
 stops nobody who could not already connect directly — and a restrictive list

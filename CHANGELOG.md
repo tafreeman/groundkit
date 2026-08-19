@@ -40,14 +40,22 @@ it scored.
 
 ### Changed
 
-- `grk serve` bounds how many requests it holds in flight. uvicorn is started
-  with `limit_concurrency` set to `cli.SERVE_MAX_CONCURRENT_REQUESTS`, so
-  requests past that ceiling are answered 503 rather than accepted. Every
+- `grk serve` bounds concurrent corpus-scale work. `search` and `index_status`
+  acquire a semaphore admitting `service.tools.MAX_CONCURRENT_CORPUS_SCANS` at
+  a time, shared across both transports because they share the handlers. Every
   operation on this unauthenticated surface is O(corpus), so arrival rate alone
   previously decided peak memory — an OOMKill on the single-replica Kubernetes
   deployment was traffic, not corpus growth, while the manifest's own comment
-  said otherwise. This is a concurrency cap, not rate limiting; `SECURITY.md`
-  states the difference.
+  said otherwise. Waiters queue rather than being shed: a waiter holds a
+  connection but not a corpus-scale working set. This is a concurrency bound,
+  not rate limiting; `SECURITY.md` states the difference.
+- uvicorn is separately started with `limit_concurrency =
+  cli.SERVE_MAX_CONNECTIONS`, a generous backstop against connection
+  exhaustion. It is named for connections because that is what uvicorn counts —
+  server-wide, idle keep-alive included — and because it substitutes a 503 app
+  before routing, so a trip answers every route including the Kubernetes
+  probes. It cannot express "bound the expensive work", and is no longer
+  described as though it could.
 - `SQLiteMetadataStore` sets `PRAGMA busy_timeout` explicitly, to
   `metadata.BUSY_TIMEOUT_MS`. The value it had was already five seconds,
   inherited from `sqlite3.connect`'s `timeout=5.0` default rather than chosen;

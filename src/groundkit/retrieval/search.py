@@ -457,6 +457,34 @@ class Retriever:
         ``KNOWN_LIMITATIONS.md``; the standing fix is a postings list that
         scores only candidate chunks.
 
+        **The invariant this depends on:** a ``BM25Index`` handed to a
+        ``Retriever`` is never mutated afterwards. Unlike
+        :meth:`~groundkit.index.dense.InMemoryVectorStore.search`, which
+        snapshots before dispatching, the worker reads ``self._bm25``'s five
+        parallel lists live, and
+        :meth:`~groundkit.index.bm25.BM25Index.index_chunks` appends to three
+        of them in separate statements — so a mid-scan append would let the
+        worker see ``len(self._chunks)`` grow past the matching
+        ``_doc_lengths`` entry and raise ``IndexError`` out of an ``async
+        def`` that promises typed failures. Nothing in ``src/`` does that:
+        ``index_chunks`` is called only from
+        :meth:`~groundkit.index.bm25.BM25Index.from_store`, before the
+        retriever that will hold the index exists. It is stated here, and on
+        ``BM25Index`` itself, because that is a property of the *call graph*
+        rather than of the class, and :meth:`Retriever.__init__` is public and
+        accepts a caller-supplied index.
+
+        **Cancellation needs no special handling here**, in deliberate
+        contrast to ``SQLiteMetadataStore._run`` two modules away, which
+        documents the opposite conclusion at length. That machinery exists for
+        a shared ``sqlite3`` connection that must be rolled back by the thread
+        using it, and a lock whose release must outlive the cancelled
+        coroutine. This holds no lock and mutates nothing. Cancelling the
+        awaiting coroutine also propagates to the underlying
+        ``concurrent.futures.Future``, so queued-but-unstarted scans are
+        discarded rather than piling up behind a client that connects,
+        searches and disconnects in a loop.
+
         Args:
             query: The raw query string, tokenized by the index itself.
             k: Already-validated ``top_k`` for this search.

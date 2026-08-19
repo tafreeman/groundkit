@@ -105,9 +105,20 @@ Four residuals of that fix, named rather than implied:
 - **Starlette admits any `[::…]`-shaped `Host` on the REST surface.** It
   strips the port by splitting on the *first* colon, so `[::1]:8765` reduces
   to `"["` — which the allow-list must therefore contain for any IPv6
-  loopback client to be served at all, and which also matches other bracketed
-  literals. Not reachable by rebinding: a bracketed address literal is never
-  the product of a DNS answer, so no browser can be made to send one.
+  loopback client to be served at all, and which also matches any other `Host`
+  beginning `[:` — `[2001:db8::1]` reduces to `"[2001"` and is refused, so the
+  admitted set is narrower than "bracketed literals" generally, matching the
+  `[::…]`-shaped wording in ADR-0024 and `KNOWN_LIMITATIONS.md`. Not reachable
+  by rebinding: a bracketed address literal is never the product of a DNS
+  answer, so no browser can be made to send one.
+- **The MCP matcher's port wildcard admits a non-numeric port.** With
+  `localhost:*` on the list it tests `host.startswith("localhost:")`, so
+  `Host: localhost:evil.com` passes, as does `Origin: http://localhost:evil`.
+  Named here rather than fixed, and for the same reason as the entry above: a
+  browser will not put a non-numeric port in a URL, so it cannot be driven to
+  send one, and a non-browser client already on the loopback interface needs no
+  such trick. Listed because the four residuals above were named rather than
+  implied, and this is a fifth of the same shape.
 - **Neither matcher normalises `Host` for letter case or a trailing root
   dot.** `Host` is case-insensitive and the trailing-dot FQDN form is legal,
   but Starlette compares with `==` and the MCP SDK with `in`, so `LOCALHOST`,
@@ -223,18 +234,29 @@ it is now true because the surface exists and is tested.
 
 This section is rewritten as each phase lands real surface, per SPEC.md §7:
 
-- **A concurrency cap exists; rate limiting does not.** `grk serve` starts
-  uvicorn with `limit_concurrency` set to `cli.SERVE_MAX_CONCURRENT_REQUESTS`,
-  so requests past that ceiling are answered 503 rather than accepted. That
-  bounds how much work is in flight at once, which is what a single replica
-  under a hard memory limit actually needs — every operation on this surface
-  is O(corpus) and none of it is authenticated, so without a cap arrival rate
-  alone decided peak memory. It is *not* rate limiting: it counts concurrent
-  requests, not requests per caller per interval, so a client that waits for
-  each response is unbounded, and nothing attributes load to a caller. Rate
-  limiting, when it arrives, will be process-local — not a distributed or
-  DoS-grade control — and will be documented as such. Neither control is a
-  substitute for not exposing this surface to untrusted callers.
+- **A concurrency bound exists; rate limiting does not.** `search` and
+  `index_status` — the two O(corpus) operations — acquire a semaphore admitting
+  `service.tools.MAX_CONCURRENT_CORPUS_SCANS` at a time, shared across both
+  transports because they share the handlers. Peak memory therefore tracks that
+  bound rather than arrival rate, which is what a single replica under a hard
+  memory limit needs, since none of this surface is authenticated. Waiters
+  queue; they hold a connection but not a corpus-scale working set. `search`
+  holds the bound across the retriever acquisition as well as the search, since
+  a cache-miss rebuild is itself the O(corpus) step.
+- It is **not** rate limiting: it counts concurrent operations, not requests per
+  caller per interval, so a client that waits for each response is unbounded and
+  nothing attributes load to a caller. Rate limiting, when it arrives, will be
+  process-local — not a distributed or DoS-grade control — and will be
+  documented as such. Neither control is a substitute for not exposing this
+  surface to untrusted callers.
+- **`cli.SERVE_MAX_CONNECTIONS` is a separate, generous backstop** passed to
+  uvicorn as `limit_concurrency`, against connection exhaustion only. It is
+  named for connections because that is what uvicorn counts — server-wide,
+  idle keep-alive included — and because a trip substitutes a 503 app before
+  routing, answering every route including the Kubernetes probes. An earlier
+  version of this document described that setting as the bound on in-flight
+  requests. It is not, and `KNOWN_LIMITATIONS.md` records what that would have
+  cost.
 - Redaction at the LLM boundary (structural patterns by default, names only
   via configured patterns) shipped in Phase 5 and runs on every cloud **chat**
   call (`build_chat` wraps it in `RedactingChat`, no operator opt-out); local

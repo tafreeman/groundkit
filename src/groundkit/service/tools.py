@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from pydantic import BaseModel
@@ -115,6 +115,48 @@ if TYPE_CHECKING:
     ToolHandler: TypeAlias = Callable[["ServiceContext", Any], Awaitable[ToolResult]]
 
 
+#: How many corpus-scale operations may be in flight at once, across both
+#: transports, in one server process.
+#:
+#: The operations this bounds — :func:`handle_search` and
+#: :func:`handle_index_status` — are O(corpus) regardless of ``top_k``: BM25
+#: scores every indexed chunk (ADR-0002's accepted trade), and status reads an
+#: aggregate over every chunk row plus every document row. Each one in flight
+#: holds its own corpus-scale working set, so without a bound peak memory is
+#: decided by arrival rate, and the single replica ``infra/k8s/deployment.yaml``
+#: describes is OOMKilled rather than slowed.
+#:
+#: **This is the bound on work. uvicorn's ``limit_concurrency`` is not**, and
+#: the first version of this control used it as though it were. That setting
+#: trips on ``len(connections) >= limit or len(tasks) >= limit`` — connections
+#: server-wide, idle keep-alive included — and substitutes a 503 app *before*
+#: routing, so it answers every route including the Kubernetes probes. `grk
+#: serve` mounts a stateful MCP transport whose clients hold an SSE stream open
+#: for up to :data:`~groundkit.service.mcp_server._SESSION_IDLE_TIMEOUT_SECONDS`,
+#: so idle sessions alone could have tripped it, 503-ing a server doing no work
+#: and restart-looping the pod through its liveness probe. A cap on connections
+#: cannot express "bound the expensive work": only a bound at the operation can.
+#:
+#: Waiters queue rather than being shed. A waiter holds a connection but *not*
+#: a corpus-scale working set, which is the distinction the connection cap
+#: could not draw; connection exhaustion is bounded separately, by
+#: ``cli.SERVE_MAX_CONNECTIONS``. Eight rather than the thread-pool width
+#: because the binding resource is memory, not CPU: the scan itself already
+#: runs on the shared ``asyncio.to_thread`` executor, so more concurrent scans
+#: buy queued working sets rather than throughput.
+MAX_CONCURRENT_CORPUS_SCANS: Final[int] = 8
+
+
+def _new_scan_limiter() -> asyncio.Semaphore:
+    """Build a fresh limiter for one :class:`ServiceContext`.
+
+    Per context rather than module-global so tests are isolated from each
+    other; safe to construct outside a running loop, since an
+    ``asyncio.Semaphore`` binds no loop until it first has to wait.
+    """
+    return asyncio.Semaphore(MAX_CONCURRENT_CORPUS_SCANS)
+
+
 @dataclass(frozen=True, slots=True)
 class ServiceContext:
     """Everything a handler may reach. Assembled at serve time, never per request.
@@ -133,6 +175,10 @@ class ServiceContext:
         reranker: Cross-encoder, or ``None`` when the server was started
             without ``--rerank``. ``None`` is a refusal, never a passthrough.
         default_top_k: Applied when a request omits ``top_k``.
+        scan_limiter: Bounds concurrent corpus-scale work to
+            :data:`MAX_CONCURRENT_CORPUS_SCANS`. Shared by both transports
+            because they share these handlers, which is the point: two
+            transports over one runtime must contend for one budget, not two.
     """
 
     registry: CollectionRegistry
@@ -140,6 +186,7 @@ class ServiceContext:
     base_dir: Path
     reranker: RerankerProtocol | None = None
     default_top_k: int = 5
+    scan_limiter: asyncio.Semaphore = field(default_factory=_new_scan_limiter, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,7 +253,10 @@ async def handle_search(ctx: ServiceContext, request: SearchRequest) -> SearchRe
     top_k = request.top_k if request.top_k is not None else ctx.default_top_k
     fetch_k = MAX_TOP_K if request.rerank else top_k
 
-    async with ctx.registry.acquire(request.collection) as runtime:
+    # Held across the retriever acquisition too, not just the search: a
+    # rebuild is itself the O(corpus) BM25 reconstruction (ADR-0002), so
+    # bounding the search alone would leave the more expensive half unbounded.
+    async with ctx.scan_limiter, ctx.registry.acquire(request.collection) as runtime:
         acquired = await runtime.acquire()
         response = await acquired.retriever.search(request.query, top_k=fetch_k, mode=request.mode)
 
@@ -381,16 +431,23 @@ async def handle_index_status(
     directory paths: SPEC.md §7 records that SQLite here is content-bearing
     data, so enumerating sources would disclose corpus layout to an
     unauthenticated reader.
+
+    Both counts are aggregates. Each was once a ``len()`` over a materialized
+    table — the chunk half pulling every chunk's full text, the document half
+    every source string — to produce two integers for the cheapest-*looking*
+    call on this surface. Bounded by :data:`MAX_CONCURRENT_CORPUS_SCANS` even
+    so: an aggregate over every row is still a full table scan, and this
+    handler is reachable unauthenticated.
     """
-    async with ctx.registry.acquire(request.collection) as runtime:
-        sources = await runtime.get_document_sources()
+    async with ctx.scan_limiter, ctx.registry.acquire(request.collection) as runtime:
+        document_count = await runtime.document_count()
         chunk_count = await runtime.chunk_count()
         manifest = await runtime.get_manifest()
         generation = await runtime.get_generation()
 
     return IndexStatusResponse(
         collection=request.collection,
-        document_count=len(sources),
+        document_count=document_count,
         chunk_count=chunk_count,
         embedding=manifest,
         # Read from the same manifest the refusal in Retriever.search reads, so
