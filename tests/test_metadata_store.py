@@ -153,6 +153,30 @@ def test_add_chunks_rejects_source_with_no_document(tmp_path: Path) -> None:
         asyncio.run(_run())
 
 
+def test_add_chunks_rejects_chunk_with_mismatched_document_id(tmp_path: Path) -> None:
+    """``add_chunks`` carries its own copy of the document-id guard
+    ``replace_document`` enforces (exercised by
+    ``test_generation_bump_is_atomic_with_the_write`` below via a real
+    failure path, not a patched one). ``add_chunks`` has no production
+    caller today -- ``indexer.py`` uses ``replace_document`` exclusively --
+    but remains a required ``MetadataStoreProtocol`` member a third-party
+    implementation could rely on, so a refactor of ``add_chunks`` alone
+    dropping this guard would otherwise go unnoticed.
+    """
+
+    async def _run() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "col")
+        try:
+            await store.upsert_document(source="a.md", document_id="doc-1", content_hash="h1")
+            mismatched = _make_chunk("c1", "WRONG-DOC", "orphaned content")
+            await store.add_chunks([mismatched], source="a.md")
+        finally:
+            await store.close()
+
+    with pytest.raises(StorageError, match="does not match"):
+        asyncio.run(_run())
+
+
 def test_upsert_replaces_existing_source_and_its_chunks(tmp_path: Path) -> None:
     """Re-ingesting a source drops its old document_id, hash, and chunks."""
 

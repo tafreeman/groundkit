@@ -1,7 +1,8 @@
-"""End-to-end CLI tests: grk ingest -> grk search on a real temp index."""
+"""End-to-end CLI tests: grk ingest -> grk search / grk answer on a real temp index."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import ClassVar
@@ -10,7 +11,9 @@ import pytest
 
 from groundkit import snapshots
 from groundkit.cli import _build_parser, _is_url_source, _print_eval_summary, main
+from groundkit.config import ChatConfig, EmbeddingConfig
 from groundkit.contracts import Document
+from groundkit.errors import ChatError, StorageError
 from groundkit.evals.schema import (
     EvalReport,
     MetricSet,
@@ -19,6 +22,9 @@ from groundkit.evals.schema import (
     StageName,
     StageResult,
 )
+from groundkit.index.metadata import SQLiteMetadataStore
+from groundkit.providers import embeddings as embeddings_module
+from groundkit.providers.protocols import ChatProtocol, EmbeddingProtocol
 from groundkit.retrieval.search import MAX_TOP_K
 
 
@@ -1412,3 +1418,214 @@ def test_ingest_url_source_rejects_base_dir_before_constructing_url_loader(
     err = capsys.readouterr().err
     assert "error:" in err
     assert "--base-dir" in err
+
+
+# --- answer (GK-011) --------------------------------------------------------
+#
+# `build_chat` only ever constructs "ollama" or "openai_compatible"
+# (`_add_chat_args`'s docstring), so the answer path has no offline provider
+# double reachable through it the way `--embed-provider inmemory` gives the
+# dense path one (mirrored by the eval `--judge`/`--synthesis` comment
+# above: those are left untested through `main()` for the same reason).
+# `_CliScriptedChat` stands in for the missing double, the same way
+# `tests/test_answer.py`'s `_AnswerScriptedChat` stands in for the pipeline
+# layer beneath it.
+
+
+class _CliScriptedChat:
+    """A minimal ``ChatProtocol`` double returning a fixed completion."""
+
+    def __init__(self, completion: str) -> None:
+        self._completion = completion
+
+    @property
+    def provider(self) -> str:
+        return "cli-scripted"
+
+    @property
+    def model_name(self) -> str:
+        return "cli-scripted-v1"
+
+    async def complete(self, prompt: str, *, system: str | None = None) -> str:
+        del prompt, system
+        return self._completion
+
+
+def test_answer_end_to_end_text_output(
+    corpus: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A happy-path ``main(["answer", ...])`` run through the real store,
+    retriever, and pipeline wiring -- only ``build_chat`` is substituted, the
+    one collaborator with no offline double. Exercises the mode/embed-flag
+    guard's pass-through, the store -> retriever -> chat wiring, and the
+    text-output branch ``_print_answer_report`` drives, none of which
+    ``tests/test_answer.py``'s pure-pipeline tests reach.
+    """
+    idx = str(tmp_path / "idx")
+    main(["ingest", str(corpus), "--index-dir", idx])
+    capsys.readouterr()
+
+    def _scripted_build_chat(config: ChatConfig) -> ChatProtocol:
+        del config
+        return _CliScriptedChat("[1] Reciprocal rank fusion combines rankings.")
+
+    monkeypatch.setattr("groundkit.cli.build_chat", _scripted_build_chat)
+
+    assert main(["answer", "reciprocal rank fusion", "--index-dir", idx]) == 0
+    out = capsys.readouterr().out
+    assert "Reciprocal rank fusion combines rankings." in out
+    assert "[1] " in out
+    assert "notes.md" in out
+
+
+def test_answer_json_output(
+    corpus: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``--json`` branch renders the full ``AnswerReport``, not just the answer text."""
+    idx = str(tmp_path / "idx")
+    main(["ingest", str(corpus), "--index-dir", idx])
+    capsys.readouterr()
+
+    def _scripted_build_chat(config: ChatConfig) -> ChatProtocol:
+        del config
+        return _CliScriptedChat("[1] Reciprocal rank fusion combines rankings.")
+
+    monkeypatch.setattr("groundkit.cli.build_chat", _scripted_build_chat)
+
+    assert main(["answer", "reciprocal rank fusion", "--index-dir", idx, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["query"] == "reciprocal rank fusion"
+    assert payload["answer"] == "[1] Reciprocal rank fusion combines rankings."
+    assert len(payload["citations"]) == 1
+    assert payload["verdict"] is None
+
+
+def test_answer_bm25_mode_with_embed_flags_fails_closed_before_touching_store(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The same ``--mode bm25`` + ``--embed-*`` guard ``_cmd_search`` enforces
+    (``test_search_embed_flag_without_dense_mode_fails_closed``), for
+    ``answer``. ``--index-dir`` names a directory that has never been
+    created, and the guard runs before ``SQLiteMetadataStore.open`` -- which
+    itself creates the directory -- so its continued absence is the proof
+    the guard fired first rather than after a wasted store open.
+    """
+    idx = tmp_path / "never-created"
+
+    assert main(["answer", "a query", "--index-dir", str(idx), "--embed-provider", "inmemory"]) == 1
+    err = capsys.readouterr().err
+    assert "require --mode dense or --mode hybrid" in err
+    assert not idx.exists()
+
+
+def test_answer_closes_store_and_embedder_when_build_chat_raises(
+    corpus: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``build_chat`` failure must not leave the store or embedder open.
+
+    ``--mode dense`` puts a real embedder in play; ``--embed-provider
+    inmemory`` needs no dense ingest first, because a collection with no
+    embedding-identity manifest yet passes ``verify_manifest`` trivially
+    (its own docstring), so the plain bm25 ingest above is enough to reach
+    ``build_chat``. ``chat`` itself is never built here -- ``build_chat`` is
+    what raises -- so the third resource the ``finally`` block names is
+    proven by the absence of a second, masking exception: ``chat`` stays at
+    its pre-``try`` ``None`` and ``_maybe_aclose(None)`` is a no-op, which
+    only holds if that line runs at all rather than the whole ``finally``
+    block being skipped.
+
+    ``InMemoryEmbedder`` holds no resource to release (``_maybe_aclose``'s
+    own docstring), so wrapping it below proves ``_maybe_aclose`` reaches
+    and invokes ``aclose`` on whatever ``_open_dense_deps`` built -- the
+    ordering claim this test is actually about -- not that any I/O was
+    released. ``store``'s closed connection is the one real resource here,
+    checked directly through its own post-close behaviour (``StorageError``
+    from a query against a closed connection) rather than a recorded flag.
+    """
+    idx = str(tmp_path / "idx")
+    main(["ingest", str(corpus), "--index-dir", idx])
+    capsys.readouterr()
+
+    captured_stores: list[SQLiteMetadataStore] = []
+
+    class _CapturingMetadataStore:
+        @staticmethod
+        async def open(index_dir: Path, collection: str) -> SQLiteMetadataStore:
+            store = await SQLiteMetadataStore.open(index_dir, collection)
+            captured_stores.append(store)
+            return store
+
+    monkeypatch.setattr("groundkit.cli.SQLiteMetadataStore", _CapturingMetadataStore)
+
+    class _RecordingEmbedder:
+        def __init__(self, real: EmbeddingProtocol) -> None:
+            self._real = real
+            self.closed = False
+
+        @property
+        def provider(self) -> str:
+            return self._real.provider
+
+        @property
+        def model_name(self) -> str:
+            return self._real.model_name
+
+        @property
+        def dimensions(self) -> int:
+            return self._real.dimensions
+
+        async def embed(self, texts: list[str]) -> list[list[float]]:
+            return await self._real.embed(texts)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    built_embedders: list[_RecordingEmbedder] = []
+    real_build_embedder = embeddings_module.build_embedder
+
+    def _capturing_build_embedder(config: EmbeddingConfig) -> _RecordingEmbedder:
+        wrapped = _RecordingEmbedder(real_build_embedder(config))
+        built_embedders.append(wrapped)
+        return wrapped
+
+    monkeypatch.setattr("groundkit.cli.build_embedder", _capturing_build_embedder)
+
+    def _exploding_build_chat(config: ChatConfig) -> ChatProtocol:
+        del config
+        raise ChatError("synthesis provider exploded")
+
+    monkeypatch.setattr("groundkit.cli.build_chat", _exploding_build_chat)
+
+    assert (
+        main(
+            [
+                "answer",
+                "reciprocal rank fusion",
+                "--index-dir",
+                idx,
+                "--mode",
+                "dense",
+                "--embed-provider",
+                "inmemory",
+            ]
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "synthesis provider exploded" in err
+
+    assert len(captured_stores) == 1
+    with pytest.raises(StorageError):
+        asyncio.run(captured_stores[0].count_documents())
+
+    assert len(built_embedders) == 1
+    assert built_embedders[0].closed is True

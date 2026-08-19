@@ -7,11 +7,13 @@ from pydantic import ValidationError
 
 from groundkit.config import (
     DEFAULT_OLLAMA_BASE_URL,
+    ChatConfig,
     ChunkingConfig,
     EmbeddingConfig,
     GroundkitConfig,
     IndexConfig,
     RetrievalConfig,
+    resolve_chat_config,
     resolve_embedding_config,
 )
 from groundkit.errors import ConfigurationError
@@ -126,6 +128,99 @@ class TestResolveEmbeddingConfig:
         """
         with pytest.raises(ConfigurationError, match="dimensions") as excinfo:
             resolve_embedding_config(provider=None, model_name=None, dimensions=0, base_url=None)
+        assert isinstance(excinfo.value.__cause__, ValidationError)
+
+
+class TestResolveChatConfig:
+    """Tests for ``resolve_chat_config`` -- the exact peer of
+    ``resolve_embedding_config`` (its own docstring), ported from
+    ``TestResolveEmbeddingConfig`` above field-for-field. ``dimensions`` has
+    no chat equivalent (``ChatConfig`` carries no numeric bound resolvable
+    from these four flags), so its override/invalid-value cases are played
+    by ``api_key_env`` and ``provider`` respectively.
+    """
+
+    def test_all_none_gives_defaults(self) -> None:
+        resolved = resolve_chat_config(
+            provider=None, model_name=None, base_url=None, api_key_env=None
+        )
+        assert resolved == ChatConfig()
+
+    def test_provider_override(self) -> None:
+        resolved = resolve_chat_config(
+            provider="openai_compatible", model_name=None, base_url=None, api_key_env=None
+        )
+        defaults = ChatConfig()
+        assert resolved.provider == "openai_compatible"
+        assert resolved.model_name == defaults.model_name
+        assert resolved.base_url == defaults.base_url
+        assert resolved.api_key_env == defaults.api_key_env
+
+    def test_model_name_override(self) -> None:
+        resolved = resolve_chat_config(
+            provider=None, model_name="llama3.2:1b", base_url=None, api_key_env=None
+        )
+        defaults = ChatConfig()
+        assert resolved.model_name == "llama3.2:1b"
+        assert resolved.provider == defaults.provider
+        assert resolved.base_url == defaults.base_url
+        assert resolved.api_key_env == defaults.api_key_env
+
+    def test_base_url_override(self) -> None:
+        resolved = resolve_chat_config(
+            provider=None, model_name=None, base_url="http://example:1234", api_key_env=None
+        )
+        defaults = ChatConfig()
+        assert resolved.base_url == "http://example:1234"
+        assert resolved.provider == defaults.provider
+        assert resolved.model_name == defaults.model_name
+        assert resolved.api_key_env == defaults.api_key_env
+
+    def test_api_key_env_override(self) -> None:
+        resolved = resolve_chat_config(
+            provider=None, model_name=None, base_url=None, api_key_env="MY_CHAT_KEY"
+        )
+        defaults = ChatConfig()
+        assert resolved.api_key_env == "MY_CHAT_KEY"
+        assert resolved.provider == defaults.provider
+        assert resolved.model_name == defaults.model_name
+        assert resolved.base_url == defaults.base_url
+
+    def test_all_fields_override_together(self) -> None:
+        resolved = resolve_chat_config(
+            provider="openai_compatible",
+            model_name="gpt-4o-mini",
+            base_url="https://api.example.com",
+            api_key_env="MY_CHAT_KEY",
+        )
+        assert resolved == ChatConfig(
+            provider="openai_compatible",
+            model_name="gpt-4o-mini",
+            base_url="https://api.example.com",
+            api_key_env="MY_CHAT_KEY",
+        )
+
+    def test_invalid_provider_translates_to_configuration_error(self) -> None:
+        """A bad ``provider`` must raise ``ConfigurationError``, not ``ValidationError``.
+
+        The same translation ``resolve_embedding_config`` performs for a bad
+        ``dimensions`` (see its own test's docstring): untranslated,
+        ``ValidationError`` is not a ``GroundkitError``, so ``cli.main``'s
+        handler would never catch it and the command would exit on a raw
+        pydantic traceback instead of a one-line ``error:`` message.
+        ``ChatConfig`` has no numeric bound reachable from these four
+        parameters, so ``provider``'s ``Literal`` is what stands in for
+        ``dimensions``'s ``gt=0`` here -- argparse's own ``choices=`` blocks
+        this value on the real CLI path, but ``resolve_chat_config`` is
+        called directly here, bypassing that.
+        """
+        with pytest.raises(ConfigurationError, match="provider") as excinfo:
+            resolve_chat_config(
+                provider="voyage",  # type: ignore[arg-type]
+                model_name=None,
+                base_url=None,
+                api_key_env=None,
+            )
         assert isinstance(excinfo.value.__cause__, ValidationError)
 
 

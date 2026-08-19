@@ -78,10 +78,6 @@ Declined section with the reason)
 
 | ID | Item | Sev | Phase | Effort | Status | Depends on |
 |---|---|---|---|---|---|---|
-| GK-011 | `grk answer` has no end-to-end test | HIGH | E | S | todo | — |
-| GK-012 | `resolve_chat_config` has no test | MED | E | S | todo | — |
-| GK-013 | The unauthenticated error boundary is never driven over HTTP | MED | E | S | todo | — |
-| GK-014 | `add_chunks`' document-id mismatch branch is untested | LOW | E | XS | todo | — |
 | GK-015 | `SPEC.md` §2 has no structural guard | MED | F | S | todo | — |
 | GK-016 | `BM25Index` has no protocol seam | MED | F | S | todo | — |
 | GK-017 | Frozen models alias nested caller metadata | MED | F | S | todo | — |
@@ -146,80 +142,23 @@ code. Both were only visible by executing the thing rather than reading about it
 
 ---
 
-## Phase E — Close the test gaps
+## Phase E — closed 2026-08-19
 
-**Goal:** the dark part of the covered surface contains no user-facing entry point.
-**Exit:** every CLI verb is driven through `main()` at least once.
+GK-011, GK-012, GK-013 and GK-014 landed together on `fix/backlog-phase-e` and are deleted
+from this file per the rule above. All four were coverage-only: the code each one covers
+was already correct, so none of the four changes production behaviour, and neither
+`CHANGELOG.md` nor `KNOWN_LIMITATIONS.md` owns any consequence of this phase. Each new test
+was instead demonstrated the way `tests/test_service_api.py` and `tests/test_service_errors.py`
+already demonstrate a guard with no pre-fix version to revert to: by injecting the exact
+violation it exists to catch and watching it fail for that reason, then restoring. GK-011's
+"three resources closed" criterion narrowed under execution to two: when `build_chat` is
+what raises, `chat` itself was never built, so `_maybe_aclose(None)` is a no-op by
+construction rather than a third closeable resource — what the test proves for `chat` is
+that the `finally` block still reaches that no-op rather than being skipped entirely.
 
-### GK-011 — `grk answer` has no end-to-end test
-
-- **Severity** HIGH · **Effort** S · **ADR** no · **Verified**
-- **Where** `src/groundkit/cli.py:809` (`_cmd_answer`)
-
-No `"answer"` invocation exists in `tests/test_cli.py` or `tests/test_cli_serve.py`, and
-`_cmd_answer` appears nowhere under `tests/`. `main(["search", ...])` is exercised
-repeatedly by comparison. Only the pure printer is driven, explicitly "rather than through
-`main()`" per its own docstring.
-
-Untested: the mode/embed-flag mutual-exclusion guard, the store → embedder → vector store
-→ retriever → chat wiring, the JSON/text branch, and the `finally` block that closes three
-resources in order. A cleanup-ordering bug — an exception during `build_chat` leaving the
-store or embedder unclosed — is exactly the class a unit test of the pipeline alone cannot
-see.
-
-**Acceptance criteria**
-
-- [ ] A happy-path `main(["answer", ...])` test using the existing offline doubles.
-- [ ] A test asserting the `--mode bm25` + embed-flags combination is rejected.
-- [ ] A test asserting all three resources are closed when `build_chat` raises.
-
-### GK-012 — `resolve_chat_config` has no test
-
-- **Severity** MEDIUM · **Effort** S · **ADR** no · **Verified**
-- **Where** `src/groundkit/config.py:180`
-
-Its sibling `resolve_embedding_config`, one function above it in the same file and
-documented as "the same peer ... for the same reasons", has a full test class including
-the `ValidationError` → `ConfigurationError` translation. Chat config has none. With
-GK-011, the entire `--chat-*` path is dark end to end.
-
-**Acceptance criteria**
-
-- [ ] The embedding-config test class ported to chat config, including the error
-      translation case.
-
-### GK-013 — The unauthenticated error boundary is never driven over HTTP
-
-- **Severity** MEDIUM · **Effort** S · **ADR** no
-- **Where** `src/groundkit/service/api.py:383`; `tests/test_service_errors.py:217`
-
-`unexpected_error_rendering()` is called directly as a function with no request in flight.
-No test raises a bare non-`GroundkitError` through `create_app` and inspects the actual
-response. This is the boundary that stops an internal exception message reaching an
-unauthenticated caller; a reordering of the two `except` clauses, or a refactor that
-includes `str(exc)` in the body, would go undetected.
-
-**Acceptance criteria**
-
-- [ ] An integration test with a handler monkeypatched to raise a bare exception carrying
-      a distinctive string, asserting the response status, the generic detail, and the
-      absence of that string from the body.
-
-### GK-014 — `add_chunks`' document-id mismatch branch is untested
-
-- **Severity** LOW · **Effort** XS · **ADR** no
-- **Where** `src/groundkit/index/metadata.py` (`add_chunks`)
-
-`add_chunks` has no production caller — `indexer.py` uses `replace_document` exclusively —
-but remains a required `MetadataStoreProtocol` member. `replace_document` carries a
-structurally separate copy of the same document-id guard and *is* tested; this copy is
-not. A third-party implementation, or a refactor of `add_chunks` alone, could drop it
-silently.
-
-**Acceptance criteria**
-
-- [ ] A test calling `add_chunks` with a mismatched `chunk.document_id`, mirroring the
-      existing `test_add_chunks_rejects_source_with_no_document`.
+Both exit criteria were met. Every CLI verb is now driven through `main()` at least once,
+and the dark surface named by all four items — the `--chat-*` path end to end, the
+unauthenticated 500 boundary, and `add_chunks`' orphaned guard copy — is dark no longer.
 
 ---
 
