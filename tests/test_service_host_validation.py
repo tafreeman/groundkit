@@ -820,3 +820,58 @@ def test_an_unrestricted_app_accepts_the_host_a_restricted_one_refuses(
         response = client.get("/v1/collections", headers={"host": f"{FORGED_HOST}:8765"})
 
     assert response.status_code == 200
+
+
+# -- GK-029 / ADR-0025: the library constructors' own defaults --------------
+#
+# Every REST test above passes host_allow_list explicitly, matching what
+# grk serve actually does — so none of them would notice a regression in
+# the bare default a caller gets by omitting the argument entirely. These
+# two are the ones that construct create_app / create_session_manager with
+# no host_allow_list at all.
+
+
+def test_create_app_default_refuses_a_forged_host(ctx: ServiceContext) -> None:
+    """ADR-0025 amends ADR-0024's residual: the library default is now
+    :data:`~groundkit.service.binding.LOOPBACK_HOST_ALLOW_LIST`, not
+    :data:`~groundkit.service.binding.UNRESTRICTED_HOST_ALLOW_LIST`. A caller
+    who embeds ``create_app`` without ever passing ``host_allow_list`` -- the
+    shape ADR-0024 itself named as the intended use of that default -- no
+    longer gets an app that accepts any ``Host``.
+
+    Shown to fail first: reverting ``create_app``'s default parameter to
+    ``UNRESTRICTED_HOST_ALLOW_LIST`` turns this 400 into a 200.
+    """
+    app = create_app(ctx)
+    with TestClient(app) as client:
+        response = client.get("/v1/collections", headers={"host": f"{FORGED_HOST}:8765"})
+
+    assert response.status_code == 400
+
+
+def test_create_session_manager_default_refuses_a_forged_host(ctx: ServiceContext) -> None:
+    """The MCP-side peer of the REST test above, mounted bare like
+    ``_mcp_only_app`` so nothing else could be doing the refusing.
+
+    Shown to fail first: reverting ``create_session_manager``'s default
+    parameter to ``UNRESTRICTED_HOST_ALLOW_LIST`` turns this 421 into a 200.
+    """
+    manager = create_session_manager(ctx)
+
+    async def mcp_app(scope: Scope, receive: Receive, send: Send) -> None:
+        await manager.handle_request(scope, receive, send)
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+        async with manager.run():
+            yield
+
+    app = Starlette(lifespan=lifespan, routes=[Mount(MCP_HTTP_PATH, app=mcp_app)])
+    with TestClient(app) as client:
+        response = client.post(
+            _MCP_ENDPOINT,
+            json=_INITIALIZE,
+            headers={**_MCP_HEADERS, "host": f"{FORGED_HOST}:8765"},
+        )
+
+    assert response.status_code == 421

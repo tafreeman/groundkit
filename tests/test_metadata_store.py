@@ -243,6 +243,18 @@ def test_add_chunks_rolls_back_partial_write_on_metadata_error(tmp_path: Path) -
     INSERT stayed uncommitted-but-visible on this connection after the bad
     chunk failed, and would become durable on disk the moment any later,
     unrelated ``commit()`` ran on the same connection.
+
+    ``bad`` is built with :meth:`~pydantic.BaseModel.model_construct`,
+    bypassing validation, rather than through ``_make_chunk`` /
+    ``Chunk(...)``: GK-017 added a ``metadata`` validator that itself
+    rejects a non-JSON-serializable value with ``ValidationError`` at
+    construction, so the normal constructor can no longer produce the chunk
+    this test needs. That is exactly the improvement GK-017 made — but this
+    test's actual subject is ``add_chunks``'s own rollback discipline, which
+    must hold regardless of what already validated the data reaching it
+    (defense in depth: an old row predating the validator, or any future
+    ``MetadataStoreProtocol`` implementation, can still hand it a ``Chunk``
+    Pydantic never checked).
     """
 
     async def _run() -> tuple[list[Chunk], list[Chunk]]:
@@ -250,12 +262,13 @@ def test_add_chunks_rolls_back_partial_write_on_metadata_error(tmp_path: Path) -
         try:
             await store.upsert_document(source="a.md", document_id="doc-1", content_hash="h1")
             good = _make_chunk("good", "doc-1", "good text", chunk_index=0)
-            bad = _make_chunk(
-                "bad",
-                "doc-1",
-                "bad text",
+            bad = Chunk.model_construct(
+                chunk_id="bad",
+                document_id="doc-1",
                 chunk_index=1,
+                content="bad text",
                 start_offset=9,
+                end_offset=9 + len("bad text"),
                 metadata={"oops": {1, 2, 3}},  # a set is not JSON-serializable
             )
             with pytest.raises(StorageError):

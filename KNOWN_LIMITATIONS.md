@@ -476,14 +476,6 @@ per SPEC.md §9:
   other direction is an availability failure visible on the first request.
   Address literals, including the default bind, are never resolved and are
   unaffected.
-- **`create_app` and `create_session_manager` default to an unrestricted `Host`
-  allow-list.** The security decision is made at serve time and `grk serve`
-  always passes the derived list, but a third party constructing either object
-  without `host_allow_list=` gets no `Host` check. The default is a named
-  constant (`UNRESTRICTED_HOST_ALLOW_LIST`) rather than a bare `None`, and the
-  regression tests assert the property against the CLI-assembled app rather than
-  against the defaults — but the library seam itself is fail-open (ADR-0024,
-  Consequences).
 - **No mutating operation over either transport.** No ingest, no delete, on
   REST or MCP. Deliberate (ADR-0014 decision 1), not an omission: SPEC.md
   §1.2's four tools — `search`, `fetch_chunk`, `list_collections`,

@@ -65,7 +65,7 @@ from starlette.types import ASGIApp
 
 from groundkit import __version__
 from groundkit.errors import ConfigurationError, GroundkitError
-from groundkit.service.binding import UNRESTRICTED_HOST_ALLOW_LIST, HostAllowList
+from groundkit.service.binding import LOOPBACK_HOST_ALLOW_LIST, HostAllowList
 from groundkit.service.errors import (
     ErrorRendering,
     check_collection,
@@ -141,7 +141,7 @@ def create_app(
     ctx: ServiceContext,
     *,
     mcp_mount: McpMount | None = None,
-    host_allow_list: HostAllowList = UNRESTRICTED_HOST_ALLOW_LIST,
+    host_allow_list: HostAllowList = LOOPBACK_HOST_ALLOW_LIST,
 ) -> FastAPI:
     """Build the read-only REST app, one route per registered tool.
 
@@ -163,14 +163,22 @@ def create_app(
     ``127.0.0.1``, and the browser will then treat this service as same-origin.
     ``Host`` is the only part of such a request that still names the attacker.
 
-    The default is :data:`~groundkit.service.binding.UNRESTRICTED_HOST_ALLOW_LIST`
-    and that is a deliberate, named library default rather than an oversight:
-    ``create_app`` builds an app object, while *serving* it is what makes a
-    ``Host`` decision meaningful, and ``grk serve`` always passes the derived
-    list. A caller that constructs the app for an in-process client, a test, or
-    behind its own front door is not helped by a check keyed to an address it
-    never binds. The security property is asserted against the CLI-assembled
-    app in ``tests/test_service_host_validation.py``, not against this default.
+    The default is :data:`~groundkit.service.binding.LOOPBACK_HOST_ALLOW_LIST`
+    (ADR-0025, amending ADR-0024's original choice of
+    :data:`~groundkit.service.binding.UNRESTRICTED_HOST_ALLOW_LIST`): ``create_app``
+    builds an app object, while *serving* it is what makes a ``Host`` decision
+    meaningful, and ``grk serve`` always passes the derived list regardless of
+    this default — the two coincide only for the common case, a loopback bind,
+    which is exactly why the safer constant was available to default to. A
+    caller that constructs the app for an in-process client, a test, or behind
+    its own front door and never thinks about ``host_allow_list`` at all now
+    gets the same fail-closed posture ``grk serve`` gives its own default bind,
+    rather than every ``Host`` silently accepted; one that needs the wider
+    behavior (embedding behind a reverse proxy under a name this process
+    cannot predict) still opts in explicitly with
+    :data:`~groundkit.service.binding.UNRESTRICTED_HOST_ALLOW_LIST`. The
+    security property is asserted against both the CLI-assembled app and this
+    bare default in ``tests/test_service_host_validation.py``.
 
     The context's registry is closed on shutdown. The app does not *own* the
     :class:`~groundkit.service.tools.ServiceContext` — it is assembled at serve

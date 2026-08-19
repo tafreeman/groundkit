@@ -75,7 +75,7 @@ from pydantic import BaseModel, ValidationError
 
 from groundkit import __version__
 from groundkit.errors import ConfigurationError, GroundkitError
-from groundkit.service.binding import UNRESTRICTED_HOST_ALLOW_LIST, HostAllowList
+from groundkit.service.binding import LOOPBACK_HOST_ALLOW_LIST, HostAllowList
 from groundkit.service.errors import (
     check_collection,
     map_exception,
@@ -434,7 +434,7 @@ async def list_tool_definitions(ctx: ServiceContext) -> list[types.Tool]:
 def create_session_manager(
     ctx: ServiceContext,
     *,
-    host_allow_list: HostAllowList = UNRESTRICTED_HOST_ALLOW_LIST,
+    host_allow_list: HostAllowList = LOOPBACK_HOST_ALLOW_LIST,
 ) -> StreamableHTTPSessionManager:
     """Build the streamable-HTTP session manager to mount at :data:`MCP_HTTP_PATH`.
 
@@ -474,11 +474,15 @@ def create_session_manager(
     SDK 421/403) and that is left alone: each matcher renders its own refusal,
     and wrapping them into one shape would mean re-implementing both.
 
-    The default is
-    :data:`~groundkit.service.binding.UNRESTRICTED_HOST_ALLOW_LIST` for the
-    reason :func:`groundkit.service.api.create_app` gives about its own: the
-    bind decision is made at serve time, and ``grk serve`` always passes the
-    derived list.
+    The default is :data:`~groundkit.service.binding.LOOPBACK_HOST_ALLOW_LIST`
+    (ADR-0025), for the reason :func:`groundkit.service.api.create_app` gives
+    about its own: the bind decision is made at serve time, and ``grk serve``
+    always passes the derived list regardless of this default, so the two
+    coincide only for the common case, a loopback bind. A caller that never
+    passes ``host_allow_list`` gets the same fail-closed posture as that
+    default bind rather than every ``Host`` accepted; one that needs the wider
+    behavior opts in explicitly with
+    :data:`~groundkit.service.binding.UNRESTRICTED_HOST_ALLOW_LIST`.
 
     Args:
         ctx: Serve-time context every handler is invoked with.

@@ -276,3 +276,53 @@ class VectorStoreProtocol(Protocol):
     async def delete(self, document_id: str) -> int:
         """Delete all vectors for a document. Returns deleted count."""
         ...
+
+
+@runtime_checkable
+class LexicalIndexProtocol(Protocol):
+    """In-memory lexical (keyword) index -- ``VectorStoreProtocol``'s
+    lexical-side peer, both index-layer seams
+    :class:`~groundkit.retrieval.search.Retriever` composes against.
+
+    Implemented by :class:`~groundkit.index.bm25.BM25Index` (GK-016): the
+    seams for loaders, chunkers, metadata stores, vector stores, embedders,
+    chat and rerankers all existed before this one, which made GK-018 (a
+    postings-list index, ADR-0002's named revisit trigger) and GK-020 more
+    expensive than they needed to be -- both would otherwise mean editing
+    ``Retriever.open`` directly to swap the concrete class.
+
+    Unlike ``VectorStoreProtocol``, whose construction (``open``) is never
+    called through the protocol type and is therefore not part of it,
+    :meth:`from_store` IS part of this seam on purpose: it is the whole
+    reason the seam exists, so a future implementation can be built and
+    conformance-checked (``assert_signature_parity``) without this Protocol
+    needing to change again. A classmethod factory's return annotation is
+    exempt from that check's comparison (see
+    ``tests/test_protocol_conformance.py``'s ``_assert_member_parity``): the
+    whole point of a factory is that each implementation returns its own
+    concrete type, not this Protocol's name.
+    """
+
+    @property
+    def size(self) -> int:
+        """Number of chunks currently indexed."""
+        ...
+
+    def index_chunks(self, chunks: list[Chunk]) -> None:
+        """Incrementally add chunks to the index. Existing chunks are preserved."""
+        ...
+
+    def search(self, query: str, *, top_k: int = 5) -> list[tuple[Chunk, float]]:
+        """Return ``(chunk, score)`` pairs ranked by descending relevance.
+
+        Scores are ``>= 0.0``. An empty query or an empty index returns
+        ``[]``.
+        """
+        ...
+
+    @classmethod
+    async def from_store(
+        cls, store: MetadataStoreProtocol, *, k1: float = 1.5, b: float = 0.75
+    ) -> LexicalIndexProtocol:
+        """Rebuild a fresh index from every chunk currently persisted in ``store``."""
+        ...
