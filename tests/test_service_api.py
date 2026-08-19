@@ -35,6 +35,7 @@ from groundkit.runtime import CollectionRegistry
 from groundkit.service import api as api_module
 from groundkit.service.api import DOC_PATHS, REQUEST_ID_HEADER, McpMount, create_app
 from groundkit.service.binding import UNRESTRICTED_HOST_ALLOW_LIST
+from groundkit.service.errors import GENERIC_DETAIL
 from groundkit.service.schemas import ChunkFetchResponse, IndexStatusResponse, SearchRequest
 from groundkit.service.tools import TOOLS, ServiceContext
 from groundkit.telemetry import JsonLogFormatter
@@ -368,6 +369,52 @@ def test_a_credential_in_an_exception_cause_never_reaches_the_caller(
     formatter = logging.Formatter()
     assert any(sentinel in formatter.format(record) for record in failures), (
         "the unscrubbed cause must reach the operator's log, keyed by the request id"
+    )
+
+
+def test_a_bare_exception_never_reaches_the_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The ``unexpected_error_rendering`` boundary (``_dispatch``'s ``except
+    Exception`` clause), driven over a real request for the first time.
+
+    ``unexpected_error_rendering`` itself is only ever called directly as a
+    plain function elsewhere (``test_service_errors.py``), with no request in
+    flight -- this is the gap GK-013 names: a reordering of ``_dispatch``'s
+    two ``except`` clauses, or a change that folds bare exceptions into the
+    ``GroundkitError`` branch and returns ``str(exc)``, would go undetected
+    without a test that actually raises one through ``create_app`` and reads
+    the response, the way this test's sibling above does for the
+    ``GroundkitError`` + leaked-``__cause__`` case.
+
+    Injected-violation demonstration, not a revert: ``service/api.py`` had no
+    pre-fix version to revert to (this module's docstring).
+    """
+    sentinel = "INTERNAL-DETAIL-DO-NOT-LEAK-0123456789"
+
+    async def exploding(_ctx: ServiceContext, _request: SearchRequest) -> SearchResponse:
+        raise RuntimeError(f"unexpected internal state: {sentinel}")
+
+    monkeypatch.setattr(api_module, "TOOLS", _with_handler("search", exploding))
+    app, _, _ = _make_app(tmp_path)
+
+    with TestClient(app) as client, caplog.at_level(logging.ERROR, logger=_API_LOGGER):
+        response = client.post("/v1/search", json={"query": "turbine"})
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["kind"] == "internal_error"
+    assert body["detail"] == GENERIC_DETAIL
+    assert sentinel not in response.text
+    assert all(
+        sentinel not in name and sentinel not in value for name, value in response.headers.items()
+    )
+
+    failures = [record for record in caplog.records if record.name == _API_LOGGER]
+    assert failures, "the failure was not logged server-side at all"
+    formatter = logging.Formatter()
+    assert any(sentinel in formatter.format(record) for record in failures), (
+        "the raw exception must still reach the operator's log, keyed by the request id"
     )
 
 
