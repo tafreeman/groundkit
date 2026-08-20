@@ -114,9 +114,9 @@ if TYPE_CHECKING:
 
     from groundkit.contracts import Chunk, RetrievalResult
     from groundkit.evals.corpus import GoldSpan, Judgment
-    from groundkit.evals.judge import FaithfulnessJudge
     from groundkit.evals.schema import SynthesisReport
     from groundkit.index.protocols import MetadataStoreProtocol, VectorStoreProtocol
+    from groundkit.providers.judge import FaithfulnessJudge
     from groundkit.providers.protocols import ChatProtocol, EmbeddingProtocol
     from groundkit.retrieval.protocols import RerankerProtocol
     from groundkit.retrieval.search import SearchMode
@@ -341,6 +341,210 @@ async def run_eval(
         RetrievalError: A search call fails (e.g. an index inconsistency,
             or an out-of-range ``top_k``).
     """
+    await _validate_run_inputs(
+        top_k=top_k,
+        embedder=embedder,
+        vector_store=vector_store,
+        reranker=reranker,
+        rerank_candidates=rerank_candidates,
+        chat=chat,
+        judge=judge,
+    )
+    settings = _plan_run(
+        top_k=top_k,
+        embedder=embedder,
+        vector_store=vector_store,
+        reranker=reranker,
+        rerank_candidates=rerank_candidates,
+    )
+
+    started_at = datetime.now(UTC).isoformat()
+    prepared = await _prepare_corpus(corpus_dir, judgments_path)
+
+    with tempfile.TemporaryDirectory() as tmp_dir_name:
+        store = await SQLiteMetadataStore.open(Path(tmp_dir_name), "eval")
+        try:
+            indexed = await _index_corpus(
+                store, corpus_dir=corpus_dir, prepared=prepared, settings=settings
+            )
+            scored = await _score_stages(
+                prepared.judgments, indexed, settings, capture_synthesis_inputs=chat is not None
+            )
+
+            synthesis_report: SynthesisReport | None = None
+            if chat is not None:
+                # The best stage this run actually produced — the same
+                # "best upstream" the rerank stage itself reorders
+                # (_planned_stages): `settings.planned[-1]` is `rerank` if a
+                # reranker was supplied, else `fusion` with a dense pair,
+                # else the `bm25` baseline. It shares the one index and one
+                # retriever every stage above already shares — never a second
+                # ingest of the same corpus, and since the synthesis inputs
+                # were captured during that stage's own scoring pass, never a
+                # second *retrieval* either. Re-fetching here was the earlier
+                # shape: correct, but it ran every query through the retriever
+                # twice and, on a dense or hybrid stage, through the embedding
+                # provider twice.
+                synthesis_input = settings.planned[-1]
+                synthesis_report = await run_synthesis_eval(
+                    scored.synthesis_inputs,
+                    chat=chat,
+                    input_stage=synthesis_input.stage,
+                    judge=judge,
+                    synthesis_prompt_template=synthesis_prompt_template,
+                )
+        finally:
+            # Purge BEFORE closing: the document set lives in the store, and
+            # the store is about to go away with the temp directory.
+            if vector_store is not None:
+                await _purge_eval_vectors(vector_store, store)
+            # Must close before the TemporaryDirectory context exits: on
+            # Windows the sqlite file cannot be deleted while a handle to it
+            # is still open.
+            await store.close()
+
+    return _build_report(
+        scored.stages,
+        synthesis=synthesis_report,
+        started_at=started_at,
+        prepared=prepared,
+        document_count=indexed.document_count,
+        chunk_count=indexed.chunk_count,
+        settings=settings,
+    )
+
+
+class _RunSettings(NamedTuple):
+    """How this run retrieves, resolved once before any corpus work starts.
+
+    Grouped rather than threaded through the pipeline one argument at a
+    time, because these values are not independent of each other:
+    ``rerank_input`` and ``rerank_model`` describe the same rerank stage
+    ``planned`` contains, and deriving all three together — once, here — is
+    what keeps the artifact's account of the run identical to the run
+    (:func:`_planned_stages`). Every field is read-only for the rest of the
+    pipeline; nothing below mutates it.
+
+    Attributes:
+        planned: The ordered stage plan. ``planned[0]`` is always the
+            ``bm25`` baseline and ``planned[-1]`` is the best stage this run
+            produces — the one the synthesis pass runs over.
+        top_k: Results requested per query, per stage.
+        retrieval_config: The retrieval knobs every stage shares, recorded
+            into :class:`~groundkit.evals.schema.RunConfig`.
+        embedder: The run's embedder, or ``None`` for a BM25-only run.
+        vector_store: The run's dense store, or ``None``. Paired with
+            ``embedder``, already validated.
+        reranker: The run's reranker, or ``None``.
+        rerank_candidates: Candidate depth fetched before reranking. Carried
+            unconditionally but only *recorded* when ``reranker`` is set —
+            on a run without one it describes a computation that did not
+            happen.
+        rerank_input: The stage a rerank stage reorders, or ``None``.
+        rerank_model: The reranker's identity for the artifact, or ``None``.
+    """
+
+    planned: tuple[_StagePlan, ...]
+    top_k: int
+    retrieval_config: RetrievalConfig
+    embedder: EmbeddingProtocol | None
+    vector_store: VectorStoreProtocol | None
+    reranker: RerankerProtocol | None
+    rerank_candidates: int
+    rerank_input: StageName | None
+    rerank_model: str | None
+
+
+class _CorpusPreparation(NamedTuple):
+    """Everything derived from the corpus and judgments before indexing.
+
+    Attributes:
+        judgments: The judgment set, in file order.
+        resolved_spans: ``query_id -> [(gold_span, start, end)]``, every gold
+            quote already located in its corpus document.
+        corpus_root: The resolved corpus root, the base every
+            corpus-relative path in the artifact is derived against.
+        corpus_hash: SHA-256 over the corpus contents.
+        judgments_hash: SHA-256 over the judgments file's bytes.
+    """
+
+    judgments: list[Judgment]
+    resolved_spans: dict[str, list[tuple[GoldSpan, int, int]]]
+    corpus_root: Path
+    corpus_hash: str
+    judgments_hash: str
+
+
+class _IndexedCorpus(NamedTuple):
+    """The throwaway index, and the ground truth resolved against it.
+
+    Attributes:
+        retriever: An open retriever snapshotting the freshly-ingested
+            store. Valid only while that store is open (ADR-0002).
+        document_count: Documents actually persisted.
+        chunk_count: Chunks actually persisted.
+        document_id_to_relpath: ``document_id`` -> corpus-relative posix
+            path, for labeling retrieved hits.
+        gold_by_query: ``query_id`` -> that judgment's ground truth,
+            resolved once and shared by every stage.
+    """
+
+    retriever: Retriever
+    document_count: int
+    chunk_count: int
+    document_id_to_relpath: dict[str, str]
+    gold_by_query: dict[str, _JudgmentGold]
+
+
+class _ScoredStages(NamedTuple):
+    """The scoring loop's output: every stage, plus synthesis's input.
+
+    Attributes:
+        stages: One :class:`~groundkit.evals.schema.StageResult` per planned
+            stage, in plan order, baseline first. Nothing is filtered — a
+            losing stage is reported, not dropped (SPEC.md §6).
+        synthesis_inputs: ``(query, results)`` pairs captured from the last
+            planned stage's own scoring pass, empty when the caller did not
+            ask for them.
+    """
+
+    stages: list[StageResult]
+    synthesis_inputs: list[tuple[str, list[RetrievalResult]]]
+
+
+async def _validate_run_inputs(
+    *,
+    top_k: int,
+    embedder: EmbeddingProtocol | None,
+    vector_store: VectorStoreProtocol | None,
+    reranker: RerankerProtocol | None,
+    rerank_candidates: int,
+    chat: ChatProtocol | None,
+    judge: FaithfulnessJudge | None,
+) -> None:
+    """Reject an unusable argument combination before any corpus work starts.
+
+    Every check here is cheap and every failure it raises is a caller
+    mistake that no amount of ingesting, embedding or model-loading would
+    change — so they all run first, together, rather than being discovered
+    one at a time by whichever component reaches them. The one non-raising
+    case is the in-memory embedder, which is legal and only warned about.
+
+    Args:
+        top_k: Results requested per query, per stage.
+        embedder: The run's embedder, or ``None``.
+        vector_store: The run's dense store, or ``None``.
+        reranker: The run's reranker, or ``None``.
+        rerank_candidates: Candidate depth fetched before reranking.
+        chat: The run's chat provider, or ``None``.
+        judge: The run's faithfulness judge, or ``None``.
+
+    Raises:
+        ConfigurationError: Exactly one of ``embedder`` / ``vector_store``
+            was supplied, ``vector_store`` already holds vectors, or
+            ``judge`` was supplied without ``chat``.
+        EvalError: ``top_k`` or ``rerank_candidates`` is out of range.
+    """
     if not MIN_EVAL_TOP_K <= top_k <= MAX_TOP_K:
         raise EvalError(
             f"top_k must be between {MIN_EVAL_TOP_K} and {MAX_TOP_K}, got {top_k}. The "
@@ -383,6 +587,32 @@ async def run_eval(
             INMEMORY_PROVIDER,
         )
 
+
+def _plan_run(
+    *,
+    top_k: int,
+    embedder: EmbeddingProtocol | None,
+    vector_store: VectorStoreProtocol | None,
+    reranker: RerankerProtocol | None,
+    rerank_candidates: int,
+) -> _RunSettings:
+    """Fix the stage plan and the knobs every later step reads.
+
+    Args:
+        top_k: Results requested per query, per stage.
+        embedder: The run's embedder, or ``None``.
+        vector_store: The run's dense store, or ``None``.
+        reranker: The run's reranker, or ``None``.
+        rerank_candidates: Candidate depth fetched before reranking.
+
+    Returns:
+        The run's :class:`_RunSettings`.
+
+    Raises:
+        EvalError: A rerank stage was planned first, which
+            :func:`_rerank_input_stage` refuses — unreachable while
+            :func:`_planned_stages` seeds the baseline.
+    """
     planned = _planned_stages(embedder, vector_store, reranker)
     rerank_input = _rerank_input_stage(planned)
     rerank_model = _reranker_identity(reranker) if reranker is not None else None
@@ -398,8 +628,37 @@ async def run_eval(
             rerank_candidates,
             top_k,
         )
+    return _RunSettings(
+        planned=planned,
+        top_k=top_k,
+        retrieval_config=RetrievalConfig(),
+        embedder=embedder,
+        vector_store=vector_store,
+        reranker=reranker,
+        rerank_candidates=rerank_candidates,
+        rerank_input=rerank_input,
+        rerank_model=rerank_model,
+    )
 
-    started_at = datetime.now(UTC).isoformat()
+
+async def _prepare_corpus(corpus_dir: Path, judgments_path: Path) -> _CorpusPreparation:
+    """Load the judgments, resolve every gold span, and hash both inputs.
+
+    All of it happens *before* any indexing: a missing or ambiguous gold
+    quote fails the run closed here rather than after an ingest has been
+    spent on it.
+
+    Args:
+        corpus_dir: Root directory of the corpus documents.
+        judgments_path: Path to the JSONL judgments file.
+
+    Returns:
+        The run's :class:`_CorpusPreparation`.
+
+    Raises:
+        EvalError: A judgment fails to load, a gold span fails to resolve
+            against the corpus text, or either input cannot be read.
+    """
     judgments = load_judgments(judgments_path)
 
     # Resolve every gold span against the corpus text up front, before any
@@ -417,176 +676,254 @@ async def run_eval(
     corpus_root = corpus_dir.resolve()
     # Both reads race the filesystem (a file removed or made unreadable
     # mid-traversal) and both raise bare OSError, which would escape every
-    # caller that handles GroundkitError — the CLI included.
+    # caller that handles GroundkitError — the CLI included. Both are also
+    # content-sized, so both are dispatched off the event loop; the judgments
+    # read was inline while the corpus read beside it was not, which made this
+    # comment's "both" true of the error handling and false of the dispatch.
     try:
         corpus_hash = await asyncio.to_thread(_hash_corpus, corpus_root)
     except OSError as exc:
         raise EvalError(f"Cannot hash corpus at {str(corpus_root)!r}: {exc}") from exc
     try:
-        judgments_hash = hashlib.sha256(judgments_path.read_bytes()).hexdigest()
+        judgments_hash = await asyncio.to_thread(
+            lambda: hashlib.sha256(judgments_path.read_bytes()).hexdigest()
+        )
     except OSError as exc:
         raise EvalError(f"Cannot read judgments file {str(judgments_path)!r}: {exc}") from exc
-    retrieval_config = RetrievalConfig()
 
-    with tempfile.TemporaryDirectory() as tmp_dir_name:
-        store = await SQLiteMetadataStore.open(Path(tmp_dir_name), "eval")
-        try:
-            indexer = Indexer(
-                store,
-                FileLoader(allowed_base_dir=corpus_dir),
-                chunking_config=EVAL_CHUNKING_CONFIG,
-                embedder=embedder,
-                vector_store=vector_store,
+    return _CorpusPreparation(
+        judgments=judgments,
+        resolved_spans=resolved_spans,
+        corpus_root=corpus_root,
+        corpus_hash=corpus_hash,
+        judgments_hash=judgments_hash,
+    )
+
+
+async def _index_corpus(
+    store: MetadataStoreProtocol,
+    *,
+    corpus_dir: Path,
+    prepared: _CorpusPreparation,
+    settings: _RunSettings,
+) -> _IndexedCorpus:
+    """Ingest the corpus into ``store`` and resolve ground truth against it.
+
+    Args:
+        store: The run's freshly-opened throwaway metadata store.
+        corpus_dir: Root directory of the corpus documents, ingested with
+            :data:`EVAL_CHUNKING_CONFIG`.
+        prepared: The corpus preparation, for the resolved gold spans and
+            the corpus root every relative path is derived against.
+        settings: The run's settings, for the dense pair and retrieval
+            config the one shared retriever is opened with.
+
+    Returns:
+        The run's :class:`_IndexedCorpus`, valid while ``store`` stays open.
+
+    Raises:
+        EvalError: A gold span's document was never persisted, so its ground
+            truth cannot be computed.
+        IngestionError: Ingesting ``corpus_dir`` fails.
+        StorageError: The throwaway index fails to write.
+    """
+    indexer = Indexer(
+        store,
+        FileLoader(allowed_base_dir=corpus_dir),
+        chunking_config=EVAL_CHUNKING_CONFIG,
+        embedder=settings.embedder,
+        vector_store=settings.vector_store,
+    )
+    await indexer.index_directory(str(corpus_dir))
+
+    # Opened AFTER ingestion completes: a Retriever snapshots the store at
+    # open() and never refreshes it (ADR-0002). One retriever serves every
+    # stage — nothing writes between stages, so the snapshot stays valid,
+    # and sharing it keeps the stages comparing retrieval strategy rather
+    # than index state.
+    retriever = await Retriever.open(
+        store,
+        settings.retrieval_config,
+        embedder=settings.embedder,
+        vector_store=settings.vector_store,
+    )
+
+    all_chunks = await store.get_chunks()
+    sources = await store.get_document_sources()
+
+    # Document.source is always an absolute realpath — never corpus-relative
+    # (ingestion/loaders.py). Map every document back to a corpus-relative,
+    # forward-slashed path exactly once here, via Path.relative_to, so the
+    # artifact stays identical across machines and checkout locations.
+    document_id_to_relpath = {
+        document_id: Path(source).relative_to(prepared.corpus_root).as_posix()
+        for document_id, source in sources.items()
+    }
+    relpath_to_document_id = {
+        relpath: document_id for document_id, relpath in document_id_to_relpath.items()
+    }
+
+    chunks_by_document: dict[str, list[Chunk]] = defaultdict(list)
+    for chunk in all_chunks:
+        chunks_by_document[chunk.document_id].append(chunk)
+
+    # Ground truth is a property of the corpus and the judgments, not of any
+    # retrieval strategy, so it is resolved once here and reused by every
+    # stage. Recomputing it per stage would be wasted work and, worse, a
+    # place for two stages to disagree about what "relevant" meant.
+    gold_by_query: dict[str, _JudgmentGold] = {
+        judgment.query_id: _build_gold(
+            judgment,
+            prepared.resolved_spans[judgment.query_id],
+            chunks_by_document=chunks_by_document,
+            relpath_to_document_id=relpath_to_document_id,
+        )
+        for judgment in prepared.judgments
+    }
+
+    return _IndexedCorpus(
+        retriever=retriever,
+        document_count=len(sources),
+        chunk_count=len(all_chunks),
+        document_id_to_relpath=document_id_to_relpath,
+        gold_by_query=gold_by_query,
+    )
+
+
+async def _score_stages(
+    judgments: Sequence[Judgment],
+    indexed: _IndexedCorpus,
+    settings: _RunSettings,
+    *,
+    capture_synthesis_inputs: bool,
+) -> _ScoredStages:
+    """Replay the judgment set through every planned stage, in plan order.
+
+    Every stage scores the same judgments against the same index and the
+    same retriever, so the stages differ only in retrieval strategy — which
+    is what makes their deltas
+    (:func:`~groundkit.evals.delta.derive_stage_deltas`) measure that alone.
+    Nothing is filtered here: a stage that loses to the baseline is reported
+    with the numbers it earned (SPEC.md §6).
+
+    Args:
+        judgments: The judgment set, in file order.
+        indexed: The open retriever and the ground truth resolved against
+            the same index.
+        settings: The run's settings, for the stage plan and the retrieval
+            knobs each stage is scored at.
+        capture_synthesis_inputs: Whether to keep the last planned stage's
+            raw results for the synthesis pass. Captured *during* that
+            stage's own scoring pass rather than re-retrieved afterwards —
+            re-fetching would run every query through the retriever, and on
+            a dense or hybrid stage through the embedding provider, twice.
+
+    Returns:
+        The run's :class:`_ScoredStages`.
+
+    Raises:
+        EvalError: A retrieved hit's document has no corpus-relative path,
+            or a stage has no answerable judgment to aggregate over.
+        RerankerNotConfiguredError: The reranker cannot load its model.
+        RetrievalError: A search or a rerank call failed.
+    """
+    stages: list[StageResult] = []
+    synthesis_inputs: list[tuple[str, list[RetrievalResult]]] = []
+    for plan in settings.planned:
+        is_synthesis_input = capture_synthesis_inputs and plan is settings.planned[-1]
+        query_results: list[QueryResult] = []
+        for judgment in judgments:
+            query_result, raw_results = await _evaluate_judgment(
+                judgment,
+                indexed.gold_by_query[judgment.query_id],
+                retriever=indexed.retriever,
+                top_k=settings.top_k,
+                mode=plan.mode,
+                document_id_to_relpath=indexed.document_id_to_relpath,
+                reranker=settings.reranker if plan.reranks else None,
+                rerank_candidates=settings.rerank_candidates,
             )
-            await indexer.index_directory(str(corpus_dir))
-
-            # Opened AFTER ingestion completes: a Retriever snapshots the
-            # store at open() and never refreshes it (ADR-0002). One
-            # retriever serves every stage — nothing writes between stages,
-            # so the snapshot stays valid, and sharing it keeps the stages
-            # comparing retrieval strategy rather than index state.
-            retriever = await Retriever.open(
-                store, retrieval_config, embedder=embedder, vector_store=vector_store
+            query_results.append(query_result)
+            if is_synthesis_input:
+                synthesis_inputs.append((judgment.query, raw_results))
+        stages.append(
+            _build_stage_result(
+                query_results,
+                stage=plan.stage,
+                is_baseline=not stages,
             )
+        )
+    return _ScoredStages(stages=stages, synthesis_inputs=synthesis_inputs)
 
-            all_chunks = await store.get_chunks()
-            sources = await store.get_document_sources()
-            document_count = len(sources)
-            chunk_count = len(all_chunks)
 
-            # Document.source is always an absolute realpath — never
-            # corpus-relative (ingestion/loaders.py). Map every document
-            # back to a corpus-relative, forward-slashed path exactly once
-            # here, via Path.relative_to, so the artifact stays identical
-            # across machines and checkout locations.
-            document_id_to_relpath = {
-                document_id: Path(source).relative_to(corpus_root).as_posix()
-                for document_id, source in sources.items()
-            }
-            relpath_to_document_id = {
-                relpath: document_id for document_id, relpath in document_id_to_relpath.items()
-            }
+def _build_report(
+    stages: list[StageResult],
+    *,
+    synthesis: SynthesisReport | None,
+    started_at: str,
+    prepared: _CorpusPreparation,
+    document_count: int,
+    chunk_count: int,
+    settings: _RunSettings,
+) -> EvalReport:
+    """Assemble the run's artifact from what the stages actually produced.
 
-            chunks_by_document: dict[str, list[Chunk]] = defaultdict(list)
-            for chunk in all_chunks:
-                chunks_by_document[chunk.document_id].append(chunk)
+    Args:
+        stages: The scored stages, baseline first.
+        synthesis: The synthesis pass's report, or ``None`` when no chat
+            provider was supplied.
+        started_at: ISO-8601 timestamp taken before any corpus work.
+        prepared: The corpus preparation, for the two input hashes and the
+            judgment count.
+        document_count: Documents actually persisted by this run.
+        chunk_count: Chunks actually persisted by this run.
+        settings: The run's settings, recorded into
+            :class:`~groundkit.evals.schema.RunConfig`.
 
-            # Ground truth is a property of the corpus and the judgments,
-            # not of any retrieval strategy, so it is resolved once here and
-            # reused by every stage. Recomputing it per stage would be
-            # wasted work and, worse, a place for two stages to disagree
-            # about what "relevant" meant.
-            gold_by_query: dict[str, _JudgmentGold] = {
-                judgment.query_id: _build_gold(
-                    judgment,
-                    resolved_spans[judgment.query_id],
-                    chunks_by_document=chunks_by_document,
-                    relpath_to_document_id=relpath_to_document_id,
-                )
-                for judgment in judgments
-            }
-
-            stages: list[StageResult] = []
-            # Captured while scoring the stage synthesis will run over, rather
-            # than re-retrieved afterwards. `planned[-1]` is that stage (see
-            # the synthesis block below), and its scoring pass already performs
-            # exactly the retrieval synthesis needs.
-            synthesis_inputs: list[tuple[str, list[RetrievalResult]]] = []
-            capture_for_synthesis = chat is not None
-            for plan in planned:
-                is_synthesis_input = capture_for_synthesis and plan is planned[-1]
-                query_results: list[QueryResult] = []
-                for judgment in judgments:
-                    query_result, raw_results = await _evaluate_judgment(
-                        judgment,
-                        gold_by_query[judgment.query_id],
-                        retriever=retriever,
-                        top_k=top_k,
-                        mode=plan.mode,
-                        document_id_to_relpath=document_id_to_relpath,
-                        reranker=reranker if plan.reranks else None,
-                        rerank_candidates=rerank_candidates,
-                    )
-                    query_results.append(query_result)
-                    if is_synthesis_input:
-                        synthesis_inputs.append((judgment.query, raw_results))
-                stages.append(
-                    _build_stage_result(
-                        query_results,
-                        stage=plan.stage,
-                        is_baseline=not stages,
-                    )
-                )
-
-            synthesis_report: SynthesisReport | None = None
-            if chat is not None:
-                # The best stage this run actually produced — the same
-                # "best upstream" the rerank stage itself reorders
-                # (_planned_stages): `planned[-1]` is `rerank` if a reranker
-                # was supplied, else `fusion` with a dense pair, else the
-                # `bm25` baseline. It shares the one index and one retriever
-                # every stage above already shares — never a second ingest of
-                # the same corpus, and since `synthesis_inputs` was captured
-                # during that stage's own scoring pass, never a second
-                # *retrieval* either. Re-fetching here was the earlier shape:
-                # correct, but it ran every query through the retriever twice
-                # and, on a dense or hybrid stage, through the embedding
-                # provider twice.
-                synthesis_input = planned[-1]
-                synthesis_report = await run_synthesis_eval(
-                    synthesis_inputs,
-                    chat=chat,
-                    input_stage=synthesis_input.stage,
-                    judge=judge,
-                    synthesis_prompt_template=synthesis_prompt_template,
-                )
-        finally:
-            # Purge BEFORE closing: the document set lives in the store, and
-            # the store is about to go away with the temp directory.
-            if vector_store is not None:
-                await _purge_eval_vectors(vector_store, store)
-            # Must close before the TemporaryDirectory context exits: on
-            # Windows the sqlite file cannot be deleted while a handle to it
-            # is still open.
-            await store.close()
+    Returns:
+        The assembled :class:`~groundkit.evals.schema.EvalReport`.
+    """
+    embedding = identity_of(settings.embedder) if settings.embedder is not None else None
+    # Recorded only when a fusion stage actually ran: on a BM25-only run the
+    # constant was never applied to anything, and stamping the configured
+    # value into the artifact anyway would describe a computation that did
+    # not happen.
+    rrf_k = settings.retrieval_config.rrf_k if settings.embedder is not None else None
+    # This and the other two rerank fields key off the same condition, which
+    # RunConfig's validator then re-checks: a rerank record that is half
+    # present is the silently-incomparable artifact ADR-0012 forbids.
+    rerank_candidates = settings.rerank_candidates if settings.reranker is not None else None
 
     run_metadata = RunMetadata(
         started_at=started_at,
         groundkit_version=__version__,
-        corpus_hash=corpus_hash,
-        judgments_hash=judgments_hash,
+        corpus_hash=prepared.corpus_hash,
+        judgments_hash=prepared.judgments_hash,
         document_count=document_count,
         chunk_count=chunk_count,
-        judgment_count=len(judgments),
+        judgment_count=len(prepared.judgments),
         config=RunConfig(
             chunk_size=EVAL_CHUNKING_CONFIG.chunk_size,
             chunk_overlap=EVAL_CHUNKING_CONFIG.chunk_overlap,
-            top_k=top_k,
-            bm25_k1=retrieval_config.bm25_k1,
-            bm25_b=retrieval_config.bm25_b,
-            score_threshold=retrieval_config.score_threshold,
-            embedding=identity_of(embedder) if embedder is not None else None,
-            # Recorded only when a fusion stage actually ran: on a BM25-only
-            # run the constant was never applied to anything, and stamping
-            # the configured value into the artifact anyway would describe a
-            # computation that did not happen.
-            rrf_k=retrieval_config.rrf_k if embedder is not None else None,
-            # All three keyed off the same condition, which RunConfig's
-            # validator then re-checks: a rerank record that is half present
-            # is the silently-incomparable artifact ADR-0012 forbids.
-            rerank_input=rerank_input,
-            rerank_candidates=rerank_candidates if reranker is not None else None,
-            rerank_model=rerank_model,
+            top_k=settings.top_k,
+            bm25_k1=settings.retrieval_config.bm25_k1,
+            bm25_b=settings.retrieval_config.bm25_b,
+            score_threshold=settings.retrieval_config.score_threshold,
+            embedding=embedding,
+            rrf_k=rrf_k,
+            rerank_input=settings.rerank_input,
+            rerank_candidates=rerank_candidates,
+            rerank_model=settings.rerank_model,
         ),
     )
     logger.info(
         "Eval run complete: %d stages, %d judgments, %d documents, %d chunks",
         len(stages),
-        len(judgments),
+        len(prepared.judgments),
         document_count,
         chunk_count,
     )
-    return EvalReport(run=run_metadata, stages=stages, synthesis=synthesis_report)
+    return EvalReport(run=run_metadata, stages=stages, synthesis=synthesis)
 
 
 def _planned_stages(

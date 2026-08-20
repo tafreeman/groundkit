@@ -161,6 +161,7 @@ nav:
       - "ADR-0023 — Snapshot lifecycle is bound to the document row": adr/ADR-0023-snapshot-lifecycle-is-bound-to-the-document-row.md
       - "ADR-0024 — Host header validation on both transports": adr/ADR-0024-host-header-validation-on-both-transports.md
       - "ADR-0025 — Library constructors default Host validation on": adr/ADR-0025-library-constructors-default-host-validation-on.md
+      - "ADR-0026 — Measure the rebuild cliff before rebuilding incrementally": adr/ADR-0026-measure-the-rebuild-cliff-before-rebuilding-incrementally.md
   - Project:
       - Security: security.md
       - Known limitations: limitations.md

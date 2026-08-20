@@ -18,11 +18,12 @@ from pathlib import Path
 
 import pytest
 
-from groundkit.contracts import Chunk, CollectionManifest, EmbeddingIdentity
+from groundkit.contracts import Chunk, EmbeddingIdentity
 from groundkit.errors import ConfigurationError, StorageError
 from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.providers.embeddings import InMemoryEmbedder
 from groundkit.runtime import AcquiredRetriever, CollectionRegistry, CollectionRuntime
+from metadata_store_doubles import DelegatingMetadataStore
 
 
 def _chunk(chunk_id: str, document_id: str, content: str) -> Chunk:
@@ -51,22 +52,28 @@ async def _write(index_dir: Path, collection: str, source: str, doc_id: str, tex
         await store.close()
 
 
-class _CountingStore:
+class _CountingStore(DelegatingMetadataStore):
     """Delegating store wrapper that counts rebuilds and can stall one.
 
     Counts ``get_chunks`` because that is what ``BM25Index.from_store`` calls:
     one call per rebuild, so the count is the rebuild count.
+
+    Only that one member is written here. Every other store member — including
+    the keyed ``get_document_record`` and the ``COUNT(*)`` aggregates
+    ``CollectionRuntime`` reaches for — is inherited from the shared
+    :class:`~metadata_store_doubles.DelegatingMetadataStore`, so this double
+    stopped needing an edit per protocol widening (GK-019). It previously
+    hand-wrote fourteen forwarders and, because it was written before those
+    members existed, silently lacked them: a test that drove
+    ``runtime.chunk_count()`` through this wrapper would have died on
+    ``AttributeError``.
     """
 
     def __init__(self, inner: SQLiteMetadataStore) -> None:
-        self._inner = inner
+        super().__init__(inner)
         self.get_chunks_calls = 0
         self.gate: asyncio.Event | None = None
         self.entered: asyncio.Event | None = None
-
-    @property
-    def db_path(self) -> Path:
-        return self._inner.db_path
 
     async def get_chunks(self) -> list[Chunk]:
         """Read first, *then* stall.
@@ -86,47 +93,6 @@ class _CountingStore:
         if self.gate is not None:
             await self.gate.wait()
         return chunks
-
-    async def upsert_document(self, source: str, document_id: str, content_hash: str) -> None:
-        await self._inner.upsert_document(source, document_id, content_hash)
-
-    async def get_document_hash(self, source: str) -> str | None:
-        return await self._inner.get_document_hash(source)
-
-    async def get_document_id(self, source: str) -> str | None:
-        return await self._inner.get_document_id(source)
-
-    async def get_document_sources(self) -> dict[str, str]:
-        return await self._inner.get_document_sources()
-
-    async def add_chunks(self, chunks: list[Chunk], source: str) -> None:
-        await self._inner.add_chunks(chunks, source)
-
-    async def replace_document(
-        self, source: str, document_id: str, content_hash: str, chunks: list[Chunk]
-    ) -> None:
-        await self._inner.replace_document(source, document_id, content_hash, chunks)
-
-    async def get_chunk(self, chunk_id: str) -> Chunk | None:
-        return await self._inner.get_chunk(chunk_id)
-
-    async def delete_document(self, document_id: str) -> int:
-        return await self._inner.delete_document(document_id)
-
-    async def write_manifest(self, identity: EmbeddingIdentity) -> None:
-        await self._inner.write_manifest(identity)
-
-    async def verify_manifest(self, identity: EmbeddingIdentity) -> CollectionManifest | None:
-        return await self._inner.verify_manifest(identity)
-
-    async def get_manifest(self) -> CollectionManifest | None:
-        return await self._inner.get_manifest()
-
-    async def get_generation(self) -> int | None:
-        return await self._inner.get_generation()
-
-    async def close(self) -> None:
-        await self._inner.close()
 
 
 def test_cached_retriever_observes_an_out_of_process_ingest(tmp_path: Path) -> None:
@@ -559,6 +525,148 @@ def test_chunk_count_does_not_read_chunk_content(tmp_path: Path) -> None:
             assert not re.search(r"content", executed), (
                 f"chunk_count read chunk content: {statements!r}"
             )
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+
+
+# -- Rebuild observability (ADR-0026, GK-020) ------------------------------
+#
+# GK-020's claim is that the cache stops working during an ingest: the
+# generation bumps once per document (ADR-0013 decision 1), every bump fails
+# the equality predicate, so an ingest over N documents costs N rebuilds and
+# the hit rate goes to zero for its duration. Before these counters existed
+# that claim was unfalsifiable from outside the process -- the only symptom
+# was latency, which has many other causes.
+#
+# On the SPEC.md §8 fail-first procedure, honestly: reverting
+# `src/groundkit/runtime.py` does make all three fail, but it fails them by
+# *absence* (`rebuild_stats` is gone), which is the weakest form of red and
+# proves only that something was added. So each test below additionally pins
+# the specific arithmetic that makes a counter mean what `index_status` says
+# it means, and each docstring names the plausible wrong implementation it
+# rejects -- a lone `rebuilds` counter, a counter incremented at publication,
+# a handler that reads the meter by moving it. Those are the versions that
+# would ship green.
+
+
+def test_rebuild_counters_count_acquires_and_rebuilds_separately(tmp_path: Path) -> None:
+    """A rebuild count with no denominator cannot express a hit rate.
+
+    Rejects the obvious under-specified version of this feature: a lone
+    ``rebuilds`` counter. Two acquires over an unchanged store are one rebuild
+    and one hit, and only the pair of numbers says so -- ``rebuilds == 1``
+    alone is equally consistent with a runtime that served one request and
+    with one that served a thousand.
+
+    Also pins the total against the single rebuild that produced it, which is
+    a structural identity rather than a timing assertion: after exactly one
+    rebuild the cumulative total *is* that rebuild's duration.
+    """
+
+    async def run() -> None:
+        await _write(tmp_path, "col", "/a.md", "doc-a", "alpha")
+        inner = await SQLiteMetadataStore.open(tmp_path, "col")
+        counting = _CountingStore(inner)
+        runtime = CollectionRuntime(counting)  # type: ignore[arg-type]
+        try:
+            first = await runtime.acquire()
+            second = await runtime.acquire()
+            assert first is second, "precondition: the second acquire must be a cache hit"
+
+            stats = runtime.rebuild_stats()
+            assert stats.acquires == 2
+            assert stats.rebuilds == 1
+            assert stats.rebuilds == counting.get_chunks_calls, (
+                "the counter disagrees with the rebuilds the store actually saw"
+            )
+            assert stats.last_rebuild_seconds is not None
+            assert stats.rebuild_seconds_total == pytest.approx(stats.last_rebuild_seconds)
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+
+
+def test_the_counters_report_the_per_document_invalidation_cliff(tmp_path: Path) -> None:
+    """THE measurement GK-020 asks for: every acquire during an ingest rebuilds.
+
+    An ingest is modelled the way it actually reaches a running service -- one
+    commit per document, from a *separate* store handle, exactly as an
+    out-of-process ``grk ingest`` does. A request between each commit sees a
+    generation it has never observed, so it rebuilds; the derived hit fraction
+    over that window is zero, and it returns to non-zero only once the writes
+    stop.
+
+    The independent check is what gives this test teeth: the counter is
+    asserted against ``get_chunks_calls``, the rebuild count observed at the
+    store rather than reported by the object under test. A counter incremented
+    in the wrong place -- per acquire, per published artifact, once per
+    generation-change instead of once per rebuild -- passes every assertion
+    about itself and fails this one.
+    """
+
+    documents_ingested = 3
+
+    async def run() -> None:
+        await _write(tmp_path, "col", "/a.md", "doc-a", "alpha")
+        inner = await SQLiteMetadataStore.open(tmp_path, "col")
+        counting = _CountingStore(inner)
+        runtime = CollectionRuntime(counting)  # type: ignore[arg-type]
+        try:
+            await runtime.acquire()  # cold: one rebuild
+            for n in range(documents_ingested):
+                await _write(tmp_path, "col", f"/w{n}.md", f"doc-w{n}", f"body {n}")
+                await runtime.acquire()  # each one invalidated by its own commit
+            await runtime.acquire()  # the ingest stopped; this one hits
+
+            stats = runtime.rebuild_stats()
+            assert stats.acquires == documents_ingested + 2
+            assert stats.rebuilds == documents_ingested + 1
+            assert stats.rebuilds == counting.get_chunks_calls
+
+            # The reader derives the ratio; nothing stores it (ADR-0026).
+            hit_fraction = 1 - stats.rebuilds / stats.acquires
+            assert hit_fraction < 0.5, (
+                "an ingest of N documents must show as N invalidations, not one"
+            )
+        finally:
+            await runtime.aclose()
+
+    asyncio.run(run())
+
+
+def test_a_failed_rebuild_is_still_charged_to_the_counters(tmp_path: Path) -> None:
+    """A rebuild that raises held the lock and blocked waiters; it is not free.
+
+    Rejects the natural implementation -- increment and stop the clock next to
+    the ``self._cached`` assignment, where the artifact is published. That
+    version reports a runtime whose every rebuild fails as one that never
+    rebuilds at all: total zero, count zero, hit rate a perfect 1.0, while it
+    is in fact doing an O(corpus) read and taking the rebuild lock on every
+    single request. The cost is at its highest exactly where that version
+    reports none.
+    """
+
+    class _Exploding(_CountingStore):
+        async def get_chunks(self) -> list[Chunk]:
+            raise StorageError("simulated backend failure")
+
+    async def run() -> None:
+        await _write(tmp_path, "col", "/a.md", "doc-a", "alpha")
+        inner = await SQLiteMetadataStore.open(tmp_path, "col")
+        store = _Exploding(inner)
+        runtime = CollectionRuntime(store)  # type: ignore[arg-type]
+        try:
+            for _ in range(2):
+                with pytest.raises(StorageError, match="simulated"):
+                    await runtime.acquire()
+
+            stats = runtime.rebuild_stats()
+            assert stats.acquires == 2
+            assert stats.rebuilds == 2, "a failed rebuild was not counted"
+            assert stats.last_rebuild_seconds is not None, "a failed rebuild was not timed"
         finally:
             await runtime.aclose()
 

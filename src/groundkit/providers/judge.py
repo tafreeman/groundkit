@@ -8,22 +8,31 @@ schema-pinned :class:`FaithfulnessVerdict` before returning it. The chat call
 is injected via :class:`~groundkit.providers.protocols.ChatProtocol`, so unit
 tests exercise this module with a scripted fake and never touch the network.
 
-This module is intentionally not a leaf (:mod:`groundkit.evals.metrics` is
-the leaf in this package) but it does not import
-:mod:`groundkit.evals.runner` or :mod:`groundkit.evals.schema` either — it
-takes and returns plain strings and a verdict model, never a
-:class:`~groundkit.evals.schema.EvalReport` or anything the runner produces.
-Mapping a synthesized answer and its retrieved sources into the plain
-``str`` arguments this module expects, and folding a verdict into an eval
-artifact, are both jobs for a caller one layer up, not for this module —
-keeping the dependency shape acyclic.
+## Why this lives in ``providers``, not ``evals``
 
-This module is also deliberately decoupled from ``groundkit.providers.llm``
-and ``groundkit.providers.synthesis``: it never imports either. Judging
-faithfulness only needs a query, an answer, and source texts as strings; a
-harness adapter (built alongside this module, not in it) is responsible for
-extracting those strings out of whatever synthesis type the rest of the
-codebase uses.
+This is a :class:`~groundkit.providers.protocols.ChatProtocol` consumer,
+exactly like :mod:`groundkit.providers.synthesis` and
+:mod:`groundkit.providers.query_rewrite`, and it sits beside them. It began
+in ``groundkit.evals`` because the eval harness needed it first, but
+:mod:`groundkit.answer` — a runtime module on the ``grk answer`` path,
+nothing to do with the harness — composes it too. A production module
+importing the eval package makes ``evals`` undroppable from a runtime
+install and would make this module the one special case in
+``tests/test_deterministic_core.py``'s "no runtime module imports
+``groundkit.evals``" scan; needing that exemption is the signal it was on
+the wrong side of the line, so it moved rather than being exempted.
+
+The import direction is now one-way and this module is at the far end of
+it: it imports **nothing** from :mod:`groundkit.evals` and nothing from
+:mod:`groundkit.providers.llm` or :mod:`groundkit.providers.synthesis`
+either. It takes and returns plain strings and a verdict model, never an
+:class:`~groundkit.evals.schema.EvalReport`, a
+:class:`~groundkit.providers.synthesis.SynthesizedAnswer`, or anything the
+eval runner produces. Mapping a synthesized answer and its retrieved
+sources into the plain ``str`` arguments this module expects, and folding a
+verdict into an eval artifact, are both jobs for a caller one layer up
+(:mod:`groundkit.answer`, :mod:`groundkit.evals.synthesis_eval`) — never
+for this module.
 
 **ADVISORY ONLY.** :class:`FaithfulnessJudge` returns a
 :class:`FaithfulnessVerdict` or raises :class:`~groundkit.errors.JudgeError`.

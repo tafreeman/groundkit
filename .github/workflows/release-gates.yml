@@ -130,6 +130,10 @@ jobs:
       - name: Docs strict build
         run: uv run mkdocs build --strict
 
+      # requirements-audit.txt is generated here and gitignored, never
+      # committed — same reasoning as ci.yml's `audit` job: the export is the
+      # only copy pip-audit reads, so a tracked one would be an unread second
+      # rendering of uv.lock, free to drift (GK-028).
       - name: Supply-chain audit
         run: |
           uv export --no-emit-project --group dev --format requirements.txt -o requirements-audit.txt

@@ -258,6 +258,10 @@ jobs:
         with:
           python-version: "3.11"
       - run: uv sync --locked --group dev
+      # requirements-audit.txt is generated here and gitignored, never
+      # committed: this export is the only copy pip-audit ever reads, so a
+      # tracked one would be a second rendering of uv.lock that nothing
+      # checks and nothing notices drifting (GK-028).
       - run: uv export --no-emit-project --group dev --format requirements.txt -o requirements-audit.txt
       - run: uv run pip-audit -r requirements-audit.txt --disable-pip
 

@@ -510,7 +510,7 @@ class SynthesisReport(BaseModel):
         judge_error_count: Judge calls that raised
             :class:`~groundkit.errors.JudgeError` (malformed verdict JSON),
             or ``None``. **Advisory only** — see
-            :mod:`groundkit.evals.judge`'s module docstring: nothing here
+            :mod:`groundkit.providers.judge`'s module docstring: nothing here
             gates on any of these three tallies.
     """
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,6 @@ from groundkit.contracts import Chunk, Document, RetrievalResult
 from groundkit.errors import ChatError, ConfigurationError, EvalError, GroundkitError
 from groundkit.evals import runner as runner_module
 from groundkit.evals.delta import derive_stage_deltas
-from groundkit.evals.judge import FaithfulnessJudge
 from groundkit.evals.runner import (
     EVAL_CHUNKING_CONFIG,
     MIN_EVAL_TOP_K,
@@ -34,6 +34,7 @@ from groundkit.index.dense import InMemoryVectorStore
 from groundkit.index.protocols import VectorStoreProtocol
 from groundkit.ingestion.chunking import RecursiveChunker
 from groundkit.providers.embeddings import InMemoryEmbedder
+from groundkit.providers.judge import FaithfulnessJudge
 from groundkit.providers.protocols import ChatProtocol
 from groundkit.retrieval.search import MAX_TOP_K
 
@@ -359,6 +360,68 @@ class TestCorpusHash:
         second = asyncio.run(run())
 
         assert first.run.corpus_hash == second.run.corpus_hash
+
+
+class TestHashReadsRunOffTheEventLoop:
+    """Both run-metadata hash reads are dispatched, not just the corpus one.
+
+    ``run_eval`` computes ``corpus_hash`` through ``asyncio.to_thread`` and
+    then computed ``judgments_hash`` inline, one statement later, under a
+    comment that said "both reads" -- true of the ``OSError`` handling it was
+    written about and false of the dispatch. A judgment set is a whole file
+    read and hashed on the event loop.
+
+    Asserts thread identity, not timing, matching this repo's other
+    off-the-loop tests (``tests/test_retrieval.py``,
+    ``tests/test_dense.py``): ``asyncio.to_thread`` always dispatches to an
+    executor worker and an inline call always reports the loop's own thread,
+    so nothing here can flake.
+
+    ``Path.read_bytes`` is the hook because it is the innermost primitive
+    both reads share and it exists identically before and after the fix. It
+    has exactly two call sites in ``src/groundkit`` -- this hash and
+    ``_hash_corpus`` -- so the recorded reads are unambiguous.
+    """
+
+    def test_judgments_hash_read_does_not_run_on_the_event_loop(
+        self, corpus: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reads: list[tuple[Path, int]] = []
+        original = Path.read_bytes
+
+        def _recording_read_bytes(self: Path) -> bytes:
+            reads.append((Path(self), threading.get_ident()))
+            return original(self)
+
+        monkeypatch.setattr(Path, "read_bytes", _recording_read_bytes)
+
+        judgments_path = tmp_path / "judgments.jsonl"
+        _write_judgments(judgments_path, [_QUOKKA_JUDGMENT])
+
+        async def run() -> None:
+            loop_thread = threading.get_ident()
+            await run_eval(corpus, judgments_path)
+
+            judgments_reads = [ident for path, ident in reads if path.name == judgments_path.name]
+            assert judgments_reads, (
+                "the judgments file was never read via read_bytes; recorded reads: "
+                f"{[str(path) for path, _ident in reads]}"
+            )
+            offenders = [ident for ident in judgments_reads if ident == loop_thread]
+            assert not offenders, (
+                f"the judgments hash read ran on the event loop thread ({loop_thread}) "
+                f"for {len(offenders)} of {len(judgments_reads)} read(s)"
+            )
+
+            # The symmetry the comment above the two reads claims, stated as
+            # something checkable: no read_bytes anywhere on this path runs on
+            # the loop, corpus documents included. The corpus half already
+            # held; asserting it here is what makes "both" a property rather
+            # than a comment.
+            all_offenders = [str(path) for path, ident in reads if ident == loop_thread]
+            assert not all_offenders, f"read_bytes ran on the loop thread for: {all_offenders}"
+
+        asyncio.run(run())
 
 
 class TestEvalChunkingConfigPinned:

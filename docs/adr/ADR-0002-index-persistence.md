@@ -40,6 +40,52 @@ revisit the BM25 library choice (ADR-0001) or the dense store (Phase 3).
    that can drift out of sync with SQLite the way `memory.py`'s in-process
    `_key_map` drifted from its backing store.
 
+   **ERRATUM: "the postings, document frequencies, and length statistics"
+   named three structures, and until GK-018 (2026-08-19) only two of them
+   existed.** `BM25Index` held `_doc_freqs` (the document-frequency counter
+   IDF reads) and `_doc_lengths`/`_avg_doc_length` (the length statistics),
+   and no `term → [chunk index]` map at all — the one structure the word
+   *postings* actually names, and the one an inverted index exists for. The
+   class docstring claimed the inverted index too. Nothing was wrong with the
+   sentence's *claim* — whatever postings exist are a pure function of the
+   persisted chunk set, which is why building them now needs no migration and
+   no format — it was wrong about the tree, in the same way this repo's other
+   erratum (ADR-0022 decision 5, a method named that never existed) was: an
+   accepted ADR describing code that is not there. The consequence was not
+   cosmetic. `search` scored **every** indexed chunk for every query, so
+   query cost was a function of corpus size rather than of query
+   selectivity, and a one-term query against a large collection did the same
+   work as a query matching everything.
+
+   `index_chunks` now appends each chunk's index to the postings list of
+   every term it holds, from the same first-sighting branch that increments
+   `_doc_freqs`, and `search` walks the union of the query terms' postings
+   instead of `range(len(self._chunks))`. Three properties make this an
+   erratum against decision 2 rather than a new decision needing its own ADR:
+
+   - **It is score-identical, not an approximation.** A chunk holding no
+     query term skips every term inside `_score_document`, scores exactly
+     `0.0`, and was already dropped by the existing `score > 0.0` filter.
+     Narrowing the walk removes work, never a result — including the
+     low-scoring-but-nonzero tail, which is precisely what an approximate
+     candidate-generation scheme (a score cutoff, a top-N-per-term cap)
+     *would* have dropped. That is why none was taken.
+   - **The candidate union is walked in ascending chunk index**, so the
+     stable sort behind the `content_hash` tie-break still falls back to
+     insertion order for two byte-identical chunks — the one tie no
+     content-derived key can resolve (`KNOWN_LIMITATIONS.md`). Iterating the
+     union as a set would have handed that fallback to set layout, which is
+     the one way this change could have altered output while every
+     score-equality assertion still passed.
+   - **Nothing is persisted and nothing shadows SQLite.** The postings map is
+     built in memory by `index_chunks`, from the chunks `from_store` read out
+     of SQLite, and dies with the instance. Decision 2's invariant is
+     untouched, and so is the *alternative* below: **the O(corpus)
+     rebuild-at-open cost is unchanged**, and "persisted BM25 postings tables
+     in SQLite" is still deferred with its measurement trigger unmet. This
+     erratum changes what a *query* costs, not what an *open* costs; reading
+     it as having taken that alternative would be exactly backwards.
+
 3. **Incremental re-ingest is content-hash gated.** `upsert_document` records
    a `content_hash` per `source`; the ingestion pipeline (outside this
    module's scope) calls `get_document_hash(source)` first and skips

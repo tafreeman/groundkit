@@ -276,6 +276,55 @@ precision = 2
 #    module still decides nothing about the response — only what gets shipped
 #    to a collector alongside it. It is covered by the whole-package 80% gate
 #    instead, the same treatment `service/` gets for the same reason.
+#
+# 5. `extraction.py` (ADR-0016 Wave 3) is IN, added explicitly on note 3's
+#    precedent — a package-root module no glob catches. It passes note 3's
+#    test (does the module decide whether an answer is CORRECT) in the
+#    direction that puts it in, and more directly than `runtime.py` does:
+#    `resolve_citation`'s `extracted` branch re-derives a citation's text by
+#    calling `active_extractors()` and running the recorded extractor over
+#    the source file again, and the verdict — verified, drifted,
+#    unresolvable — is then decided entirely by whether the string this
+#    module returns still matches the indexed span. An extractor whose output
+#    quietly moved would raise nowhere; it would report drift against
+#    unchanged bytes, or agree with an index built by its own older behavior
+#    and call a moved span verified.
+#
+#    Note 1's shape repeats exactly. `retrieval/citations.py` — the
+#    comparison — is already gated by the glob above, so leaving
+#    `extraction.py` out gated the comparison but not the text being
+#    compared, the same way leaving `dense.py` out gated the combiner but not
+#    one of its two inputs.
+#
+#    The honest cost, recorded the way note 1 records its own: both extractor
+#    bodies are reachable only with the optional `pdf` and `html` extras
+#    installed, so it is the dev group's `pypdf` and `beautifulsoup4` pins
+#    that make CI measure the extraction itself rather than measure
+#    `active_extractors()` skipping over both. Drop either pin and this entry
+#    would still gate a registry loop and two guarded imports at a
+#    comfortable percentage while the extraction that decides the verdict
+#    went unmeasured — and the gate would not say so. That is the same
+#    convention-not-invariant caveat note 1 records for `lancedb`, and the
+#    contrast is `rerank`, deliberately not mirrored into the dev group,
+#    which is why `retrieval/rerank.py`'s model-calling half is proved by a
+#    gated suite instead of by this floor.
+#
+# 6. `snapshots.py` (ADR-0016 Wave 4) stays OUT. It is the other package-root
+#    module that ADR-0016 added, so it is argued here rather than left to
+#    silence, but the case is not close: two one-expression functions of pure
+#    path arithmetic — `<index_dir>/<collection>.snapshots`, and that
+#    directory joined with a document id — with no I/O, no branch, and no
+#    failure mode of their own. It fails note 3's test in `telemetry.py`'s
+#    direction: it decides where a snapshot lives, never whether the text
+#    read from it matches what was indexed. Everything that does decide that
+#    — the containment check against `snapshot_dir`, the read, the slice, the
+#    comparison — lives in `retrieval/citations.py`'s `_resolve_snapshot`,
+#    which the glob above already gates. A floor over two expressions could
+#    only restate that gate, and the drift it would nominally guard against
+#    (the write side and the read side disagreeing on what a snapshot path
+#    means) is impossible by construction, since both sides call these same
+#    two functions — which is the entire reason the module exists.
+#    Whole-package gate, as with `telemetry.py`.
 [tool.groundkit.coverage]
 core_subset = [
   "src/groundkit/retrieval/*",            # search orchestration + citation resolution
@@ -283,4 +332,5 @@ core_subset = [
   "src/groundkit/index/bm25.py",          # lexical scoring
   "src/groundkit/index/dense.py",         # vector scoring (Wave F; see caveats above)
   "src/groundkit/runtime.py",             # collection lifecycle (ADR-0013; see note 3)
+  "src/groundkit/extraction.py",          # citation re-extraction (ADR-0016; see note 5)
 ]

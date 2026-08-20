@@ -44,7 +44,10 @@ module exists; spec §10.1).
 
 from __future__ import annotations
 
+import asyncio
+import errno
 import logging
+import os
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -67,6 +70,44 @@ logger = logging.getLogger(__name__)
 #: resource and a local file are bounded by the same default -- refused past
 #: it, never truncated.
 DEFAULT_MAX_BYTES: int = 10 * 1024 * 1024
+
+#: Total wall-clock bound on one fetch, in seconds -- connect, headers, and
+#: every body read together, not per operation. Mirrors
+#: ``EmbeddingConfig.timeout_seconds`` (``config.py``): same default, same
+#: strictly-positive invariant, spelled as a constructor argument because this
+#: loader takes no config object of its own (neither does ``FileLoader``).
+#:
+#: httpx's own ``timeout=`` is per operation, so a server that dribbles one
+#: byte just inside the read timeout holds the connection indefinitely without
+#: ever tripping it -- the bound the caller thought it set is not the bound it
+#: got. Only a wall-clock bound around the whole exchange closes that, which is
+#: why this is enforced with ``asyncio.timeout`` rather than handed to httpx.
+DEFAULT_TIMEOUT_SECONDS: float = 30.0
+
+#: ``os.O_NOFOLLOW`` where the platform defines it, ``0`` (a no-op in a flag
+#: mask) where it does not. Windows has no such flag, and CI runs Linux while
+#: this repo is developed on Windows, so the guard must degrade rather than
+#: raise ``AttributeError`` at import on the maintainer's own machine. The
+#: consequence is stated plainly rather than hidden: on Windows the snapshot
+#: write is exactly as racy as it was before, and the refusal below can only
+#: fire where the flag exists.
+_O_NOFOLLOW: int = getattr(os, "O_NOFOLLOW", 0)
+
+#: ``os.O_BINARY`` on Windows, ``0`` elsewhere. Required because ``os.open``
+#: leaves the descriptor in the C runtime's default (text) mode on Windows,
+#: which would translate ``\n`` on write *underneath* the text wrapper doing
+#: the same -- turning one newline into ``\r\r\n``. With this flag and
+#: ``newline=""`` the file is byte-for-byte ``content.encode("utf-8")`` on
+#: every platform, which is what this module's docstring already promises
+#: ("``content`` is the exact string also written to disk") and what the
+#: citation offsets are measured against.
+_O_BINARY: int = getattr(os, "O_BINARY", 0)
+
+#: Errnos a POSIX ``open(..., O_NOFOLLOW)`` reports when the final path
+#: component is a symbolic link. POSIX specifies ``ELOOP``; some BSDs have
+#: historically used ``EMLINK`` for this case alone, so both are treated as
+#: the refusal rather than as an unrelated I/O failure.
+_SYMLINK_ERRNOS: frozenset[int] = frozenset({errno.ELOOP, errno.EMLINK})
 
 #: Content-Type media types (the part before any ";" parameter) treated as
 #: HTML-shaped, triggering the identical tag-stripping step Wave 3's
@@ -202,6 +243,10 @@ class UrlLoader:
             they do not already exist.
         max_bytes: Maximum response body size in bytes; a larger response is
             refused rather than read partway and truncated.
+        timeout_seconds: Total wall-clock bound on one fetch (see
+            :data:`DEFAULT_TIMEOUT_SECONDS`). Must be greater than zero;
+            zero or negative is a :class:`ValueError` at construction rather
+            than a bound that silently means "immediately" or "never".
         client: Optional pre-built ``httpx.AsyncClient`` -- the seam tests
             replace with one wired to ``httpx.MockTransport``, the same
             pattern ``providers/embeddings.py`` already uses. When omitted, a
@@ -215,10 +260,14 @@ class UrlLoader:
         snapshot_dir: Path,
         *,
         max_bytes: int = DEFAULT_MAX_BYTES,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         client: httpx.AsyncClient | None = None,
     ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError(f"timeout_seconds must be > 0, got {timeout_seconds!r}")
         self._snapshot_dir = snapshot_dir.resolve()
         self._max_bytes = max_bytes
+        self._timeout_seconds = timeout_seconds
         self._client = client
 
     @property
@@ -257,10 +306,11 @@ class UrlLoader:
                 or the response is HTML-shaped and the ``html`` extra is not
                 installed (:func:`~groundkit.extraction.html_extractor`).
             IngestionError: The response is a redirect (3xx), an error status
-                (4xx/5xx), exceeds ``max_bytes``, cannot be decoded under its
+                (4xx/5xx), exceeds ``max_bytes``, took longer than
+                ``timeout_seconds`` in total, cannot be decoded under its
                 declared (or default UTF-8) charset, the transport itself
                 failed, or the resulting snapshot path would escape
-                ``snapshot_dir``.
+                ``snapshot_dir`` (or turned into a symlink after that check).
         """
         # Guard immediately before the request, not at construction -- this
         # loader has no fixed endpoint the way an embedder's base_url is
@@ -275,7 +325,19 @@ class UrlLoader:
             self._client if self._client is not None else httpx.AsyncClient(follow_redirects=False)
         )
         try:
-            body, content_type, charset = await self._fetch(client, source)
+            # A *total* bound, deliberately not httpx's per-operation
+            # `timeout=`: see DEFAULT_TIMEOUT_SECONDS. It covers the whole
+            # exchange -- connect, status, headers, and every body read --
+            # because the failure mode being closed is a server that stays
+            # just inside each per-operation deadline forever.
+            async with asyncio.timeout(self._timeout_seconds):
+                body, content_type, charset = await self._fetch(client, source)
+        except TimeoutError as exc:
+            raise IngestionError(
+                f"fetching {sanitize_url(source)!r} exceeded the total "
+                f"{self._timeout_seconds}-second request bound; abandoned rather "
+                "than left holding the connection"
+            ) from exc
         finally:
             if owns_client:
                 await client.aclose()
@@ -295,7 +357,12 @@ class UrlLoader:
             source_class="snapshot",
             metadata={"content_type": content_type} if content_type else {},
         )
-        self._write_snapshot(document.document_id, text)
+        # Dispatched rather than called inline: the snapshot is content-sized
+        # (up to ``max_bytes``), and every other content-sized read or write in
+        # this package already runs off the loop. Nothing else is scheduled on
+        # this loop today -- URL ingestion is CLI-only -- but this is exactly
+        # the code a service-side ingest tool would reuse verbatim.
+        await asyncio.to_thread(self._write_snapshot, document.document_id, text)
         return [document]
 
     async def _fetch(
@@ -372,17 +439,28 @@ class UrlLoader:
         for a real snapshot), extracted, and the scratch file is always
         removed regardless of outcome.
 
+        That scratch write is content-sized and so is dispatched to a worker
+        thread, for the same reason the snapshot write is: it is the whole
+        fetched body, and it would otherwise be the one blocking write left
+        on the loop between two awaits that already yield
+        (``ExtractorProtocol.extract`` itself dispatches).
+
         Raises:
             ConfigurationError: The ``html`` extra is not installed.
         """
         extractor = extraction.html_extractor()
         with tempfile.TemporaryDirectory() as scratch:
             scratch_path = Path(scratch) / "fetched.html"
-            scratch_path.write_text(text, encoding="utf-8")
+            await asyncio.to_thread(scratch_path.write_text, text, encoding="utf-8")
             return await extractor.extract(scratch_path)
 
     def _write_snapshot(self, document_id: str, content: str) -> Path:
         """Write *content* to ``snapshot_dir/document_id``, contained.
+
+        Blocking, and deliberately left synchronous: callers on the event
+        loop run it via ``asyncio.to_thread`` (see :meth:`load`), matching
+        ``FileLoader._read_text`` on the read side. Tests call it directly to
+        exercise the containment check without a fetch.
 
         In practice ``document_id`` is always ``Document``'s own
         ``uuid.uuid4().hex`` default (never derived from ``source`` -- spec
@@ -391,8 +469,23 @@ class UrlLoader:
         exact path: a hand-constructed ``document_id`` must not be trusted
         implicitly (spec §10.1).
 
+        The open is ``O_NOFOLLOW`` where the platform has it, which closes the
+        window between the containment check and the write. ``ensure_within_base``
+        resolves symlinks, so a snapshot path that is *already* a link out of
+        the root is refused above -- but the check and the open are two
+        syscalls, and anything that can create a file in the snapshot
+        directory can win the gap between them and have the write land
+        wherever it points. The window is narrow (``document_id`` is an
+        unguessable ``uuid4``, and the read side returns nothing unless the
+        bytes still match) and the flag costs nothing, so it is closed rather
+        than argued about. See :data:`_O_NOFOLLOW` for what happens on
+        Windows, which has no such flag.
+
         Raises:
-            IngestionError: The resulting path would escape ``snapshot_dir``.
+            IngestionError: The resulting path would escape ``snapshot_dir``,
+                or is a symbolic link at the moment of the write.
+            OSError: The write failed for any other reason (propagated
+                unchanged -- only the symlink refusal is reinterpreted).
         """
         candidate = self._snapshot_dir / document_id
         try:
@@ -403,5 +496,20 @@ class UrlLoader:
                 "containment root; refused rather than written"
             ) from exc
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW | _O_BINARY
+        try:
+            # 0o600: a snapshot is the local copy citation verification trusts,
+            # written and read back by the same process identity, so there is
+            # no reader for it to be group- or world-readable for.
+            descriptor = os.open(path, flags, 0o600)
+        except OSError as exc:
+            if exc.errno in _SYMLINK_ERRNOS:
+                raise IngestionError(
+                    f"snapshot path for document {document_id!r} is a symbolic link; "
+                    "refused rather than followed -- it was a regular path when it "
+                    "was containment-checked, so something replaced it in between"
+                ) from exc
+            raise
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
         return path

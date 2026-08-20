@@ -26,6 +26,7 @@ from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.providers import embeddings as embeddings_module
 from groundkit.providers.protocols import ChatProtocol, EmbeddingProtocol
 from groundkit.retrieval.search import MAX_TOP_K
+from groundkit.runtime import AcquiredRetriever, CollectionRuntime
 
 
 @pytest.fixture
@@ -1545,11 +1546,18 @@ def test_answer_closes_store_and_embedder_when_build_chat_raises(
 
     ``InMemoryEmbedder`` holds no resource to release (``_maybe_aclose``'s
     own docstring), so wrapping it below proves ``_maybe_aclose`` reaches
-    and invokes ``aclose`` on whatever ``_open_dense_deps`` built -- the
+    and invokes ``aclose`` on whatever ``_open_read_runtime`` built -- the
     ordering claim this test is actually about -- not that any I/O was
     released. ``store``'s closed connection is the one real resource here,
     checked directly through its own post-close behaviour (``StorageError``
     from a query against a closed connection) rather than a recorded flag.
+
+    The store is captured at ``groundkit.runtime``'s import of it, not
+    ``groundkit.cli``'s: since GK-026 the read commands no longer open a
+    store themselves, they hand the collection to
+    :meth:`CollectionRuntime.open` and let ``aclose()`` close it. That
+    relocation is precisely what this test still has to prove happens, so
+    the patch follows the ownership rather than the command.
     """
     idx = str(tmp_path / "idx")
     main(["ingest", str(corpus), "--index-dir", idx])
@@ -1564,7 +1572,7 @@ def test_answer_closes_store_and_embedder_when_build_chat_raises(
             captured_stores.append(store)
             return store
 
-    monkeypatch.setattr("groundkit.cli.SQLiteMetadataStore", _CapturingMetadataStore)
+    monkeypatch.setattr("groundkit.runtime.SQLiteMetadataStore", _CapturingMetadataStore)
 
     class _RecordingEmbedder:
         def __init__(self, real: EmbeddingProtocol) -> None:
@@ -1629,3 +1637,161 @@ def test_answer_closes_store_and_embedder_when_build_chat_raises(
 
     assert len(built_embedders) == 1
     assert built_embedders[0].closed is True
+
+
+# --- ADR-0013 decision 7 / GK-026 -------------------------------------------
+#
+# ADR-0013 (Accepted) recorded that the CLI's read lifecycle is absorbed into
+# `CollectionRuntime` -- "three prospective new copies collapse into one" --
+# and claimed the resulting benefit that "the default suite then exercises the
+# runtime's open path on every CLI test". Neither was implemented: `cli.py`
+# imported only `CollectionRegistry`, `_cmd_search` opened its own
+# `Retriever`, and Phase 5's `_cmd_answer` added a fourth `Retriever.open`
+# lifecycle the ADR never counted.
+#
+# These tests are that claim made checkable. Every observation below exists
+# only on the runtime path, so none of them can be satisfied by a `cli.py`
+# that opens a retriever directly -- the recorded acquires stay empty, and a
+# refusing `acquire` is simply never consulted.
+
+
+def _record_runtime_acquires(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Record the collection db path behind every ``CollectionRuntime.acquire``.
+
+    Patches the method on the class rather than rebinding a name inside
+    ``groundkit.cli``, so it observes the real collaborator regardless of how
+    the command under test reached it, and delegates to the real
+    implementation so the command's own result is still produced by it.
+    """
+    acquired: list[Path] = []
+    real_acquire = CollectionRuntime.acquire
+
+    async def _recording_acquire(self: CollectionRuntime) -> AcquiredRetriever:
+        acquired.append(self.db_path)
+        return await real_acquire(self)
+
+    monkeypatch.setattr(CollectionRuntime, "acquire", _recording_acquire)
+    return acquired
+
+
+def _refuse_runtime_acquire(monkeypatch: pytest.MonkeyPatch, message: str) -> None:
+    """Make ``CollectionRuntime.acquire`` fail.
+
+    A command that reads through it then cannot produce a result; a command
+    that does not is unaffected, which is the whole discriminating power here.
+    """
+
+    async def _failing_acquire(self: CollectionRuntime) -> AcquiredRetriever:
+        del self
+        raise StorageError(message)
+
+    monkeypatch.setattr(CollectionRuntime, "acquire", _failing_acquire)
+
+
+def test_search_reads_through_the_collection_runtime(
+    corpus: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``grk search`` acquires exactly one retriever, from the runtime."""
+    idx = tmp_path / "idx"
+    assert main(["ingest", str(corpus), "--index-dir", str(idx)]) == 0
+    capsys.readouterr()
+
+    acquired = _record_runtime_acquires(monkeypatch)
+
+    assert main(["search", "reciprocal rank fusion", "--index-dir", str(idx)]) == 0
+    out = capsys.readouterr().out
+
+    # One acquire, against this collection's own store: the single lifecycle
+    # decision 7 describes, not a second one opened alongside it.
+    assert acquired == [idx / "default.sqlite3"]
+    # And the results are still the real ones, so the runtime is the path the
+    # answer came down rather than an extra call bolted beside the old one.
+    assert "notes.md" in out
+
+
+def test_search_cannot_answer_when_the_runtime_refuses_a_retriever(
+    corpus: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refusing ``acquire`` must abort the search, not be routed around.
+
+    The sharper half of the pair above: recording a call proves the runtime
+    was *consulted*, while this proves the printed results could only have
+    come *through* it. A ``_cmd_search`` holding its own ``Retriever`` would
+    print the ranking below regardless of what ``acquire`` does.
+    """
+    idx = tmp_path / "idx"
+    assert main(["ingest", str(corpus), "--index-dir", str(idx)]) == 0
+    capsys.readouterr()
+
+    _refuse_runtime_acquire(monkeypatch, "collection is unreadable")
+
+    assert main(["search", "reciprocal rank fusion", "--index-dir", str(idx)]) == 1
+    captured = capsys.readouterr()
+    assert "error: collection is unreadable" in captured.err
+    assert "notes.md" not in captured.out
+
+
+def test_answer_reads_through_the_collection_runtime(
+    corpus: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``grk answer`` -- the fourth lifecycle ADR-0013 never counted -- too."""
+    idx = tmp_path / "idx"
+    assert main(["ingest", str(corpus), "--index-dir", str(idx)]) == 0
+    capsys.readouterr()
+
+    def _scripted_build_chat(config: ChatConfig) -> ChatProtocol:
+        del config
+        return _CliScriptedChat("[1] Reciprocal rank fusion combines rankings.")
+
+    monkeypatch.setattr("groundkit.cli.build_chat", _scripted_build_chat)
+    acquired = _record_runtime_acquires(monkeypatch)
+
+    assert main(["answer", "reciprocal rank fusion", "--index-dir", str(idx)]) == 0
+    out = capsys.readouterr().out
+
+    assert acquired == [idx / "default.sqlite3"]
+    # The citation resolved, so the pipeline was driven by the acquired
+    # retriever's own search rather than by a second retriever's.
+    assert "notes.md" in out
+
+
+def test_answer_builds_no_chat_provider_when_the_runtime_refuses(
+    corpus: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The read lifecycle is reached before any provider is built.
+
+    Two properties in one observation. That ``answer`` fails at all proves
+    its retriever comes from ``acquire``; that ``build_chat`` was never
+    called proves the acquire happens first, so a collection this process
+    cannot read costs no provider construction -- and, on a cloud provider,
+    no billable call.
+    """
+    idx = tmp_path / "idx"
+    assert main(["ingest", str(corpus), "--index-dir", str(idx)]) == 0
+    capsys.readouterr()
+
+    built: list[str] = []
+
+    def _tracking_build_chat(config: ChatConfig) -> ChatProtocol:
+        del config
+        built.append("build_chat")
+        return _CliScriptedChat("[1] never reached")
+
+    monkeypatch.setattr("groundkit.cli.build_chat", _tracking_build_chat)
+    _refuse_runtime_acquire(monkeypatch, "collection is unreadable")
+
+    assert main(["answer", "reciprocal rank fusion", "--index-dir", str(idx)]) == 1
+    assert "error: collection is unreadable" in capsys.readouterr().err
+    assert built == []

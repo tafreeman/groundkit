@@ -36,6 +36,9 @@ from __future__ import annotations
 import asyncio
 import builtins
 import logging
+import os
+import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path, PurePath
 from typing import Any, Final
@@ -46,9 +49,11 @@ import pytest
 from groundkit import extraction
 from groundkit.contracts import Document
 from groundkit.errors import ConfigurationError, IngestionError
+from groundkit.ingestion import url_loader
 from groundkit.ingestion.protocols import LoaderProtocol
-from groundkit.ingestion.url_loader import DEFAULT_MAX_BYTES, UrlLoader
+from groundkit.ingestion.url_loader import DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT_SECONDS, UrlLoader
 from groundkit.utils import url_safety
+from groundkit.utils.path_safety import ensure_within_base
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -873,3 +878,296 @@ class TestUrlLoaderRefusesQueryStringCredentials:
         with pytest.raises(IngestionError):
             _load(loader, "https://internal.example.com/export?token=sk-live-1")
         assert list(tmp_path.rglob("*")) == []
+
+
+# -- content-sized writes never run on the event loop --------------------------
+
+#: The scratch filename ``UrlLoader._extract_html`` writes the decoded body to
+#: before handing it to the extractor. Named here rather than inlined because
+#: the write-off-the-loop tests below identify that write by filename; if the
+#: production name changes, ``assert scratch_writes`` fails loudly rather than
+#: the test quietly asserting nothing.
+_SCRATCH_FILENAME: Final[str] = "fetched.html"
+
+_WriteRecord = tuple[Path, int]
+
+
+def _record_write_text(monkeypatch: pytest.MonkeyPatch) -> list[_WriteRecord]:
+    """Record ``(path, thread ident)`` for every ``Path.write_text`` call.
+
+    Hooks the innermost blocking primitive, deliberately, rather than any
+    helper a fix might introduce: ``Path.write_text`` exists identically
+    before and after the change, so a test written against it exercises the
+    defect itself. A test that patched a post-fix ``_write_sync`` would also
+    fail against the unfixed code -- but with ``AttributeError``, which is a
+    failure about the helper's existence, not about which thread the write
+    ran on.
+
+    Used by the HTML scratch write only. The snapshot write stopped being a
+    ``Path.write_text`` call when it took ``O_NOFOLLOW`` (GK-028), and there
+    is no lower-level primitive to hook in its place that is worth patching
+    process-wide, so that test records ``_write_snapshot`` itself -- an
+    established method whose absence would be just as loud.
+    """
+    records: list[_WriteRecord] = []
+    original = Path.write_text
+
+    def _recording_write_text(
+        self: Path,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
+        records.append((Path(self), threading.get_ident()))
+        return original(self, data, encoding=encoding, errors=errors, newline=newline)
+
+    monkeypatch.setattr(Path, "write_text", _recording_write_text)
+    return records
+
+
+class TestUrlLoaderWritesOffTheEventLoop:
+    """Neither content-sized write may run on the loop thread.
+
+    ``UrlLoader`` had the only content-sized filesystem I/O in the package
+    not dispatched through ``asyncio.to_thread``: the snapshot write at the
+    end of ``load`` and the scratch write inside ``_extract_html``, each
+    handling up to ``max_bytes`` of fetched body. Bounded today only because
+    URL ingestion is CLI-only and nothing else is scheduled on that loop --
+    which is a property of the current caller, not of this code, and this is
+    exactly the module a service-side ingest tool would reuse verbatim.
+
+    Asserts thread identity, not timing, the same way
+    ``tests/test_retrieval.py::test_bm25_scoring_does_not_run_on_the_event_loop``
+    and ``tests/test_dense.py::test_in_memory_search_does_not_score_on_the_event_loop``
+    do: ``asyncio.to_thread`` always dispatches to an executor worker and an
+    inline call always reports the loop's own thread, so there is no sleep,
+    no timeout, and nothing to make flaky.
+
+    The two writes are asserted in separate tests, each recording only its
+    own write, so neither fix can mask the other: reverting one leaves
+    exactly one of these red. They hook different things -- the snapshot
+    write is no longer a ``Path.write_text`` call at all (GK-028) -- which is
+    why the recording helper below serves only the scratch-write test.
+    """
+
+    @staticmethod
+    def _text_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain; charset=utf-8"},
+            content=b"snapshot body written to disk",
+        )
+
+    @staticmethod
+    def _html_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            content=b"<html><body><p>scratch body written to disk</p></body></html>",
+        )
+
+    def test_snapshot_write_does_not_run_on_the_event_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Recorded at `_write_snapshot` rather than at `Path.write_text` (which
+        # the scratch-write test below still hooks): the snapshot write is an
+        # `os.open`/`os.fdopen` pair now, so it can carry `O_NOFOLLOW`
+        # (GK-028), and no `Path.write_text` call is left on this path to
+        # record. The property under test is unchanged and just as reverting:
+        # the whole helper -- containment check and write together -- must run
+        # off the loop thread, so an inline call here still turns this red.
+        idents: list[int] = []
+        original_write_snapshot = UrlLoader._write_snapshot
+
+        def _recording_write_snapshot(loader: UrlLoader, document_id: str, content: str) -> Path:
+            idents.append(threading.get_ident())
+            return original_write_snapshot(loader, document_id, content)
+
+        monkeypatch.setattr(UrlLoader, "_write_snapshot", _recording_write_snapshot)
+        loader = UrlLoader(tmp_path, client=_client(self._text_handler))
+
+        async def run() -> None:
+            loop_thread = threading.get_ident()
+            docs = await loader.load("https://example.com/doc.txt")
+
+            assert len(docs) == 1
+            assert idents, "the snapshot was never written"
+            offenders = [ident for ident in idents if ident == loop_thread]
+            assert not offenders, (
+                f"the snapshot write ran on the event loop thread ({loop_thread}) "
+                f"for {len(offenders)} of {len(idents)} write(s)"
+            )
+
+        asyncio.run(run())
+
+    def test_html_scratch_write_does_not_run_on_the_event_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        writes = _record_write_text(monkeypatch)
+        loader = UrlLoader(tmp_path, client=_client(self._html_handler))
+
+        async def run() -> None:
+            loop_thread = threading.get_ident()
+            docs = await loader.load("https://example.com/page.html")
+
+            assert len(docs) == 1
+            scratch_writes = [
+                (path, ident) for path, ident in writes if path.name == _SCRATCH_FILENAME
+            ]
+            assert scratch_writes, (
+                f"no {_SCRATCH_FILENAME!r} write was recorded; the extraction path did not "
+                "run, or the scratch filename changed. Recorded writes: "
+                f"{[str(path) for path, _ident in writes]}"
+            )
+            offenders = [ident for _path, ident in scratch_writes if ident == loop_thread]
+            assert not offenders, (
+                f"the HTML scratch write ran on the event loop thread ({loop_thread}) "
+                f"for {len(offenders)} of {len(scratch_writes)} write(s)"
+            )
+
+        asyncio.run(run())
+
+
+# -- total request bound and the snapshot write's O_NOFOLLOW (GK-028) --------
+
+#: How long the deliberately slow handler below stalls before answering. Far
+#: longer than the bound the loader is given, and finite on purpose: against
+#: code with no total bound this test must FAIL, not hang, so the handler has
+#: to return eventually (a `threading.Event` handshake would deadlock instead).
+_SLOW_HANDLER_SECONDS: Final[float] = 5.0
+
+#: The bound the loader is given. Small enough that the difference between
+#: "abandoned at the bound" and "waited for the server" is unmistakable.
+_TINY_TIMEOUT_SECONDS: Final[float] = 0.05
+
+
+class TestUrlLoaderTotalRequestBound:
+    """One fetch is bounded in wall-clock, not merely per operation.
+
+    httpx's ``timeout=`` is per operation, so a server that answers just
+    inside the read timeout, forever, never trips it: the connection is held
+    for as long as it likes while the caller believes it set a bound. The
+    loader wraps the whole exchange in ``asyncio.timeout`` instead, which is
+    what these tests pin.
+    """
+
+    def test_a_slow_response_is_abandoned_at_the_total_bound(self, tmp_path: Path) -> None:
+        async def _slow_handler(_request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(_SLOW_HANDLER_SECONDS)
+            return httpx.Response(
+                200, headers={"content-type": "text/plain; charset=utf-8"}, content=b"too late"
+            )
+
+        loader = UrlLoader(
+            tmp_path,
+            timeout_seconds=_TINY_TIMEOUT_SECONDS,
+            client=httpx.AsyncClient(transport=httpx.MockTransport(_slow_handler)),
+        )
+
+        started = time.monotonic()
+        with pytest.raises(IngestionError, match="exceeded the total"):
+            _load(loader, "https://example.com/slow.txt")
+        elapsed = time.monotonic() - started
+
+        # Stated twice on purpose: the refusal proves the bound is enforced,
+        # the clock proves it is enforced *at the bound* rather than after the
+        # server finally answered.
+        assert elapsed < _SLOW_HANDLER_SECONDS / 2, (
+            f"the fetch was bounded at {_TINY_TIMEOUT_SECONDS}s but took {elapsed:.2f}s, "
+            f"which is the server's {_SLOW_HANDLER_SECONDS}s pace, not the caller's bound"
+        )
+        assert list(tmp_path.iterdir()) == [], "an abandoned fetch must snapshot nothing"
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0])
+    def test_a_non_positive_bound_is_refused_at_construction(
+        self, tmp_path: Path, bad: float
+    ) -> None:
+        """Zero or negative is refused rather than silently meaning
+        "immediately" (``asyncio.timeout(0)``) or "never" -- mirroring
+        ``EmbeddingConfig.timeout_seconds``' ``gt=0``, which is a startup
+        failure for the same reason."""
+        with pytest.raises(ValueError, match="timeout_seconds"):
+            UrlLoader(tmp_path, timeout_seconds=bad)
+
+    def test_default_bound_matches_the_embedding_config_default(self) -> None:
+        from groundkit.config import EmbeddingConfig
+
+        assert EmbeddingConfig().timeout_seconds == DEFAULT_TIMEOUT_SECONDS
+
+
+class TestUrlLoaderSnapshotWriteDoesNotFollowASymlink:
+    """The containment check and the open are two syscalls; the gap is closed.
+
+    ``ensure_within_base`` resolves symlinks, so a snapshot path that is
+    *already* a link out of the root is refused by the check itself (the
+    traversal class above covers that). What the check cannot see is a link
+    created after it returned and before the file is opened. The window is
+    narrow -- ``document_id`` is an unguessable ``uuid4`` and the read side
+    returns nothing unless the bytes still match -- but ``O_NOFOLLOW`` costs
+    nothing, so it is closed rather than argued about (GK-028).
+
+    The race is driven from the code path itself rather than from a second
+    thread: the containment check is wrapped so that planting the symlink is
+    the last thing it does before returning. That makes the interleaving
+    deterministic instead of timing-dependent, and it is the only way to
+    reach the window at all -- a symlink planted before the call is caught by
+    the check, and one planted after the write is too late to matter.
+    """
+
+    def test_a_symlink_planted_after_the_containment_check_is_not_followed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if not hasattr(os, "O_NOFOLLOW"):
+            pytest.skip("O_NOFOLLOW does not exist on this platform (Windows)")
+
+        outside = tmp_path / "outside.txt"
+        outside.write_text("original", encoding="utf-8")
+        probe = tmp_path / "symlink-probe"
+        try:
+            probe.symlink_to(outside)
+        except OSError:
+            pytest.skip("this platform or user cannot create symlinks")
+        probe.unlink()
+
+        snapshot_dir = tmp_path / "col.snapshots"
+        loader = UrlLoader(snapshot_dir)
+        # Bind the real function from its defining module, not from
+        # ``url_loader``'s re-export: the monkeypatch below replaces the
+        # latter, and mypy --strict rejects reading a name a module does not
+        # explicitly export.
+        real_ensure_within_base = ensure_within_base
+
+        def _plant_symlink_after_checking(path: str | Path, base_dir: str | Path) -> Path:
+            resolved = real_ensure_within_base(path, base_dir)
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.symlink_to(outside)
+            return resolved
+
+        monkeypatch.setattr(url_loader, "ensure_within_base", _plant_symlink_after_checking)
+
+        with pytest.raises(IngestionError, match="symbolic link"):
+            loader._write_snapshot("doc-1", "hijacked")
+
+        assert outside.read_text(encoding="utf-8") == "original", (
+            "the snapshot write followed a symlink out of the containment root "
+            "and overwrote the file it pointed at"
+        )
+
+    def test_a_write_failure_that_is_not_a_symlink_is_not_reinterpreted(
+        self, tmp_path: Path
+    ) -> None:
+        """Only the symlink errno becomes an ``IngestionError``; every other
+        ``OSError`` propagates unchanged, so an unrelated I/O failure is never
+        reported as a containment refusal. A directory where the snapshot file
+        belongs is the portable way to provoke one (``EISDIR`` on POSIX,
+        ``EACCES`` on Windows)."""
+        snapshot_dir = tmp_path / "col.snapshots"
+        (snapshot_dir / "doc-1").mkdir(parents=True)
+        loader = UrlLoader(snapshot_dir)
+
+        # `IngestionError` is not an `OSError`, so demanding an `OSError` here
+        # is the whole assertion: had the handler swallowed every errno into a
+        # containment refusal, this would not match.
+        with pytest.raises(OSError):
+            loader._write_snapshot("doc-1", "content")

@@ -70,6 +70,35 @@ class _ConcurrencyTrackingLoader:
         return [Document(source=source, content="x")]
 
 
+class _SiblingTrackingLoader:
+    """Fails one file immediately and finishes the other slowly, recording both.
+
+    What *started* is identical either way -- a bare ``gather`` dispatches
+    every coroutine before the first failure reaches the awaiting frame -- so
+    the only observable difference between supervised and detached siblings is
+    what has *finished* by the time the error surfaces. Hence two lists.
+    """
+
+    def __init__(self, failing_stem: str, delay_seconds: float) -> None:
+        self._failing_stem = failing_stem
+        self._delay = delay_seconds
+        self.started: list[str] = []
+        self.finished: list[str] = []
+
+    @property
+    def supported_extensions(self) -> list[str]:
+        return [".txt"]
+
+    async def load(self, source: str) -> list[Document]:
+        stem = Path(source).stem
+        self.started.append(stem)
+        if stem == self._failing_stem:
+            raise IngestionError(f"loader refused {stem}")
+        await asyncio.sleep(self._delay)
+        self.finished.append(stem)
+        return [Document(source=source, content="x")]
+
+
 def _write_files(root: Path, *relative_paths: str) -> None:
     for rel in relative_paths:
         path = root / rel
@@ -300,6 +329,41 @@ class TestIngestDirectory:
 
         with pytest.raises(IngestionError, match="Chunking failed"):
             asyncio.run(pipeline.ingest_directory(str(tmp_path)))
+
+    def test_a_failure_waits_for_its_siblings_instead_of_detaching_them(
+        self, tmp_path: Path
+    ) -> None:
+        """GK-028: a failed file must not leave the others running unsupervised.
+
+        ``asyncio.gather`` without ``return_exceptions=True`` hands the first
+        exception to the awaiting frame the moment it is raised, and neither
+        cancels nor awaits the siblings already in flight. ``IngestionPipeline``
+        is exported public API, so a third-party host that catches the error
+        inherits loads and chunkings it cannot see, await, or cancel.
+
+        The discriminating assertion is ``finished``, not ``started``: both
+        files are dispatched either way. Under a bare gather the sibling is
+        still sleeping when the error propagates, and ``asyncio.run`` then
+        cancels it during loop shutdown, so it never records completion --
+        which is a failed assertion, not a hang, exactly as a fail-first test
+        of this defect must be.
+        """
+        _write_files(tmp_path, "a_fails.txt", "b_slow.txt")
+        loader = _SiblingTrackingLoader(failing_stem="a_fails", delay_seconds=0.05)
+        pipeline = IngestionPipeline(loader=loader)
+
+        with pytest.raises(IngestionError, match="loader refused a_fails"):
+            asyncio.run(pipeline.ingest_directory(str(tmp_path), max_concurrent=2))
+
+        assert loader.started == ["a_fails", "b_slow"], (
+            "both files must be dispatched -- path-sorted order, bounded by the "
+            f"semaphore; got {loader.started}"
+        )
+        assert loader.finished == ["b_slow"], (
+            "the sibling was still running when ingest_directory raised: the "
+            "caller has seen the failure while work it started continues "
+            f"detached; finished={loader.finished}"
+        )
 
 
 class TestProtocolConformance:

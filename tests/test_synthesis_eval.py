@@ -32,8 +32,8 @@ import pytest
 
 from groundkit.contracts import RetrievalResult
 from groundkit.errors import ChatError
-from groundkit.evals.judge import DEFAULT_JUDGE_PROMPT, FaithfulnessJudge
 from groundkit.evals.synthesis_eval import hash_prompt_template, run_synthesis_eval
+from groundkit.providers.judge import DEFAULT_JUDGE_PROMPT, FaithfulnessJudge
 from groundkit.providers.llm import RedactingChat
 from groundkit.providers.protocols import ChatProtocol
 from groundkit.providers.redaction import RedactionConfig

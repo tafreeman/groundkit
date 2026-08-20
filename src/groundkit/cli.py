@@ -80,7 +80,6 @@ from groundkit.evals.echo import (
     run_echo_check,
     write_echo_report,
 )
-from groundkit.evals.judge import FaithfulnessJudge
 from groundkit.evals.runner import MIN_EVAL_TOP_K, run_eval, write_report
 from groundkit.evals.schema import EvalReport, SynthesisReport
 from groundkit.index.dense import InMemoryVectorStore, LanceDBVectorStore
@@ -89,6 +88,7 @@ from groundkit.indexer import Indexer, IndexReport
 from groundkit.ingestion.loaders import FileLoader
 from groundkit.ingestion.url_loader import UrlLoader
 from groundkit.providers.embeddings import INMEMORY_PROVIDER, build_embedder
+from groundkit.providers.judge import FaithfulnessJudge
 from groundkit.providers.llm import build_chat
 from groundkit.providers.query_rewrite import QueryRewriter
 from groundkit.providers.synthesis import Synthesizer
@@ -99,8 +99,8 @@ from groundkit.providers.synthesis import Synthesizer
 # costs nothing, and `--rerank` fails at first use with the typed error that
 # names the install command.
 from groundkit.retrieval.rerank import DEFAULT_RERANK_MODEL, CrossEncoderReranker
-from groundkit.retrieval.search import MAX_TOP_K, Retriever
-from groundkit.runtime import CollectionRegistry
+from groundkit.retrieval.search import MAX_TOP_K
+from groundkit.runtime import CollectionRegistry, CollectionRuntime
 
 # Importing this module never imports FastAPI, uvicorn or the MCP SDK either.
 # `binding.py` is stdlib + `errors.py` only, and `service/tools.py` reaches no
@@ -621,18 +621,102 @@ def _resolve_embedding_config(args: argparse.Namespace) -> EmbeddingConfig:
     )
 
 
+def _dense_store_path(index_dir: Path, collection: str) -> Path:
+    """The pinned LanceDB layout: ``<index-dir>/<collection>.lance``.
+
+    A directory, sibling of ``<collection>.sqlite3``, opened with the default
+    table name. One function rather than the expression repeated at each of
+    the three places that need it — ``ingest --dense``, the read lifecycle
+    below, and ``serve``'s per-collection factory — because it is a layout
+    every one of them must agree on: two callers disagreeing would not fail,
+    they would search vectors that join against no chunk id in the SQLite
+    they were paired with, which is the silently-thin-result class
+    :data:`~groundkit.runtime.CollectionVectorStoreFactory` describes.
+
+    Callers are responsible for having validated ``collection`` first — this
+    interpolates it into a path and checks nothing.
+    """
+    return index_dir / f"{collection}.lance"
+
+
 async def _open_dense_deps(
     args: argparse.Namespace,
 ) -> tuple[EmbeddingProtocol, VectorStoreProtocol]:
-    """Build the embedder + LanceDB store pair shared by ``ingest --dense`` and dense/hybrid search.
+    """Build the embedder + LanceDB store pair ``ingest --dense`` needs eagerly.
 
-    Layout is pinned: the LanceDB data for a collection lives at
-    ``<index-dir>/<collection>.lance`` (a directory, sibling of
-    ``<collection>.sqlite3``), opened with the default table name.
+    The read commands do not use this: they need the vector store built
+    *lazily*, inside the runtime's rebuild — see :func:`_open_read_runtime`.
     """
     embedder = build_embedder(_resolve_embedding_config(args))
-    vector_store = await LanceDBVectorStore.open(Path(args.index_dir) / f"{args.collection}.lance")
+    vector_store = await LanceDBVectorStore.open(
+        _dense_store_path(Path(args.index_dir), args.collection)
+    )
     return embedder, vector_store
+
+
+async def _open_read_runtime(
+    args: argparse.Namespace,
+) -> tuple[CollectionRuntime, EmbeddingProtocol | None]:
+    """Open the one read lifecycle ``grk search`` and ``grk answer`` share (ADR-0013 decision 7).
+
+    ADR-0013 decided that the CLI's read lifecycle *is* the runtime's, and
+    said why: the cache never hits in a one-shot process — one ``acquire``,
+    one rebuild, identical behaviour — so what is bought is not speed but
+    that the CLI and the service surface open, stamp and close a collection
+    through the same code, and the default suite therefore exercises the
+    path a long-lived server runs on. The decision was recorded and not
+    implemented; ``_cmd_answer`` then added a fourth ``Retriever.open``
+    lifecycle the ADR never counted (GK-026). Both now route here.
+
+    Ordering is load-bearing and is preserved by the factory being lazy.
+    ``SQLiteMetadataStore.open`` — which :meth:`CollectionRuntime.open` calls
+    first — is what validates the collection name, and the LanceDB path is
+    built by interpolating that same name. The direct predecessor of this
+    function opened the store first for exactly that reason. Here the
+    factory is not *called* until :meth:`CollectionRuntime.acquire` runs a
+    rebuild, which is strictly after the store opened, so the name is
+    validated before any path is derived from it whatever the caller does.
+
+    Returns:
+        ``(runtime, embedder)``. The embedder comes back rather than staying
+        reachable only through the runtime because **nothing else will close
+        it**: :meth:`CollectionRuntime.aclose` deliberately does not close an
+        embedder it was merely handed. ``None`` in ``--mode bm25``, where no
+        embedder is built at all. Closing the runtime is likewise the
+        caller's job — it owns the store handle.
+
+    Raises:
+        ConfigurationError: An invalid collection name, or an unusable
+            embedding configuration.
+        StorageError: The collection's store could not be opened.
+    """
+    embedder: EmbeddingProtocol | None = None
+    vector_store_factory: Callable[[], Awaitable[VectorStoreProtocol]] | None = None
+    if args.mode != "bm25":
+        embedder = build_embedder(_resolve_embedding_config(args))
+
+        async def _open_dense_store() -> VectorStoreProtocol:
+            return await LanceDBVectorStore.open(
+                _dense_store_path(Path(args.index_dir), args.collection)
+            )
+
+        vector_store_factory = _open_dense_store
+
+    try:
+        runtime = await CollectionRuntime.open(
+            Path(args.index_dir),
+            args.collection,
+            RetrievalConfig(),
+            embedder=embedder,
+            vector_store_factory=vector_store_factory,
+        )
+    except BaseException:
+        # The embedder is built before the store is opened, so a rejected
+        # collection name or an unopenable store would otherwise leak the
+        # provider's HTTP client — there is no caller yet to close it.
+        await _maybe_aclose(embedder)
+        raise
+    return runtime, embedder
 
 
 async def _maybe_aclose(provider: object | None) -> None:
@@ -800,24 +884,14 @@ async def _cmd_search(args: argparse.Namespace) -> int:
             "--mode dense or --mode hybrid; bm25 mode never touches the dense path"
         )
 
-    # SQLiteMetadataStore.open validates the collection name before any
-    # path (including the LanceDB directory below) is built from it.
-    store = await SQLiteMetadataStore.open(Path(args.index_dir), args.collection)
-    embedder: EmbeddingProtocol | None = None
+    runtime, embedder = await _open_read_runtime(args)
     try:
-        vector_store: VectorStoreProtocol | None = None
-        if args.mode != "bm25":
-            embedder, vector_store = await _open_dense_deps(args)
-        retriever = await Retriever.open(
-            store,
-            RetrievalConfig(),
-            embedder=embedder,
-            vector_store=vector_store,
-            collection=args.collection,
-        )
-        response = await retriever.search(args.query, top_k=args.top_k, mode=args.mode)
+        acquired = await runtime.acquire()
+        response = await acquired.retriever.search(args.query, top_k=args.top_k, mode=args.mode)
     finally:
-        await store.close()
+        # aclose() closes the store the runtime owns; the embedder it was
+        # handed is ours to close, and it never is.
+        await runtime.aclose()
         await _maybe_aclose(embedder)
 
     if args.json:
@@ -844,32 +918,23 @@ async def _cmd_answer(args: argparse.Namespace) -> int:
             "--mode dense or --mode hybrid; bm25 mode never touches the dense path"
         )
 
-    # SQLiteMetadataStore.open validates the collection name before any
-    # path (including the LanceDB directory below) is built from it.
-    store = await SQLiteMetadataStore.open(Path(args.index_dir), args.collection)
-    embedder: EmbeddingProtocol | None = None
+    runtime, embedder = await _open_read_runtime(args)
     chat: ChatProtocol | None = None
     try:
-        vector_store: VectorStoreProtocol | None = None
-        if args.mode != "bm25":
-            embedder, vector_store = await _open_dense_deps(args)
-        retriever = await Retriever.open(
-            store,
-            RetrievalConfig(),
-            embedder=embedder,
-            vector_store=vector_store,
-            collection=args.collection,
-        )
+        # Before build_chat, deliberately: a collection this process cannot
+        # read is a failure worth reaching before any provider is built, let
+        # alone called.
+        acquired = await runtime.acquire()
         chat = build_chat(_resolve_chat_config(args))
         pipeline = AnswerPipeline(
-            retriever.search,
+            acquired.retriever.search,
             Synthesizer(chat),
             rewriter=QueryRewriter(chat) if args.rewrite else None,
             judge=FaithfulnessJudge(chat) if args.judge else None,
         )
         report = await pipeline.answer(args.query, top_k=args.top_k, mode=args.mode)
     finally:
-        await store.close()
+        await runtime.aclose()
         await _maybe_aclose(embedder)
         await _maybe_aclose(chat)
 
@@ -1326,7 +1391,7 @@ def _build_service_context(
     # and join the resulting chunk ids against another's SQLite — no error, just
     # a silently thin result on a healthy collection.
     async def _open_collection_store(collection: str) -> VectorStoreProtocol:
-        return await LanceDBVectorStore.open(index_dir / f"{collection}.lance")
+        return await LanceDBVectorStore.open(_dense_store_path(index_dir, collection))
 
     embedder: EmbeddingProtocol | None = None
     vector_store_factory: Callable[[str], Awaitable[VectorStoreProtocol]] | None = None

@@ -243,12 +243,13 @@ CI enforces an 80% coverage floor twice, so neither gate can hide the other:
 once on the whole package, and again on the SPEC.md §8 core subset —
 `retrieval/` (retrieval + citation resolution), `ingestion/chunking.py`
 (chunking), `index/bm25.py` (lexical scoring), `index/dense.py` (vector
-scoring), and `runtime.py` (collection lifecycle, ADR-0013). The core subset
+scoring), `runtime.py` (collection lifecycle, ADR-0013), and `extraction.py`
+(the re-extraction half of citation verification, ADR-0016). The core subset
 is the literal list in `pyproject.toml`'s `[tool.groundkit.coverage]` table;
 optional providers (e.g. `providers/embeddings.py`) are excluded from it.
-That table also records the one caveat this subset carries — `index/dense.py`
-is a mixed file, and gating it wholesale admits inside one file the
-offsetting the subset exists to prevent.
+That table argues every entry, and every deliberate omission, one file at a
+time and cost included — `index/dense.py` is a mixed file, and gating it
+wholesale admits inside one file the offsetting the subset exists to prevent.
 
 To build the documentation site:
 

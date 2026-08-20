@@ -6,10 +6,33 @@ search, a cited synthesis, and an optional advisory faithfulness judge into
 one call and one report. Building the collaborators it composes — resolving
 a chat config, constructing a concrete chat provider, opening a
 ``Retriever`` over a persisted collection — is deliberately not this
-module's job: every collaborator is injected, so composing
-``providers.synthesis`` with ``evals.judge`` here creates no dependency edge
-between those two packages. This module never imports ``groundkit.config``
-or ``groundkit.providers.llm``, and constructs no provider itself.
+module's job: this module never imports ``groundkit.config`` or
+``groundkit.providers.llm``, and constructs no provider itself.
+
+## What "injected" does and does not mean here
+
+Every collaborator *instance* is supplied by the caller — none is
+constructed, discovered, or defaulted here. The *types* are not
+correspondingly abstract, and nothing below claims they are: only
+``search`` is a structural Protocol (:class:`SearchCallable`, and even that
+exists so this module's own tests need not build a real ``Retriever``,
+not as a declared extension point). ``synthesizer``, ``rewriter`` and
+``judge`` are annotated as the concrete
+:class:`~groundkit.providers.synthesis.Synthesizer`,
+:class:`~groundkit.providers.query_rewrite.QueryRewriter` and
+:class:`~groundkit.providers.judge.FaithfulnessJudge` classes, which this
+module therefore imports; a substitute must be an instance of the class,
+not merely something with a matching shape.
+
+That is a deliberate trade rather than an oversight. All three are
+themselves :class:`~groundkit.providers.protocols.ChatProtocol` consumers
+whose own seam is the chat provider, so the substitution a caller actually
+wants — a different model, a scripted fake, a redacting wrapper — is
+reached by injecting a different ``ChatProtocol`` into them, and a second
+Protocol layer here would only restate that seam one level out. All three
+also now live together under ``groundkit.providers`` (GK-021 moved the
+judge there from ``groundkit.evals``), so importing them commits this
+module to no dependency on the eval harness.
 
 ## Abstention has one representation
 
@@ -22,7 +45,7 @@ second, redundant boolean: it exposes exactly the same rule its
 
 ## The judge is advisory, never a gate, and never special-cases abstention
 
-When a :class:`~groundkit.evals.judge.FaithfulnessJudge` is injected, it
+When a :class:`~groundkit.providers.judge.FaithfulnessJudge` is injected, it
 runs after synthesis and its verdict is recorded — unconditionally, with no
 attempt to detect or skip judging an abstained answer, because "abstained"
 is not a branch this module takes, only a shape ``citations`` happens to
@@ -82,7 +105,7 @@ from pydantic import BaseModel, ConfigDict
 
 from groundkit.contracts import Citation, RetrievalResult, SearchResponse
 from groundkit.errors import RetrievalError
-from groundkit.evals.judge import FaithfulnessJudge, FaithfulnessVerdict
+from groundkit.providers.judge import FaithfulnessJudge, FaithfulnessVerdict
 from groundkit.providers.query_rewrite import QueryRewriter
 from groundkit.providers.synthesis import Synthesizer
 from groundkit.retrieval.search import SearchMode
@@ -141,7 +164,7 @@ class AnswerReport(BaseModel):
             auditable against its actual inputs rather than only against
             the subset it happened to cite.
         verdict: The advisory faithfulness verdict, when a
-            :class:`~groundkit.evals.judge.FaithfulnessJudge` was injected
+            :class:`~groundkit.providers.judge.FaithfulnessJudge` was injected
             and ran successfully. ``None`` when no judge was configured.
             Never inspected by this module to alter ``answer`` or
             ``citations`` — advisory in the strict sense (ADR-0018).
@@ -160,8 +183,10 @@ class AnswerReport(BaseModel):
 class AnswerPipeline:
     """Composes rewrite, retrieval, synthesis, and an advisory judge into one call.
 
-    Every collaborator is supplied by the caller — this class builds none of
-    them, imports no configuration, and constructs no provider. A class
+    Every collaborator *instance* is supplied by the caller — this class
+    builds none of them, imports no configuration, and constructs no
+    provider. Their *types* are concrete rather than abstract, deliberately;
+    see the module docstring for what that does and does not buy. A class
     (rather than a bare function) because every optional collaborator it
     holds — ``rewriter``, ``judge`` — is fixed for the lifetime of a caller's
     usage (one ``grk answer`` invocation, one eval run) and this repo's

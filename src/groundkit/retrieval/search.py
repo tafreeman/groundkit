@@ -324,31 +324,35 @@ class Retriever:
                     raise RetrievalError(f"top_k must be between 1 and {MAX_TOP_K}, got {k}")
 
                 started = time.perf_counter_ns()
-                records = await self._document_records()
+                # One lookup object per search, never per retriever: the
+                # document read has to stay live so a document deleted after
+                # open() fails closed instead of resolving against a snapshot
+                # (see :class:`_DocumentRecordLookup`).
+                lookup = _DocumentRecordLookup(self._store)
 
                 metadata: dict[str, object]
                 stage: Stage
                 if mode == "bm25":
                     pairs = await self._bm25_search(query, k)
-                    results = self._resolve(pairs, records, apply_threshold=True)
+                    results = await self._resolve(pairs, lookup, apply_threshold=True)
                     stage = "bm25"
                     metadata = {"stage": stage, "top_k": k}
                 elif mode == "dense":
                     embedder, vector_store = self._require_dense(mode)
-                    pairs = await self._dense_candidates(query, k, records, embedder, vector_store)
-                    results = self._resolve(pairs, records, apply_threshold=True)
+                    pairs = await self._dense_candidates(query, k, lookup, embedder, vector_store)
+                    results = await self._resolve(pairs, lookup, apply_threshold=True)
                     stage = "dense"
                     metadata = {"stage": stage, "top_k": k}
                 elif mode == "hybrid":
                     embedder, vector_store = self._require_dense(mode)
                     bm25_pairs = await self._bm25_search(query, k)
                     dense_pairs = await self._dense_candidates(
-                        query, k, records, embedder, vector_store
+                        query, k, lookup, embedder, vector_store
                     )
                     fused = reciprocal_rank_fusion(
                         [bm25_pairs, dense_pairs], rrf_k=self._config.rrf_k, top_k=k
                     )
-                    results = self._resolve(fused, records, apply_threshold=False)
+                    results = await self._resolve(fused, lookup, apply_threshold=False)
                     stage = "fusion"
                     metadata = {"stage": stage, "top_k": k, "rrf_k": self._config.rrf_k}
                 else:
@@ -499,40 +503,11 @@ class Retriever:
         """
         return await asyncio.to_thread(self._bm25.search, query, top_k=k)
 
-    async def _document_records(self) -> dict[str, DocumentRecord]:
-        """Read every stored document's provenance for this search's one join.
-
-        Prefers ``get_document_records`` (:class:`DocumentRecordStoreProtocol`)
-        when ``self._store`` implements that capability — every
-        :class:`~groundkit.index.metadata.SQLiteMetadataStore` does, and this
-        is the ADR-0016 read half of the join
-        :meth:`~groundkit.index.protocols.MetadataStoreProtocol.replace_document`
-        writes — and degrades to plain ``get_document_sources`` otherwise,
-        wrapping each bare source string in a :class:`DocumentRecord` at the
-        ``text``/``None`` default.
-
-        That fallback is deliberately narrow rather than folded into
-        :class:`~groundkit.index.protocols.MetadataStoreProtocol` itself —
-        see :class:`DocumentRecordStoreProtocol`'s docstring for why
-        widening the required protocol would break every hand-built
-        protocol-conforming store double that predates ADR-0016. It is
-        honest rather than a silent downgrade: a store with no way to report
-        ``source_class``/``extractor`` never had richer data to report in
-        the first place, unlike the actual fail-open defect this method
-        closes (a real store dropping a value it *did* have).
-        """
-        if isinstance(self._store, DocumentRecordStoreProtocol):
-            return await self._store.get_document_records()
-        sources = await self._store.get_document_sources()
-        return {
-            document_id: DocumentRecord(source=source) for document_id, source in sources.items()
-        }
-
     async def _dense_candidates(
         self,
         query: str,
         k: int,
-        records: dict[str, DocumentRecord],
+        lookup: _DocumentRecordLookup,
         embedder: EmbeddingProtocol,
         vector_store: VectorStoreProtocol,
     ) -> list[tuple[Chunk, float]]:
@@ -541,12 +516,12 @@ class Retriever:
         The vector-store handle is live, so this filter is what gives the
         dense path the same ``open()``-time snapshot semantics the BM25
         rebuild has structurally (see the class docstring). Three cases per
-        hit, decided against the open()-time snapshot and the live
-        ``records`` map:
+        hit, decided against the open()-time snapshot and a live per-hit
+        ``lookup``:
 
         - document known at ``open()`` → kept (the join may still fail
           closed later if the document has since been deleted).
-        - unknown at ``open()`` but present in ``records`` → ingested after
+        - unknown at ``open()`` but ``lookup`` finds it → ingested after
           ``open()``; dropped silently, exactly as invisible as it is to the
           stale in-memory BM25 index.
         - in neither → orphaned vectors; fail closed loudly.
@@ -579,7 +554,7 @@ class Retriever:
         fetch = k
         for attempt in range(_MAX_SNAPSHOT_FETCH_ATTEMPTS):
             pairs = await vector_store.search(embedding, top_k=fetch)
-            kept = self._apply_snapshot_filter(pairs, records)
+            kept = await self._apply_snapshot_filter(pairs, lookup)
             if len(kept) >= k or len(pairs) < fetch:
                 # Enough survivors, or the store returned less than asked and
                 # therefore holds nothing more to widen into.
@@ -599,20 +574,26 @@ class Retriever:
             fetch *= 2
         return kept[:k]
 
-    def _apply_snapshot_filter(
-        self, pairs: list[tuple[Chunk, float]], records: dict[str, DocumentRecord]
+    async def _apply_snapshot_filter(
+        self, pairs: list[tuple[Chunk, float]], lookup: _DocumentRecordLookup
     ) -> list[tuple[Chunk, float]]:
         """Keep only hits whose document existed at ``open()``; fail closed on orphans.
 
         Split out of :meth:`_dense_candidates` because the over-fetch loop
         applies it once per widening attempt.
+
+        The ``lookup`` is consulted only for a hit the ``open()``-time
+        snapshot does not already vouch for, which on a healthy collection is
+        no hits at all: the common path costs zero document reads, where the
+        pre-GK-019 shape paid for the whole ``documents`` table before the
+        first hit was examined.
         """
         kept: list[tuple[Chunk, float]] = []
         for chunk, score in pairs:
             if chunk.document_id in self._documents_at_open:
                 kept.append((chunk, score))
                 continue
-            if chunk.document_id in records:
+            if await lookup.get(chunk.document_id) is not None:
                 continue
             raise RetrievalError(
                 f"Index inconsistency: dense hit for chunk {chunk.chunk_id} references "
@@ -621,10 +602,10 @@ class Retriever:
             )
         return kept
 
-    def _resolve(
+    async def _resolve(
         self,
         pairs: list[tuple[Chunk, float]],
-        records: dict[str, DocumentRecord],
+        lookup: _DocumentRecordLookup,
         *,
         apply_threshold: bool,
     ) -> list[RetrievalResult]:
@@ -635,6 +616,13 @@ class Retriever:
         results, and this is the one place the fail-closed rule lives).
         ``apply_threshold=False`` is the hybrid path: ADR-0005 decision 6
         keeps ``score_threshold`` away from rank-derived fused scores.
+
+        The join is per surviving hit (GK-019), and deliberately *after* the
+        threshold filter rather than before it: a pair below
+        ``score_threshold`` is discarded without ever costing a document
+        read. What this replaces read the whole ``documents`` table before
+        the mode branch even ran, so a search that returned nothing still
+        paid corpus-proportional cost.
 
         Every constructed :class:`RetrievalResult` carries the document's
         real ``source_class``/``extractor`` (ADR-0016) rather than the
@@ -653,7 +641,7 @@ class Retriever:
         for chunk, score in pairs:
             if threshold is not None and score < threshold:
                 continue
-            record = records.get(chunk.document_id)
+            record = await lookup.get(chunk.document_id)
             if record is None:
                 raise RetrievalError(
                     f"Index inconsistency: chunk {chunk.chunk_id} references "
@@ -674,6 +662,75 @@ class Retriever:
                 )
             )
         return results
+
+
+class _DocumentRecordLookup:
+    """Answers "which document is this, and is it still there?" for ONE search.
+
+    Scoped to a single :meth:`Retriever.search` call, and that scope is the
+    whole design. The read it performs must stay **live** — a document
+    deleted after ``open()`` has to fail closed rather than resolve against
+    a snapshot — so it can never be hoisted to ``open()`` or cached on the
+    retriever. Within one search it memoizes per document ID, which is
+    strictly no less live than what it replaces: the previous shape took a
+    single whole-table snapshot *before* the mode branch ran and resolved
+    every hit against it, so each answer here is read at or after the moment
+    the old one was.
+
+    Two branches, chosen once per search rather than per hit:
+
+    - **Keyed** (:class:`~groundkit.index.protocols.DocumentRecordStoreProtocol`,
+      which every :class:`~groundkit.index.metadata.SQLiteMetadataStore`
+      implements): one primary-key seek per distinct document actually hit.
+      Cost is proportional to the results, which is what the question was.
+    - **Full table** (any other store): the pre-GK-019 path, kept as the
+      fallback so no store is refused for lacking an optional capability.
+      Reads ``get_document_sources`` once, lazily — on the first miss, not
+      on construction — so a search that resolves nothing reads nothing, and
+      wraps each bare source in a :class:`DocumentRecord` at the
+      ``text``/``None`` default. That is honest rather than a silent
+      downgrade: a store with no way to report ``source_class``/``extractor``
+      never had richer data to report, unlike the ADR-0016 fail-open defect
+      where a real store dropped a value it *did* have.
+
+    A memoized ``None`` is a real answer — "no such document" — and is
+    cached like any other, because both callers fail closed on it and
+    re-asking would not change the verdict.
+    """
+
+    def __init__(self, store: MetadataStoreProtocol) -> None:
+        self._store = store
+        self._keyed: DocumentRecordStoreProtocol | None = (
+            store if isinstance(store, DocumentRecordStoreProtocol) else None
+        )
+        self._cache: dict[str, DocumentRecord | None] = {}
+        self._materialized = False
+
+    async def get(self, document_id: str) -> DocumentRecord | None:
+        """Return ``document_id``'s record, or ``None`` if the store has no such document."""
+        if document_id in self._cache:
+            return self._cache[document_id]
+        record = (
+            await self._keyed.get_document_record(document_id)
+            if self._keyed is not None
+            else await self._from_full_table(document_id)
+        )
+        self._cache[document_id] = record
+        return record
+
+    async def _from_full_table(self, document_id: str) -> DocumentRecord | None:
+        """Fallback branch: materialize ``documents`` once, then answer from it.
+
+        Once per search at most, and only for a store without the keyed
+        capability — the same single read the old code path performed
+        unconditionally.
+        """
+        if not self._materialized:
+            sources = await self._store.get_document_sources()
+            for stored_id, source in sources.items():
+                self._cache.setdefault(stored_id, DocumentRecord(source=source))
+            self._materialized = True
+        return self._cache.get(document_id)
 
 
 def _validate_dense_pair(
