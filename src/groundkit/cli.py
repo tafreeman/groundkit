@@ -1363,12 +1363,10 @@ def _build_mcp_mount(
     the second — so the method is wrapped in an ASGI callable here rather than
     the manager being handed over as though it were an app.
 
-    Unlike the two service constructors, this one defaults to
-    :data:`~groundkit.service.binding.LOOPBACK_HOST_ALLOW_LIST` rather than the
-    unrestricted list, and the asymmetry is the point: this function is CLI
-    plumbing, not a library seam, so the default that belongs here is the
-    default ``grk serve`` has — never publishing a corpus because an argument
-    was omitted.
+    Defaults to :data:`~groundkit.service.binding.LOOPBACK_HOST_ALLOW_LIST`,
+    matching the two service constructors' own default since ADR-0025: never
+    publishing a corpus because an argument was omitted, here or in a caller
+    embedding either of them directly.
 
     Args:
         ctx: Serve-time context every handler is invoked with.

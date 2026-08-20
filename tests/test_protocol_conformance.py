@@ -14,19 +14,18 @@ untouched.
 :func:`assert_signature_parity` closes that gap: for every PUBLIC member a
 Protocol declares in its own class body (not inherited from ``Protocol`` or
 ``object``), it asserts the implementation has a same-shaped member —
-matching property-vs-method kind, sync-vs-async, parameter names, kinds,
-order, and defaults (``self``/``cls`` ignored on both sides), plus resolved
-type hints via :func:`typing.get_type_hints` whenever both sides can resolve
-them. Extra members an implementation adds beyond the Protocol are never a
-failure — implementations are always free to grow. That also makes this
-helper robust to a concurrent change that adds a new method to
-``SQLiteMetadataStore`` without (yet) adding it to ``MetadataStoreProtocol``:
-only members the Protocol itself declares are ever checked.
-
-``VectorStoreProtocol`` (``groundkit/index/protocols.py``) and
-``RerankerProtocol`` (``groundkit/retrieval/protocols.py``) have no
-implementations yet — Phase 3 stubs — so they are intentionally not
-exercised here.
+matching property-vs-method-vs-classmethod kind, sync-vs-async, parameter
+names, kinds, order, and defaults (``self``/``cls`` ignored on both sides),
+plus resolved type hints via :func:`typing.get_type_hints` whenever both
+sides can resolve them. Extra members an implementation adds beyond the
+Protocol are never a failure — implementations are always free to grow.
+That also makes this helper robust to a concurrent change that adds a new
+method to ``SQLiteMetadataStore`` without (yet) adding it to
+``MetadataStoreProtocol``: only members the Protocol itself declares are
+ever checked. A classmethod member is the one exception to "matches": its
+return annotation is deliberately left uncompared (see
+:func:`_assert_member_parity`), because a construction factory's whole
+point is that each implementation returns its own concrete type.
 """
 
 from __future__ import annotations
@@ -40,9 +39,14 @@ import pytest
 
 from groundkit.answer import SearchCallable
 from groundkit.extraction import ExtractorProtocol, HtmlExtractor, PdfExtractor
+from groundkit.index.bm25 import BM25Index
 from groundkit.index.dense import InMemoryVectorStore, LanceDBVectorStore
 from groundkit.index.metadata import SQLiteMetadataStore
-from groundkit.index.protocols import MetadataStoreProtocol, VectorStoreProtocol
+from groundkit.index.protocols import (
+    LexicalIndexProtocol,
+    MetadataStoreProtocol,
+    VectorStoreProtocol,
+)
 from groundkit.ingestion.chunking import RecursiveChunker
 from groundkit.ingestion.loaders import FileLoader
 from groundkit.ingestion.protocols import ChunkerProtocol, LoaderProtocol
@@ -112,8 +116,10 @@ def _param_specs(signature: inspect.Signature) -> list[_ParamSpec]:
     ]
 
 
-def _callable_target(member: property | Callable[..., object]) -> Callable[..., object]:
-    """Return the underlying callable for a plain method or a property's getter.
+def _callable_target(
+    member: property | classmethod[Any, ..., Any] | Callable[..., object],
+) -> Callable[..., object]:
+    """Return the underlying callable for a plain method, a classmethod, or a property's getter.
 
     Raises:
         AssertionError: If *member* is a write-only property (no getter) —
@@ -124,6 +130,8 @@ def _callable_target(member: property | Callable[..., object]) -> Callable[..., 
         if member.fget is None:
             raise AssertionError(f"property {member!r} has no getter")
         return member.fget
+    if isinstance(member, classmethod):
+        return member.__func__
     return member
 
 
@@ -147,7 +155,7 @@ def _assert_member_parity(
     protocol: type,
     implementation: type,
     name: str,
-    proto_raw: property | Callable[..., object],
+    proto_raw: property | classmethod[Any, ..., Any] | Callable[..., object],
     impl_name: str | None = None,
 ) -> None:
     """Assert *implementation* has a same-shaped member as *protocol* declares.
@@ -163,11 +171,12 @@ def _assert_member_parity(
             Defaults to *name*.
 
     Raises:
-        AssertionError: On a missing member, a property/method kind
-            mismatch, a sync/async mismatch, a parameter-shape mismatch, a
-            return-annotation mismatch, or (when both sides resolve) a
-            resolved-type-hints mismatch. Every message names the protocol,
-            the implementation, the member, and the concrete diff.
+        AssertionError: On a missing member, a property/method/classmethod
+            kind mismatch, a sync/async mismatch, a parameter-shape
+            mismatch, a return-annotation mismatch, or (when both sides
+            resolve) a resolved-type-hints mismatch. Every message names
+            the protocol, the implementation, the member, and the concrete
+            diff.
     """
     impl_name = impl_name if impl_name is not None else name
     impl_raw = inspect.getattr_static(implementation, impl_name, None)
@@ -185,6 +194,25 @@ def _assert_member_parity(
             f"{'property' if proto_is_property else 'method'}, but "
             f"{implementation.__qualname__}.{impl_name} is a "
             f"{'property' if impl_is_property else 'method'}"
+        )
+
+    # A classmethod factory is the one member shape where the return
+    # annotation is *expected* to differ: each implementation's factory
+    # returns its own concrete type (BM25Index.from_store -> BM25Index), not
+    # the Protocol's name, and there is no single spelling ("Self", the
+    # Protocol's own name, ...) every implementation could be made to share
+    # without lying about what it actually returns. Checked below: kind
+    # (classmethod-ness), sync/async, and every parameter including their
+    # resolved types. Not checked: the return annotation, in either its raw
+    # or its resolved form.
+    proto_is_classmethod = isinstance(proto_raw, classmethod)
+    impl_is_classmethod = isinstance(impl_raw, classmethod)
+    if proto_is_classmethod != impl_is_classmethod:
+        raise AssertionError(
+            f"{protocol.__qualname__}.{name} is a "
+            f"{'classmethod' if proto_is_classmethod else 'plain method'}, but "
+            f"{implementation.__qualname__}.{impl_name} is a "
+            f"{'classmethod' if impl_is_classmethod else 'plain method'}"
         )
 
     proto_target = _callable_target(proto_raw)
@@ -213,16 +241,26 @@ def _assert_member_parity(
             f"  implementation: {impl_params}"
         )
 
-    proto_return = _raw_annotation_text(proto_sig.return_annotation)
-    impl_return = _raw_annotation_text(impl_sig.return_annotation)
-    if proto_return != impl_return:
-        raise AssertionError(
-            f"{protocol.__qualname__}.{name} return annotation {proto_return!r} does not "
-            f"match {implementation.__qualname__}.{impl_name} return annotation {impl_return!r}"
-        )
+    if not proto_is_classmethod:
+        proto_return = _raw_annotation_text(proto_sig.return_annotation)
+        impl_return = _raw_annotation_text(impl_sig.return_annotation)
+        if proto_return != impl_return:
+            raise AssertionError(
+                f"{protocol.__qualname__}.{name} return annotation {proto_return!r} does not "
+                f"match {implementation.__qualname__}.{impl_name} return annotation "
+                f"{impl_return!r}"
+            )
 
     proto_hints = _resolved_hints(proto_target)
     impl_hints = _resolved_hints(impl_target)
+    if proto_is_classmethod:
+        # Same exemption as the raw-text check above, applied to the
+        # resolved form: every OTHER key (each parameter's resolved type)
+        # still has to agree.
+        if proto_hints is not None:
+            proto_hints = {k: v for k, v in proto_hints.items() if k != "return"}
+        if impl_hints is not None:
+            impl_hints = {k: v for k, v in impl_hints.items() if k != "return"}
     if proto_hints is not None and impl_hints is not None and proto_hints != impl_hints:
         raise AssertionError(
             f"{protocol.__qualname__}.{name} resolved type hints {proto_hints} do not "
@@ -283,7 +321,9 @@ def assert_signature_parity(
     for name, proto_member in vars(protocol).items():
         if name.startswith("_") and name not in _CHECKED_DUNDERS:
             continue
-        if not (isinstance(proto_member, property) or inspect.isfunction(proto_member)):
+        if not (
+            isinstance(proto_member, (property, classmethod)) or inspect.isfunction(proto_member)
+        ):
             continue
         _assert_member_parity(protocol, implementation, name, proto_member, member_map.get(name))
         checked += 1
@@ -373,6 +413,55 @@ class _FakeIncompleteImpl:
     the baseline "missing member" case for the helper's own error message."""
 
 
+@runtime_checkable
+class _FakeClassmethodProtocol(Protocol):
+    """A classmethod-factory-shaped Protocol -- the shape
+    ``LexicalIndexProtocol.from_store`` and ``BM25Index.from_store`` share
+    (GK-016). Before ``_callable_target``/``_assert_member_parity`` learned
+    to unwrap ``classmethod``, this shape was invisible to the helper the
+    same way ``__call__`` once was: ``inspect.isfunction`` is ``False`` for a
+    raw ``classmethod`` object, so the member-admission filter skipped it
+    silently."""
+
+    @classmethod
+    async def build(cls, value: int, *, flag: bool = False) -> _FakeClassmethodProtocol: ...
+
+
+class _FakeConformingClassmethodImpl:
+    """Matches on kind, async-ness and parameters. Deliberately returns its
+    OWN type, not the Protocol's -- the case the return-annotation exemption
+    exists for: every real classmethod factory in this codebase does this,
+    since returning literally ``_FakeClassmethodProtocol`` would defeat the
+    point of a typed constructor."""
+
+    @classmethod
+    async def build(cls, value: int, *, flag: bool = False) -> _FakeConformingClassmethodImpl:
+        return cls()
+
+
+class _FakeMismatchedClassmethodParamImpl:
+    """Same kind and same return-type shape as the conforming impl above,
+    but a renamed parameter -- proves the return-annotation exemption does
+    not also exempt parameters from being compared."""
+
+    @classmethod
+    async def build(
+        cls, renamed_value: int, *, flag: bool = False
+    ) -> _FakeMismatchedClassmethodParamImpl:
+        return cls()
+
+
+class _FakeNonClassmethodImpl:
+    """Same name and parameter shape as the Protocol's ``build``, but a
+    plain instance method rather than a classmethod. ``isinstance`` cannot
+    see this distinction, and neither could this helper before the
+    classmethod fix -- ``build`` would have failed ``inspect.isfunction``
+    on the Protocol side and never been compared against anything."""
+
+    async def build(self, value: int, *, flag: bool = False) -> _FakeNonClassmethodImpl:
+        return self
+
+
 class TestAssertSignatureParityHelper:
     def test_matching_signature_passes(self) -> None:
         assert_signature_parity(_FakeProtocol, _FakeConformingImpl)
@@ -412,6 +501,31 @@ class TestAssertSignatureParityHelper:
     def test_protocol_with_no_checkable_members_fails(self) -> None:
         with pytest.raises(AssertionError, match="vacuously"):
             assert_signature_parity(_FakeUncheckableProtocol, _FakeConformingImpl)
+
+    def test_matching_classmethod_shaped_protocol_passes(self) -> None:
+        """The return-annotation exemption is exercised for real here:
+        ``_FakeConformingClassmethodImpl.build`` returns
+        ``_FakeConformingClassmethodImpl``, not ``_FakeClassmethodProtocol``
+        -- a raw-text return-annotation comparison would reject this pair,
+        which is exactly why classmethod members skip that comparison."""
+        assert_signature_parity(_FakeClassmethodProtocol, _FakeConformingClassmethodImpl)
+
+    def test_classmethod_with_renamed_parameter_still_fails(self) -> None:
+        """The return-annotation exemption does not widen into a parameter
+        exemption: a renamed parameter is still caught."""
+        with pytest.raises(AssertionError, match="build"):
+            assert_signature_parity(_FakeClassmethodProtocol, _FakeMismatchedClassmethodParamImpl)
+
+    def test_classmethod_satisfied_by_a_plain_method_fails(self) -> None:
+        """Before ``classmethod`` unwrapping existed, this pair's ``build``
+        would never have been compared at all: ``inspect.isfunction`` is
+        ``False`` for a raw ``classmethod`` object, so the Protocol side's
+        member-admission filter skipped it, and the only other member
+        (there is none here) would have left ``checked == 0`` -- a vacuous
+        pass hiding a real defect (a factory that must be callable on the
+        class itself, not only on an instance)."""
+        with pytest.raises(AssertionError, match="classmethod"):
+            assert_signature_parity(_FakeClassmethodProtocol, _FakeNonClassmethodImpl)
 
 
 # ── LoaderProtocol <- FileLoader ───────────────────────────────────────────
@@ -480,6 +594,14 @@ class TestVectorStoreProtocolConformance:
 
     def test_lancedb_vector_store_matches_vector_store_protocol(self) -> None:
         assert_signature_parity(VectorStoreProtocol, LanceDBVectorStore)
+
+
+# ── LexicalIndexProtocol <- BM25Index ───────────────────────────────────────
+
+
+class TestLexicalIndexProtocolConformance:
+    def test_bm25_index_matches_lexical_index_protocol(self) -> None:
+        assert_signature_parity(LexicalIndexProtocol, BM25Index)
 
 
 # ── RerankerProtocol <- CrossEncoderReranker ───────────────────────────────

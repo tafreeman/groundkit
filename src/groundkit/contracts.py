@@ -13,15 +13,96 @@ these models return new objects; nothing here is mutated.
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import json
 import uuid
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 #: Score at or above which a retrieval result is considered high-confidence.
 #: Producers must normalize scores to be >= 0 (see RetrievalResult.score).
 HIGH_CONFIDENCE_SCORE: float = 0.7
+
+
+def _isolated_json_safe_metadata(value: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy ``metadata`` and reject anything that would not survive ``json.dumps``.
+
+    Shared by every model below carrying a ``metadata`` field (GK-017).
+    ``frozen=True`` blocks *rebinding* ``model.metadata`` but never touches
+    nested mutable values: a plain ``dict[str, Any]`` field lets pydantic
+    pass the caller's original list/dict straight through unvalidated, so a
+    caller mutating a value they still hold reaches inside an
+    already-constructed, "frozen" model. The type is deliberately left
+    ``Any`` here rather than narrowed to a recursive JSON-value alias: every
+    real caller already passes JSON-safe scalars/containers (verified
+    against every ``metadata=`` construction site in this codebase), and
+    narrowing the field's public type ripples ``Any`` into a real union
+    everywhere a caller *reads* ``metadata`` back out -- a much larger,
+    higher-risk change than this bug calls for. ``json.dumps`` is the
+    correctness check that matters: ``metadata`` is persisted as JSON
+    (``index/metadata.py``, ``index/dense.py``), so failing here means
+    failing at construction rather than at that far-away persistence
+    boundary, and raising outright (never silently coercing a non-JSON
+    value into something that happens to serialize) matches this project's
+    fail-closed rule for malformed input.
+
+    ``allow_nan=False``, not the stdlib default: ``json.dumps`` accepts
+    ``NaN``/``Infinity`` by default and renders them as bare (non-JSON)
+    identifiers, so the plain default-``json.dumps`` check this validator
+    used to run would let a ``NaN`` score through construction as
+    "JSON-serializable" and it would still be unpersistable at the real
+    boundary -- and worse, `service/mcp_server.py`'s
+    ``model_dump(mode="json")`` silently turns such a value into ``null``
+    rather than raising, so a caller-visible number would become
+    caller-visible ``None`` with nothing failing anywhere. This mirrors
+    ``retrieval/rerank.py``'s existing ``math.isfinite`` guard on ``score``
+    for the same reason, extended to metadata values.
+
+    ``RecursionError`` is caught alongside ``TypeError``/``ValueError``:
+    both operations below recurse per nesting level, so a sufficiently deep
+    ``metadata`` value overflows the interpreter's call stack rather than
+    raising either of those. Pydantic auto-wraps a ``ValueError`` raised
+    inside a field validator into a clean ``ValidationError``; it does not
+    auto-wrap a bare ``RecursionError``, which would otherwise propagate
+    past every typed-error boundary a caller of this constructor has
+    (``ingestion/chunking.py`` catches only ``pydantic.ValidationError``
+    around its own ``Chunk(...)`` call).
+
+    **Both** operations are guarded, not just ``json.dumps``, because which
+    one overflows first is an interpreter-version detail rather than a
+    property of the value. ``json.dumps``'s C encoder is bounded by the
+    separate C recursion limit CPython 3.12 introduced (~10k frames, not
+    ``sys.getrecursionlimit()``), while ``copy.deepcopy`` is pure Python
+    costing ~3 Python frames per nesting level. So the same 3000-deep dict
+    is rejected by ``json.dumps`` on 3.11 and sails through it on 3.13,
+    where ``deepcopy`` is what overflows — which is exactly how an
+    unguarded ``deepcopy`` reached CI green on 3.11 and red on 3.13. Only
+    ``RecursionError`` is caught on the copy: everything that survives the
+    ``json.dumps`` check above is a JSON scalar or container, all of which
+    are deep-copyable, so any other exception there is a bug worth seeing
+    rather than a malformed input worth reporting.
+
+    Passing the ``json.dumps`` check is necessary, not sufficient, for
+    round-trip fidelity: ``copy.deepcopy`` preserves the exact Python type
+    of whatever was handed in, so a tuple value survives as a ``tuple``
+    here but would come back as a ``list`` after a real trip through
+    ``index/metadata.py``'s ``json.dumps``/``json.loads``. No shipped
+    caller passes a tuple as of this writing, so this is not fixed
+    pre-emptively -- worth revisiting if one starts to.
+    """
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError(f"metadata must be JSON-serializable: {exc}") from exc
+    try:
+        return copy.deepcopy(value)
+    except RecursionError as exc:
+        raise ValueError(
+            f"metadata must be JSON-serializable and shallow enough to copy: {exc}"
+        ) from exc
+
 
 #: How a document's ``content`` relates to its source, and therefore how a
 #: citation into it is verified (ADR-0016).
@@ -71,6 +152,11 @@ class Document(BaseModel):
     source_class: SourceClass = "text"
     extractor: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata", mode="after")
+    @classmethod
+    def _isolate_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _isolated_json_safe_metadata(value)
 
     @model_validator(mode="after")
     def _validate_extractor(self) -> Document:
@@ -123,6 +209,11 @@ class Chunk(BaseModel):
     start_offset: int = Field(ge=0)
     end_offset: int = Field(gt=0)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata", mode="after")
+    @classmethod
+    def _isolate_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _isolated_json_safe_metadata(value)
 
     @model_validator(mode="after")
     def _validate_offsets(self) -> Chunk:
@@ -224,6 +315,11 @@ class RetrievalResult(BaseModel):
     start_offset: int = Field(ge=0)
     end_offset: int = Field(gt=0)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata", mode="after")
+    @classmethod
+    def _isolate_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _isolated_json_safe_metadata(value)
 
     @model_validator(mode="after")
     def _validate_offsets(self) -> RetrievalResult:
@@ -345,3 +441,8 @@ class SearchResponse(BaseModel):
     results: list[RetrievalResult] = Field(default_factory=list)
     total_results: int = Field(ge=0)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata", mode="after")
+    @classmethod
+    def _isolate_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _isolated_json_safe_metadata(value)

@@ -167,9 +167,10 @@ src = ["src", "tests"]
 select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "ARG", "S", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
-# S101: pytest asserts. ARG002: protocol-conformant test fakes must keep the
-# protocol's exact parameter names (mypy structural typing), used or not.
-"tests/**" = ["S101", "ARG002"]
+# S101: pytest asserts. ARG002/ARG003: protocol-conformant test fakes (method-
+# and classmethod-shaped alike) must keep the protocol's exact parameter
+# names (mypy structural typing), used or not.
+"tests/**" = ["S101", "ARG002", "ARG003"]
 
 [tool.mypy]
 strict = true

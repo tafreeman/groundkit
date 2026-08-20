@@ -78,12 +78,17 @@ Declined section with the reason)
 
 | ID | Item | Sev | Phase | Effort | Status | Depends on |
 |---|---|---|---|---|---|---|
+| GK-011 | `grk answer` has no end-to-end test | HIGH | E | S | todo | — |
+| GK-012 | `resolve_chat_config` has no test | MED | E | S | todo | — |
+| GK-013 | The unauthenticated error boundary is never driven over HTTP | MED | E | S | todo | — |
+| GK-014 | `add_chunks`' document-id mismatch branch is untested | LOW | E | XS | todo | — |
+| GK-018 | BM25 has no postings list | MED | G | S | todo | — |
 | GK-015 | `SPEC.md` §2 has no structural guard | MED | F | S | todo | — |
 | GK-016 | `BM25Index` has no protocol seam | MED | F | S | todo | — |
 | GK-017 | Frozen models alias nested caller metadata | MED | F | S | todo | — |
 | GK-018 | BM25 has no postings list | MED | G | S | todo | GK-016 |
 | GK-019 | Three read paths materialize a table to answer a keyed question | MED | G | M | todo | — |
-| GK-020 | The staleness cache stops working during an ingest | MED | G | L | todo | GK-016, GK-019 |
+| GK-020 | The staleness cache stops working during an ingest | MED | G | L | todo | GK-019 |
 | GK-021 | `answer.py` imports the eval harness | MED | H | S | todo | — |
 | GK-022 | `extraction.py` omitted from the coverage core subset | MED | H | XS | todo | — |
 | GK-024 | Blocking filesystem I/O inside `async def` | MED | H | XS | todo | — |
@@ -91,7 +96,6 @@ Declined section with the reason)
 | GK-026 | ADR-0013 decision 7 was never implemented | LOW | H | S | todo | — |
 | GK-027 | `run_eval` is one long, deeply nested function | LOW | H | M | todo | — |
 | GK-028 | Assorted small correctness debt | LOW | H | S | todo | — |
-| GK-029 | The service's library constructors default `Host` validation off | MED | F | S | todo | — |
 
 ---
 
@@ -162,126 +166,47 @@ unauthenticated 500 boundary, and `add_chunks`' orphaned guard copy — is dark 
 
 ---
 
-## Phase F — Structural guards and seams
+## Phase F — closed 2026-08-19
 
-**Goal:** the invariants this project rests on are enforced by mechanism, not by review.
-**Exit:** GK-015 landed; GK-016 landed so Phase G can proceed without touching `Retriever`.
+GK-015, GK-016, GK-017 and GK-029 landed together on `fix/backlog-phase-f` and are
+deleted from this file per the rule above. GK-016's consequence is structural (`Retriever`
+now depends on `LexicalIndexProtocol`, unblocking Phase G); GK-029's lives in ADR-0025,
+`SECURITY.md` and `KNOWN_LIMITATIONS.md` (one of the four `Host` residuals closed); GK-015
+and GK-017 change no behaviour a doc describes.
 
-### GK-015 — `SPEC.md` §2's central claim has no structural guard
+Both exit criteria were met. One item grew in scope under execution: `assert_signature_parity`
+(`tests/test_protocol_conformance.py`) could not see a classmethod member at all —
+`inspect.isfunction` is `False` for a raw `classmethod` object, the same blind spot
+`__call__` once was before PR #23 — so `LexicalIndexProtocol.from_store` would have passed
+conformance vacuously. The helper itself was extended first (classmethod unwrapping, a
+kind-mismatch check, a return-annotation exemption specific to construction factories) and
+proven against the unfixed helper before `LexicalIndexProtocol` was written, mirroring the
+same helper's own `__call__` fix in PR #23.
 
-- **Severity** MEDIUM · **Effort** S · **ADR** no · **Verified**
-- **Where** the only AST import scan is `tests/test_service_tools.py:184`, scoped to
-  `service/`
+GK-017's fix was adversarially reviewed (as instructed) and the review found three real gaps
+the initial fix missed: `json.dumps`'s stdlib default accepts `NaN`/`Infinity` and would have
+let a non-finite metadata float pass construction as "JSON-serializable" while still breaking
+the REST/MCP read surface; a sufficiently deep metadata value overflows `json.dumps`'s
+recursion rather than raising `TypeError`, and pydantic does not auto-wrap a bare
+`RecursionError` the way it does `ValueError`, so it would have escaped every typed-error
+boundary a caller has. Both are fixed (`allow_nan=False`; `RecursionError` caught
+alongside `TypeError`/`ValueError`) and regression-tested. A third, informational finding —
+`copy.deepcopy` preserves a tuple as a tuple where a real JSON round-trip would return a
+list — has no live caller today and is left as a documented comment rather than fixed
+pre-emptively.
 
-"Deterministic core, LLM at the boundary" currently holds — nothing under `retrieval/`,
-`index/` or `ingestion/` imports the LLM boundary. But it is enforced by review alone,
-while a strictly *narrower* property already has an AST scan whose docstring reads "Guard,
-demonstrated by injection." Meanwhile `answer.py` composes retrieval with synthesis,
-rewrite and the judge one import away, so the obvious next request — make query rewrite an
-option on `Retriever.search` so `grk search` benefits — is a two-line change that violates
-the project's central claim and that nothing would catch.
+GK-029 surfaced its own regression during verification, caught by re-running the full suite
+rather than only the newly-touched test file: `tests/test_service_api.py`'s six `create_app(...)`
+call sites relied on the old unrestricted default while testing unrelated REST-surface
+behaviour, and `TestClient`'s default `Host: testserver` does not satisfy the new
+`LOOPBACK_HOST_ALLOW_LIST` default. Fixed by passing `host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST`
+explicitly at each site — that file tests the REST surface, not `Host` validation, which is
+`tests/test_service_host_validation.py`'s job and the one file that varies the argument.
 
-This is the cheapest high-value item in the backlog, and it is the structural answer to the
-process gap that produced GK-003: a module grew a contract underneath it and no mechanism
-noticed.
-
-**Acceptance criteria**
-
-- [ ] `test_deterministic_core_imports_no_llm` AST-walks `src/groundkit/{retrieval,index,
-      ingestion}/*.py` plus `indexer.py`, `contracts.py` and `identity.py`.
-- [ ] Bars `groundkit.providers.{llm,synthesis,query_rewrite}` and `groundkit.evals.*`;
-      allows `groundkit.providers.protocols`, since the embedding seam legitimately sits in
-      the retrieval path.
-- [ ] Demonstrated by injection: add a barred import, watch it fail, remove it.
-
-### GK-016 — `BM25Index` has no protocol seam
-
-- **Severity** MEDIUM · **Effort** S · **ADR** no
-- **Where** `src/groundkit/retrieval/search.py:105` takes the concrete class
-
-Seams exist for loaders, chunkers, metadata stores, vector stores, embedders, chat and
-rerankers. `VectorStoreProtocol` and `RerankerProtocol` were even defined before their
-implementations existed, so Phase 3 could fill them in without touching callers. The
-lexical side — the one component carrying a named revisit trigger in ADR-0002 — got no such
-treatment, which makes GK-018 and GK-020 more expensive than they need to be, since both
-would otherwise mean editing `Retriever.open` directly.
-
-**Acceptance criteria**
-
-- [ ] `LexicalIndexProtocol` defined with exactly `size`, `index_chunks`, `search` and the
-      `from_store` factory.
-- [ ] A `tests/test_protocol_conformance.py` entry using `assert_signature_parity`.
-- [ ] `Retriever`'s annotation changed; no behaviour change, no test changes beyond the
-      new conformance entry.
-
-### GK-029 — The service's library constructors default `Host` validation off
-
-- **Severity** MEDIUM · **Effort** S · **ADR** yes · **Verified**
-- **Where** `src/groundkit/service/api.py` (`create_app`) and
-  `src/groundkit/service/mcp_server.py` (`create_session_manager`), both defaulting
-  `host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST`
-
-Found by a post-merge security review of PR #26, and confirmed by execution. The shipped
-binary is unaffected: `grk serve` always passes the list derived from the bind, and the
-regression tests assert the property against the CLI-assembled app rather than against
-these defaults. So the blast radius is third-party embedders only.
-
-The finding is about the *shape of the default*, not the reachable behaviour. ADR-0024
-records it as a residual and justifies it: "a caller embedding the app behind its own front
-door is not helped by a check keyed to an address it never binds." That argument supports
-letting such a caller **opt out**; it does not support opting them out by default. A caller
-who does not know the parameter exists gets no `Host` check, in a codebase whose stated rule
-is that an unconfigured provider raises rather than falls back (`errors.py`). `cli._build_mcp_mount`
-already demonstrates the safe shape — it defaults to `LOOPBACK_HOST_ALLOW_LIST`, and its own
-docstring calls the asymmetry deliberate.
-
-Marked `ADR: yes` because ADR-0024's Consequences section argues the current default
-explicitly. Flipping it contradicts a recorded position, so it needs ADR-0025 amending
-ADR-0024, not a silent change — which is also why it was not folded into the review-findings
-PR that produced this item.
-
-**Acceptance criteria**
-
-- [ ] ADR-0025 written, amending ADR-0024's residual, one decision, alternatives recorded,
-      added to **both** `docs/adr/index.md` and `mkdocs.yml`'s `nav`.
-- [ ] Both constructors default to `LOOPBACK_HOST_ALLOW_LIST`; the public signature is
-      unchanged, so an embedder passing `UNRESTRICTED_HOST_ALLOW_LIST` explicitly keeps
-      exactly today's behaviour.
-- [ ] Regression test, shown to fail first: `create_app(ctx)` with no `host_allow_list`
-      refuses a forged `Host`.
-- [ ] `SECURITY.md` and `KNOWN_LIMITATIONS.md` updated — this closes one of the four named
-      `Host` residuals, so neither may keep listing it.
-
-### GK-017 — Frozen models alias nested caller metadata
-
-- **Severity** MEDIUM · **Effort** S · **ADR** no · **Verified**
-- **Where** `src/groundkit/contracts.py` — `metadata: dict[str, Any]` on `Document`,
-  `Chunk`, `RetrievalResult`, `SearchResponse`
-
-Confirmed by execution: Pydantic's `frozen=True` blocks attribute rebinding and rebuilds
-the *outer* dict, but nested mutable values remain the same objects the caller holds, so a
-caller mutation lands inside the frozen model. Dormant today only because every shipped
-loader writes scalars.
-
-The chain that would survive is real, not hypothetical: `BM25Index.from_store` builds each
-`Chunk` once and holds it for the index's lifetime, and `CollectionRuntime` caches one
-`Retriever` across every request in a running server, so the same objects reach the service
-boundary on every query. `providers/context_assembly.py:304` defensively copies the dict
-while `retrieval/rerank.py:178` beside it does not — and that copy is itself shallow, so it
-closes nothing.
-
-Per-call-site discipline is the wrong fix; PDF/HTML loaders will add call sites.
-
-**Acceptance criteria**
-
-- [ ] Immutability enforced at the contract boundary — a validator that deep-copies or
-      converts to immutable equivalents on construction — so new call sites are safe by
-      default.
-- [ ] Consider narrowing the type: metadata must already survive `json.dumps` at
-      persistence, so a recursive `JSONValue` alias would fail closed at construction
-      rather than at the far-away persistence boundary.
-- [ ] Regression test, shown to fail first: mutating a nested value the caller still holds
-      does not change the model's view of it.
+**`fix/backlog-phase-e` was still open, unmerged, when this branch was cut from `main`.**
+This file therefore still shows GK-011..014 as `todo` above — accurate as of this branch's
+base commit, not current. Merging both PRs will conflict on this file; resolve by rebasing
+whichever merges second, not by discarding either closure note.
 
 ---
 
@@ -297,8 +222,7 @@ Per-call-site discipline is the wrong fix; PDF/HTML loaders will add call sites.
 
 ### GK-018 — BM25 has no postings list
 
-- **Severity** MEDIUM · **Effort** S · **ADR** yes (erratum to ADR-0002) ·
-  **Depends on** GK-016 · **Verified**
+- **Severity** MEDIUM · **Effort** S · **ADR** yes (erratum to ADR-0002) · **Verified**
 - **Where** `src/groundkit/index/bm25.py:113` —
   `for doc_idx in range(len(self._chunks))`
 
@@ -354,7 +278,7 @@ capability fork in the retrieval hot path with a silent downgrade branch.
 
 ### GK-020 — The staleness cache stops working during an ingest
 
-- **Severity** MEDIUM · **Effort** L · **ADR** yes · **Depends on** GK-016, GK-019
+- **Severity** MEDIUM · **Effort** L · **ADR** yes · **Depends on** GK-019
 - **Where** `src/groundkit/index/metadata.py:659` (bump per document);
   `src/groundkit/runtime.py:229` (cache validity)
 

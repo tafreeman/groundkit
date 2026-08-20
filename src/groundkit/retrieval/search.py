@@ -29,7 +29,11 @@ from groundkit.telemetry import get_tracer, span_attributes
 
 if TYPE_CHECKING:
     from groundkit.contracts import Chunk
-    from groundkit.index.protocols import MetadataStoreProtocol, VectorStoreProtocol
+    from groundkit.index.protocols import (
+        LexicalIndexProtocol,
+        MetadataStoreProtocol,
+        VectorStoreProtocol,
+    )
     from groundkit.providers.protocols import EmbeddingProtocol
     from groundkit.telemetry import Stage
 
@@ -104,7 +108,7 @@ class Retriever:
     def __init__(
         self,
         store: MetadataStoreProtocol,
-        bm25: BM25Index,
+        bm25: LexicalIndexProtocol,
         config: RetrievalConfig | None = None,
         *,
         embedder: EmbeddingProtocol | None = None,

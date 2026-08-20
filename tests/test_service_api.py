@@ -34,6 +34,7 @@ from groundkit.retrieval.search import MAX_QUERY_LEN, MAX_TOP_K
 from groundkit.runtime import CollectionRegistry
 from groundkit.service import api as api_module
 from groundkit.service.api import DOC_PATHS, REQUEST_ID_HEADER, McpMount, create_app
+from groundkit.service.binding import UNRESTRICTED_HOST_ALLOW_LIST
 from groundkit.service.errors import GENERIC_DETAIL
 from groundkit.service.schemas import ChunkFetchResponse, IndexStatusResponse, SearchRequest
 from groundkit.service.tools import TOOLS, ServiceContext
@@ -89,9 +90,22 @@ def _make_app(tmp_path: Path) -> tuple[FastAPI, Path, Path]:
     registry on shutdown, which is why every test below drives it through
     ``with TestClient(app)`` rather than calling the client bare — the context
     manager is what runs startup and shutdown.
+
+    Every ``create_app(...)`` call in this file passes
+    ``host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST`` explicitly (ADR-0025
+    flipped the constructor's own default to
+    :data:`~groundkit.service.binding.LOOPBACK_HOST_ALLOW_LIST`, which
+    ``TestClient``'s default ``Host: testserver`` does not satisfy). This
+    file exercises the REST surface's own behaviour, not ``Host`` validation
+    -- that is ``tests/test_service_host_validation.py``'s job, and it is
+    the file that actually varies ``host_allow_list``.
     """
     index_dir, corpus, _ = asyncio.run(_seed(tmp_path))
-    return create_app(_context(index_dir, corpus)), index_dir, corpus
+    return (
+        create_app(_context(index_dir, corpus), host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST),
+        index_dir,
+        corpus,
+    )
 
 
 def _empty_context(index_dir: Path) -> ServiceContext:
@@ -170,7 +184,9 @@ def test_routes_are_exactly_the_registry(tmp_path: Path) -> None:
     operations that go *through* the registry; a route added with a bare
     decorator would bypass it entirely, and this is what notices.
     """
-    app = create_app(_empty_context(tmp_path / "index"))
+    app = create_app(
+        _empty_context(tmp_path / "index"), host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST
+    )
     assert _route_pairs(app), "the app registered no routes at all"
     _assert_registry_route_parity(app)
 
@@ -184,7 +200,9 @@ def test_a_hand_added_route_breaks_parity(tmp_path: Path) -> None:
     ``TOOLS`` — and assert the same assertion the test above passes now fails.
     A parity test that cannot be made to fail is decoration.
     """
-    app = create_app(_empty_context(tmp_path / "index"))
+    app = create_app(
+        _empty_context(tmp_path / "index"), host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST
+    )
     _assert_registry_route_parity(app)
 
     @app.get("/v1/documents")
@@ -533,7 +551,9 @@ def test_no_route_accepts_a_query_parameter(tmp_path: Path) -> None:
     and a JSON body, so there is no query-string channel for such a value to
     arrive on even if a model were widened to accept one.
     """
-    app = create_app(_empty_context(tmp_path / "index"))
+    app = create_app(
+        _empty_context(tmp_path / "index"), host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST
+    )
     schema = app.openapi()
     offenders: list[str] = []
     for path, operations in schema["paths"].items():
@@ -569,7 +589,9 @@ def test_no_generated_schema_carries_provider_or_filesystem_configuration(tmp_pa
     ``embed``.
     """
     forbidden_exact = {"base_url", "index_dir", "base_dir", "api_key_env"}
-    app = create_app(_empty_context(tmp_path / "index"))
+    app = create_app(
+        _empty_context(tmp_path / "index"), host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST
+    )
     components: dict[str, Any] = app.openapi().get("components", {}).get("schemas", {})
     assert components, "the app published no component schemas to check"
 
@@ -615,6 +637,7 @@ def test_the_rest_surface_mounts_an_mcp_transport_without_importing_one(tmp_path
     app = create_app(
         _empty_context(tmp_path / "index"),
         mcp_mount=McpMount(path="/mcp", app=transport_app, lifespan=transport_lifespan),
+        host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST,
     )
     _assert_registry_route_parity(app)
 

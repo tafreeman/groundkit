@@ -140,15 +140,16 @@ Four residuals of that fix, named rather than implied:
   A bind that stays on loopback — including a hostname that resolves there —
   keeps it enforced, and says so in the log rather than claiming a publication
   that did not happen.
-- **The library seam is fail-open.** `create_app` and `create_session_manager`
-  default to an unrestricted allow-list when constructed directly, so an
-  application embedding either of them in its own ASGI stack gets no `Host`
-  check unless it passes `host_allow_list=`. `grk serve` always passes the
-  derived list, and the regression tests assert the property against the
-  CLI-assembled app rather than against the defaults, so the shipped binary is
-  unaffected — but the default is a named constant
-  (`UNRESTRICTED_HOST_ALLOW_LIST`) rather than a safe one, which is a choice
-  ADR-0024 records under Consequences rather than one it hides.
+
+**The library seam defaults closed.** `create_app` and `create_session_manager`
+default `host_allow_list` to `LOOPBACK_HOST_ALLOW_LIST` (ADR-0025, amending
+ADR-0024's original choice of `UNRESTRICTED_HOST_ALLOW_LIST`), so an
+application embedding either of them without passing `host_allow_list=`
+gets the same fail-closed posture as `grk serve`'s own default bind, not
+every `Host` accepted. `grk serve` itself is unaffected either way — it
+always passes the derived list — and a caller that genuinely needs the
+wider behavior (embedding behind a reverse proxy under a name this process
+cannot predict) still opts in explicitly with `UNRESTRICTED_HOST_ALLOW_LIST`.
 
 This does not change the **outbound** rebinding gap recorded further down;
 that is the opposite direction and remains open.

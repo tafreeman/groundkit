@@ -160,6 +160,7 @@ nav:
       - "ADR-0022 — Observability dependency shape and span attributes": adr/ADR-0022-observability-dependency-shape-and-span-attribute-allowlist.md
       - "ADR-0023 — Snapshot lifecycle is bound to the document row": adr/ADR-0023-snapshot-lifecycle-is-bound-to-the-document-row.md
       - "ADR-0024 — Host header validation on both transports": adr/ADR-0024-host-header-validation-on-both-transports.md
+      - "ADR-0025 — Library constructors default Host validation on": adr/ADR-0025-library-constructors-default-host-validation-on.md
   - Project:
       - Security: security.md
       - Known limitations: limitations.md
