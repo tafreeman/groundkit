@@ -3,6 +3,9 @@ extended with the offset invariants groundkit adds."""
 
 from __future__ import annotations
 
+import json
+import sys
+
 import pytest
 from pydantic import ValidationError
 
@@ -324,3 +327,39 @@ class TestMetadataIsolation:
 
         with pytest.raises(ValidationError, match="JSON-serializable"):
             make_chunk(metadata=deep)
+
+    def test_deep_metadata_is_rejected_even_when_json_dumps_accepts_it(self) -> None:
+        """The interpreter-independent half of the test above.
+
+        Which of the validator's two recursive operations overflows first
+        is a CPython-version detail, not a property of the value:
+        ``json.dumps``'s C encoder is bounded by the separate C recursion
+        limit 3.12 introduced (~10k frames, not
+        ``sys.getrecursionlimit()``), while ``copy.deepcopy`` is pure
+        Python at ~3 Python frames per nesting level. So on 3.11 the
+        3000-deep dict above is rejected by ``json.dumps`` and the
+        ``deepcopy`` that follows is never reached, leaving its guard
+        untested -- which is exactly how an unguarded ``deepcopy`` passed
+        CI's 3.11 leg and failed its 3.13 one with a bare
+        ``RecursionError``. Raising the limit above what ``json.dumps``
+        needs and below what ``deepcopy`` needs reproduces the 3.13 shape
+        on every version, so this test fails on all three matrix legs if
+        the copy is ever unguarded again.
+        """
+        deep: dict[str, object] = {}
+        cursor = deep
+        for _ in range(3000):
+            cursor["n"] = {}
+            cursor = cursor["n"]  # type: ignore[assignment]
+
+        original_limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(5000)
+        try:
+            # Precondition: the first guard must *not* fire, or this test
+            # would silently degrade into a duplicate of the one above.
+            json.dumps(deep)
+
+            with pytest.raises(ValidationError, match="JSON-serializable"):
+                make_chunk(metadata=deep)
+        finally:
+            sys.setrecursionlimit(original_limit)

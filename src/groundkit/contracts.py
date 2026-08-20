@@ -61,7 +61,7 @@ def _isolated_json_safe_metadata(value: dict[str, Any]) -> dict[str, Any]:
     for the same reason, extended to metadata values.
 
     ``RecursionError`` is caught alongside ``TypeError``/``ValueError``:
-    ``json.dumps`` recurses per nesting level, so a sufficiently deep
+    both operations below recurse per nesting level, so a sufficiently deep
     ``metadata`` value overflows the interpreter's call stack rather than
     raising either of those. Pydantic auto-wraps a ``ValueError`` raised
     inside a field validator into a clean ``ValidationError``; it does not
@@ -69,6 +69,20 @@ def _isolated_json_safe_metadata(value: dict[str, Any]) -> dict[str, Any]:
     past every typed-error boundary a caller of this constructor has
     (``ingestion/chunking.py`` catches only ``pydantic.ValidationError``
     around its own ``Chunk(...)`` call).
+
+    **Both** operations are guarded, not just ``json.dumps``, because which
+    one overflows first is an interpreter-version detail rather than a
+    property of the value. ``json.dumps``'s C encoder is bounded by the
+    separate C recursion limit CPython 3.12 introduced (~10k frames, not
+    ``sys.getrecursionlimit()``), while ``copy.deepcopy`` is pure Python
+    costing ~3 Python frames per nesting level. So the same 3000-deep dict
+    is rejected by ``json.dumps`` on 3.11 and sails through it on 3.13,
+    where ``deepcopy`` is what overflows — which is exactly how an
+    unguarded ``deepcopy`` reached CI green on 3.11 and red on 3.13. Only
+    ``RecursionError`` is caught on the copy: everything that survives the
+    ``json.dumps`` check above is a JSON scalar or container, all of which
+    are deep-copyable, so any other exception there is a bug worth seeing
+    rather than a malformed input worth reporting.
 
     Passing the ``json.dumps`` check is necessary, not sufficient, for
     round-trip fidelity: ``copy.deepcopy`` preserves the exact Python type
@@ -82,7 +96,12 @@ def _isolated_json_safe_metadata(value: dict[str, Any]) -> dict[str, Any]:
         json.dumps(value, allow_nan=False)
     except (TypeError, ValueError, RecursionError) as exc:
         raise ValueError(f"metadata must be JSON-serializable: {exc}") from exc
-    return copy.deepcopy(value)
+    try:
+        return copy.deepcopy(value)
+    except RecursionError as exc:
+        raise ValueError(
+            f"metadata must be JSON-serializable and shallow enough to copy: {exc}"
+        ) from exc
 
 
 #: How a document's ``content`` relates to its source, and therefore how a
