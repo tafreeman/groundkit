@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Final
 
 import pytest
 
@@ -27,7 +27,7 @@ from groundkit.errors import ConfigurationError, IndexIdentityError, RetrievalEr
 from groundkit.index.bm25 import BM25Index
 from groundkit.index.dense import InMemoryVectorStore
 from groundkit.index.metadata import SQLiteMetadataStore
-from groundkit.index.protocols import MetadataStoreProtocol
+from groundkit.index.protocols import DocumentRecordStoreProtocol, MetadataStoreProtocol
 from groundkit.indexer import Indexer
 from groundkit.ingestion.loaders import FileLoader
 from groundkit.providers.embeddings import InMemoryEmbedder
@@ -35,6 +35,7 @@ from groundkit.providers.protocols import EmbeddingProtocol
 from groundkit.retrieval.citations import resolve_citation, verify_citation
 from groundkit.retrieval.fusion import reciprocal_rank_fusion
 from groundkit.retrieval.search import MAX_TOP_K, Retriever, SearchMode
+from metadata_store_doubles import DelegatingMetadataStore, RefusingMetadataStore
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -127,58 +128,29 @@ class TestRetriever:
         asyncio.run(run())
 
     def test_missing_source_mapping_fails_closed(self) -> None:
+        """A chunk whose document has no row is refused, on the whole-table fallback branch.
+
+        The double builds on :class:`RefusingMetadataStore`, which does *not*
+        implement ``DocumentRecordStoreProtocol`` — so this drives the
+        fallback branch of ``_DocumentRecordLookup`` specifically. The keyed
+        branch has its own fail-closed test in
+        ``tests/test_keyed_document_reads.py``; both must refuse, and a store
+        without the optional capability must not be the one that fails open.
+        """
         doc = Document(source="ghost.md", content="orphaned chunk content")
 
-        class OrphanStore:
-            async def upsert_document(
-                self, source: str, document_id: str, content_hash: str
-            ) -> None:
-                raise NotImplementedError
-
-            async def get_document_hash(self, source: str) -> str | None:
-                return None
-
-            async def get_document_id(self, source: str) -> str | None:
-                return None
+        class OrphanStore(RefusingMetadataStore):
+            """No documents at all, but a chunk claiming one."""
 
             async def get_document_sources(self) -> dict[str, str]:
                 return {}
 
-            async def add_chunks(self, chunks: list[Chunk], source: str) -> None:
-                raise NotImplementedError
-
-            async def replace_document(
-                self, source: str, document_id: str, content_hash: str, chunks: list[Chunk]
-            ) -> None:
-                raise NotImplementedError
-
             async def get_chunks(self) -> list[Chunk]:
                 return _chunks_for(doc)
 
-            async def get_chunk(self, chunk_id: str) -> Chunk | None:
-                return None
-
-            async def delete_document(self, document_id: str) -> int:
-                return 0
-
-            async def write_manifest(self, identity: EmbeddingIdentity) -> None:
-                raise NotImplementedError
-
-            async def verify_manifest(
-                self, identity: EmbeddingIdentity
-            ) -> CollectionManifest | None:
-                raise NotImplementedError
-
-            async def get_manifest(self) -> CollectionManifest | None:
-                return None
-
-            async def get_generation(self) -> int | None:
-                # None means "freshness unanswerable" (ADR-0013), which is the
-                # honest answer for a hand-built fake with no durable state.
-                return None
-
         store = OrphanStore()
         assert isinstance(store, MetadataStoreProtocol)
+        assert not isinstance(store, DocumentRecordStoreProtocol)
 
         async def run() -> None:
             retriever = await Retriever.open(store)
@@ -631,7 +603,7 @@ class TestManifestVerificationAtOpen:
         asyncio.run(run())
 
 
-class _BindsManifestDuringVerify:
+class _BindsManifestDuringVerify(DelegatingMetadataStore):
     """Metadata store that runs a concurrent dense ingest inside ``verify_manifest``.
 
     Delegates everything to a real :class:`SQLiteMetadataStore`; the only
@@ -641,13 +613,18 @@ class _BindsManifestDuringVerify:
     manifest read, so it makes the TOCTOU window deterministic instead of
     hoping a real thread race lands in it.
 
-    Satisfies :class:`MetadataStoreProtocol` structurally, by delegation.
+    Delegation is inherited from the shared
+    :class:`~metadata_store_doubles.DelegatingMetadataStore` rather than
+    written here as ``__getattr__``. The old ``__getattr__`` returned ``Any``,
+    so mypy checked nothing about the forwarded surface — a store method this
+    wrapper is meant to pass through could be renamed out from under it with
+    no error anywhere.
     """
 
     def __init__(
         self, inner: SQLiteMetadataStore, on_verify: Callable[[], Awaitable[None]]
     ) -> None:
-        self._inner = inner
+        super().__init__(inner)
         self._on_verify = on_verify
         self._fired = False
 
@@ -657,9 +634,6 @@ class _BindsManifestDuringVerify:
             self._fired = True
             await self._on_verify()
         return manifest
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
 
 
 class TestNoBackfillDenseRead:
@@ -1303,8 +1277,11 @@ def test_bm25_scoring_does_not_run_on_the_event_loop(
 ) -> None:
     """Whole-corpus BM25 scoring must run off the loop thread, on both call sites.
 
-    ``BM25Index.search`` scores every indexed chunk before truncating to
-    ``top_k``, in pure Python. Called inline from ``Retriever.search``'s
+    ``BM25Index.search`` scores the union of the query terms' postings
+    before truncating to ``top_k`` (GK-018), in pure Python -- and for an
+    unselective query that is still most of the corpus, which is why the
+    dispatch this test pins did not stop being necessary when the postings
+    map landed. Called inline from ``Retriever.search``'s
     ``async def``, that ran on the single event loop ``grk serve`` has -- so
     one query stalled every other in-flight request, ``index_status`` and
     ``fetch_chunk`` included, for the length of a full corpus scan. It was

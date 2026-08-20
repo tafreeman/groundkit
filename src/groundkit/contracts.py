@@ -232,7 +232,26 @@ class Chunk(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def content_hash(self) -> str:
-        """SHA-256 hash of the chunk content for deduplication."""
+        """SHA-256 hash of the chunk content for deduplication.
+
+        Recomputed on every access, and deliberately **not** a
+        ``functools.cached_property`` (GK-028). Staleness is not the
+        objection -- the model is frozen and the hash is a pure function of
+        ``content``, so a cache could never disagree with its input. Unfreezing
+        is: pydantic's ``__setattr__`` special-cases ``cached_property``
+        *before* it consults the frozen config
+        (``pydantic/main.py::BaseModel._setattr_handler``, checked against
+        the pinned 2.13 in this tree), so ``chunk.content_hash = "..."``
+        would stop raising and start writing straight into ``__dict__``.
+        Every later reader -- BM25's and dense's tie-breaks, the value
+        ``index/metadata.py`` persists -- would then use a string that is not
+        the hash of ``content``, on a model whose entire contract is that it
+        cannot be changed after validation. Trading that for an unmeasured
+        saving on a bounded string is the wrong way round; a caller that
+        wants the hash once caches it itself at build time
+        (``index/bm25.py``). ``tests/test_contracts.py`` pins the assignment
+        refusal so the trade-off is enforced rather than remembered.
+        """
         return hashlib.sha256(self.content.encode()).hexdigest()
 
 

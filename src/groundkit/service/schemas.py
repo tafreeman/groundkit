@@ -141,6 +141,21 @@ class IndexStatusResponse(BaseModel):
     ``generation`` is ``None`` when the collection predates ADR-0013's marker,
     which is also when ``cache_enabled`` is ``False`` — surfaced so a degraded
     collection is visible directly rather than inferred from latency.
+
+    The four ``retriever_*``/``rebuild_*`` fields are that same argument
+    applied to the cache's *behaviour* rather than to its availability
+    (ADR-0026). ``cache_enabled: true`` says the cache is switched on; it says
+    nothing about whether it is hitting, and under a concurrent ``grk ingest``
+    it can be on and hitting almost never. These counters make that visible
+    instead of inferrable from latency. They describe this **process's** work
+    against the collection, not the collection, so they reset when the
+    registry evicts and reopens a runtime — see
+    :class:`~groundkit.runtime.RebuildStats`.
+
+    Adding them discloses nothing new. A rebuild happens exactly when the
+    generation moved, and ``generation`` is already reported on this same
+    response — a strictly finer-grained signal of the same write activity. No
+    field here names a source, a query, a path, or a byte of content.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -153,3 +168,18 @@ class IndexStatusResponse(BaseModel):
     generation: int | None = None
     cache_enabled: bool = True
     schema_version: int = Field(ge=0)
+    #: Retriever acquires served by this process for this collection. The
+    #: denominator: the cache-hit fraction is ``1 - retriever_rebuilds /
+    #: retriever_acquires``, derived by the reader rather than stored here
+    #: beside the two numbers that determine it.
+    retriever_acquires: int = Field(default=0, ge=0)
+    #: How many of those acquires had to rebuild the retriever — an O(corpus)
+    #: BM25 rebuild holding the store lock the ingest writer also needs.
+    retriever_rebuilds: int = Field(default=0, ge=0)
+    #: Wall-clock seconds this process spent rebuilding, failed rebuilds
+    #: included.
+    rebuild_seconds_total: float = Field(default=0.0, ge=0.0)
+    #: Duration of the most recent rebuild, or ``None`` if none has run.
+    #: Reported next to the total because an average over the total hides the
+    #: spike a single rebuild is.
+    last_rebuild_seconds: float | None = Field(default=None, ge=0.0)

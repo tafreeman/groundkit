@@ -280,7 +280,7 @@ class EchoCaseResult(BaseModel):
             ``positive_grounded`` and not ``leaked_absent_marker``. Stored
             and validated for coherence against its own inputs rather than
             derived silently at read time — the same shape
-            :class:`~groundkit.evals.judge.FaithfulnessVerdict` uses for its
+            :class:`~groundkit.providers.judge.FaithfulnessVerdict` uses for its
             own internal coherence check, and for the same reason: a
             recomputed value that disagreed with the fields it came from
             would be indistinguishable from a genuine disagreement about

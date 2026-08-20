@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -101,6 +102,62 @@ class AcquiredRetriever:
     retriever: Retriever
 
 
+@dataclass(frozen=True, slots=True)
+class RebuildStats:
+    """How often this runtime rebuilt its retriever, and what that cost (ADR-0026).
+
+    The cache's *steady state* is cheap and well understood: one indexed
+    single-row read per request. Its behaviour under a concurrent ``grk
+    ingest`` is neither, and could not be observed at all before this existed.
+    ADR-0013 decision 1 bumps the generation once per **commit**, and an ingest
+    commits once per document, so an ingest over N changed files publishes N
+    distinct generations and the equality predicate in
+    :meth:`CollectionRuntime.acquire` fails against every one of them. Whether
+    that actually costs anything depends on the request rate, the corpus size
+    and the ingest's duration — three things a design document can only guess
+    at. These counters are what turn the guess into a reading.
+
+    **Derived, not stored.** There is no ``hit_rate`` field, following the same
+    rule :mod:`groundkit.evals.schema` applies to a stage delta: a ratio stored
+    beside its own inputs is redundant state that can disagree with them. The
+    reader computes ``1 - rebuilds / acquires``. That is also why ``acquires``
+    is here at all — a rebuild count with no denominator says how much work was
+    done, never what fraction of requests paid for it, and the fraction is the
+    cliff.
+
+    **Process-local, and deliberately not persisted.** Nothing here describes
+    the collection; it describes one :class:`CollectionRuntime` object's
+    history. Persisting it would put a write on the path of an unauthenticated
+    read and would need a schema bump to hold it. The consequence is real and
+    is recorded rather than hidden: a runtime evicted by
+    :class:`CollectionRegistry`'s LRU bound and later reopened starts from
+    zero, so these are not lifetime totals for a collection.
+
+    Attributes:
+        acquires: Calls to :meth:`CollectionRuntime.acquire` that got past the
+            closed check. The denominator.
+        rebuilds: Rebuild bodies that *started*, counted at entry rather than
+            at publication. Counting at entry means a rebuild in flight is
+            already visible and a rebuild that keeps failing is visible as
+            work rather than as silence; a counter that only advanced on
+            success would report a crash-looping runtime as idle.
+        rebuild_seconds_total: Wall-clock seconds spent inside those rebuild
+            bodies, **including ones that raised**. A failed rebuild still
+            held the rebuild lock for its duration and still made every
+            concurrent request wait, so charging only successes would
+            understate the cost exactly when it is highest.
+        last_rebuild_seconds: Duration of the most recent rebuild, or ``None``
+            if none has run. Kept alongside the total because a total divided
+            by a count is an average, and an average hides the spike that a
+            single O(corpus) rebuild actually is.
+    """
+
+    acquires: int = 0
+    rebuilds: int = 0
+    rebuild_seconds_total: float = 0.0
+    last_rebuild_seconds: float | None = None
+
+
 class CollectionRuntime:
     """Hands out a retriever for one collection, rebuilding it when the store changes.
 
@@ -147,6 +204,16 @@ class CollectionRuntime:
         self._rebuild_lock = asyncio.Lock()
         self._closed = False
         self._warned_unanswerable = False
+        # Plain counters rather than a frozen RebuildStats held and replaced:
+        # acquire() touches one of them on every request, and rebuilding an
+        # immutable snapshot per request would put an allocation on the path
+        # this class exists to keep cheap. The immutable object is built once
+        # per *read*, in rebuild_stats(), which is the direction that matters
+        # — a caller must not be handed something it can advance.
+        self._acquires: int = 0
+        self._rebuilds: int = 0
+        self._rebuild_seconds_total: float = 0.0
+        self._last_rebuild_seconds: float | None = None
 
     @classmethod
     async def open(
@@ -215,6 +282,12 @@ class CollectionRuntime:
                 embedding identity (ADR-0004).
         """
         self._require_open()
+        # Counted here — every acquire that will go on to either hit the cache
+        # or rebuild — so that rebuilds/acquires is the fraction of requests
+        # that paid for a rebuild. Counting after the fast-path return would
+        # make the denominator "requests that missed", against which the ratio
+        # is always 1 and says nothing (ADR-0026).
+        self._acquires += 1
         generation = await self._store.get_generation()
         if generation is None and not self._warned_unanswerable:
             self._warned_unanswerable = True
@@ -271,26 +344,39 @@ class CollectionRuntime:
         merely unused. That is a structural consequence of the predicate, not
         defensive code.
         """
-        vector_store: VectorStoreProtocol | None = None
-        if self._vector_store_factory is not None:
-            vector_store = await self._vector_store_factory()
+        # Counted and timed around the WHOLE body, in a finally, so a rebuild
+        # that raises is still charged for the lock it held and the waiters it
+        # blocked. perf_counter, not time(): a wall clock can step backwards
+        # and a negative duration added to a monotonically growing total is
+        # the one arithmetic this counter cannot survive (ADR-0026).
+        self._rebuilds += 1
+        started = time.perf_counter()
+        try:
+            vector_store: VectorStoreProtocol | None = None
+            if self._vector_store_factory is not None:
+                vector_store = await self._vector_store_factory()
 
-        retriever = await Retriever.open(
-            self._store,
-            self._config,
-            embedder=self._embedder,
-            vector_store=vector_store,
-            collection=self._collection,
-        )
-        acquired = AcquiredRetriever(generation=generation, retriever=retriever)
+            retriever = await Retriever.open(
+                self._store,
+                self._config,
+                embedder=self._embedder,
+                vector_store=vector_store,
+                collection=self._collection,
+            )
+            acquired = AcquiredRetriever(generation=generation, retriever=retriever)
 
-        # The superseded handle is dropped rather than closed: no vector store
-        # in this repo exposes a close(). If one ever does, this is where the
-        # old handle must be closed, and the same applies to Retriever itself.
-        self._vector_store = vector_store
-        if generation is not None:
-            self._cached = acquired
-        return acquired
+            # The superseded handle is dropped rather than closed: no vector
+            # store in this repo exposes a close(). If one ever does, this is
+            # where the old handle must be closed, and the same applies to
+            # Retriever itself.
+            self._vector_store = vector_store
+            if generation is not None:
+                self._cached = acquired
+            return acquired
+        finally:
+            elapsed = time.perf_counter() - started
+            self._last_rebuild_seconds = elapsed
+            self._rebuild_seconds_total += elapsed
 
     def _release_after_rebuild(self, worker: asyncio.Future[Any]) -> None:
         """Release the rebuild lock once the rebuild is done with the store.
@@ -322,6 +408,28 @@ class CollectionRuntime:
         """Path to the collection's SQLite file, for diagnostics."""
         return self._store.db_path
 
+    def rebuild_stats(self) -> RebuildStats:
+        """Return a snapshot of this runtime's rebuild counters (ADR-0026).
+
+        Synchronous, and deliberately not guarded by :meth:`_require_open`.
+        That guard exists for the members that reach the store handle, which
+        is what closing invalidates; these counters are plain integers this
+        object owns, and refusing to report them once the runtime is closed
+        would withhold the diagnostic at the one moment someone is asking why
+        a shut-down runtime spent its life rebuilding.
+
+        A fresh :class:`RebuildStats` per call rather than a stored one handed
+        out repeatedly: the caller gets a value that cannot advance under it
+        while it reads the fields, and cannot advance the runtime's own
+        counters by holding it.
+        """
+        return RebuildStats(
+            acquires=self._acquires,
+            rebuilds=self._rebuilds,
+            rebuild_seconds_total=self._rebuild_seconds_total,
+            last_rebuild_seconds=self._last_rebuild_seconds,
+        )
+
     async def get_chunk(self, chunk_id: str) -> Chunk | None:
         """Return one chunk by id, or ``None``."""
         self._require_open()
@@ -332,14 +440,29 @@ class CollectionRuntime:
         self._require_open()
         return await self._store.get_document_sources()
 
+    async def get_document_record(self, document_id: str) -> DocumentRecord | None:
+        """Return one document's record, or ``None`` if the collection has no such document.
+
+        What ``fetch_chunk`` calls (GK-019). It reached for
+        :meth:`get_document_records` instead — the whole ``documents`` table,
+        one validated model per row — to answer a question about the single
+        document the requested chunk belongs to. The chunk read above it is
+        already keyed; this is the same shape, and the two now cost the same
+        kind of read.
+        """
+        self._require_open()
+        return await self._store.get_document_record(document_id)
+
     async def get_document_records(self) -> dict[str, DocumentRecord]:
         """Return ``{document_id: DocumentRecord}`` for every document in the collection.
 
         The ADR-0016 sibling of :meth:`get_document_sources`: each record
         carries the document's real ``source_class``/``extractor`` alongside
-        its source, for a caller (``fetch_chunk``) building a ``Citation``
-        that must not silently default to ``("text", None)`` regardless of
-        what was actually ingested.
+        its source.
+
+        Whole-table, so it is for a caller that genuinely wants every row.
+        A caller holding one document ID — which is every caller on a
+        request path — wants :meth:`get_document_record`.
         """
         self._require_open()
         return await self._store.get_document_records()
@@ -382,12 +505,13 @@ class CollectionRuntime:
 
         The earlier note declining to widen
         :class:`~groundkit.index.protocols.MetadataStoreProtocol` with a
-        ``COUNT(*)`` still stands, and is why this is not that. The protocol is
-        held to exact signature parity by conformance tests and implemented by
-        several hand-built doubles; the count lives on the concrete store
-        instead, which is what this runtime is constructed with. Declining to
-        widen a shared protocol never required using the slowest
-        implementation available behind it.
+        ``COUNT(*)`` still stands, and is why this is not that. What has
+        changed since (GK-019) is that the count is no longer reachable only
+        by holding the concrete class: it is declared on the *optional*
+        :class:`~groundkit.index.protocols.DocumentRecordStoreProtocol`,
+        which a store implements exactly when it can answer cheaply.
+        Declining to widen a shared protocol never required using the
+        slowest implementation available behind it.
         """
         self._require_open()
         return await self._store.count_chunks()

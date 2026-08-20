@@ -45,14 +45,16 @@ the result.
 ## Ingestion & incremental indexing
 
 What counts as "unchanged" on a re-ingest, the boundary between the
-load→chunk utility and the actual ingest path, and the cached runtime that
-tracks whether a collection is stale.
+load→chunk utility and the actual ingest path, the cached runtime that
+tracks whether a collection is stale, and what that cache costs while an
+ingest is invalidating it.
 
 | ADR | Title | Status |
 | --- | ----- | ------ |
 | [ADR-0009](ADR-0009-incremental-skip-key-is-a-processing-fingerprint.md) | The incremental skip key is a processing fingerprint, not a content hash | Accepted |
 | [ADR-0010](ADR-0010-ingestion-pipeline-is-not-the-ingest-path.md) | `IngestionPipeline` is a load→chunk utility, not the ingest path | Accepted |
 | [ADR-0013](ADR-0013-collection-runtime-persisted-staleness-marker.md) | A cached `CollectionRuntime` whose validity is a marker persisted in SQLite | Accepted |
+| [ADR-0026](ADR-0026-measure-the-rebuild-cliff-before-rebuilding-incrementally.md) | Measure the rebuild cliff before rebuilding incrementally, and re-defer ADR-0002's persisted postings against a trigger the measurement can satisfy | Accepted |
 
 ## Extracted & remote sources
 

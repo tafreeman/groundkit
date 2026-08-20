@@ -192,32 +192,75 @@ class MetadataStoreProtocol(Protocol):
 
 @runtime_checkable
 class DocumentRecordStoreProtocol(Protocol):
-    """Optional capability: a store that can report each document's full ADR-0016 provenance.
+    """Optional capability: a store that answers keyed and aggregate questions directly.
+
+    Two things at once, and deliberately one protocol rather than two. It
+    reports each document's full ADR-0016 provenance (``get_document_record``,
+    ``get_document_records``), and it answers "how many" without reading rows
+    (``count_documents``, ``count_chunks``). What binds them is the property a
+    caller actually selects on: **a store that can answer a keyed or aggregate
+    question without materializing a table**. Splitting them would make a
+    caller test two capabilities to establish one fact, and no store in this
+    repo — or plausibly outside it — implements one half without the other,
+    since both are the same single SQL statement against the same two tables.
 
     Deliberately **not** a member of :class:`MetadataStoreProtocol`. That
     protocol is held to two structural guards from outside this module —
     ``tests/test_protocol_conformance.py``'s exact signature-parity check and
     ``tests/test_metadata_store.py``'s mutating/read-only completeness
-    classification — and several hand-built protocol-conforming test doubles
-    elsewhere in the suite (retrieval and runtime tests that predate
-    ADR-0016) implement only the pre-existing member set. Folding this in as
-    a required member of ``MetadataStoreProtocol`` would fail every one of
-    them: the ``isinstance`` check some are asserted against (structural
-    Protocol conformance requires every declared member to be present), and
-    a real call from :class:`~groundkit.retrieval.search.Retriever` would
-    raise a bare ``AttributeError`` on the rest rather than the typed
-    refusal SPEC.md §2 asks for.
+    classification — and hand-built protocol-conforming test doubles
+    elsewhere in the suite implement only the pre-existing member set.
+    Folding this in as a required member of ``MetadataStoreProtocol`` would
+    fail every one of them: the ``isinstance`` check some are asserted
+    against (structural Protocol conformance requires every declared member
+    to be present), and a real call from
+    :class:`~groundkit.retrieval.search.Retriever` would raise a bare
+    ``AttributeError`` on the rest rather than the typed refusal SPEC.md §2
+    asks for.
+
+    That reasoning stands, but it is no longer load-bearing on the test side:
+    ``tests/metadata_store_doubles.py`` now supplies the one shared base every
+    hand-built double derives from (GK-019), so widening a protocol costs one
+    edit rather than one per double. Keeping this capability separate is now a
+    statement about stores, not about test maintenance — a store either can
+    answer these cheaply or it cannot, and a caller is entitled to know which
+    before choosing a query plan.
 
     A store either implements this narrower, separate capability
     (:class:`~groundkit.index.metadata.SQLiteMetadataStore` does) or it does
-    not, and ``Retriever`` degrades to ``text``/``None`` defaults for one
-    that does not (see ``Retriever._document_records``) — which is honest
-    rather than a silent downgrade: a store with no way to report richer
-    provenance never had it to report in the first place. That is different
-    from the actual ADR-0016 defect this capability closes, where a real
+    not, and ``Retriever`` degrades to ``text``/``None`` defaults over a
+    single full-table read for one that does not (see
+    ``Retriever``'s ``_DocumentRecordLookup``) — which is honest rather than a
+    silent downgrade: a store with no way to report richer provenance never
+    had it to report in the first place. That is different from the actual
+    ADR-0016 defect this capability closes, where a real
     ``SQLiteMetadataStore`` *did* have the value (it was on the ingested
     ``Document``) and dropped it on write.
     """
+
+    async def get_document_record(self, document_id: str) -> DocumentRecord | None:
+        """Return one document's :class:`DocumentRecord`, or ``None`` if unknown.
+
+        The keyed form of :meth:`get_document_records`, and the one every
+        read path on a query's critical path should use (GK-019):
+        :meth:`~groundkit.retrieval.search.Retriever.search` and
+        ``service.tools.handle_fetch_chunk`` each need at most ``top_k``
+        document IDs, and answered them by materializing the whole
+        ``documents`` table — one validated model per stored row — to look
+        up a handful of keys.
+
+        ``None`` means *no such document*, and the callers that fail closed
+        on a dangling chunk depend on that being distinguishable from a
+        stored document whose provenance happens to be at its defaults. An
+        implementation must never substitute a fabricated record for a
+        missing row.
+
+        This read is **live**, never cached at open: the whole reason a
+        retriever re-reads it per search rather than snapshotting it is that
+        a document deleted after ``open()`` must fail closed rather than
+        resolve against a stale row.
+        """
+        ...
 
     async def get_document_records(self) -> dict[str, DocumentRecord]:
         """Return ``{document_id: DocumentRecord}`` for every stored document.
@@ -226,6 +269,26 @@ class DocumentRecordStoreProtocol(Protocol):
         reports each document's full ADR-0016 provenance, not just its
         source string — the read half of the join
         :meth:`MetadataStoreProtocol.replace_document` writes.
+
+        Whole-table by definition, so it belongs to callers that genuinely
+        want every row (a diagnostic, an export, a fallback over a store
+        without the keyed form). A caller holding a bounded set of document
+        IDs wants :meth:`get_document_record` instead.
+        """
+        ...
+
+    async def count_documents(self) -> int:
+        """Return how many documents are stored, without reading their rows."""
+        ...
+
+    async def count_chunks(self) -> int:
+        """Return how many chunks are stored, without reading any of them.
+
+        The one ``index_status`` reports. Answering it as
+        ``len(await get_chunks())`` pulls the entire corpus text into memory
+        as re-validated :class:`~groundkit.contracts.Chunk` models to produce
+        one integer, on the cheapest-*looking* call of a read-only service
+        surface.
         """
         ...
 

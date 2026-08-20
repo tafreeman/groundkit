@@ -372,21 +372,24 @@ per SPEC.md §9:
   snapshot.
 - BM25 rebuilds in memory at open — O(corpus) startup cost, accepted and
   bounded by ADR-0002's revisit trigger.
-- **BM25 scoring no longer stalls the event loop, but it still costs
-  O(corpus).** `BM25Index.search` scores every indexed chunk before
-  truncating to `top_k`; it was called inline from `Retriever.search`'s `async
-  def`, so on `grk serve`'s single uvicorn worker one query blocked every
-  other in-flight request for a full corpus scan. Both call sites — the
-  `bm25` branch and the `hybrid` branch's lexical half — now dispatch through
-  `asyncio.to_thread`, as does `InMemoryVectorStore.search`'s equivalent scan.
-  What that changes is the *stalling*, not the *cost*: total CPU is unchanged,
-  the pure-Python scoring loop holds the GIL for most of its run so a
-  concurrent caller still contends for it, and the scan is still linear in
-  corpus size. The standing fix is a postings list that scores only candidate
-  chunks. Pinned by
+- **BM25 scoring is off the event loop and no longer linear in corpus size,
+  but an unselective query still is.** `BM25Index.search` scores the union of
+  the query terms' postings rather than every indexed chunk (GK-018, erratum
+  to ADR-0002 decision 2), so its cost tracks the number of chunks holding a
+  query term. That is a real bound for a selective query and no bound at all
+  for an unselective one: a stopword present in every chunk has every chunk in
+  its postings list, so a natural-language query still scores most of the
+  corpus. There is no stopword list and no term-at-a-time early exit — both
+  change which results come back, or need a score bound to be safe, and
+  neither is built. Both call sites — the `bm25` branch and the `hybrid`
+  branch's lexical half — still dispatch through `asyncio.to_thread`, as does
+  `InMemoryVectorStore.search`'s equivalent scan, because the pure-Python
+  scoring holds the GIL for most of its run and a concurrent caller still
+  contends for it; what that buys is that the loop keeps turning. Pinned by
   `tests/test_retrieval.py::test_bm25_scoring_does_not_run_on_the_event_loop`
   and its dense counterpart in `tests/test_dense.py`, both asserting thread
-  identity rather than timing.
+  identity rather than timing, and by `tests/test_bm25_postings.py` for the
+  candidate walk itself.
 - **A writer that loses a lock race waits, then fails; nothing retries it.**
   `SQLiteMetadataStore` sets `PRAGMA busy_timeout` explicitly, to
   `metadata.BUSY_TIMEOUT_MS`. Past that window the operation raises
@@ -584,6 +587,127 @@ per SPEC.md §9:
   legitimately need, to close a bypass in the same trust domain as
   `base_url` itself. The threat model is operator misconfiguration, not a
   hostile operator (ADR-0014 Consequences).
+
+- **The keyed document read and the `COUNT(*)` aggregates are one optional
+  capability, so a store implementing only half of it falls back to the whole
+  table.** `DocumentRecordStoreProtocol` declares `get_document_record`,
+  `get_document_records`, `count_documents` and `count_chunks` together, and
+  `Retriever`'s `isinstance` check is all-or-nothing: a hypothetical store that
+  could answer the keyed document read but not the counts would silently take
+  the whole-table fallback on every search. That is correct but slow, and it is
+  invisible — nothing logs the downgrade. Accepted because no store in this
+  repo is in that position (all four are the same single SQL statement against
+  the same two tables) and because splitting the protocol would make a caller
+  test two capabilities to establish one fact. Revisit if a second real
+  implementation ever appears.
+- **Within one search, a document's record is read once and memoized.** A
+  document deleted between two hits on it inside the same `search` call is
+  therefore still resolved from the earlier read. This is strictly no worse
+  than the behaviour it replaced — which resolved every hit against a single
+  snapshot taken before the search began — and the fail-closed guarantee across
+  searches is unaffected, but the read is "live per search", not "live per
+  hit".
+
+- **The staleness cache's rebuild cliff is now measurable, and is not fixed.**
+  `index_status` reports `retriever_acquires`, `retriever_rebuilds`,
+  `rebuild_seconds_total` and `last_rebuild_seconds` (ADR-0026), so the cache's
+  hit rate can be read rather than inferred from latency. What an operator will
+  see during a concurrent `grk ingest` is the defect itself: ADR-0013 bumps the
+  generation once per commit and `grk ingest` commits once per document, so an
+  ingest over N changed files publishes N generations, fails the cache's equality
+  predicate N times, and costs N full `BM25Index.from_store` rebuilds — each
+  serialized against the ingest writer on the metadata store's single lock, and
+  each waited through rather than served stale by every concurrent request
+  (ADR-0013 decision 5). For the duration of an ingest the fallback is the
+  reopen-per-request baseline ADR-0013 rejected on measurement, and the
+  contention runs both ways: the reads slow the ingest that is invalidating them.
+  The incremental remedy — a monotonic per-document watermark, a
+  `get_chunks_since`, and a `remove_document` on the lexical index, behind a
+  `SCHEMA_VERSION` bump — is deliberately not built. `remove_document` is the
+  hard half: a watermark cannot represent a row that is *gone*, and
+  `BM25Index`'s postings map is keyed by position in its chunk list, so removing
+  a chunk from the middle invalidates every position above it. Whatever replaces
+  it must be score-identical to a full rebuild, including the insertion-order
+  tie-break, or ADR-0002 decision 2's "pure function of the persisted chunk set"
+  invariant becomes false — and that invariant is the guard against repeating
+  ARP's `memory.py` `_key_map` drift.
+- **The rebuild counters are process-local and reset without saying so.** They
+  describe one `CollectionRuntime` object's history, not the collection's, and
+  are deliberately not persisted (persisting them would need a schema bump, would
+  put a write on an unauthenticated read path, and would either invalidate the
+  cache it measures or break ADR-0013 decision 1's bump-inside-the-`_op` rule). A
+  runtime evicted by `CollectionRegistry`'s LRU bound and later reopened starts
+  from zero, and so does a restarted process, so a scrape taken immediately after
+  either reports zeros meaning "no data" rather than "no rebuilds" — a real trap
+  for anyone graphing them. Nothing aggregates across processes: a multi-process
+  deployment must read each process's own `index_status`.
+
+- **URL ingestion's writes are off the event loop; its buffering is not.**
+  `UrlLoader`'s snapshot write and its HTML scratch write now dispatch through
+  `asyncio.to_thread`, so neither blocks the loop for the length of a
+  content-sized write. Two smaller things stay on the loop deliberately: the
+  fetched body is held whole in memory before either write — the size cap, not
+  streaming, is what bounds it, because ADR-0016 decision 4 requires refusing
+  past `DEFAULT_MAX_BYTES` rather than truncating, and a truncated read would
+  produce offsets into a partial document — and the scratch
+  `TemporaryDirectory`'s create and cleanup are constant-cost syscalls that are
+  not dispatched. What changed is the *stalling*, not the *cost*. Pinned by
+  `tests/test_url_loader.py::TestUrlLoaderWritesOffTheEventLoop`, which asserts
+  thread identity rather than timing, as its BM25 and dense counterparts above
+  do.
+
+- **`metadata_filter` is a seam with no caller, and that is a decision.**
+  SPEC.md §5.3 requires metadata filtering on both dense stores from the
+  first dense-store commit, and it exists: `VectorStoreProtocol.search`
+  declares it, `InMemoryVectorStore` and `LanceDBVectorStore` both apply it
+  through the single `_matches_filter` helper, and `tests/test_dense.py`
+  covers both paths. Nothing in the product passes one — no CLI flag, no
+  `SearchRequest` field, and `Retriever._dense_candidates` calls
+  `vector_store.search(embedding, top_k=fetch)` and nothing else — so the
+  enabled branch is the most expensive code in the dense path, sits inside a
+  file the coverage `core_subset` gates, and is proved only by its own unit
+  tests. Recorded here rather than left to be rediscovered as an oversight.
+
+  Exposing it is not the parameter-forwarding it looks like. `index/bm25.py`
+  has no filter at all, so a surface-level filter would apply in `dense`
+  mode, have nothing to apply to in `bm25` mode (the default, ADR-0007), and
+  in `hybrid` mode filter one candidate list while RRF fused the survivors
+  with an unfiltered lexical list — excluded chunks re-entering the ranking
+  through the other side by a depth-dependent amount (ADR-0005). A filter
+  honoured by one of three modes and silently leaky in a second is ADR-0001
+  hazard 3's symptom, plausible-looking unfiltered results, one layer above
+  where that hazard was closed. Two further costs: the keys chunk metadata
+  actually carries are `source` — the ingest-time copy ADR-0006 made
+  retrieval *ignore* because it goes stale on re-ingest — plus
+  `file_name`/`file_extension` from `FileLoader` and `content_type` from
+  `UrlLoader`, nearly all of them derivable from the `documents` row that
+  owns them durably; and a non-empty filter switches LanceDB from a top-k
+  query to `count_rows` plus a full-table fetch, so a `filter` field on
+  `SearchRequest` would give any caller of the read-only surface a switch
+  that makes every dense query O(corpus), and would be the first
+  unbounded-cardinality input on a surface whose other fields are all
+  bounded scalars.
+
+  **Trigger to wire it up:** a concrete request to restrict results to a
+  subset of one collection that cannot be met by making that subset its own
+  collection — collections, not filters, are this repo's partitioning
+  mechanism (one SQLite store and one LanceDB table each, and
+  `SearchRequest` already takes `collection`). When that request exists the
+  filter belongs at `Retriever`'s document join, over `documents` columns
+  (`source`, `source_class`, `extractor`), where all three modes honour it
+  identically and the durable source is filtered rather than its
+  chunk-metadata copy; `metadata_filter` then becomes a push-down
+  optimization beneath it rather than the surface itself. That change needs
+  its own ADR for the bounds and failure mode of a caller-supplied filter
+  (key count, key and value length, allowed key charset, and whether an
+  unknown key fails closed or matches nothing): ADR-0014 decision 6's schema
+  test checks field *names*, so it would pass such a field without
+  constraining any of it.
+
+- **The snapshot *read* path can still be raced by a symlink; the write path cannot.** `UrlLoader._write_snapshot` now opens with `O_NOFOLLOW`, closing the gap between its containment check and its write. `retrieval/citations.py::_resolve_snapshot` still does the same two steps — `ensure_within_base`, then `Path.read_text` — with nothing between them, so an attacker able to create a file in `<collection>.snapshots/` in that window can have citation resolution read, and return to a service caller, the contents of whatever the link points at. This is the more exploitable half of the pair: the write side could only corrupt a file, the read side exfiltrates one. It is unclosed because it needs an `O_NOFOLLOW` open on the read side too, which is a change to `citations.py` (GK-028 sub-item 4, write half only).
+- **`O_NOFOLLOW` does not exist on Windows, so the snapshot write is unguarded there.** `_O_NOFOLLOW` degrades to `0` — a no-op in the flag mask — so nothing crashes and nothing changes on win32, and `tests/test_url_loader.py::TestUrlLoaderSnapshotWriteDoesNotFollowASymlink` skips rather than passing vacuously. CI runs Linux, where the guard is real.
+- **`UrlLoader`'s timeout bounds the fetch, not everything a `load()` call does.** `timeout_seconds` wraps the HTTP exchange. The preceding `ensure_safe_endpoint` DNS resolution and the trailing snapshot write are outside it, so a pathological resolver or filesystem can still hold a `load()` past the configured bound. Both are bounded by other means (the resolver by the OS, the write by `max_bytes`), and neither holds a remote connection open, which is the resource the bound exists to protect.
+- **`Chunk.content_hash` is recomputed on every access, deliberately.** It is a sort tie-break in `retrieval/fusion.py` and `index/dense.py`, so it is hashed once per candidate per query (`index/bm25.py` caches it once at build time instead). Caching it on the model with `functools.cached_property` would unfreeze it: pydantic's `__setattr__` special-cases `cached_property` before it consults `frozen`, so `chunk.content_hash = ...` would silently succeed and every later reader — both tie-breaks and the value `index/metadata.py` persists — would use a string unrelated to `content`. The cost is unmeasured and the correctness loss is not, so it stays uncached; `tests/test_contracts.py::TestChunk::test_content_hash_cannot_be_decoupled_from_content_by_assignment` pins the refusal.
 
 ## Loaders workstream (ADR-0016) — URL ingestion landed (wave 4); the PDF/HTML ingest-side loaders have not
 
@@ -1027,7 +1151,7 @@ was executed.
   nothing and the exit code never depends on them; malformed or incoherent
   model output is a `JudgeError`, never coerced. The calibration procedure
   required before gating could ever be proposed is documented in
-  `evals/judge.py`'s module docstring; no human-labeled verdict set exists
+  `providers/judge.py`'s module docstring; no human-labeled verdict set exists
   yet, and normal CI never runs the judge.
 - **Synthesis quality is unmeasured by the default `pytest` suite, but it is
   no longer true that nothing re-measures it automatically.** `grk eval

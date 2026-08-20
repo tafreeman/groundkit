@@ -3,6 +3,7 @@ extended with the offset invariants groundkit adds."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 
@@ -80,6 +81,37 @@ class TestChunk:
         a, b = make_chunk("same text"), make_chunk("same text", start=50)
         assert a.content_hash == b.content_hash
         assert a.content_hash != make_chunk("other text").content_hash
+
+    def test_content_hash_cannot_be_decoupled_from_content_by_assignment(self) -> None:
+        """GK-028: pinned because the obvious optimization would break it.
+
+        ``content_hash`` is a plain ``@property`` under ``@computed_field``,
+        recomputed on every access. Caching it with
+        ``functools.cached_property`` -- the change this guard exists to catch
+        -- would also make this assignment *succeed*: pydantic's
+        ``__setattr__`` special-cases ``cached_property`` before it consults
+        ``frozen`` (``pydantic/main.py::BaseModel._setattr_handler``, checked
+        against the 2.13 pinned in this tree), writing the value straight into
+        ``__dict__`` and bypassing the frozen refusal entirely. Every reader
+        thereafter -- BM25's and dense's tie-breaks
+        (``index/bm25.py``, ``index/dense.py``), the value
+        ``index/metadata.py`` persists -- would see a string unrelated to
+        ``content``, on a model whose whole contract is that it cannot change
+        after validation.
+
+        Both halves are asserted: that the assignment is refused, and that the
+        value afterwards is still the hash of ``content``. The second is the
+        one that survives a future pydantic release changing *which* exception
+        a refused assignment raises.
+        """
+        chunk = make_chunk("hello world")
+        expected = hashlib.sha256(b"hello world").hexdigest()
+        assert chunk.content_hash == expected
+
+        with pytest.raises(ValidationError):
+            chunk.content_hash = "0" * len(expected)  # type: ignore[misc]
+
+        assert chunk.content_hash == expected
 
     def test_substring_property_holds_against_parent(self) -> None:
         doc = Document(source="a.md", content="0123456789")

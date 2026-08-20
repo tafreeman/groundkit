@@ -33,19 +33,42 @@ logger = logging.getLogger(__name__)
 #: matching the RetrievalResult ``score >= 0`` contract.
 _IDF_SMOOTHING: float = 1.0
 
+#: The postings list of a term the index has never seen. A module constant so
+#: :meth:`BM25Index.search` can look a term up through ``dict.get`` and still
+#: name what "absent" means: ``self._postings[token]`` reads identically on
+#: the first call and then, the map being a ``defaultdict``, inserts an empty
+#: list — an unbounded write driven by query content, on the read path of an
+#: index :class:`BM25Index` documents as frozen while a search is running.
+_NO_POSTINGS: tuple[int, ...] = ()
+
 
 class BM25Index:
     """Pure-Python in-memory BM25 keyword index.
 
-    Builds an inverted index from chunks, tokenizes on lowercased word
+    Builds an inverted index from chunks — a ``term -> [chunk index]``
+    postings map (``_postings``) beside the document-frequency counter
+    (``_doc_freqs``) and the length statistics — tokenizes on lowercased word
     characters, and scores candidates with Okapi BM25.
+
+    ADR-0002 decision 2 named all three of those from its first version, and
+    until GK-018 only two of them existed — so :meth:`search` scored every
+    indexed chunk however selective the query was, making query cost a
+    function of corpus size. The postings map closes that, recorded as an
+    erratum on the decision itself rather than silently. What it buys is
+    **score-identical, not an approximation**: a chunk holding no query term
+    skips every term inside :meth:`_score_document`, scores exactly ``0.0``,
+    and was already dropped by that method's caller, so narrowing the walk to
+    the union of the query terms' postings removes work and never a result —
+    the low-scoring-but-nonzero tail included, which is what an approximate
+    candidate scheme would have cost and why none was taken.
 
     **Not safe to mutate while a search is running.**
     :class:`~groundkit.retrieval.search.Retriever` dispatches :meth:`search` to
-    a worker thread, where it reads the five parallel lists below live;
-    :meth:`index_chunks` appends to three of them in separate statements, so an
-    append landing mid-scan would be observed torn — ``len(self._chunks)`` past
-    the matching ``_doc_lengths`` entry, raising ``IndexError`` from
+    a worker thread, where it reads the parallel per-chunk lists and the
+    postings map below live; :meth:`index_chunks` extends them in separate
+    statements, so an append landing mid-scan would be observed torn — a
+    posting, or ``len(self._chunks)``, past the matching ``_doc_lengths`` or
+    ``_doc_term_freqs`` entry, raising ``IndexError`` from
     :meth:`_score_document`. Build the index fully (normally via
     :meth:`from_store`) and treat it as frozen thereafter; rebuilding means
     constructing a new instance, which is what
@@ -62,6 +85,14 @@ class BM25Index:
         self._chunks: list[Chunk] = []
         self._tie_keys: list[str] = []
         self._doc_freqs: dict[str, int] = defaultdict(int)
+        # term -> the indices of every chunk holding it, strictly ascending
+        # and duplicate-free (see index_chunks). Not a second copy of
+        # _doc_freqs: that counter answers "how many chunks hold this term"
+        # for IDF, this answers "which ones" for candidate selection, and
+        # ``len(self._postings[term]) == self._doc_freqs[term]`` holds by
+        # construction because both are written from the same first-sighting
+        # branch.
+        self._postings: dict[str, list[int]] = defaultdict(list)
         self._doc_term_freqs: list[dict[str, int]] = []
         self._doc_lengths: list[int] = []
         self._avg_doc_length: float = 0.0
@@ -78,10 +109,20 @@ class BM25Index:
         not a replacement. Rebuilding from scratch means constructing a new
         :class:`BM25Index` (see :meth:`from_store`).
 
+        A chunk's index joins the postings list of every term it holds, on
+        that term's *first* occurrence in the chunk rather than on every
+        occurrence — the same branch that increments the document-frequency
+        counter, so the two cannot disagree about which chunks hold a term.
+        Appending in chunk order then leaves each postings list strictly
+        ascending and duplicate-free, which is the property :meth:`search`
+        relies on to visit candidates in the order a whole-corpus scan
+        would have.
+
         Args:
             chunks: Chunks to add.
         """
         for chunk in chunks:
+            doc_idx = len(self._chunks)
             self._chunks.append(chunk)
             self._tie_keys.append(chunk.content_hash)
             tokens = _tokenize(chunk.content)
@@ -93,6 +134,7 @@ class BM25Index:
                 term_freq[token] += 1
                 if token not in seen_terms:
                     self._doc_freqs[token] += 1
+                    self._postings[token].append(doc_idx)
                     seen_terms.add(token)
             self._doc_term_freqs.append(dict(term_freq))
 
@@ -102,6 +144,12 @@ class BM25Index:
 
     def search(self, query: str, *, top_k: int = 5) -> list[tuple[Chunk, float]]:
         """Search the index with a BM25 query.
+
+        Only chunks holding at least one query term are scored (GK-018), so
+        the cost is proportional to the number of matching chunks rather than
+        to the corpus. The returned list is exactly what scoring every chunk
+        produced, ties included — see the class docstring for why that is an
+        identity rather than an approximation.
 
         Args:
             query: The search query string.
@@ -121,8 +169,20 @@ class BM25Index:
         if not query_tokens or not self._chunks:
             return []
 
+        candidates: set[int] = set()
+        for token in query_tokens:
+            candidates.update(self._postings.get(token, _NO_POSTINGS))
+        if not candidates:
+            return []
+
+        # Ascending, so the walk visits candidates in the order a
+        # whole-corpus scan visited them. ``list.sort`` below is stable, so
+        # that order is what two chunks tied on *both* score and
+        # ``content_hash`` — byte-identical chunks, the one case the
+        # tie-break cannot resolve — still fall back to. Iterating
+        # ``candidates`` directly would hand that fallback to set layout.
         scored: list[tuple[float, int]] = []
-        for doc_idx in range(len(self._chunks)):
+        for doc_idx in sorted(candidates):
             score = self._score_document(query_tokens, doc_idx)
             if score > 0.0:
                 scored.append((score, doc_idx))

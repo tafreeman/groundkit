@@ -172,7 +172,7 @@ four — nothing more, nothing fewer:
 | `search` | Runs a query against one collection — BM25, dense, or hybrid — optionally reranked. | A `SearchResponse`: the same shape `grk search --json` prints, with citation-bearing results. |
 | `fetch_chunk` | Fetches one chunk by id and re-verifies its citation by re-reading the source file, not the indexed copy. | A chunk, its citation, and a verification verdict (`verified`, `drifted`, or `unresolvable`) — content is included only when verified. |
 | `list_collections` | Lists the collections present in the server's index directory. | A list of collection names. |
-| `index_status` | Reports one collection's document and chunk counts and its embedding identity. | Counts, the embedding manifest when the collection is dense, and the schema version — no document content, no source paths. |
+| `index_status` | Reports one collection's document and chunk counts, its embedding identity, and how often its retriever has been rebuilt. | Counts, the embedding manifest when the collection is dense, the schema version, and the staleness cache's rebuild counters (ADR-0026) — no document content, no source paths. |
 
 **Ingest is deliberately not among them.** SPEC.md §1.2 is the authority
 cited so this reads as a decision rather than an omission: every operation

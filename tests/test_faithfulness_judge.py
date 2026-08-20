@@ -1,6 +1,6 @@
 """Faithfulness judge tests (Phase 5 synthesis-mode advisory judge, SPEC.md §6).
 
-Exercises :class:`~groundkit.evals.judge.FaithfulnessJudge` against a
+Exercises :class:`~groundkit.providers.judge.FaithfulnessJudge` against a
 module-local scripted double, ``_JudgeScriptedChat``, that conforms
 structurally to ``ChatProtocol`` — mirroring
 ``tests/test_query_rewrite.py``'s ``_RewriteScriptedChat``. This module never
@@ -22,7 +22,7 @@ import pytest
 from pydantic import ValidationError
 
 from groundkit.errors import ChatError, ChatProviderNotConfiguredError, JudgeError
-from groundkit.evals.judge import FaithfulnessJudge, FaithfulnessVerdict
+from groundkit.providers.judge import FaithfulnessJudge, FaithfulnessVerdict
 from groundkit.providers.protocols import ChatProtocol
 
 

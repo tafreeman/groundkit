@@ -28,7 +28,7 @@ from groundkit.errors import (
     RetrievalError,
     SynthesisError,
 )
-from groundkit.evals.judge import FaithfulnessJudge
+from groundkit.providers.judge import FaithfulnessJudge
 from groundkit.providers.protocols import ChatProtocol
 from groundkit.providers.query_rewrite import QueryRewriter
 from groundkit.providers.synthesis import Synthesizer

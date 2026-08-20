@@ -185,6 +185,23 @@ locally. Both were true the day this was written.
   themselves. That is the intended friction, and the reopening trigger in
   decision 5 is what it takes to remove it.
 
+## Amendment (2026-08-19) — the judge module moved to `groundkit.providers`
+
+Decision 4's barred list above names `groundkit.evals.judge`, which is where
+`FaithfulnessJudge` lived when this ADR was accepted. It now lives at
+`groundkit.providers.judge` (GK-021), beside the two other `ChatProtocol`
+consumers decision 4 bars, and the import scan bars the new path in place of the
+old one.
+
+Nothing decision 4 decided changes: the same class stays barred from the
+`service` package, for the same reason, three steps upstream of the route that
+would have exposed it. The move was made for a reason outside this ADR's scope —
+the module's *other* consumer, `groundkit.answer`, is runtime code rather than
+part of the eval harness, so a production import path made the eval package
+undroppable from a plain library install. It is recorded here because this ADR
+names the module by path, and a barred list naming a module that no longer
+exists is a list nobody can check.
+
 ## References
 
 - SPEC.md §4 (the verb list this deviates from), §7 (the shared-secret rule and

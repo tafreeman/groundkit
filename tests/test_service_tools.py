@@ -25,7 +25,7 @@ import pytest
 from groundkit.contracts import Chunk, RetrievalResult, SearchResponse
 from groundkit.errors import ConfigurationError, RerankerNotConfiguredError
 from groundkit.index.metadata import SQLiteMetadataStore
-from groundkit.runtime import CollectionRegistry, CollectionRuntime
+from groundkit.runtime import CollectionRegistry, CollectionRuntime, RebuildStats
 from groundkit.service import tools as tools_module
 
 if TYPE_CHECKING:
@@ -76,10 +76,10 @@ _WRITE_PATH_MODULES = frozenset(
 #: their corpus to a cloud provider) — neither bounded by the loopback bind.
 _SYNTHESIS_PATH_MODULES = frozenset(
     {
+        "groundkit.providers.judge",
         "groundkit.providers.llm",
         "groundkit.providers.query_rewrite",
         "groundkit.providers.synthesis",
-        "groundkit.evals.judge",
         "groundkit.answer",
     }
 )
@@ -600,6 +600,16 @@ class _FakeRuntime:
     async def get_generation(self) -> int:
         return 0
 
+    def rebuild_stats(self) -> RebuildStats:
+        """Sync, matching :meth:`CollectionRuntime.rebuild_stats` (ADR-0026).
+
+        Zeroed rather than populated: these tests park ``index_status`` to
+        assert it shares the scan budget, and this double never builds a
+        retriever, so a non-zero reading here would describe work no fake
+        ever did.
+        """
+        return RebuildStats()
+
 
 class _FakeRegistry:
     """Registry stand-in: no SQLite, no worker threads, no real collection."""
@@ -747,6 +757,53 @@ def test_index_status_counts_without_materializing_either_table(tmp_path: Path) 
                 f"index_status read chunk content: {statements!r}"
             )
             assert "source" not in executed, f"index_status read document sources: {statements!r}"
+        finally:
+            await ctx.registry.aclose()
+
+    asyncio.run(run())
+
+
+def test_index_status_reports_the_runtimes_rebuild_counters(tmp_path: Path) -> None:
+    """The counters reach the wire, and asking for them does not move them (ADR-0026).
+
+    Two halves, and the second is the load-bearing one.
+
+    ``cache_enabled: true`` already told a caller the staleness cache was
+    switched on. It never told them whether it was *hitting*, which under a
+    concurrent ``grk ingest`` is the whole question (GK-020). This drives two
+    real acquires through the registry -- one cold rebuild, one hit -- and
+    asserts the response says exactly that.
+
+    Then it calls the handler a second time and asserts ``retriever_acquires``
+    did not move. ``handle_index_status`` reports counts and identity; it must
+    never build a retriever. An implementation that reached for
+    ``runtime.acquire()`` -- to get a retriever it does not need, or simply by
+    copying the shape of ``handle_search`` -- would inflate its own
+    denominator on every call, driving the reported hit rate toward 1.0 in
+    precise proportion to how often anyone looked. A monitor that improves the
+    number it is reading is worse than no monitor.
+    """
+
+    async def run() -> None:
+        index_dir, corpus, _ = await _seed(tmp_path)
+        ctx = _context(index_dir, corpus)
+        try:
+            async with ctx.registry.acquire("default") as runtime:
+                first = await runtime.acquire()
+                second = await runtime.acquire()
+                assert first is second, "precondition: the second acquire must hit the cache"
+
+            status = await tools_module.handle_index_status(ctx, IndexStatusRequest())
+            assert status.retriever_acquires == 2
+            assert status.retriever_rebuilds == 1
+            assert status.last_rebuild_seconds is not None
+            assert status.rebuild_seconds_total >= status.last_rebuild_seconds
+
+            observed_again = await tools_module.handle_index_status(ctx, IndexStatusRequest())
+            assert observed_again.retriever_acquires == status.retriever_acquires, (
+                "index_status acquired a retriever; reading the meter moved it"
+            )
+            assert observed_again.retriever_rebuilds == status.retriever_rebuilds
         finally:
             await ctx.registry.aclose()
 

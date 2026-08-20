@@ -20,7 +20,7 @@ decision 6).
 **Reuses, never duplicates, the judge and synthesis machinery.** This module
 constructs a :class:`~groundkit.providers.synthesis.Synthesizer` around the
 injected ``chat`` and calls the caller-supplied
-:class:`~groundkit.evals.judge.FaithfulnessJudge` exactly the way
+:class:`~groundkit.providers.judge.FaithfulnessJudge` exactly the way
 :class:`~groundkit.answer.AnswerPipeline` does for ``grk answer --judge`` —
 unconditionally, with no attempt to special-case an abstained answer. Neither
 class's internals (prompt rendering, completion parsing, verdict validation)
@@ -53,7 +53,7 @@ per-case failure.
 
 Nothing in this module inspects a verdict to change behavior, and nothing
 here raises on an unfaithful verdict or a judge failure. Both are tallied
-and returned; SPEC.md §6 and :mod:`groundkit.evals.judge`'s module docstring
+and returned; SPEC.md §6 and :mod:`groundkit.providers.judge`'s module docstring
 own the calibration procedure that would ever be allowed to change that.
 
 ## What is, and is not, caught
@@ -91,8 +91,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from groundkit.contracts import RetrievalResult
-    from groundkit.evals.judge import FaithfulnessJudge
     from groundkit.evals.schema import StageName
+    from groundkit.providers.judge import FaithfulnessJudge
     from groundkit.providers.protocols import ChatProtocol
 
 

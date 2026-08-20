@@ -291,7 +291,7 @@ groundkit runs an MCP server exposing four tools, all read-only:
 | `search` | Search a collection and return citation-bearing results |
 | `fetch_chunk` | Fetch one chunk and re-verify its citation against its source, right now |
 | `list_collections` | List the collections this server can search |
-| `index_status` | Report a collection's document/chunk counts and embedding identity |
+| `index_status` | Report a collection's document/chunk counts, embedding identity, and retriever rebuild counters |
 
 Point an MCP-capable assistant — Claude Desktop or Claude Code, for
 instance — at a running groundkit server, and it can search your indexed

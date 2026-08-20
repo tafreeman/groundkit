@@ -3,12 +3,17 @@
 The composition root behind `grk answer` (ADR-0019; Phase 5 of SPEC.md §9):
 an optional query rewrite, a retrieval search, cited synthesis, and an
 optional advisory faithfulness judge, wired into one call and one report.
-Every collaborator is injected rather than constructed here — resolving a
-chat config, constructing a concrete chat provider, opening a `Retriever`
-over a persisted collection is the caller's job, so `AnswerPipeline` itself
-never imports `groundkit.config` or `groundkit.providers.llm`, and composing
-`providers.synthesis` with `evals.judge` inside it creates no dependency edge
-between those two packages.
+Every collaborator *instance* is injected rather than constructed here —
+resolving a chat config, constructing a concrete chat provider, opening a
+`Retriever` over a persisted collection is the caller's job, so
+`AnswerPipeline` itself never imports `groundkit.config` or
+`groundkit.providers.llm`. The *types* are concrete rather than abstract, and
+this page does not claim otherwise: only the search collaborator is a
+structural Protocol, while the synthesizer, rewriter and judge are the named
+classes, which the module therefore imports. All three are `ChatProtocol`
+consumers living under `providers`, so the substitution a caller wants is
+reached by injecting a different chat provider into them — and composing them
+here costs the module no dependency on the eval harness.
 
 `grk answer` deliberately does **not** reach the [service](service.md)
 surface (ADR-0019) — the read-only REST API and MCP server never run

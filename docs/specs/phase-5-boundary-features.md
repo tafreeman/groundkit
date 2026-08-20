@@ -6,6 +6,27 @@ judge.*
 
 Status: **done**. Nothing here overrides SPEC.md; where this document makes a
 decision SPEC.md does not already contain, it names the ADR that carries it.
+
+> **Amendment (2026-08-20, GK-021).** `FaithfulnessJudge` and
+> `FaithfulnessVerdict` moved from `src/groundkit/evals/judge.py` to
+> `src/groundkit/providers/judge.py`. The original text below is retained as
+> the record of what Phase 5 delivered, so **every `evals/judge.py` and
+> `evals.judge` reference in this document names a path that no longer
+> exists** — read them as `providers/judge.py`. Import path only: the class,
+> its verdict schema, its prompt template and its advisory, ungated semantics
+> are unchanged.
+>
+> One passage is not merely relocated but *retired*: the argument that a
+> composition root "belongs outside whichever package happened to need it
+> first, so composing `providers.synthesis` with `evals.judge` creates no
+> dependency edge between them". That reasoning held only while the judge
+> lived in `evals`. It does not survive the move, and it was the wrong side of
+> the line anyway — `answer.py` importing the eval harness is what made
+> `groundkit.evals` undroppable from a library install, which is the defect
+> GK-021 closed. Both consumers are now `ChatProtocol` consumers in
+> `providers/`, and
+> `tests/test_deterministic_core.py::test_runtime_surface_does_not_import_the_eval_harness`
+> enforces it.
 Three ADRs carry it, all Accepted —
 [ADR-0017](../adr/ADR-0017-chat-seam-and-redaction-boundary.md),
 [ADR-0018](../adr/ADR-0018-llm-output-is-validated-never-trusted.md),

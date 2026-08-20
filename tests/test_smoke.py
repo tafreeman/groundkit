@@ -21,12 +21,21 @@ def test_version_matches_pyproject() -> None:
     The version lives in two independent places: ``pyproject.toml``'s
     ``project.version`` (what the wheel and PyPI see) and this package's
     ``__version__`` (what ``grk --version`` prints and what
-    ``RunMetadata.groundkit_version`` stamps into every eval artifact).
-    Nothing else enforces that they match -- ``release-gates.yml``'s
-    tag/version parity step compares the release tag against
-    ``pyproject.toml`` alone and never reads ``__version__``, so a bump to
-    one and not the other ships a package whose CLI misreports its own
-    version, past every gate, with a green suite.
+    ``RunMetadata.groundkit_version`` stamps into every eval artifact). A bump
+    to one and not the other ships a package whose CLI misreports its own
+    version.
+
+    This is the only check that catches that **per PR**, which is the claim
+    worth making and the narrowest one that is true (GK-028 -- the docstring
+    used to say "nothing else enforces that they match", and that was wrong).
+    Two other gates touch the pair, neither of them a substitute:
+    ``release-gates.yml``'s tag/version parity step compares the release tag
+    against ``pyproject.toml`` alone and never reads ``__version__``; its
+    clean-wheel install step *does* assert the built distribution's metadata
+    equals ``groundkit.__version__``, which is the same equality observed
+    from the other end -- but it runs only when a release is being cut. Both
+    leave ``main`` free to sit mismatched between releases, which is exactly
+    the interval this test covers.
 
     Skipped rather than failed when ``pyproject.toml`` is absent, which is
     the installed-wheel case: the file is not packaged, and this check is a

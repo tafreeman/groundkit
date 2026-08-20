@@ -334,6 +334,42 @@ Net: three prospective new copies collapse into one; the eval runner's survives 
 its reason recorded. **Revisit trigger:** if `run_eval` ever writes to its store
 *between* stages, its single-retriever assumption breaks and it needs the runtime.
 
+**Implementation record (2026-08-19, GK-026).** This decision was recorded and then not
+carried out. `_cmd_search` kept its own `Retriever.open()`, `cli.py` imported only
+`CollectionRegistry`, and Phase 5 added `_cmd_answer` — a fourth read lifecycle written
+against the very pattern this decision retires, and one it could not have counted. The
+claimed benefit went with it: no CLI test referenced `CollectionRuntime`, so "the
+default suite then exercises the runtime's open path on every CLI test" described a
+suite that did not exist. Both commands now open through `cli.py`'s
+`_open_read_runtime`, and the arithmetic above is restated rather than merely preserved:
+**four** `Retriever.open()` call sites become two — the runtime's and the eval runner's
+— and the reason the second survives is unchanged.
+
+The claim is held in place by tests that cannot pass against a command holding its own
+retriever, since on that path none of what they observe exists:
+`test_search_reads_through_the_collection_runtime` and
+`test_answer_reads_through_the_collection_runtime` record the acquire, and
+`test_search_cannot_answer_when_the_runtime_refuses_a_retriever` /
+`test_answer_builds_no_chat_provider_when_the_runtime_refuses` make a refusing `acquire`
+abort the command — the sharper half, because recording a call proves only that the
+runtime was consulted, while a refusal that stops the command proves the result came
+down that path.
+
+Two consequences are recorded here rather than left to be rediscovered:
+
+- The CLI now reads the generation marker before it builds a retriever, so `grk search`
+  and `grk answer` over a collection predating decision 2's schema emit the runtime's
+  "freshness cannot be asserted" warning on stderr (never stdout, so `--json` output is
+  unaffected). Its wording addresses a server — *"every request will rebuild its
+  retriever"* — and on a one-shot command that request is the only one. The remedy it
+  names, re-ingesting into a fresh collection, is correct for both.
+- The dense vector store is now opened by a factory the runtime invokes during a
+  rebuild, never eagerly by the command. That makes structural an ordering the previous
+  code held by convention and a comment: `SQLiteMetadataStore.open` is what validates a
+  collection name, and `<index-dir>/<collection>.lance` interpolates that same name into
+  a path. A rebuild happens strictly after the store is open, so the path can no longer
+  be derived before the name it is derived from has been validated.
+
 ### 8. The module is `src/groundkit/runtime.py`, added explicitly to the coverage core subset
 
 Placement follows `identity.py`, whose docstring records the precedent: a module holding

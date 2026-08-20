@@ -38,6 +38,8 @@ it scored.
   overlay-network deployment (ADR-0024 decision 3). The container default
   `--host 0.0.0.0 --allow-remote-access` (ADR-0021) is unaffected.
 
+- The URL loader's snapshot write no longer follows a symbolic link. `ensure_within_base` resolves symlinks, so a snapshot path that is *already* a link out of `<collection>.snapshots/` was refused — but the check and the write are two syscalls, and anything able to create a file in that directory could win the gap between them and have the write land wherever the link pointed. The write is now `O_NOFOLLOW`, and only that errno becomes an `IngestionError`; every other `OSError` propagates unchanged. The window was narrow (`document_id` is an unguessable `uuid4`, and citation resolution returns nothing unless the bytes still match) and the flag costs nothing. Two limits are stated rather than implied: Windows has no `O_NOFOLLOW`, so the write is unchanged there, and the *read* side (`retrieval/citations.py`) still has the same two-syscall gap.
+
 ### Changed
 
 - `grk serve` bounds concurrent corpus-scale work. `search` and `index_status`
@@ -62,6 +64,120 @@ it scored.
   nothing named it, stated it, or tested it. Behaviour is unchanged and the
   value now belongs to the module, guarded by a test that forces the connect
   default to 0 and requires the pragma to hold.
+
+- `src/groundkit/extraction.py` is now inside the SPEC.md §8 coverage core
+  subset, and `src/groundkit/snapshots.py` is argued out of it. Both sit at
+  the package root where no glob in the table catches them, and neither had a
+  note in either direction — an omission the table's own convention forbids as
+  firmly as an unargued entry. `extraction.py` is the re-derivation half of
+  citation verification: `resolve_citation`'s `extracted` branch decides
+  verified-versus-drifted entirely by what the recorded extractor returns on a
+  second pass, so gating `retrieval/citations.py` through the glob while
+  leaving `extraction.py` out gated the comparison but not the text being
+  compared. `snapshots.py` is two one-expression path functions with no I/O and
+  no branch, and every step that decides a snapshot citation's verdict lives in
+  the already-gated `_resolve_snapshot`; the whole-package gate covers it, as
+  with `telemetry.py`. `README.md`'s enumerated subset list follows the table.
+
+- `FaithfulnessJudge` and `FaithfulnessVerdict` moved from `groundkit.evals.judge`
+  to `groundkit.providers.judge` (GK-021). They are `ChatProtocol` consumers
+  exactly like `Synthesizer` and `QueryRewriter`, and they now sit beside them.
+  The move is what stops the eval harness being a runtime dependency:
+  `groundkit.answer` — the `grk answer` composition root, no part of the
+  harness — imported the eval package to reach the judge, which made
+  `groundkit.evals` undroppable from a plain library install and would have
+  forced a standing exemption in the structural guard below. Import path only:
+  the class, its verdict schema, its prompt template and its advisory, ungated
+  semantics are unchanged, and `grk answer --judge` / `grk eval --judge` behave
+  identically.
+- A second structural guard,
+  `tests/test_deterministic_core.py::test_runtime_surface_does_not_import_the_eval_harness`,
+  AST-scans every module under `src/groundkit` for an import of
+  `groundkit.evals` and fails on any hit. `cli.py` is the single exemption and
+  the only defensible one, since it hosts `grk eval`. The eval harness ships in
+  the wheel today, so this guards the *option* of making it an extra rather than
+  a property already relied on. The deterministic-core scan in the same module
+  now bars `groundkit.providers.judge` by name — it used to bar the judge for
+  free via the `groundkit.evals` prefix, and stopped the moment the judge became
+  a provider.
+- `groundkit.answer` no longer claims, unqualified, that "every collaborator is
+  injected". Every collaborator *instance* is injected; the *types* are
+  concrete — only the search collaborator is a structural Protocol, while the
+  synthesizer, rewriter and judge are the named classes the module imports. The
+  claim is narrowed rather than made true by adding indirection, because all
+  three are themselves `ChatProtocol` consumers and the substitution a caller
+  actually wants (a different model, a scripted fake, a redacting wrapper) is
+  reached through that seam.
+
+- `BM25Index` builds the postings list ADR-0002 said it built. `index_chunks`
+  now records a `term -> [chunk index]` map alongside the document-frequency
+  counter, and `search` scores the union of the query terms' postings instead
+  of every indexed chunk, so query cost tracks the number of chunks holding a
+  query term rather than corpus size. The result list is unchanged —
+  identical, not approximately so: a chunk holding no query term already
+  scored exactly zero and was already discarded by the existing filter, and
+  the candidate union is walked in ascending chunk index, so even the
+  insertion-order fallback between two byte-identical chunks is preserved.
+  Nothing is persisted and nothing shadows SQLite, so the O(corpus)
+  rebuild-at-open cost is untouched and ADR-0002's deferred "persisted BM25
+  postings tables in SQLite" alternative stays deferred — this changes what a
+  query costs, not what an open costs. Recorded as an erratum on ADR-0002
+  decision 2, which named three structures where the code had two. Pinned by
+  `tests/test_bm25_postings.py`, which compares `search` against a
+  transcription of the pre-change whole-corpus loop over the golden corpus —
+  byte for byte, chunk identity and exact float scores, ties included — for
+  every query in `evals/judgments.jsonl`, and which sabotages one posting to
+  show that comparison can fail.
+
+- The read paths that needed at most `top_k` document IDs now ask for them by
+  key instead of materializing the `documents` table. `Retriever.search` read
+  every stored row — one validated model per row — on **every** query, before
+  the mode branch even ran; `fetch_chunk` did the same for the single document
+  its already-keyed chunk read had just named, and did it before establishing
+  the chunk existed at all. Both now use a new keyed
+  `get_document_record(document_id)` on the optional
+  `DocumentRecordStoreProtocol`, which also gains the `COUNT(*)` aggregates
+  that previously existed only on the concrete SQLite store. Query cost is now
+  proportional to the results rather than to the corpus.
+- Two consequences worth naming, both pinned by tests asserting on the SQL the
+  store executes rather than on which method was called: a search whose hits
+  all fall below `score_threshold` now performs no document read at all, since
+  the join happens per surviving hit after the filter; and a `fetch_chunk`
+  naming an unknown chunk id — the cheapest possible rejection on an
+  unauthenticated read-only surface — no longer costs a corpus-proportional
+  scan.
+- The document read stays **live** per search and is deliberately not cached at
+  `open()`. That is what makes a hit against a document deleted after `open()`
+  fail closed instead of resolving to a citation nothing can verify, so the
+  cheaper fix was the wrong one. Within a single search the lookup memoizes per
+  distinct document ID, which is no less live than the single whole-table
+  snapshot it replaces. A store that does not implement the optional capability
+  keeps working through the previous whole-table path, now taken lazily.
+- Every hand-built metadata-store double in the suite derives from one shared
+  base (`tests/metadata_store_doubles.py`), itself checked against both store
+  protocols by `assert_signature_parity`. Test-maintenance cost was the
+  recorded reason for keeping capabilities off the required protocol and for
+  the `isinstance` fork in the retrieval hot path; widening a protocol is now
+  one edit in one file rather than one per double.
+
+- `grk search` and `grk answer` open their collection through `CollectionRuntime`
+  instead of calling `Retriever.open` themselves, carrying out ADR-0013 decision 7,
+  which had been recorded and not implemented. Four read lifecycles become two — the
+  runtime's and the eval runner's, whose exemption that decision already argued.
+  Behaviour is unchanged for every current collection: the runtime's cache cannot hit
+  in a one-shot process, so it is still one open, one rebuild, one close. What changes
+  is that the CLI and the service surface now share that code, so the default test
+  suite exercises the open path a long-lived server runs on — the benefit the ADR
+  claimed and did not deliver. Two visible edges: a collection predating ADR-0013's
+  schema now emits the runtime's "freshness cannot be asserted" warning on stderr
+  (never stdout, so `--json` is unaffected), and the dense vector store is opened by a
+  factory during the runtime's rebuild rather than eagerly by the command — which makes
+  structural an ordering the previous code held by convention, since a collection name
+  is validated by `SQLiteMetadataStore.open` before `<index-dir>/<collection>.lance`
+  can be derived from it.
+
+- `UrlLoader` bounds a fetch in wall-clock time. `timeout_seconds` (default 30 seconds, the same default and the same strictly-positive invariant as `EmbeddingConfig.timeout_seconds`) is enforced with `asyncio.timeout` around the whole exchange — connect, status, headers and every body read together. httpx's own `timeout=` is per operation, so a server that answers just inside the read timeout, indefinitely, never trips it: the bound the caller thought it set was not the bound it got. The bound covers the fetch only, not the preceding address check or the snapshot write.
+- `IngestionPipeline.ingest_directory` no longer returns while work it started is still running. A file that fails still raises, still deterministically (path-sorted order, first error in argument order), but only once every dispatched file has settled. `asyncio.gather` without `return_exceptions=True` hands the first exception to the awaiting frame the moment it is raised and neither cancels nor awaits the siblings already in flight; `IngestionPipeline` is exported public API, so a third-party host that caught the error inherited loads and chunkings it could not see, await, or cancel. There is no torn write here — this module never touches a collection (ADR-0010) — so the fix is about supervision, not durability, unlike the identically-shaped one in `indexer.py`.
 
 ### Fixed
 
@@ -90,6 +206,24 @@ it scored.
   losing to it — previously a colliding key made `metadata_filter={"source": ...}`
   on dense search return zero or wrong results with nothing raised.
 
+- Neither of `UrlLoader`'s content-sized writes runs on the event loop. The
+  snapshot write at the end of `load` and the scratch write inside
+  `_extract_html` each handle up to `max_bytes` of fetched body, and were the
+  only content-sized filesystem I/O left in the package called inline from an
+  `async def`; both now dispatch through `asyncio.to_thread`, as every
+  comparable site already did. This was bounded in practice only because URL
+  ingestion is CLI-only and nothing else is scheduled on that loop — a property
+  of the current caller, not of this module, which is exactly the code a
+  service-side ingest tool would reuse verbatim. `_write_snapshot` stays
+  synchronous deliberately: the caller dispatches it, and tests keep calling it
+  directly to exercise the containment check without a fetch.
+- `run_eval` computes `judgments_hash` off the event loop, as it already
+  computed `corpus_hash` one statement earlier. The comment above the pair
+  claimed a symmetry ("both reads") that was true of their `OSError` handling
+  and false of their dispatch — the judgments file was read whole and hashed on
+  the loop. Both are now dispatched, and the comment says which half of "both"
+  it means.
+
 ### Documentation
 
 - `config.IndexConfig.index_dir` and `index.protocols.VectorStoreProtocol` no
@@ -102,6 +236,63 @@ it scored.
   `pip install groundkit` is now the primary install path, and the PyPI version,
   Python versions and License badges are present as live endpoints.
 
+- `scripts/measure_retriever_open.py` now prices the whole query path, not just
+  `Retriever.open()`. Four selectable sections (`--sections`): the existing open
+  timings; `BM25Index.search` and `Retriever.search` per query, each reported
+  beside the measured candidate fraction that bounds what a postings list could
+  skip; the full-table document read every search performs, against a keyed
+  single-row read of the same table and the rows-materialized-versus-`top_k`
+  amplification; and a warm `CollectionRuntime.acquire()` against a rebuild,
+  followed by an ingest window timing the same commits with and without a
+  concurrent acquire loop. Queries are derived from the corpus's own measured
+  term frequencies rather than written in, so none can quietly stop being rare
+  or common when the generator changes. Everything runs offline with no
+  credentials. This closes the mode ADR-0013 recorded the script as owed — "a
+  mode that times a warm acquire against a rebuild so this claim is measured
+  rather than asserted" — and supplies the measurement ADR-0002 names as the
+  trigger for reconsidering persisted postings. As before, no number it produces
+  is restated in any doc.
+
+- ADR-0026 records why measurement precedes the incremental-rebuild work and
+  re-defers ADR-0002's persisted-BM25-postings alternative against a **new**
+  trigger. The old trigger — "rebuild-at-open time is *measured* to be a problem
+  for a real corpus size" — was half-unmeetable rather than merely unmet:
+  `scripts/measure_retriever_open.py` settled the per-open cost for ADR-0013, but
+  whether that cost is a *problem* depends on how often an open happens, and no
+  instrument in the repo could observe that. The new trigger asks for a recorded
+  reading of the counters above from a real corpus, quoted in the ADR that acts
+  on it, and states which of the two competing remedies each shape of reading
+  selects. ADR-0013 is unmodified: its per-commit bump, stamp ordering,
+  single-flight and wait-rather-than-serve-stale rules all stand as written.
+
+### Added
+
+- `index_status` now reports what the ADR-0013 staleness cache actually *does*,
+  not only that it is switched on: `retriever_acquires`, `retriever_rebuilds`,
+  `rebuild_seconds_total` and `last_rebuild_seconds` (ADR-0026). `cache_enabled:
+  true` was equally compatible with a cache hitting on every request and with one
+  that had not hit since the process started, and the only external symptom of
+  the difference was latency — which on this path has several other causes (an
+  O(corpus) aggregate, a cold page cache, a dense probe, a reranker). The hit
+  fraction is derived by the reader as `1 - retriever_rebuilds /
+  retriever_acquires` and is deliberately not stored, following the rule the eval
+  harness applies to a stage delta: a ratio kept beside its own inputs is
+  redundant state that can disagree with them. Nothing new is disclosed — a
+  rebuild happens exactly when the generation moved, and `generation` was already
+  on this response.
+- `CollectionRuntime.rebuild_stats()` returns those counters as a frozen
+  `RebuildStats` snapshot. Rebuilds are counted at entry rather than at
+  publication and timed in a `finally`, so a rebuild that raises is still charged
+  for the lock it held and the waiters it blocked; the natural implementation —
+  incrementing beside the `self._cached` assignment — reports a runtime whose
+  every rebuild fails as one that never rebuilds at all, with a perfect hit rate,
+  while it takes the rebuild lock and does an O(corpus) read on every request.
+  `handle_index_status` builds no retriever, so reading the meter cannot move it,
+  and a test asserts two consecutive calls leave `retriever_acquires` unchanged.
+
+### Removed
+
+- `requirements-audit.txt` is no longer committed; it is generated and gitignored. `ci.yml`'s `audit` job and `release-gates.yml`'s supply-chain step both re-export it from `uv.lock` immediately before `pip-audit` reads it, so the tracked copy was never the file audited — a second rendering of the lockfile that nothing read and that had already drifted from it once. `uv.lock` remains the tracked source of truth.
 ## [0.1.0] - 2026-08-18
 
 First release. Everything below is initial, so this entry describes the

@@ -140,7 +140,8 @@ APPLICATION_ID: Final[int] = 0x47524B31  # "GRK1"
 #: ``INSERT`` naming them would fail with a raw ``sqlite3.OperationalError``.
 #: :meth:`SQLiteMetadataStore._require_source_class_capable` is the guard
 #: (:meth:`upsert_document`, :meth:`replace_document`,
-#: :meth:`get_document_records` only — see its docstring for why the other
+#: :meth:`get_document_records` and :meth:`get_document_record` only — see its
+#: docstring for why the other
 #: methods are untouched), refusing with a clear :class:`StorageError` naming
 #: the delete-and-re-ingest remedy instead of surfacing that raw driver
 #: error. Pre-1.0, there is no migration path (ADR-0004 decision 5): every
@@ -542,6 +543,45 @@ class SQLiteMetadataStore:
 
         return await self._run(_op)
 
+    async def get_document_record(self, document_id: str) -> DocumentRecord | None:
+        """Return one document's :class:`DocumentRecord`, or ``None`` if there is no such row.
+
+        The keyed form of :meth:`get_document_records`, added by GK-019.
+        ``document_id`` is the ``documents`` primary key, so this is an index
+        seek: what it replaces is a full table scan that built a validated
+        model per stored row so that its two callers —
+        :meth:`~groundkit.retrieval.search.Retriever.search`, on **every**
+        query, and ``service.tools.handle_fetch_chunk``, for a single ID —
+        could look up at most ``top_k`` keys in the result. Cost scaled with
+        the corpus while the question scaled with ``top_k``.
+
+        Returning ``None`` for an unknown ID rather than raising is what lets
+        those callers keep their fail-closed branch: a chunk whose document
+        row is gone must be refused, and refusing is their decision to make
+        with their own error vocabulary, not this store's.
+
+        Args:
+            document_id: The document's unique identifier.
+
+        Raises:
+            StorageError: This store predates the ``source_class``/
+                ``extractor`` columns (schema v3, ADR-0016), or a backend
+                failure occurs.
+        """
+        self._require_source_class_capable("read a document record")
+
+        def _op() -> DocumentRecord | None:
+            cur = self._conn.execute(
+                "SELECT source, source_class, extractor FROM documents WHERE document_id = ?",
+                (document_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return DocumentRecord(source=str(row[0]), source_class=row[1], extractor=row[2])
+
+        return await self._run(_op)
+
     async def get_document_records(self) -> dict[str, DocumentRecord]:
         """Return a ``document_id -> DocumentRecord`` map for every stored document.
 
@@ -549,12 +589,15 @@ class SQLiteMetadataStore:
         (ADR-0016). Every one of that method's five existing call sites reads
         only the source string or the key set, so changing its return type
         would touch five call sites for a field none of them need; adding
-        this method instead confines the change to the two call sites that
-        actually need the richer read (``Retriever._resolve`` and
-        ``handle_fetch_chunk``, both building a ``Citation``/
-        ``RetrievalResult`` that must carry the document's real
-        ``source_class``/``extractor`` rather than silently defaulting to
-        ``("text", None)`` — the fail-open defect this method closes).
+        this method instead confined the change to the two call sites that
+        actually need the richer read.
+
+        Whole-table by construction. Since GK-019 the two callers that wanted
+        a bounded set of keys use :meth:`get_document_record` instead, and
+        this remains for callers that genuinely want every row: a diagnostic
+        or export, and ``Retriever``'s fallback branch for a store that does
+        not implement :class:`~groundkit.index.protocols.DocumentRecordStoreProtocol`
+        at all.
 
         Raises:
             StorageError: This store predates the ``source_class``/
@@ -737,6 +780,13 @@ class SQLiteMetadataStore:
         chunk half, one line above it in ``service/tools.py`` and missed when
         that half was fixed.
 
+        Declared on the optional
+        :class:`~groundkit.index.protocols.DocumentRecordStoreProtocol` since
+        GK-019, alongside the keyed document read: both describe the same
+        property of a store — that it can answer a bounded question without
+        materializing a table — and neither belongs on the protocol every
+        store must satisfy.
+
         Returns:
             The number of rows in ``documents``.
 
@@ -755,13 +805,14 @@ class SQLiteMetadataStore:
 
         Deliberately **not** a :class:`~groundkit.index.protocols.MetadataStoreProtocol`
         member. That protocol is held to exact signature parity by
-        ``tests/test_protocol_conformance.py`` and implemented by several
-        hand-built doubles across the suite; widening it for a reporting
+        ``tests/test_protocol_conformance.py`` and implemented by hand-built
+        doubles across the suite; widening it for a reporting
         convenience is the trade ADR-0012 decision 3 already refused for
-        ``model_name``. This is a concrete capability of the SQLite store,
-        reached by :meth:`~groundkit.runtime.CollectionRuntime.chunk_count`,
-        which holds a concrete :class:`SQLiteMetadataStore` rather than the
-        protocol.
+        ``model_name``. It is instead declared on the *optional*
+        :class:`~groundkit.index.protocols.DocumentRecordStoreProtocol`
+        (GK-019), which only a store that can genuinely answer cheaply
+        implements — so the capability is now stated in the type system
+        rather than reached for by holding the concrete class.
 
         What it replaces: ``len(await store.get_chunks())``, which
         materialized every chunk's full text — the entire corpus, in memory,
@@ -1092,8 +1143,9 @@ class SQLiteMetadataStore:
         rather than borrowing :class:`IndexIdentityError`'s manifest-specific
         message.
 
-        Called by :meth:`upsert_document`, :meth:`replace_document`, and
-        :meth:`get_document_records` — the only three methods that read or
+        Called by :meth:`upsert_document`, :meth:`replace_document`,
+        :meth:`get_document_records` and :meth:`get_document_record` — the
+        only methods that read or
         write ``source_class``/``extractor`` (ADR-0016). Every other method
         (``get_document_hash``, ``get_document_id``, ``get_document_sources``,
         ``add_chunks``, ``get_chunks``, ``get_chunk``, ``delete_document``,

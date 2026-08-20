@@ -291,14 +291,17 @@ async def handle_fetch_chunk(ctx: ServiceContext, request: FetchChunkRequest) ->
     """
     async with ctx.registry.acquire(request.collection) as runtime:
         chunk = await runtime.get_chunk(request.chunk_id)
-        records = await runtime.get_document_records()
+        # Keyed, and conditional: this used to read every row of ``documents``
+        # unconditionally — before even establishing the chunk exists — to
+        # look up the one document that chunk belongs to (GK-019). A request
+        # naming an unknown chunk now performs no document read at all.
+        record = None if chunk is None else await runtime.get_document_record(chunk.document_id)
 
     if chunk is None:
         raise ConfigurationError(
             f"no chunk {request.chunk_id!r} in collection {request.collection!r}"
         )
 
-    record = records.get(chunk.document_id)
     if record is None:
         # The dangling-document case Retriever.search already fails closed on.
         raise RetrievalError(
@@ -306,7 +309,8 @@ async def handle_fetch_chunk(ctx: ServiceContext, request: FetchChunkRequest) ->
             "which has no stored source — the index is inconsistent"
         )
 
-    # ``get_document_records`` rather than ``get_document_sources`` (ADR-0016).
+    # A ``DocumentRecord`` rather than ``get_document_sources``' bare string
+    # (ADR-0016).
     # A bare source string would leave this Citation at its ``("text", None)``
     # field defaults no matter what the document was ingested as, and the
     # consequences are not cosmetic: ``search`` would report a chunk's citation
@@ -438,12 +442,21 @@ async def handle_index_status(
     call on this surface. Bounded by :data:`MAX_CONCURRENT_CORPUS_SCANS` even
     so: an aggregate over every row is still a full table scan, and this
     handler is reachable unauthenticated.
+
+    It also reports the runtime's rebuild counters (ADR-0026). This is the one
+    operation on the surface that already holds the runtime and already
+    reports the staleness marker, so it is where the marker's *cost* belongs
+    too. The read is free — four attributes off the object already checked
+    out, no store round-trip — and it is deliberately **not** an acquire: this
+    handler never builds a retriever, so reading the counters here cannot move
+    them.
     """
     async with ctx.scan_limiter, ctx.registry.acquire(request.collection) as runtime:
         document_count = await runtime.document_count()
         chunk_count = await runtime.chunk_count()
         manifest = await runtime.get_manifest()
         generation = await runtime.get_generation()
+        stats = runtime.rebuild_stats()
 
     return IndexStatusResponse(
         collection=request.collection,
@@ -457,6 +470,10 @@ async def handle_index_status(
         generation=generation,
         cache_enabled=generation is not None,
         schema_version=SCHEMA_VERSION,
+        retriever_acquires=stats.acquires,
+        retriever_rebuilds=stats.rebuilds,
+        rebuild_seconds_total=stats.rebuild_seconds_total,
+        last_rebuild_seconds=stats.last_rebuild_seconds,
     )
 
 

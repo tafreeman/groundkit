@@ -165,7 +165,10 @@ class IngestionPipeline:
         Raises:
             IngestionError: ``source_dir`` does not exist or is not a
                 directory, the directory cannot be walked, or ingesting any
-                discovered file fails (see :meth:`ingest`).
+                discovered file fails (see :meth:`ingest`). A failure is
+                raised only once every dispatched file has settled, so this
+                method never returns while work it started is still running
+                (see the comment on the ``gather`` call below).
             ValueError: ``max_concurrent`` is less than 1.
         """
         if max_concurrent < 1:
@@ -192,11 +195,35 @@ class IngestionPipeline:
             async with semaphore:
                 return await self.ingest(str(path))
 
-        results = await asyncio.gather(*(_ingest_one(path) for path in files))
+        # return_exceptions=True, for a different reason than `indexer.py`'s.
+        # There is no torn write to fear here: this module never touches a
+        # collection (ADR-0010), so the concern is supervision, not durability.
+        # A bare gather hands the first exception to this frame the moment it
+        # is raised, but it neither cancels nor awaits the siblings already in
+        # flight -- they keep running, detached, inside a caller that has
+        # already seen the failure and moved on. `IngestionPipeline` is
+        # exported public API, so a third-party host that catches the error
+        # inherits loads and chunkings it cannot see, await, or cancel, whose
+        # own failures surface later as unretrieved task exceptions on
+        # whichever loop is still running. Letting every `_ingest_one` settle
+        # first costs nothing on the success path and leaves nothing behind on
+        # the failure path.
+        settled = await asyncio.gather(
+            *(_ingest_one(path) for path in files), return_exceptions=True
+        )
 
         all_chunks: list[Chunk] = []
-        for chunks in results:
-            all_chunks.extend(chunks)
+        first_error: BaseException | None = None
+        for result in settled:
+            if isinstance(result, BaseException):
+                # files is path-sorted and gather resolves in argument order,
+                # so "first" is deterministic across runs.
+                if first_error is None:
+                    first_error = result
+            else:
+                all_chunks.extend(result)
+        if first_error is not None:
+            raise first_error
         return all_chunks
 
     @staticmethod

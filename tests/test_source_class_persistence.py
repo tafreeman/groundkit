@@ -76,10 +76,11 @@ def test_sqlite_metadata_store_conforms_to_document_record_store_protocol(
 
     Deliberately a separate protocol from ``MetadataStoreProtocol`` (see
     ``DocumentRecordStoreProtocol``'s docstring) — this pins that
-    ``SQLiteMetadataStore`` is nonetheless a real implementer, so
-    ``Retriever._document_records``'s ``isinstance`` check takes the
-    enriched branch for every real store, never the ``text``/``None``
-    fallback meant only for a store double that predates ADR-0016.
+    ``SQLiteMetadataStore`` is nonetheless a real implementer, so the
+    ``isinstance`` check inside ``Retriever``'s ``_DocumentRecordLookup``
+    takes the keyed, enriched branch for every real store, never the
+    whole-table ``text``/``None`` fallback meant only for a store double that
+    predates ADR-0016.
     """
 
     async def run() -> SQLiteMetadataStore:

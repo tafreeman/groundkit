@@ -20,6 +20,15 @@ htmlcov/
 # Eval artifacts — generated, never committed (reports are reproducible)
 evals/results/
 
+# Supply-chain audit input, generated. `ci.yml`'s `audit` job and
+# `release-gates.yml`'s `Supply-chain audit` step both run
+# `uv export ... -o requirements-audit.txt` immediately before `pip-audit`
+# reads it, so a committed copy is never the file that gets audited — it is a
+# second, unread rendering of `uv.lock` that can (and did) drift away from it
+# with nothing to notice. `uv.lock` is the tracked source of truth; this is
+# derived from it at run time (GK-028).
+requirements-audit.txt
+
 # Local index data. SQLite runs in WAL mode (ADR-0002), so a store is three
 # files rather than one and the `-wal`/`-shm` sidecars outlive any open
 # connection — without them the sidecars are the only part of an index
