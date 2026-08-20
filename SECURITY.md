@@ -188,7 +188,13 @@ US-state code in another), so a credential under an unlisted parameter name
 still reaches the fetch. Redirects are refused rather than followed
 (`follow_redirects=False` per request; a 3xx status raises rather than being
 chased), and the response body is bounded by a byte cap and refused, never
-truncated, past it.
+truncated, past it. The fetch is also bounded in *wall-clock* time by
+`timeout_seconds` (GK-028), enforced with `asyncio.timeout` around the whole
+exchange — connect, status, headers and every body read together — because
+httpx's own `timeout=` is per operation and a server answering just inside
+each per-operation deadline, indefinitely, never trips it. The bound covers
+the fetch only: the preceding DNS resolution in `ensure_safe_endpoint` and
+the trailing snapshot write sit outside it.
 
 The userinfo credential leak in `_sanitize_url` is **fixed**. It previously
 rebuilt the sanitized URL's `netloc` including `user:password@`, redacting

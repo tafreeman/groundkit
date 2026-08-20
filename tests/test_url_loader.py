@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import errno
 import logging
 import os
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -1171,3 +1173,36 @@ class TestUrlLoaderSnapshotWriteDoesNotFollowASymlink:
         # containment refusal, this would not match.
         with pytest.raises(OSError):
             loader._write_snapshot("doc-1", "content")
+
+    @pytest.mark.skipif(
+        sys.platform.startswith(("freebsd", "netbsd", "openbsd", "dragonfly")),
+        reason="EMLINK legitimately means 'symlinked final component' on these BSDs",
+    )
+    def test_emlink_is_not_reported_as_a_symlink_attack(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``EMLINK`` is "Too many links" off the BSDs, not a planted symlink.
+
+        Reinterpreting it would tell an operator that something replaced the
+        snapshot path between the containment check and the open -- a TOCTOU
+        attack -- when a directory merely hit its link ceiling. The sibling
+        test above provokes ``EISDIR``/``EACCES`` and so never covered this
+        one, which is the errno that was actually misclassified.
+
+        Fail-first: with ``EMLINK`` in ``_SYMLINK_ERRNOS`` unconditionally,
+        this raises ``IngestionError`` and the ``OSError`` expectation fails.
+        """
+        snapshot_dir = tmp_path / "col.snapshots"
+        loader = UrlLoader(snapshot_dir)
+
+        def _raise_emlink(*_args: object, **_kwargs: object) -> int:
+            raise OSError(errno.EMLINK, "Too many links")
+
+        # String target: reading ``url_loader.os`` as an expression trips
+        # mypy --strict, which rejects a name a module does not re-export.
+        monkeypatch.setattr("groundkit.ingestion.url_loader.os.open", _raise_emlink)
+
+        with pytest.raises(OSError) as excinfo:
+            loader._write_snapshot("doc-1", "content")
+        assert not isinstance(excinfo.value, IngestionError)
+        assert excinfo.value.errno == errno.EMLINK

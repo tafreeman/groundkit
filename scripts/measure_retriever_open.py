@@ -25,21 +25,24 @@ is whatever a run prints on the machine and corpus it was run against.
 ``search``
     ``BM25Index.search`` (the scoring loop alone) and ``Retriever.search``
     (the same loop plus the store join), per query, over queries of *measured*
-    selectivity. Today the loop visits every chunk regardless of how few
-    contain a query term, so the reported candidate fraction — chunks holding
-    at least one query term, over all chunks — is the share of that loop a
-    postings list could skip, and therefore the ceiling on what one could win.
-    A query whose terms match everything has no headroom at all; reporting the
-    fraction beside the time is what keeps that visible.
+    selectivity. Since GK-018 the loop visits the union of the query terms'
+    postings rather than every chunk, so the reported candidate fraction —
+    chunks holding at least one query term, over all chunks — is now the share
+    of the corpus actually scored, not the share a hypothetical postings list
+    could skip. A query whose terms match everything still scores everything;
+    reporting the fraction beside the time is what keeps that visible, and is
+    what turns this section from a justification into a verification.
 
 ``records``
-    the full-table ``get_document_records()`` read ``Retriever.search``
-    performs on **every** query, against a keyed single-row read of the same
-    table, plus the amplification: rows materialized per query against the at
-    most ``top_k`` rows the join actually consumes. The keyed number is a
-    lower bound, not an equivalent — it is an existing indexed single-row
-    SELECT returning one column and building no model, where a keyed record
-    read would validate one ``DocumentRecord``.
+    the full-table ``get_document_records()`` read ``Retriever.search`` used
+    to perform on **every** query — replaced by a per-hit keyed read in
+    GK-019, and still the fallback branch for a store without the optional
+    capability — against a keyed single-row read of the same table, plus the
+    amplification: rows materialized per query against the at most ``top_k``
+    rows the join actually consumes. The keyed number is the
+    real ``get_document_record(document_id)`` GK-019 added, not a proxy for
+    it: the same indexed single-row SELECT building the same validated
+    ``DocumentRecord`` the search path builds.
 
 ``acquire``
     ``CollectionRuntime.acquire()`` warm (generation unchanged, cache hit)
@@ -257,11 +260,12 @@ def _chunk_terms(chunks: list[Chunk]) -> list[set[str]]:
 def _candidate_count(chunk_terms: list[set[str]], query: str) -> int:
     """Return how many chunks hold at least one of ``query``'s terms.
 
-    This is the union of the query terms' postings — the set a postings list
-    would restrict the scoring loop to, and the only chunks that can score
-    above zero. Every other chunk is scored to ``0.0`` today and then
-    discarded, so the difference between this and the corpus size is the
-    wasted half of the loop, measured rather than assumed.
+    This is the union of the query terms' postings — the set the scoring loop
+    is restricted to since GK-018, and the only chunks that can score above
+    zero. Before that erratum every other chunk was scored to ``0.0`` and
+    discarded, so the difference between this and the corpus size was the
+    wasted half of the loop; it is now the half that is no longer walked, and
+    reporting it is how a run confirms that rather than assuming it.
     """
     terms = set(_tokenize(query))
     return sum(1 for chunk in chunk_terms if chunk & terms)
@@ -308,7 +312,7 @@ async def _measure_search(
     repeats: int,
 ) -> None:
     """Section ``search``: per-query cost against measured query selectivity."""
-    print("  search (every query scores every chunk; candidates bound what postings could skip)")
+    print("  search (candidates = chunks actually scored, since GK-018's postings walk)")
     total = len(chunk_terms)
     if not total:
         print("    empty collection; nothing to query")
@@ -323,24 +327,31 @@ async def _measure_search(
         retriever_samples = await _async_samples(
             partial(retriever.search, query, top_k=top_k, mode="bm25"), repeats
         )
-        # The gap between these two is the store join: the full-table read the
-        # records section prices, plus the to_thread hop and citation resolve.
+        # The gap between these two is the store join -- since GK-019 a keyed
+        # read per distinct hit, not the full-table read the records section
+        # prices -- plus the to_thread hop and citation resolve.
         _report("      BM25Index.search ", index_samples)
         _report("      Retriever.search ", retriever_samples)
 
 
 async def _measure_records(store: SQLiteMetadataStore, *, top_k: int, repeats: int) -> None:
     """Section ``records``: the full-table read every query pays, against a keyed read."""
-    print("  document records (read in full on every Retriever.search, to use at most top_k)")
+    print("  document records (full-table read: the pre-GK-019 cost, now the fallback branch)")
     records = await store.get_document_records()
     if not records:
         print("    empty collection; nothing to read")
         return
-    probe = sorted(record.source for record in records.values())[len(records) // 2]
+    # A document_id, not a source: `get_document_record` is the keyed read
+    # `Retriever.search` and `handle_fetch_chunk` actually perform since
+    # GK-019. This used to time `get_document_hash` as a stand-in and label
+    # the figure a lower bound, because the real keyed read did not exist and
+    # the proxy returned one column without validating a model. It exists now,
+    # so the section times the real thing and the caveat is gone.
+    probe = sorted(records)[len(records) // 2]
     full = await _async_samples(store.get_document_records, repeats)
-    keyed = await _async_samples(partial(store.get_document_hash, probe), repeats)
+    keyed = await _async_samples(partial(store.get_document_record, probe), repeats)
     _report("    full-table get_document_records()", full)
-    _report("    keyed single-row read (lower bound)", keyed)
+    _report("    keyed get_document_record()", keyed)
 
     keyed_budget = top_k * statistics.median(keyed)
     ratio = f"{statistics.median(full) / keyed_budget:.1f}x" if keyed_budget > 0 else "n/a"

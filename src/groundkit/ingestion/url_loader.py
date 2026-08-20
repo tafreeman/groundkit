@@ -48,6 +48,7 @@ import asyncio
 import errno
 import logging
 import os
+import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -103,11 +104,32 @@ _O_NOFOLLOW: int = getattr(os, "O_NOFOLLOW", 0)
 #: citation offsets are measured against.
 _O_BINARY: int = getattr(os, "O_BINARY", 0)
 
+#: Platforms whose ``open(..., O_NOFOLLOW)`` has historically reported
+#: ``EMLINK`` rather than POSIX's ``ELOOP`` for a symlinked final component.
+_EMLINK_MEANS_SYMLINK_PLATFORMS: tuple[str, ...] = (
+    "freebsd",
+    "netbsd",
+    "openbsd",
+    "dragonfly",
+)
+
 #: Errnos a POSIX ``open(..., O_NOFOLLOW)`` reports when the final path
-#: component is a symbolic link. POSIX specifies ``ELOOP``; some BSDs have
-#: historically used ``EMLINK`` for this case alone, so both are treated as
-#: the refusal rather than as an unrelated I/O failure.
-_SYMLINK_ERRNOS: frozenset[int] = frozenset({errno.ELOOP, errno.EMLINK})
+#: component is a symbolic link.
+#:
+#: ``ELOOP`` everywhere, per POSIX. ``EMLINK`` **only** on the BSDs above,
+#: and the narrowing is the point: on Linux — which is what CI runs —
+#: ``EMLINK`` is "Too many links", an unrelated filesystem limit. Treating it
+#: as a symlink refusal there would tell an operator that someone replaced
+#: the snapshot path between the containment check and the open, i.e. report
+#: a TOCTOU attack, when what actually happened is that a directory hit its
+#: link ceiling. A security refusal that fires on an unrelated I/O failure
+#: costs more than the exotic case it was meant to cover: it trains the
+#: reader to disbelieve the message.
+_SYMLINK_ERRNOS: frozenset[int] = (
+    frozenset({errno.ELOOP, errno.EMLINK})
+    if sys.platform.startswith(_EMLINK_MEANS_SYMLINK_PLATFORMS)
+    else frozenset({errno.ELOOP})
+)
 
 #: Content-Type media types (the part before any ";" parameter) treated as
 #: HTML-shaped, triggering the identical tag-stripping step Wave 3's

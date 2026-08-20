@@ -301,7 +301,7 @@ async def run_eval(
             golden-corpus synthesis pass described above. ``report.synthesis``
             stays ``None`` when omitted — the default, and the whole of this
             run's behavior when a caller wants only the stages above.
-        judge: Optional :class:`~groundkit.evals.judge.FaithfulnessJudge`
+        judge: Optional :class:`~groundkit.providers.judge.FaithfulnessJudge`
             (keyword-only), reused exactly as given — this function never
             constructs one. Requires ``chat`` (there is nothing for a judge
             to evaluate without a synthesized answer); supplying ``judge``

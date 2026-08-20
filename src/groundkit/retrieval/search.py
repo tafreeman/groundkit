@@ -443,9 +443,13 @@ class Retriever:
         """Score the whole corpus off the event loop.
 
         :meth:`~groundkit.index.bm25.BM25Index.search` is synchronous and
-        CPU-bound: it scores *every* indexed chunk before truncating to
-        ``top_k`` (ADR-0002's accepted O(corpus) trade), so its cost tracks
-        corpus size rather than ``k``. Called inline from this ``async def``,
+        CPU-bound: it scores the union of the query terms' postings before
+        truncating to ``top_k`` (GK-018, erratum to ADR-0002 decision 2), so
+        its cost tracks how many chunks hold a query term rather than ``k``.
+        That is a real bound for a selective query and none at all for an
+        unselective one — a term present in every chunk has every chunk in
+        its postings — so the worst case is still a full corpus scan and the
+        dispatch below is still required. Called inline from this ``async def``,
         that arithmetic runs on the one event loop ``grk serve`` has — a
         single uvicorn worker — and stalls every other in-flight request for
         its duration, ``index_status`` and ``fetch_chunk`` included.
@@ -724,11 +728,30 @@ class _DocumentRecordLookup:
         Once per search at most, and only for a store without the keyed
         capability — the same single read the old code path performed
         unconditionally.
+
+        Two full-table reads, tried in that order, and the order is the point.
+        ``get_document_records`` carries ``source_class``/``extractor``;
+        ``get_document_sources`` cannot, and yields the ``text``/``None``
+        defaults. The ``isinstance`` gate above is all-or-nothing over four
+        members, so a store implementing ``get_document_records`` but not the
+        two ``COUNT(*)`` aggregates fails it — and answering that store from
+        ``get_document_sources`` would report ``text`` for a document it holds
+        an ``extracted`` row for. That is ADR-0016's fail-open defect (a real
+        store dropping a value it did have) reinstated silently, with the
+        search still succeeding and the citation then verified under the wrong
+        class's assumptions. Falling back on cost is acceptable; falling back
+        on truth is not, so the capability is probed per method rather than
+        inferred from the protocol as a whole.
         """
         if not self._materialized:
-            sources = await self._store.get_document_sources()
-            for stored_id, source in sources.items():
-                self._cache.setdefault(stored_id, DocumentRecord(source=source))
+            records = getattr(self._store, "get_document_records", None)
+            if records is not None:
+                for stored_id, record in (await records()).items():
+                    self._cache.setdefault(stored_id, record)
+            else:
+                sources = await self._store.get_document_sources()
+                for stored_id, source in sources.items():
+                    self._cache.setdefault(stored_id, DocumentRecord(source=source))
             self._materialized = True
         return self._cache.get(document_id)
 

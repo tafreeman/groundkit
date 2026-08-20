@@ -1277,8 +1277,11 @@ def test_bm25_scoring_does_not_run_on_the_event_loop(
 ) -> None:
     """Whole-corpus BM25 scoring must run off the loop thread, on both call sites.
 
-    ``BM25Index.search`` scores every indexed chunk before truncating to
-    ``top_k``, in pure Python. Called inline from ``Retriever.search``'s
+    ``BM25Index.search`` scores the union of the query terms' postings
+    before truncating to ``top_k`` (GK-018), in pure Python -- and for an
+    unselective query that is still most of the corpus, which is why the
+    dispatch this test pins did not stop being necessary when the postings
+    map landed. Called inline from ``Retriever.search``'s
     ``async def``, that ran on the single event loop ``grk serve`` has -- so
     one query stalled every other in-flight request, ``index_status`` and
     ``fetch_chunk`` included, for the length of a full corpus scan. It was

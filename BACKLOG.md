@@ -78,24 +78,8 @@ Declined section with the reason)
 
 | ID | Item | Sev | Phase | Effort | Status | Depends on |
 |---|---|---|---|---|---|---|
-| GK-011 | `grk answer` has no end-to-end test | HIGH | E | S | todo | — |
-| GK-012 | `resolve_chat_config` has no test | MED | E | S | todo | — |
-| GK-013 | The unauthenticated error boundary is never driven over HTTP | MED | E | S | todo | — |
-| GK-014 | `add_chunks`' document-id mismatch branch is untested | LOW | E | XS | todo | — |
-| GK-018 | BM25 has no postings list | MED | G | S | todo | — |
-| GK-015 | `SPEC.md` §2 has no structural guard | MED | F | S | todo | — |
-| GK-016 | `BM25Index` has no protocol seam | MED | F | S | todo | — |
-| GK-017 | Frozen models alias nested caller metadata | MED | F | S | todo | — |
-| GK-018 | BM25 has no postings list | MED | G | S | todo | GK-016 |
-| GK-019 | Three read paths materialize a table to answer a keyed question | MED | G | M | todo | — |
-| GK-020 | The staleness cache stops working during an ingest | MED | G | L | todo | GK-019 |
-| GK-021 | `answer.py` imports the eval harness | MED | H | S | todo | — |
-| GK-022 | `extraction.py` omitted from the coverage core subset | MED | H | XS | todo | — |
-| GK-024 | Blocking filesystem I/O inside `async def` | MED | H | XS | todo | — |
-| GK-025 | `metadata_filter` has no caller | LOW | H | XS | todo | — |
-| GK-026 | ADR-0013 decision 7 was never implemented | LOW | H | S | todo | — |
-| GK-027 | `run_eval` is one long, deeply nested function | LOW | H | M | todo | — |
-| GK-028 | Assorted small correctness debt | LOW | H | S | todo | — |
+| GK-020 | The staleness cache stops working during an ingest | MED | G | L | todo | — |
+| GK-030 | The snapshot read path can still be raced by a symlink | MED | H | XS | todo | — |
 
 ---
 
@@ -210,231 +194,145 @@ whichever merges second, not by discarding either closure note.
 
 ---
 
-## Phase G — Scale
+## Phase G — closed in part 2026-08-20; GK-020 remains open
 
 **Goal:** remove the complexity-class limits, not just their symptoms.
 **Exit:** query cost is proportional to matching chunks, not corpus size.
 
-> Before starting this phase, extend `scripts/measure_retriever_open.py` (or add a sibling)
-> to time `search` and a warm-vs-rebuild acquire. ADR-0002's revisit trigger is explicitly
-> *"that measurement is the trigger, not a guess made now"* — and the ordering of GK-018,
-> GK-019 and GK-020 should follow measurement rather than this file's guess.
+The measurement prerequisite is **done** and is no longer a gate:
+`scripts/measure_retriever_open.py` now times `search`, the document read and a
+warm-vs-rebuild acquire, plus an ingest window with and without a concurrent
+acquire loop. ADR-0002's revisit trigger asked for a measurement rather than a
+guess, and the ordering that measurement produced - GK-019 first, because its
+waste ratio is `documents / top_k` and no corpus or query shape makes it small,
+where GK-018's win is bounded by the candidate fraction the script prints - is
+recorded here rather than left in an agent's report.
 
-### GK-018 — BM25 has no postings list
+GK-018 and GK-019 are **closed** and deleted from this file per the rule above.
+GK-018's consequence is an erratum on ADR-0002 decision 2, which named three
+structures where the code had two; GK-019's is the optional
+`DocumentRecordStoreProtocol` widening plus `tests/metadata_store_doubles.py`,
+the shared base that actually removes the test-maintenance constraint the
+`isinstance` fork was built around.
 
-- **Severity** MEDIUM · **Effort** S · **ADR** yes (erratum to ADR-0002) · **Verified**
-- **Where** `src/groundkit/index/bm25.py:113` —
-  `for doc_idx in range(len(self._chunks))`
-
-The class docstring says it builds an inverted index, and ADR-0002 asserts that "the
-postings, document frequencies, and length statistics are pure functions of the persisted
-chunk set." Two of those three exist. `_doc_freqs` is a document-frequency counter used
-only for IDF; there is no `term → [doc_idx]` map, so every query scores every chunk
-regardless of selectivity.
-
-The fix is score-identical rather than an approximation: chunks with no matching term
-already score exactly `0.0` and are discarded by the existing filter, so restricting the
-loop to the union of the query terms' postings changes no output, including the tie-break.
-It needs no new dependency and no persisted-format change, so ADR-0002's no-shadow-state
-invariant is untouched.
-
-**Acceptance criteria**
-
-- [ ] A postings map populated in `index_chunks` alongside the existing counter.
-- [ ] `search` iterates the union of the query terms' postings.
-- [ ] An equivalence test over the golden corpus asserting byte-identical result lists
-      before and after, including ties.
-- [ ] The class docstring corrected, and an ADR-0002 erratum recording that the postings
-      the ADR described were not built until now — following the ADR-0022 `Indexer.run`
-      erratum precedent.
-
-### GK-019 — Three read paths materialize a table to answer a keyed question
-
-- **Severity** MEDIUM · **Effort** M · **ADR** no
-- **Where** `src/groundkit/retrieval/search.py:322`; `src/groundkit/service/tools.py:244`;
-  `src/groundkit/runtime.py:357`
-
-`Retriever.search` calls `get_document_records()` on **every** query — a full `documents`
-scan building a validated model per row — to look up at most `top_k` IDs. This read must be
-live rather than cached at open, so deletions fail closed; the cost is therefore
-load-bearing, not incidental. `handle_fetch_chunk`, the tool a client is expected to call
-per result, does the same for a single ID. `chunk_count` does it for chunks (see GK-009).
-
-The recorded reason in all three places is test maintenance: widening
-`MetadataStoreProtocol` would break hand-built doubles across the suite. The discipline is
-right and has become a design constraint, and the workaround it produced is an `isinstance`
-capability fork in the retrieval hot path with a silent downgrade branch.
-
-**Acceptance criteria**
-
-- [ ] `get_document_record(document_id)` and count aggregates added to the **optional**
-      `DocumentRecordStoreProtocol`, which only the real store implements — no test double
-      is affected.
-- [ ] `_resolve` / `_apply_snapshot_filter` look up per hit; `handle_fetch_chunk` uses the
-      keyed form; the existing full-table path stays as the fallback branch.
-- [ ] Separately: hand-built store doubles replaced by one shared base in `tests/`, so the
-      next legitimate protocol widening is not blocked by test cost. This is the item that
-      actually removes the constraint.
+The exit criterion is **partly** met, and saying so is the point of having one.
+A query no longer materializes the `documents` table, and no longer scores
+chunks holding none of its terms. It is still not proportional to matching
+chunks in two ways, both recorded in `KNOWN_LIMITATIONS.md`: an unselective
+query has most of the corpus in its postings union, and `BM25Index.from_store`
+still rebuilds in O(corpus) at open.
 
 ### GK-020 — The staleness cache stops working during an ingest
 
-- **Severity** MEDIUM · **Effort** L · **ADR** yes · **Depends on** GK-019
-- **Where** `src/groundkit/index/metadata.py:659` (bump per document);
-  `src/groundkit/runtime.py:229` (cache validity)
+- **Severity** MEDIUM · **Effort** L (criteria 2-3 only) - **ADR** ADR-0026
+  (Accepted) · **Verified**
+- **Where** `src/groundkit/index/metadata.py` (bump per document);
+  `src/groundkit/runtime.py` (cache validity)
 
-The generation bumps once per *document*, and any bump invalidates the cache. So an ingest
-over N changed files commits N invalidations, and each rebuild is a full-corpus
-`get_chunks()` holding the same lock the ingest writer needs. During an ingest the hit rate
-approaches zero and the fallback is the reopen-per-request baseline ADR-0013 rejected on
-measurement, plus contention that also slows the ingest. Waiters cannot be served stale by
-design, so concurrent requests each absorb a full rebuild.
+**Criteria 1 and 4 landed 2026-08-20; the cliff itself is not fixed.**
+`index_status` now reports `retriever_acquires`, `retriever_rebuilds`,
+`rebuild_seconds_total` and `last_rebuild_seconds`, so the hit rate is read
+rather than inferred from latency, and ADR-0026 records the decision and
+re-defers ADR-0002's persisted-postings alternative against a trigger the new
+measurement can satisfy.
 
-ADR-0013's per-commit bump is correct as specified; what is unrecorded is this
-consequence, and that ADR-0002's deferred alternative is still open with its trigger now
-satisfied.
+The defect is unchanged: the generation bumps once per *document* and any bump
+invalidates the cache, so an ingest over N changed files commits N
+invalidations, and each rebuild is a full-corpus `get_chunks()` holding the same
+lock the ingest writer needs. During an ingest the hit rate approaches zero and
+the fallback is the reopen-per-request baseline ADR-0013 rejected on
+measurement, plus contention that also slows the ingest.
+
+Criteria 2 and 3 were deliberately **not attempted** rather than half-landed.
+`SCHEMA_VERSION` is at 3, and v3 adds columns to an existing table, which
+`CREATE TABLE IF NOT EXISTS` cannot supply to an older store - which is why it
+refuses *writes* on a pre-v3 store. A watermark column has exactly that shape,
+so a partial v4 would strand real indexes. The other hard half is
+`remove_document` on the lexical index: a watermark cannot represent a row that
+is *gone*, and `BM25Index`'s postings map is keyed by position in its chunk
+list, so removing a chunk renumbers every posting after it - an index redesign
+carrying GK-018's score-identity obligation, not an added method.
 
 **Acceptance criteria**
 
-- [ ] Observability first: a rebuild counter and duration visible via `index_status`, so
-      the cliff is measurable rather than inferred.
-- [ ] Then incremental rebuild: a monotonic per-document watermark (`ingested_at` is a
-      wall-clock string and unsuitable), a `get_chunks_since`, and a `remove_document` on
-      the lexical index, which does not exist today — `index_chunks` is accumulate-only.
-- [ ] A schema bump, with the delete-and-re-ingest consequence recorded per ADR-0004
-      decision 5.
-- [ ] ADR recording the decision and closing out ADR-0002's deferred alternative
-      explicitly, either by adopting or by re-deferring with a new trigger.
+- [x] Observability first: a rebuild counter and duration visible via
+      `index_status`, so the cliff is measurable rather than inferred.
+- [ ] Then incremental rebuild: a monotonic per-document watermark
+      (`ingested_at` is a wall-clock string and unsuitable), a
+      `get_chunks_since`, and a `remove_document` on the lexical index, which
+      does not exist today - `index_chunks` is accumulate-only.
+- [ ] A schema bump, with the delete-and-re-ingest consequence recorded per
+      ADR-0004 decision 5.
+- [x] ADR recording the decision and closing out ADR-0002's deferred
+      alternative explicitly - ADR-0026 re-defers it against a new trigger: a
+      recorded reading of `index_status`'s counters under a concurrent ingest.
+
+**Start here:** take the reading before building anything. The counters and the
+measurement script both exist so that the next attempt is triggered by a
+measurement rather than by this file's argument.
 
 ---
 
-## Phase H — Hygiene and smaller debt
+## Phase H — closed 2026-08-20
 
-**Goal:** clear the long tail. No ordering constraint between items.
+GK-021, GK-022, GK-024, GK-025, GK-026, GK-027 and GK-028 all landed and are
+deleted from this file per the rule above. Notes on the three that did not land
+exactly as scoped:
 
-### GK-021 — `answer.py` imports the eval harness
-
-- **Severity** MEDIUM · **Effort** S · **Verified**
-- **Where** `src/groundkit/answer.py:85` — `from groundkit.evals.judge import ...`
-
-A production module depends on the eval package, so `evals` can never become an extra or be
-dropped from a runtime install. `FaithfulnessJudge` is a `ChatProtocol` consumer like
-`Synthesizer` and `QueryRewriter` and belongs beside them. It would also force a special
-case in GK-015's guard, which is the signal that it is on the wrong side of the line.
-
-- [ ] `FaithfulnessJudge` / `FaithfulnessVerdict` moved to `providers/`;
-      `evals/synthesis_eval.py` imports from there.
-- [ ] `answer.py`'s docstring claim that "every collaborator is injected" made true, or
-      narrowed — the instances are injected, the types are concrete.
-
-### GK-022 — `extraction.py` omitted from the coverage core subset
-
-- **Severity** MEDIUM · **Effort** XS
-- **Where** `pyproject.toml` `[tool.groundkit.coverage].core_subset`
-
-The table's own convention — restated in `CONTRIBUTING.md` — is that every module in the
-subset *and every module left out of it* is argued in the comment above the table. Four
-modules get exactly that. `extraction.py` sits at the package root where no glob catches
-it, gets no note in either direction, and is real citation-resolution code called directly
-by `resolve_citation`. `snapshots.py` is a weaker case (pure path arithmetic) and a
-one-line exclusion note may be the right answer for it.
-
-- [ ] `extraction.py` added to `core_subset` with a note in house style, or excluded with
-      an argued note. Check its current coverage before choosing.
-- [ ] `snapshots.py` given a note either way, so the convention holds with no silent
-      omissions left.
-- [ ] `README.md`'s core-subset list kept in step.
-
-### GK-024 — Blocking filesystem I/O inside `async def`
-
-- **Severity** MEDIUM · **Effort** XS
-- **Where** `src/groundkit/ingestion/url_loader.py` — `_write_snapshot` and the scratch
-  write in `_extract_html`
-
-The only content-sized I/O in the repo not wrapped in `asyncio.to_thread`, against a
-convention followed at every comparable site. Bounded today because URL ingestion is
-CLI-only and nothing else is scheduled on that loop, but this is exactly the code a
-service-side ingest tool would reuse verbatim.
-
-- [ ] Both writes wrapped.
-- [ ] Also `evals/runner.py`'s judgments-hash read, which is unwrapped while the
-      corpus-hash read beside it is wrapped — the comment above them asserts a symmetry the
-      code does not have.
-
-### GK-025 — `metadata_filter` has no caller
-
-- **Severity** LOW · **Effort** XS · **Verified**
-- **Where** `src/groundkit/index/dense.py` only
-
-A `SPEC.md` §5.3 obligation met at the seam and never connected to a surface: no CLI flag,
-no `SearchRequest` field, no call site passes it. Its enabled branch is the most expensive
-code in the dense path, is gated by the coverage core subset, and is unreachable in
-production — so its cost has never been paid and its correctness is proved only by unit
-tests. Not a bug; a decision never written down.
-
-- [ ] Decide: expose it (a `SearchRequest` field plus a `Retriever.search` parameter, which
-      per ADR-0014 decision 6 must not carry any resolution-shaped key), or record in
-      `KNOWN_LIMITATIONS.md` that the seam exists with no caller, and name the trigger to
-      wire it up.
-
-### GK-026 — ADR-0013 decision 7 was never implemented
-
-- **Severity** LOW · **Effort** S · **Verified**
-- **Where** `src/groundkit/cli.py:780`, `:825`
-
-The ADR, status Accepted, states that `_cmd_search` is absorbed into the runtime so "three
-prospective new copies collapse into one", and claims the resulting benefit that the
-default suite then exercises the runtime's open path on every CLI test. Neither is true:
-four `Retriever.open` sites exist, `cli.py` imports only `CollectionRegistry`, and no CLI
-test references `CollectionRuntime`. Phase 5's `_cmd_answer` added a fourth lifecycle the
-ADR never counted.
-
-- [ ] Either route `_cmd_search` and `_cmd_answer` through the runtime (behaviour-identical
-      — the cache never hits in a one-shot process), or amend ADR-0013 with an erratum
-      stating decision 7 was not implemented and why.
-
-### GK-027 — `run_eval` is one long, deeply nested function
-
-- **Severity** LOW · **Effort** M
-- **Where** `src/groundkit/evals/runner.py:199`
-
-Against the repo's own guidance of roughly 50 lines and four levels, it mixes corpus
-hashing, store lifecycle, gold-truth resolution, a stage × judgment double loop, synthesis
-and report assembly. Its test file is large as a direct consequence — though notably that
-file is well organized into single-concern classes, not copy-paste, so the cost is
-concentrated in the source. Worth noting the other large functions in the repo are benign
-flat dispatch tables; this is the only genuine offender.
-
-- [ ] Split into corpus/store setup, the per-stage scoring loop, and report assembly.
-- [ ] Behaviour-preserving: the existing tests should pass unchanged.
-
-### GK-028 — Assorted small correctness debt
-
-- **Severity** LOW · **Effort** S
-
-Grouped because each is a few lines and none justifies its own branch.
-
-- [ ] `ingestion/pipeline.py:195` — `asyncio.gather` without `return_exceptions=True`.
-      `indexer.py:452` does the opposite with a comment explaining why. No torn-write risk
-      here since the pipeline never writes, but it is exported public API, so a third-party
-      host inherits unsupervised background work after the first failure.
-- [ ] `contracts.py:141` — `content_hash` is an uncached `computed_field` recomputing
-      SHA-256 on every access, used as a sort tie-break per candidate per query in
-      `fusion.py` and `dense.py`. `bm25.py:75` already caches it once at build time.
-      `cached_property` works on a frozen model. Profile before prioritizing.
-- [ ] `ingestion/url_loader.py` — no explicit total-request timeout, so httpx's
-      per-operation default lets a slow server hold a connection well past the intended
-      bound. Mirror `EmbeddingConfig.timeout_seconds`.
-- [ ] `url_loader.py` / `snapshots.py` — check-then-use between the containment check and
-      the open. Narrow (`document_id` is an unguessable uuid4, and the read path returns
-      nothing unless bytes match) but `O_NOFOLLOW` costs nothing.
-- [ ] `tests/test_smoke.py` — the docstring claiming nothing but that test holds
-      `__version__` to `pyproject.toml` is wrong; `release-gates.yml`'s clean-wheel step
-      asserts it independently. Narrow the claim.
-- [ ] `requirements-audit.txt` — both `ci.yml` and `release-gates.yml` re-export it
-      immediately before auditing, so the committed copy is never read and has already
-      drifted once. Gitignore it, or add a step asserting it matches a fresh export.
+- **GK-025 was decided, not built.** Option (b): the seam is recorded in
+  `KNOWN_LIMITATIONS.md` with the trigger that would justify wiring it up, and
+  no source file changed. The argument for not exposing it is worth keeping:
+  `index/bm25.py` has no filter at all, so a surface-level `metadata_filter`
+  would apply in `dense` mode, have nothing to apply to in the default `bm25`
+  mode, and in `hybrid` mode filter one candidate list while RRF fused the
+  survivors with an unfiltered lexical list - excluded chunks re-entering the
+  ranking by a depth-dependent amount. A filter honoured by one of three modes
+  and silently leaky in a second is worse than an unexposed seam. The item's own
+  "**Where** `index/dense.py` only" was wrong as a change footprint: the
+  footprint was documentation.
+- **GK-028 sub-item 2 was declined**, with the reason recorded in
+  `contracts.py` rather than only here. `content_hash` stays an uncached
+  `computed_field`. The instruction was to justify a change on correctness
+  rather than an unmeasured performance claim, and correctness argues the other
+  way: on a frozen model, assignment to a `cached_property` succeeds and writes
+  into `__dict__`, where assignment to a field raises `ValidationError`. Caching
+  would open a way to decouple the hash from the content it hashes. Pinned by
+  `tests/test_contracts.py::test_content_hash_cannot_be_decoupled_from_content_by_assignment`.
+- **GK-028 sub-item 4 landed on the write side only.** The snapshot *read* path
+  still has the same check-then-use gap, and it is the more exploitable half -
+  the write side could corrupt a file, the read side returns one to a service
+  caller. Carried forward as GK-030 below.
 
 ---
+
+## Net-new from the Phase G/H review
+
+Found by the adversarial review of this fan-out rather than by the original
+audit. Two of its findings landed as fixes in the same branch - a partial
+`DocumentRecordStoreProtocol` implementer being silently downgraded to the
+`text` source class, and `EMLINK` being reported as a planted symlink on
+platforms where it means "too many links" - each with a regression test shown
+to fail first. One is carried forward.
+
+### GK-030 — The snapshot read path can still be raced by a symlink
+
+- **Severity** MEDIUM · **Effort** XS · **ADR** no · **Verified**
+- **Where** `src/groundkit/retrieval/citations.py` — `_resolve_snapshot`
+
+`ensure_within_base` resolves symlinks, then `Path.read_text` opens the path:
+two syscalls with nothing between them. An attacker able to create a file in
+`<collection>.snapshots/` in that window has citation resolution read, and
+return to a service caller, whatever the link points at. GK-028 closed the
+identical gap on the write side with `O_NOFOLLOW`; this is the same fix on the
+read side, and the read side is the one that exfiltrates rather than corrupts.
+
+**Acceptance criteria**
+
+- [ ] The snapshot read opens with `O_NOFOLLOW` where the platform has it,
+      degrading to today's behaviour on Windows exactly as the write side does.
+- [ ] A regression test that plants a symlink after the containment check,
+      skipped on platforms without `O_NOFOLLOW` rather than passing vacuously.
+- [ ] The `KNOWN_LIMITATIONS.md` bullet recording the gap removed, not edited.
 
 ## Declined
 

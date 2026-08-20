@@ -350,6 +350,69 @@ def test_the_fallback_branch_still_resolves_at_the_text_default() -> None:
     assert result.extractor is None
 
 
+def test_a_partial_implementer_is_not_downgraded_to_the_text_default() -> None:
+    """A store that *can* report provenance must never read back as ``text``.
+
+    Regression test for the widening itself.
+    ``DocumentRecordStoreProtocol`` grew from one member to four, and
+    ``Retriever`` gates on ``isinstance`` — which is all-or-nothing. A store
+    implementing ``get_document_records`` (so it genuinely holds
+    ``source_class``/``extractor``) but not the two ``COUNT(*)`` aggregates
+    fails that gate and lands in the fallback branch. Answering it from
+    ``get_document_sources`` would report ``text``/``None`` for a document it
+    holds an ``extracted`` row for: ADR-0016's fail-open defect — a real store
+    dropping a value it did have — reinstated silently, with the search still
+    succeeding and the citation then verified under the wrong class's
+    assumptions.
+
+    Falling back on *cost* is acceptable; falling back on *truth* is not. The
+    fallback therefore probes the capability per method instead of inferring
+    it from the protocol as a whole.
+
+    Fail-first: against a ``_from_full_table`` that reads only
+    ``get_document_sources``, ``source_class`` comes back ``"text"`` and
+    ``extractor`` ``None``.
+    """
+
+    class _RecordsButNoCounts(RefusingMetadataStore):
+        """Holds full provenance; lacks the aggregates, so ``isinstance`` fails."""
+
+        async def get_chunks(self) -> list[Chunk]:
+            return [_chunk("chunk-x", "doc-0", "extracted chunk content")]
+
+        async def get_document_records(self) -> dict[str, DocumentRecord]:
+            return {
+                "doc-0": DocumentRecord(
+                    source="paper.pdf", source_class="extracted", extractor="pdf:v1"
+                )
+            }
+
+        async def get_document_sources(self) -> dict[str, str]:
+            """Answers too, so the pre-fix failure is a wrong value, not a refusal.
+
+            A double that refused this would prove only that the fallback
+            called it. What the defect actually does is answer -- with
+            ``source_class`` silently flattened to ``text`` -- and that is
+            what must fail.
+            """
+            return {"doc-0": "paper.pdf"}
+
+    store = _RecordsButNoCounts()
+    # The precondition the defect depends on: it really does miss the gate.
+    assert not isinstance(store, DocumentRecordStoreProtocol)
+
+    async def run() -> SearchResponse:
+        retriever = await Retriever.open(store)
+        return await retriever.search("extracted chunk")
+
+    response = asyncio.run(run())
+    assert response.total_results == 1
+    result = response.results[0]
+    assert result.source == "paper.pdf"
+    assert result.source_class == "extracted"
+    assert result.extractor == "pdf:v1"
+
+
 # -- handle_fetch_chunk -------------------------------------------------------
 
 
