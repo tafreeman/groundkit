@@ -79,7 +79,6 @@ Declined section with the reason)
 | ID | Item | Sev | Phase | Effort | Status | Depends on |
 |---|---|---|---|---|---|---|
 | GK-020 | The staleness cache stops working during an ingest | MED | G | L | todo | — |
-| GK-030 | The snapshot read path can still be raced by a symlink | MED | H | XS | todo | — |
 
 ---
 
@@ -299,40 +298,33 @@ exactly as scoped:
   would open a way to decouple the hash from the content it hashes. Pinned by
   `tests/test_contracts.py::test_content_hash_cannot_be_decoupled_from_content_by_assignment`.
 - **GK-028 sub-item 4 landed on the write side only.** The snapshot *read* path
-  still has the same check-then-use gap, and it is the more exploitable half -
-  the write side could corrupt a file, the read side returns one to a service
-  caller. Carried forward as GK-030 below.
+  kept the same check-then-use gap, and it was the more exploitable half - the
+  write side could corrupt a file, the read side returns one to a service
+  caller. Carried forward as GK-030 and closed on
+  `fix/gk-030-snapshot-read-nofollow`.
 
 ---
 
 ## Net-new from the Phase G/H review
 
-Found by the adversarial review of this fan-out rather than by the original
-audit. Two of its findings landed as fixes in the same branch - a partial
-`DocumentRecordStoreProtocol` implementer being silently downgraded to the
-`text` source class, and `EMLINK` being reported as a planted symlink on
-platforms where it means "too many links" - each with a regression test shown
-to fail first. One is carried forward.
+Found by the adversarial review of this fan-out rather than by the original audit. Two
+of its findings landed as fixes in the same branch - a partial
+`DocumentRecordStoreProtocol` implementer being silently downgraded to the `text` source
+class, and `EMLINK` being reported as a planted symlink on platforms where it means "too
+many links" - each with a regression test shown to fail first. The third — the snapshot
+read path's symlink race — was carried forward as GK-030 and has since landed on
+`fix/gk-030-snapshot-read-nofollow`, so nothing from this review remains open.
 
-### GK-030 — The snapshot read path can still be raced by a symlink
-
-- **Severity** MEDIUM · **Effort** XS · **ADR** no · **Verified**
-- **Where** `src/groundkit/retrieval/citations.py` — `_resolve_snapshot`
-
-`ensure_within_base` resolves symlinks, then `Path.read_text` opens the path:
-two syscalls with nothing between them. An attacker able to create a file in
-`<collection>.snapshots/` in that window has citation resolution read, and
-return to a service caller, whatever the link points at. GK-028 closed the
-identical gap on the write side with `O_NOFOLLOW`; this is the same fix on the
-read side, and the read side is the one that exfiltrates rather than corrupts.
-
-**Acceptance criteria**
-
-- [ ] The snapshot read opens with `O_NOFOLLOW` where the platform has it,
-      degrading to today's behaviour on Windows exactly as the write side does.
-- [ ] A regression test that plants a symlink after the containment check,
-      skipped on platforms without `O_NOFOLLOW` rather than passing vacuously.
-- [ ] The `KNOWN_LIMITATIONS.md` bullet recording the gap removed, not edited.
+Closing it turned up a second defect on the same line of code, which is why the read is
+now a byte read and its own decode rather than only an `O_NOFOLLOW` open:
+`Path.read_text` defaults to universal-newline mode, so a snapshot served with CRLF came
+back one character shorter per line break and every offset past the first was wrong —
+`fetch_chunk` returning a shifted span, or `drifted` on a snapshot that had not drifted.
+It was invisible to every existing test because the fixtures are LF-only, and invisible
+to the write side because that side already pinned byte-exactness with `newline=""` and
+`O_BINARY` — the asymmetry was the bug. Recorded here because the lesson outlives the
+item: a round trip is only verified by a fixture that differs between the two
+representations.
 
 ## Declined
 
