@@ -8,12 +8,18 @@ compare it to what retrieval returned. Pure code, no LLM.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from groundkit import extraction, snapshots
 from groundkit.errors import IngestionError, RetrievalError
-from groundkit.utils.path_safety import ensure_within_base
+from groundkit.utils.path_safety import (
+    O_BINARY,
+    O_NOFOLLOW,
+    SYMLINK_ERRNOS,
+    ensure_within_base,
+)
 from groundkit.utils.url_safety import sanitize_url
 
 if TYPE_CHECKING:
@@ -176,6 +182,57 @@ async def resolve_citation(
     return _slice_verified_span(text, citation)
 
 
+def _read_snapshot_text(path: Path) -> str:
+    """Read *path* as UTF-8, refusing to follow a symlink at the final component.
+
+    Blocking; callers on the event loop run it through ``asyncio.to_thread``,
+    matching every other content-sized read in this package.
+
+    Two things are deliberate here, and neither is what ``Path.read_text``
+    would do (GK-030):
+
+    ``O_NOFOLLOW`` closes the window between the containment check and the
+    open. :func:`~groundkit.utils.path_safety.ensure_within_base` resolves
+    symlinks, so a snapshot path that is *already* a link out of the root is
+    refused by the check -- but the check and the open are two syscalls, and
+    anything able to create a file in the snapshot directory can win the gap
+    between them. This is the same fix
+    :meth:`~groundkit.ingestion.url_loader.UrlLoader._write_snapshot` applies
+    on the write side, and it matters more here: the write side could corrupt
+    a file, the read side hands whatever the link points at back to a service
+    caller.
+
+    The decode is ours rather than the text layer's, because the text layer's
+    default is universal-newline mode, which turns a CRLF into a bare LF. The
+    snapshot on disk is byte-for-byte the ``content`` string that was indexed
+    (the write side pins that with ``newline=""`` and ``O_BINARY``), so
+    translating on the way back in makes the text one character shorter per
+    CRLF than the offsets were measured against -- silently returning the
+    wrong span, or a false ``drifted`` verdict, for any source served with
+    CRLF line endings.
+
+    Raises:
+        RetrievalError: The path was a symbolic link at the moment of the
+            open (``verdict="unresolvable"``).
+        OSError: Any other read failure, propagated unchanged -- only the
+            symlink errno is reinterpreted.
+        UnicodeDecodeError: The bytes are not valid UTF-8.
+    """
+    try:
+        descriptor = os.open(path, os.O_RDONLY | O_NOFOLLOW | O_BINARY)
+    except OSError as exc:
+        if exc.errno in SYMLINK_ERRNOS:
+            raise RetrievalError(
+                f"the local snapshot at {path.name!r} is a symbolic link; refused "
+                "rather than followed -- it was a regular path when it was "
+                "containment-checked, so something replaced it in between",
+                verdict="unresolvable",
+            ) from exc
+        raise
+    with os.fdopen(descriptor, "rb") as handle:
+        return handle.read().decode("utf-8")
+
+
 async def _resolve_snapshot(citation: Citation, snapshot_dir: Path | None) -> str:
     """Read a ``snapshot`` citation's local copy and slice it (ADR-0016 decision 4).
 
@@ -193,7 +250,8 @@ async def _resolve_snapshot(citation: Citation, snapshot_dir: Path | None) -> st
 
     Raises:
         RetrievalError: ``snapshot_dir`` is ``None``, the resolved snapshot
-            path escapes it, the file cannot be read, or is not valid UTF-8
+            path escapes it, the path is a symbolic link at the moment it is
+            opened, the file cannot be read, or is not valid UTF-8
             (``verdict="unresolvable"`` in every case) — or the file no
             longer covers the cited offsets (``verdict="drifted"``).
     """
@@ -218,7 +276,7 @@ async def _resolve_snapshot(citation: Citation, snapshot_dir: Path | None) -> st
         raise RetrievalError(str(exc), verdict="unresolvable") from exc
 
     try:
-        text = await asyncio.to_thread(snapshot_path.read_text, "utf-8")
+        text = await asyncio.to_thread(_read_snapshot_text, snapshot_path)
     except OSError as exc:
         raise RetrievalError(
             f"cannot read the local snapshot for {sanitize_url(citation.source)!r}: {exc}",

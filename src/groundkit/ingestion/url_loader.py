@@ -45,10 +45,8 @@ module exists; spec §10.1).
 from __future__ import annotations
 
 import asyncio
-import errno
 import logging
 import os
-import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -58,7 +56,12 @@ import httpx
 from groundkit import extraction
 from groundkit.contracts import Document
 from groundkit.errors import IngestionError
-from groundkit.utils.path_safety import ensure_within_base
+from groundkit.utils.path_safety import (
+    O_BINARY,
+    O_NOFOLLOW,
+    SYMLINK_ERRNOS,
+    ensure_within_base,
+)
 from groundkit.utils.url_safety import (
     credential_query_params,
     ensure_safe_endpoint,
@@ -85,51 +88,12 @@ DEFAULT_MAX_BYTES: int = 10 * 1024 * 1024
 #: why this is enforced with ``asyncio.timeout`` rather than handed to httpx.
 DEFAULT_TIMEOUT_SECONDS: float = 30.0
 
-#: ``os.O_NOFOLLOW`` where the platform defines it, ``0`` (a no-op in a flag
-#: mask) where it does not. Windows has no such flag, and CI runs Linux while
-#: this repo is developed on Windows, so the guard must degrade rather than
-#: raise ``AttributeError`` at import on the maintainer's own machine. The
-#: consequence is stated plainly rather than hidden: on Windows the snapshot
-#: write is exactly as racy as it was before, and the refusal below can only
-#: fire where the flag exists.
-_O_NOFOLLOW: int = getattr(os, "O_NOFOLLOW", 0)
-
-#: ``os.O_BINARY`` on Windows, ``0`` elsewhere. Required because ``os.open``
-#: leaves the descriptor in the C runtime's default (text) mode on Windows,
-#: which would translate ``\n`` on write *underneath* the text wrapper doing
-#: the same -- turning one newline into ``\r\r\n``. With this flag and
-#: ``newline=""`` the file is byte-for-byte ``content.encode("utf-8")`` on
-#: every platform, which is what this module's docstring already promises
-#: ("``content`` is the exact string also written to disk") and what the
-#: citation offsets are measured against.
-_O_BINARY: int = getattr(os, "O_BINARY", 0)
-
-#: Platforms whose ``open(..., O_NOFOLLOW)`` has historically reported
-#: ``EMLINK`` rather than POSIX's ``ELOOP`` for a symlinked final component.
-_EMLINK_MEANS_SYMLINK_PLATFORMS: tuple[str, ...] = (
-    "freebsd",
-    "netbsd",
-    "openbsd",
-    "dragonfly",
-)
-
-#: Errnos a POSIX ``open(..., O_NOFOLLOW)`` reports when the final path
-#: component is a symbolic link.
-#:
-#: ``ELOOP`` everywhere, per POSIX. ``EMLINK`` **only** on the BSDs above,
-#: and the narrowing is the point: on Linux — which is what CI runs —
-#: ``EMLINK`` is "Too many links", an unrelated filesystem limit. Treating it
-#: as a symlink refusal there would tell an operator that someone replaced
-#: the snapshot path between the containment check and the open, i.e. report
-#: a TOCTOU attack, when what actually happened is that a directory hit its
-#: link ceiling. A security refusal that fires on an unrelated I/O failure
-#: costs more than the exotic case it was meant to cover: it trains the
-#: reader to disbelieve the message.
-_SYMLINK_ERRNOS: frozenset[int] = (
-    frozenset({errno.ELOOP, errno.EMLINK})
-    if sys.platform.startswith(_EMLINK_MEANS_SYMLINK_PLATFORMS)
-    else frozenset({errno.ELOOP})
-)
+#: ``O_NOFOLLOW``/``O_BINARY``/``SYMLINK_ERRNOS`` are imported from
+#: :mod:`groundkit.utils.path_safety` rather than defined here: the snapshot
+#: read side (:func:`groundkit.retrieval.citations.resolve_citation`) needs the
+#: identical answer to "which errno means the final component was a symlink",
+#: and two copies of that answer can drift apart. See that module for why each
+#: one is shaped the way it is, and for what happens on Windows.
 
 #: Content-Type media types (the part before any ";" parameter) treated as
 #: HTML-shaped, triggering the identical tag-stripping step Wave 3's
@@ -500,7 +464,7 @@ class UrlLoader:
         wherever it points. The window is narrow (``document_id`` is an
         unguessable ``uuid4``, and the read side returns nothing unless the
         bytes still match) and the flag costs nothing, so it is closed rather
-        than argued about. See :data:`_O_NOFOLLOW` for what happens on
+        than argued about. See :data:`~groundkit.utils.path_safety.O_NOFOLLOW` for what happens on
         Windows, which has no such flag.
 
         Raises:
@@ -518,14 +482,14 @@ class UrlLoader:
                 "containment root; refused rather than written"
             ) from exc
         path.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW | _O_BINARY
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW | O_BINARY
         try:
             # 0o600: a snapshot is the local copy citation verification trusts,
             # written and read back by the same process identity, so there is
             # no reader for it to be group- or world-readable for.
             descriptor = os.open(path, flags, 0o600)
         except OSError as exc:
-            if exc.errno in _SYMLINK_ERRNOS:
+            if exc.errno in SYMLINK_ERRNOS:
                 raise IngestionError(
                     f"snapshot path for document {document_id!r} is a symbolic link; "
                     "refused rather than followed -- it was a regular path when it "
