@@ -65,10 +65,20 @@ CFG = ChunkingConfig(chunk_size=512, chunk_overlap=64, separators=["\n\n", "\n",
 #: than a document ranking to yield the same top-10 documents, so take the cap.
 CANDIDATES = 50
 
-#: Bumped by hand whenever `doc_level_scores` changes how a number is computed.
-#: It is part of the score cache's identity, so bumping it invalidates every
-#: cached score rather than letting old and new scoring share one leaderboard.
-SCORING_VERSION = 1
+#: Bumped by hand whenever anything changes what a cached result *means* -- how
+#: a score is computed, or what the recorded fields report. It is part of the
+#: score cache's identity, so bumping it invalidates every cached score rather
+#: than letting two meanings share one leaderboard.
+#:
+#: 2: entries written before the build-timing fix carry ``embed_minutes: 0.0``
+#:    whenever they were produced by a rescore against a reused index. Their
+#:    identity is otherwise unchanged, so without this bump an existing
+#:    ``--work`` directory would keep serving that zero and never receive the
+#:    correction -- the fix would apply only to caches nobody had yet built.
+SCORING_VERSION = 2
+
+#: Base seed every per-contrast generator is derived from (see ``contrast_rng``).
+BOOTSTRAP_SEED = 7
 
 #: Written into a model's index directory only after ``index_directory`` returns
 #: successfully. Its presence alone is not enough to trust a cached index -- see
@@ -370,6 +380,28 @@ async def index_and_score(
     }
 
 
+def contrast_rng(model: str) -> np.random.Generator:
+    """A generator for one model's contrast, independent of every other's.
+
+    One shared generator meant each contrast consumed whatever the previous
+    ones left, so a model's confidence interval depended on how many models
+    ran before it. If an earlier model failed, or ``WAVES`` was reordered, the
+    survivors got different resamples from byte-identical paired inputs.
+    Measured on a near-zero contrast: CI ``[-0.003427, +0.013830]`` when
+    another model ran first versus ``[-0.003587, +0.014084]`` when it did not,
+    p 0.2418 against 0.2580. No verdict flip was found searching 300 seeds, so
+    the practical effect is small -- but a published interval should not depend
+    on which unrelated models happened to complete, and
+    ``groundkit.evals.significance`` already builds a fresh generator per call
+    for exactly this reason.
+
+    Seeded from the model name so the value is deterministic *and* positional
+    independence is structural rather than a property of the loop's shape.
+    """
+    digest = hashlib.sha256(f"{BOOTSTRAP_SEED}:{model}".encode()).digest()[:8]
+    return np.random.default_rng(int.from_bytes(digest, "big"))
+
+
 def bootstrap(a: dict, b: dict, metric: str, rng: np.random.Generator) -> tuple:
     """Paired bootstrap over per-query deltas: (mean, lo, hi, p)."""
     deltas = np.array([a[q][metric] - b[q][metric] for q in a])
@@ -527,14 +559,15 @@ async def main() -> None:
             f"{len(results)} model(s) scored, 2 needed."
         )
     else:
-        rng = np.random.default_rng(7)
         print(
             f"\npaired bootstrap vs {args.baseline}, n={len(judgments)}, 10,000 resamples, nDCG@10"
         )
         for r in results:
             if r["model"] == args.baseline:
                 continue
-            mean, lo, hi, p = bootstrap(r["per_query"], base["per_query"], "ndcg_at_10", rng)
+            mean, lo, hi, p = bootstrap(
+                r["per_query"], base["per_query"], "ndcg_at_10", contrast_rng(r["model"])
+            )
             verdict = "SIGNIFICANT" if (lo > 0 or hi < 0) else "not significant"
             print(f"  {r['model']:26s} {mean:+.4f}  [{lo:+.4f}, {hi:+.4f}]  p={p:.4f}  {verdict}")
 

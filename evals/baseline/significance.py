@@ -6,6 +6,7 @@ A CI straddling zero means the systems are not separated by this test collection
 """
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import sys
@@ -38,7 +39,8 @@ from groundkit.retrieval.search import Retriever
 
 # evals/baseline/significance.py -> parents[0]=evals/baseline, [1]=evals, [2]=repo root.
 ROOT = Path(__file__).resolve().parents[2]
-RNG = np.random.default_rng(7)
+#: Base seed every per-contrast generator is derived from (see `contrast_rng`).
+SEED = 7
 corpus = load_corpus(ROOT / "evals/corpus")
 judgments = [
     json.loads(line)
@@ -142,10 +144,29 @@ def generic_per_query(size, overlap):
     return out, len(chunks)
 
 
-def bootstrap(a: dict, b: dict, metric: str, n=10000):
+def contrast_rng(label: str) -> np.random.Generator:
+    """A generator for one contrast, independent of every other's.
+
+    A single module-level generator meant each call consumed whatever the
+    previous ones left, so a metric's confidence interval depended on how many
+    contrasts ran before it -- here, on its position in the metric loop and on
+    which chunk configurations preceded it. Byte-identical paired inputs gave
+    different intervals purely by position.
+
+    Seeded from a label naming the contrast, so every reported interval is
+    reproducible on its own and reordering the loops cannot move it. Matches
+    what ``groundkit.evals.significance`` does by building a fresh
+    ``random.Random(seed)`` per call.
+    """
+    digest = hashlib.sha256(f"{SEED}:{label}".encode()).digest()[:8]
+    return np.random.default_rng(int.from_bytes(digest, "big"))
+
+
+def bootstrap(a: dict, b: dict, metric: str, label: str, n=10000):
     qids = list(a.keys())
     d = np.array([a[q][metric] - b[q][metric] for q in qids])
-    means = np.array([RNG.choice(d, size=len(d), replace=True).mean() for _ in range(n)])
+    rng = contrast_rng(label)
+    means = np.array([rng.choice(d, size=len(d), replace=True).mean() for _ in range(n)])
     lo, hi = np.percentile(means, [2.5, 97.5])
     non_positive = int((means <= 0).sum())
     non_negative = int((means >= 0).sum())
@@ -166,7 +187,7 @@ for size, overlap in [(512, 64), (320, 40)]:
         f"{'95% CI':>20s} {'p':>7s}  verdict"
     )
     for m in ("recall_at_1", "recall_at_5", "recall_at_10", "mrr", "ndcg_at_10"):
-        mean, lo, hi, p = bootstrap(gk, gen, m)
+        mean, lo, hi, p = bootstrap(gk, gen, m, f"{size}-{overlap}:{m}")
         gkv = np.mean([gk[q][m] for q in gk])
         gnv = np.mean([gen[q][m] for q in gen])
         verdict = "SEPARATED" if (lo > 0 or hi < 0) else "indistinguishable"
