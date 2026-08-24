@@ -267,6 +267,30 @@ it scored.
 
 ### Added
 
+- `groundkit.evals.significance` — paired-bootstrap comparison of two systems
+  over per-query score deltas, with a percentile confidence interval and a
+  two-sided achieved significance level. Pairing is checked by query id, so a
+  missing or reordered query cannot silently become an unpaired comparison,
+  and a seeded RNG built per call makes a result reproducible and independent
+  of call order. `significant` is decided by the confidence interval, never by
+  the p-value; the p-value carries a `(r+1)/(B+1)` finite-sample correction so
+  it is never reported as exactly zero, which no finite resampling can
+  support. `compare_report_stages` runs the same comparison between two stages
+  of one eval artifact.
+- `groundkit.evals.beir` — adapts a BEIR dataset into the harness's
+  quote-anchored corpus and judgment format. BEIR qrels are document-level, so
+  each gold quote is the whole adapted document: `resolve_gold_span` finds it
+  at offset zero and every chunk of that document counts as relevant, which is
+  document-level relevance expressed in the span vocabulary without pretending
+  BEIR provides span annotations. A BEIR corpus is an untrusted third-party
+  download, so every identifier — document ids, query ids, and the `split`,
+  which is interpolated into a path — is validated as a single path component
+  before it reaches a path join, each written path is containment-checked as
+  an independent second barrier, and query ids are checked against the
+  harness's own stricter contract *before* anything is written, so a dataset
+  the harness would reject leaves nothing on disk. Adapting into a corpus
+  directory that already holds files is refused rather than silently unioning
+  two datasets.
 - `index_status` now reports what the ADR-0013 staleness cache actually *does*,
   not only that it is switched on: `retriever_acquires`, `retriever_rebuilds`,
   `rebuild_seconds_total` and `last_rebuild_seconds` (ADR-0026). `cache_enabled:
