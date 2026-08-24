@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -51,6 +52,11 @@ CFG = ChunkingConfig(chunk_size=512, chunk_overlap=64, separators=["\n\n", "\n",
 #: ``top_k`` is capped at ``MAX_TOP_K`` (50). A chunk ranking needs a deeper pool
 #: than a document ranking to yield the same top-10 documents, so take the cap.
 CANDIDATES = 50
+
+#: Bumped by hand whenever `doc_level_scores` changes how a number is computed.
+#: It is part of the score cache's identity, so bumping it invalidates every
+#: cached score rather than letting old and new scoring share one leaderboard.
+SCORING_VERSION = 1
 
 #: Written into a model's index directory only after ``index_directory`` returns
 #: successfully. Its presence alone is not enough to trust a cached index -- see
@@ -102,25 +108,40 @@ def score_ranking(order: list[str], gold: set[str], k: int = 10) -> dict[str, fl
     }
 
 
+def corpus_fingerprint(corpus: Path) -> str:
+    """A content hash over every file in the adapted corpus directory.
+
+    Names *and* bytes, in sorted order, so a rename, an edit, an addition and
+    a deletion are all visible. A path plus a file count is not enough: a
+    corpus edited or regenerated in place keeps both, and every downstream
+    number would then be scored against an index of the previous contents
+    with nothing to indicate it. The corpus is a flat directory of small
+    per-document text files (see ``adapt_beir.py``), so reading it once per
+    run costs a second or so against index builds measured in tens of
+    minutes.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(p for p in corpus.rglob("*") if p.is_file()):
+        digest.update(path.relative_to(corpus).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _sentinel_inputs(corpus: Path) -> dict:
     """Inputs that must stay identical for a cached index to still be valid.
 
     ``corpus`` is resolved so a run from a different working directory or a
-    relative-vs-absolute ``--data`` doesn't look like a different corpus. The
-    document count is a cheap top-level file count (the adapted corpus is a
-    flat directory of per-document files -- see ``adapt_beir.py``), not a full
-    content hash; it is enough to catch a corpus swapped or partially deleted
-    between runs. The chunking config is included verbatim because it is the
-    other input that determines every chunk boundary in the index.
+    relative-vs-absolute ``--data`` doesn't look like a different corpus, and
+    fingerprinted by content so an in-place edit invalidates the cache too.
+    The chunking config is included verbatim because it is the other input
+    that determines every chunk boundary in the index.
     """
     resolved = corpus.resolve()
-    try:
-        doc_count = sum(1 for p in resolved.iterdir() if p.is_file())
-    except OSError:
-        doc_count = None
     return {
         "corpus_path": str(resolved),
-        "corpus_doc_count": doc_count,
+        "corpus_fingerprint": corpus_fingerprint(resolved),
         "chunking_config": CFG.model_dump(),
     }
 
@@ -274,19 +295,54 @@ async def main() -> None:
     scores_dir = args.work / "scores"
     scores_dir.mkdir(parents=True, exist_ok=True)
 
+    # The score cache is bound to the whole experiment, not just the model
+    # name. Reusing a --work directory against a different --data set, edited
+    # judgments, or changed scoring would otherwise return the previous
+    # dataset's numbers purely because a file of that name exists -- and a
+    # leaderboard assembled from those is wrong with nothing to show for it.
+    # SCORING_VERSION is bumped by hand whenever `doc_level_scores` changes.
+    experiment = {
+        "scoring_version": SCORING_VERSION,
+        "corpus_fingerprint": corpus_fingerprint(corpus.resolve()),
+        "judgments_sha256": hashlib.sha256(
+            (args.data / "judgments.jsonl").read_bytes()
+        ).hexdigest(),
+        "chunking_config": CFG.model_dump(),
+        "candidates": CANDIDATES,
+    }
+
     async def one_model(model: str, dims: int) -> dict | None:
         """Index and score a single model, caching the result. Never raises."""
         cached = scores_dir / f"{model.replace(':', '-')}.json"
         if cached.exists():
-            print(f"{model:26s} cached", flush=True)
-            return json.loads(cached.read_text(encoding="utf-8"))
+            try:
+                payload = json.loads(cached.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict) and payload.get("experiment") == {
+                **experiment,
+                "dims": dims,
+            }:
+                print(f"{model:26s} cached", flush=True)
+                return dict(payload["result"])
+            print(f"{model:26s} cache stale (inputs changed), rescoring", flush=True)
         started = time.perf_counter()
         try:
             result = await index_and_score(model, dims, corpus, args.work, judgments, gold)
         except Exception as exc:  # one bad model must not lose the whole run
             print(f"{model:26s} FAILED: {type(exc).__name__}: {str(exc)[:160]}", flush=True)
             return None
-        cached.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        # Written atomically and stamped with the inputs it was produced
+        # from, so a later run can tell whether it still applies.
+        tmp_path = cached.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(
+                {"experiment": {**experiment, "dims": dims}, "result": result},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, cached)
         print(f"{model:26s} done in {(time.perf_counter() - started) / 60:.1f} min", flush=True)
         return result
 

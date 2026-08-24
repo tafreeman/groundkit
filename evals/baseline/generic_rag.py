@@ -12,6 +12,21 @@ in an afternoon with standard tools, and the ones groundkit deliberately does no
 
 Same corpus, same judgments, same embedding model, same chunk size/overlap as
 groundkit's EVAL_CHUNKING_CONFIG, so the only differences are architectural.
+
+**No results file ships with this script, deliberately.** The nDCG normalization
+in :func:`score` was wrong until 2026-08-24 -- IDCG was taken over the number of
+authored gold spans while DCG earned gain from every overlapping chunk, so a
+quote straddling a chunk boundary could score above 1.0 (1.63 at worst, on 10 of
+the golden corpus's 44 queries). Every previously recorded nDCG figure for this
+pipeline came from that scorer and is inflated by an unknown amount, so it was
+removed rather than shipped with a caveat. Re-run ``run_generic.py`` against a
+live embedding provider to regenerate. Recall and MRR were never affected --
+they read the hit list, not the normalizer -- but a mixed file is worse than no
+file.
+
+The SciFact scorers under ``evals/beir/`` never had this defect: they collapse
+the chunk ranking to first-seen distinct documents before scoring, so a gold
+document can contribute gain at most once and DCG can never exceed IDCG.
 """
 
 from __future__ import annotations
@@ -155,18 +170,58 @@ def is_hit(chunk: dict, spans: list[tuple[str, int, int]]) -> bool:
     return False
 
 
-def score(ranked: list[dict], spans: list[tuple[str, int, int]], k: int = 10) -> dict:
+def relevant_chunk_count(chunks: list[dict], spans: list[tuple[str, int, int]]) -> int:
+    """How many of *chunks* overlap any gold span -- the IDCG denominator.
+
+    This is the count :func:`score` needs, and it is a property of the whole
+    index, not of one ranking, so it cannot be derived from the retrieved
+    list alone.
+    """
+    return sum(1 for c in chunks if is_hit(c, spans))
+
+
+def score(
+    ranked: list[dict],
+    spans: list[tuple[str, int, int]],
+    k: int = 10,
+    *,
+    total_relevant: int,
+) -> dict:
+    """Score one ranking. ``total_relevant`` is required, deliberately.
+
+    IDCG must be taken over the number of *chunks* that overlap a gold span,
+    not the number of authored spans, and the two differ whenever a quote
+    straddles a chunk boundary -- on the golden corpus that is 10 of 44
+    queries, each yielding two relevant chunks for one authored span. Taking
+    IDCG over `len(spans)` let DCG earn gain from both chunks while the ideal
+    ranking was allowed only one, so nDCG could exceed 1.0 (1.63 in the worst
+    case here) and the reported figure was inflated.
+
+    This matches `groundkit.evals.metrics.ndcg_at_k`, which takes IDCG over
+    `min(len(gold_ids), k)` where `gold_ids` is the complete relevant-chunk
+    set. That correspondence is the whole point: the two pipelines chunk
+    differently, so a scorer that normalized by authored spans on one side
+    and relevant chunks on the other would not be measuring the same
+    quantity, and the head-to-head comparison this file exists for would be
+    meaningless.
+
+    ``total_relevant`` is a required keyword rather than defaulting to
+    ``len(spans)`` so that a caller cannot silently reintroduce the defect;
+    :func:`relevant_chunk_count` computes it.
+    """
     rel = [1 if is_hit(c, spans) else 0 for c in ranked[:k]]
     first = next((i + 1 for i, r in enumerate(rel) if r), None)
     dcg = sum(r / np.log2(i + 2) for i, r in enumerate(rel))
-    ideal = [1] * min(len(spans), k)
+    ideal = [1] * min(total_relevant, k)
     idcg = sum(r / np.log2(i + 2) for i, r in enumerate(ideal)) or 1.0
     return {
         "recall_at_1": float(any(rel[:1])),
         "recall_at_5": float(any(rel[:5])),
         "recall_at_10": float(any(rel[:10])),
         "mrr": 1.0 / first if first else 0.0,
-        "ndcg_at_10": dcg / idcg,
+        # Clamped like groundkit's own metric: a rounding path must never
+        # publish a score above 1.0, and a silent >1 is what hid this bug.
+        "ndcg_at_10": min(1.0, dcg / idcg),
     }
 
 

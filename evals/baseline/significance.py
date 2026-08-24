@@ -22,6 +22,7 @@ from generic_rag import (
     dense_search,
     embed,
     load_corpus,
+    relevant_chunk_count,
     resolve_gold,
     rrf,
     score,
@@ -68,6 +69,20 @@ async def groundkit_per_query():
         )
         await idx.index_directory(str(ROOT / "evals/corpus"))
         r = await Retriever.open(store=store, embedder=emb, vector_store=vs, collection="gk")
+        # IDCG is taken over the relevant-*chunk* count, so groundkit's own
+        # chunk set has to be enumerated -- it cannot be derived from a
+        # ranking, and it differs from the generic pipeline's because the two
+        # chunk differently. Both sides are normalized the same way, which is
+        # what makes the comparison mean anything.
+        sources = await store.get_document_sources()
+        gk_chunks = [
+            {
+                "doc": Path(sources[c.document_id]).name,
+                "start": c.start_offset,
+                "end": c.end_offset,
+            }
+            for c in await store.get_chunks()
+        ]
         out = {}
         for j in answerable:
             resp = await r.search(j["query"], top_k=TOP_K, mode="hybrid")
@@ -75,7 +90,10 @@ async def groundkit_per_query():
                 {"doc": Path(x.source).name, "start": x.start_offset, "end": x.end_offset}
                 for x in resp.results
             ]
-            out[j["query_id"]] = score(ranked, gold[j["query_id"]], TOP_K)
+            spans = gold[j["query_id"]]
+            out[j["query_id"]] = score(
+                ranked, spans, TOP_K, total_relevant=relevant_chunk_count(gk_chunks, spans)
+            )
         await store.close()
         return out
 
@@ -101,7 +119,13 @@ def generic_per_query(size, overlap):
             b = bm25_search(con, j["query"], TOP_K)
             d = dense_search(mat, ids, qv[i], TOP_K)
             f = rrf([b, d], RRF_K)[:TOP_K]
-            out[j["query_id"]] = score([by_id[c] for c, _ in f], gold[j["query_id"]], TOP_K)
+            spans = gold[j["query_id"]]
+            out[j["query_id"]] = score(
+                [by_id[c] for c, _ in f],
+                spans,
+                TOP_K,
+                total_relevant=relevant_chunk_count(chunks, spans),
+            )
     return out, len(chunks)
 
 

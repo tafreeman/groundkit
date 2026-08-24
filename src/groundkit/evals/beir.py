@@ -216,6 +216,12 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
         raise EvalError(f"cannot read BEIR file {str(path)!r}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        # UnicodeDecodeError is a ValueError, not an OSError, so it would
+        # otherwise escape this module's documented EvalError contract and
+        # reach the CLI as a traceback. A third-party download being
+        # mis-encoded is ordinary malformed input, not a bug.
+        raise EvalError(f"BEIR file {str(path)!r} is not valid UTF-8: {exc}") from exc
 
     records: list[dict[str, Any]] = []
     for line_number, line in enumerate(lines, start=1):
@@ -236,6 +242,9 @@ def _load_qrels(path: Path) -> dict[str, set[str]]:
         rows = [line.split("\t") for line in path.read_text(encoding="utf-8").splitlines() if line]
     except OSError as exc:
         raise EvalError(f"cannot read BEIR qrels {str(path)!r}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        # See `_load_jsonl`: a ValueError, so it needs its own clause.
+        raise EvalError(f"BEIR qrels {str(path)!r} are not valid UTF-8: {exc}") from exc
     if not rows or rows[0][:3] != ["query-id", "corpus-id", "score"]:
         raise EvalError(f"unexpected or missing BEIR qrels header in {path}")
 

@@ -249,3 +249,27 @@ def test_a_non_integer_relevance_score_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(EvalError, match="invalid integer relevance score"):
         adapt_beir_dataset(source, tmp_path / "adapted")
+
+
+@pytest.mark.parametrize("filename", ["corpus.jsonl", "queries.jsonl"])
+def test_invalid_utf8_in_a_jsonl_file_is_an_eval_error_not_a_traceback(
+    tmp_path: Path, filename: str
+) -> None:
+    """``UnicodeDecodeError`` is a ``ValueError``, not an ``OSError``, so it
+    needs its own except clause -- without one it escapes this module's
+    documented ``EvalError`` contract and reaches the CLI as a traceback."""
+    source = tmp_path / "beir"
+    _write_beir(source)
+    (source / filename).write_bytes(b'{"_id": "\xff\xfe not utf-8"}\n')
+
+    with pytest.raises(EvalError, match="not valid UTF-8"):
+        adapt_beir_dataset(source, tmp_path / "adapted")
+
+
+def test_invalid_utf8_in_the_qrels_is_an_eval_error_not_a_traceback(tmp_path: Path) -> None:
+    source = tmp_path / "beir"
+    _write_beir(source)
+    (source / "qrels" / "test.tsv").write_bytes(b"query-id\tcorpus-id\tscore\n\xff\xfe\t1\t1\n")
+
+    with pytest.raises(EvalError, match="not valid UTF-8"):
+        adapt_beir_dataset(source, tmp_path / "adapted")

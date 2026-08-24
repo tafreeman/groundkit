@@ -18,6 +18,7 @@ from generic_rag import (
     dense_search,
     embed,
     load_corpus,
+    relevant_chunk_count,
     resolve_gold,
     rrf,
     score,
@@ -97,7 +98,14 @@ def main() -> None:
                 lat[stage].append((time.perf_counter() - t0) * 1000)
                 runs[stage] = r
                 if j["gold"]:
-                    results[stage].append(score([by_id[c] for c, _ in r], gold[qid], TOP_K))
+                    results[stage].append(
+                        score(
+                            [by_id[c] for c, _ in r],
+                            gold[qid],
+                            TOP_K,
+                            total_relevant=relevant_chunk_count(chunks, gold[qid]),
+                        )
+                    )
                 elif not r:
                     abstain[stage] += 1
 
