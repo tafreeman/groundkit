@@ -1,0 +1,36 @@
+{
+  "quality": {
+    "bm25": {
+      "recall_at_1": 0.4722,
+      "recall_at_5": 0.7778,
+      "recall_at_10": 0.8611,
+      "mrr": 0.6174,
+      "ndcg_at_10": 0.75
+    },
+    "dense": {
+      "recall_at_1": 0.4444,
+      "recall_at_5": 0.9444,
+      "recall_at_10": 0.9722,
+      "mrr": 0.6303,
+      "ndcg_at_10": 0.8076
+    },
+    "fusion": {
+      "recall_at_1": 0.5,
+      "recall_at_5": 0.8611,
+      "recall_at_10": 0.9444,
+      "mrr": 0.6691,
+      "ndcg_at_10": 0.8318
+    }
+  },
+  "abstain": {
+    "bm25": 8,
+    "dense": 0,
+    "fusion": 0
+  },
+  "n_chunks": 57,
+  "cost": {
+    "chunk_ms": 0.09220000356435776,
+    "fts_ms": 25.475999995251186,
+    "embed_s": 8.938158799996017
+  }
+}

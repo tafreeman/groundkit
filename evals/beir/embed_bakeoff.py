@@ -129,7 +129,7 @@ def corpus_fingerprint(corpus: Path) -> str:
     return digest.hexdigest()
 
 
-def _sentinel_inputs(corpus: Path) -> dict:
+def _sentinel_inputs(corpus: Path, model: str, dims: int) -> dict:
     """Inputs that must stay identical for a cached index to still be valid.
 
     ``corpus`` is resolved so a run from a different working directory or a
@@ -137,12 +137,23 @@ def _sentinel_inputs(corpus: Path) -> dict:
     fingerprinted by content so an in-place edit invalidates the cache too.
     The chunking config is included verbatim because it is the other input
     that determines every chunk boundary in the index.
+
+    ``model`` and ``dims`` are included even though ``index_dir`` is already
+    keyed by model slug, because the slug does not carry the dimension. If a
+    dimension is corrected for a model that already has an index, the score
+    cache invalidates (it records ``dims``) but the index would not, so the
+    stored ADR-0004 manifest would then disagree with the new embedder and
+    ``Retriever.open`` would raise. ``one_model`` catches broadly, so the
+    model would be dropped from the leaderboard with only a FAILED line --
+    a silently missing row rather than a rebuilt index.
     """
     resolved = corpus.resolve()
     return {
         "corpus_path": str(resolved),
         "corpus_fingerprint": corpus_fingerprint(resolved),
         "chunking_config": CFG.model_dump(),
+        "model": model,
+        "dims": dims,
     }
 
 
@@ -183,8 +194,18 @@ async def index_and_score(
     lance_dir = index_dir / "lance"
     index_dir.mkdir(parents=True, exist_ok=True)
 
-    sentinel_inputs = _sentinel_inputs(corpus)
+    sentinel_inputs = _sentinel_inputs(corpus, model, dims)
     fresh = not _sentinel_valid(index_dir, sentinel_inputs)
+    if fresh:
+        # Drop the old sentinel *before* touching the store, not after the
+        # rebuild succeeds. Indexing mutates an existing store in place, so a
+        # rebuild that dies partway leaves it holding a mix of the old corpus
+        # and the new one. If the previous corpus were then restored, a
+        # surviving sentinel would match it again and this run would skip
+        # repair, scoring and caching the mixed index as if it were clean.
+        # Removing it first makes any interrupted rebuild fail closed: the
+        # worst case is a re-index nobody needed.
+        (index_dir / SENTINEL_NAME).unlink(missing_ok=True)
 
     store = await SQLiteMetadataStore.open(index_dir=index_dir, collection="beir")
     embedder = build_embedder(EmbeddingConfig(provider="ollama", model_name=model, dimensions=dims))

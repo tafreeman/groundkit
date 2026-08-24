@@ -167,7 +167,7 @@ Paired bootstrap, 10,000 resamples, nDCG@10, post-fix chunker:
 
 ## Three findings
 
-**Dense decisively beats BM25 — +0.094 nDCG@10, p < 0.0001.** On the 84-chunk golden
+**Dense decisively beats BM25 — +0.094 nDCG@10, p < 0.0002.** On the 84-chunk golden
 corpus this advantage sat inside the noise band; at n = 300 on a real collection it is
 unambiguous. `nomic-embed-text` at 0.717 also beats the dense baselines BEIR originally
 published (~0.644 for GenQ/TAS-B), which is the expected sanity check — those are
