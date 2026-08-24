@@ -329,3 +329,69 @@ def test_a_document_id_merely_starting_with_a_device_name_is_allowed(tmp_path: P
 
     assert report.document_count == 1
     assert (output / "corpus" / "CONTEXT.txt").exists()
+
+
+@pytest.mark.parametrize("grade", ["2", "3", "-1"])
+def test_graded_qrels_are_refused_rather_than_flattened(tmp_path: Path, grade: str) -> None:
+    """A ``GoldSpan`` is ``(doc, quote)`` and carries no relevance grade, so a
+    2 and a 1 would become the same set membership.
+
+    That is not a lossy convenience: the adapted set would report *binary*
+    nDCG which reads as comparable to the collection's published *graded*
+    nDCG. Refused rather than coerced.
+    """
+    source = tmp_path / "beir"
+    output = tmp_path / "adapted"
+    _write_beir(source)
+    (source / "qrels" / "test.tsv").write_text(
+        f"query-id\tcorpus-id\tscore\nq-1\tdoc-1\t{grade}\n", encoding="utf-8"
+    )
+
+    with pytest.raises(EvalError, match="binary qrels only"):
+        adapt_beir_dataset(source, output)
+
+    assert not (output / "corpus").exists()
+
+
+def test_binary_qrels_still_adapt(tmp_path: Path) -> None:
+    """The guard must not reject the collections this adapter exists for --
+    SciFact's qrels are every one of them 0 or 1."""
+    source = tmp_path / "beir"
+    output = tmp_path / "adapted"
+    _write_beir(source)
+    (source / "qrels" / "test.tsv").write_text(
+        "query-id\tcorpus-id\tscore\nq-1\tdoc-1\t1\nq-1\tdoc-2\t0\n", encoding="utf-8"
+    )
+    (source / "corpus.jsonl").write_text(
+        json.dumps({"_id": "doc-1", "title": "A", "text": "alpha"})
+        + "\n"
+        + json.dumps({"_id": "doc-2", "title": "B", "text": "beta"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = adapt_beir_dataset(source, output)
+
+    assert report.relevance_pair_count == 1
+
+
+def test_a_symlinked_corpus_directory_is_refused(tmp_path: Path) -> None:
+    """An empty directory reached through a symlink passes the emptiness check
+    while every write lands outside the destination the caller named --
+    ``ensure_within_base`` cannot see it either, because it resolves the
+    candidate and the base through the same link."""
+    source = tmp_path / "beir"
+    output = tmp_path / "adapted"
+    _write_beir(source)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    output.mkdir()
+    try:
+        (output / "corpus").symlink_to(elsewhere, target_is_directory=True)
+    except (OSError, NotImplementedError):  # pragma: no cover - needs privilege
+        pytest.skip("creating a directory symlink is not permitted in this environment")
+
+    with pytest.raises(EvalError, match="symbolic link"):
+        adapt_beir_dataset(source, output)
+
+    assert list(elsewhere.iterdir()) == []

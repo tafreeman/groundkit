@@ -168,7 +168,14 @@ def adapt_beir_dataset(
         # containment check is the independent second barrier the rest of this
         # package applies wherever a path is built from outside input, and the
         # one static analysis recognizes as a path-injection sanitizer.
-        document_path = ensure_within_base(corpus_dir / f"{document_id}.txt", corpus_dir)
+        # Contained against `destination`, not `corpus_dir`. Checking against
+        # `corpus_dir` resolves the candidate *and* the base through the same
+        # link, so a `corpus` symlink pointing outside the destination passes
+        # trivially and every document lands wherever it points.
+        # `_require_empty_corpus_dir` refuses such a link outright; this is the
+        # independent second barrier, and the one that stays correct if that
+        # check is ever relaxed.
+        document_path = ensure_within_base(corpus_dir / f"{document_id}.txt", destination)
         document_path.write_text(text, encoding="utf-8", newline="\n")
 
     judgments_path = ensure_within_base(destination / "judgments.jsonl", destination)
@@ -238,6 +245,16 @@ def _require_empty_corpus_dir(corpus_dir: Path) -> None:
     ADR-0004 decision 5's delete-and-re-derive posture rather than guessing
     which files were meant to survive.
     """
+    if corpus_dir.is_symlink():
+        # An empty directory reached through a symlink passes the emptiness
+        # check below while every write lands outside the destination the
+        # caller named. Refused rather than followed, matching how the rest of
+        # this package treats a link discovered where a real path was expected.
+        raise EvalError(
+            f"BEIR output corpus path {str(corpus_dir)!r} is a symbolic link; refused "
+            "rather than followed, because documents written through it would land "
+            "outside the output directory you named. Remove the link and re-run."
+        )
     if not corpus_dir.exists():
         return
     existing = sorted(entry.name for entry in corpus_dir.iterdir())
@@ -300,7 +317,25 @@ def _load_qrels(path: Path) -> dict[str, set[str]]:
             raise EvalError(
                 f"invalid integer relevance score {raw_score!r} at {path} line {line_number}"
             ) from exc
-        if score > 0:
+        if score not in (0, 1):
+            # groundkit's judgment format cannot express a grade: a `GoldSpan`
+            # is `(doc, quote)` and nothing else, so a 2 and a 1 would become
+            # the same set membership. Flattening them is not a lossy
+            # convenience, it is a silent change to the relevance signal -- and
+            # the resulting artifact would report *binary* nDCG that reads as
+            # comparable to the collection's published *graded* nDCG. Refused
+            # rather than coerced, per this package's no-silent-coercion rule.
+            # SciFact is unaffected: every one of its qrels rows is 0 or 1.
+            raise EvalError(
+                f"graded BEIR relevance score {score} at {path} line {line_number}: this "
+                "adapter supports binary qrels only. groundkit judgments carry no "
+                "relevance grade, so every positive grade would collapse to the same "
+                "membership and the adapted set would report binary nDCG against a "
+                "collection whose published numbers are graded. Use a binary collection "
+                "(SciFact, NFCorpus's binary splits) or add graded relevance to the "
+                "harness first."
+            )
+        if score == 1:
             relevance[query_id].add(document_id)
     return dict(relevance)
 

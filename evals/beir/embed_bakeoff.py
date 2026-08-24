@@ -214,6 +214,20 @@ async def index_and_score(
         #    directory first makes an interrupted rebuild fail closed; the
         #    worst case is a re-index nobody needed.
         shutil.rmtree(index_dir, ignore_errors=True)
+        if index_dir.exists():
+            # `ignore_errors` keeps a locked or permission-protected file from
+            # raising, which would otherwise be fine -- except that the next
+            # line reopens whatever survived and treats it as a fresh index.
+            # Documents from the previous corpus are outside the new one's
+            # pruning scope, so they would stay mixed into the rebuilt
+            # collection and a completion sentinel would then certify it.
+            # Refusing here costs this model a FAILED line; not refusing costs
+            # a wrong number that looks like a right one.
+            raise RuntimeError(
+                f"could not fully remove the stale index at {index_dir}; refusing to "
+                "reuse what is left of it. Close anything holding files open there "
+                "(an editor, a previous run) and re-run."
+            )
     index_dir.mkdir(parents=True, exist_ok=True)
 
     store = await SQLiteMetadataStore.open(index_dir=index_dir, collection="beir")
@@ -412,23 +426,38 @@ async def main() -> None:
             f"{r['query_p50_ms']:6.0f}ms {r['vector_store_mb']:7.0f}MB"
         )
 
-    base = next((r for r in results if r["model"] == args.baseline), None)
-    if base is None or len(results) < 2:
-        return
-    rng = np.random.default_rng(7)
-    print(f"\npaired bootstrap vs {args.baseline}, n={len(judgments)}, 10,000 resamples, nDCG@10")
-    for r in results:
-        if r["model"] == args.baseline:
-            continue
-        mean, lo, hi, p = bootstrap(r["per_query"], base["per_query"], "ndcg_at_10", rng)
-        verdict = "SIGNIFICANT" if (lo > 0 or hi < 0) else "not significant"
-        print(f"  {r['model']:26s} {mean:+.4f}  [{lo:+.4f}, {hi:+.4f}]  p={p:.4f}  {verdict}")
-
+    # Written before the bootstrap gate below, not after it. A run that loses
+    # the baseline or produces fewer than two results used to return early,
+    # leaving a summary from some previous run in place -- which a reader, or
+    # a later script, would take for this run's output while the console said
+    # models had failed. It is rewritten unconditionally, so it always
+    # describes the run that last finished, even when that run describes very
+    # little.
     summary = args.work / "summary.json"
     summary.write_text(
         json.dumps([{k: v for k, v in r.items() if k != "per_query"} for r in results], indent=2),
         encoding="utf-8",
     )
+
+    base = next((r for r in results if r["model"] == args.baseline), None)
+    if base is None or len(results) < 2:
+        print(
+            f"\nskipping the paired bootstrap: baseline {args.baseline!r} "
+            f"{'is missing' if base is None else 'is present'}, "
+            f"{len(results)} model(s) scored, 2 needed."
+        )
+    else:
+        rng = np.random.default_rng(7)
+        print(
+            f"\npaired bootstrap vs {args.baseline}, n={len(judgments)}, 10,000 resamples, nDCG@10"
+        )
+        for r in results:
+            if r["model"] == args.baseline:
+                continue
+            mean, lo, hi, p = bootstrap(r["per_query"], base["per_query"], "ndcg_at_10", rng)
+            verdict = "SIGNIFICANT" if (lo > 0 or hi < 0) else "not significant"
+            print(f"  {r['model']:26s} {mean:+.4f}  [{lo:+.4f}, {hi:+.4f}]  p={p:.4f}  {verdict}")
+
     print(f"\nper-model scores: {scores_dir}\nsummary: {summary}")
 
 
