@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
+from functools import cache
 from pathlib import Path
 
 from groundkit.config import ChunkingConfig
@@ -20,8 +21,25 @@ from groundkit.indexer import Indexer
 from groundkit.ingestion.loaders import FileLoader
 from groundkit.retrieval.search import Retriever
 
-BASE = Path(sys.argv[1])
-CORPUS = BASE / "corpus"
+
+@cache
+def _base() -> Path:
+    """The adapted BEIR directory, from argv.
+
+    Read through a function rather than at module scope so importing this file
+    -- to check one of the scoring helpers, say -- neither raises on a missing
+    argument nor silently defaults to somewhere unhelpful.
+    """
+    if len(sys.argv) < 2:
+        raise SystemExit(f"usage: {Path(sys.argv[0]).name} <adapted-beir-dir>")
+    return Path(sys.argv[1])
+
+
+@cache
+def _corpus() -> Path:
+    return _base() / "corpus"
+
+
 CFG = ChunkingConfig(chunk_size=512, chunk_overlap=64, separators=["\n\n", "\n", ". ", " ", ""])
 CAND = 50  # groundkit caps top_k at MAX_TOP_K=50; this is the deepest pool available
 
@@ -36,8 +54,15 @@ def recall_at_k(ranked_docs, gold, k):
     return len(set(ranked_docs[:k]) & gold) / len(gold)
 
 
-def rr(ranked_docs, gold):
-    for i, d in enumerate(ranked_docs, 1):
+def rr(ranked_docs, gold, k=10):
+    """Reciprocal rank at depth ``k``, matching every other metric here.
+
+    Uncapped, this searched the whole distinct-document list -- up to CAND
+    entries -- so its effective depth varied with how many chunks a document
+    produced, and two chunking configurations were not measured at the same
+    depth. See embed_bakeoff.score_ranking.
+    """
+    for i, d in enumerate(ranked_docs[:k], 1):
         if d in gold:
             return 1.0 / i
     return 0.0
@@ -46,7 +71,7 @@ def rr(ranked_docs, gold):
 async def main():
     judgments = [
         json.loads(line)
-        for line in (BASE / "judgments.jsonl").open(encoding="utf-8")
+        for line in (_base() / "judgments.jsonl").open(encoding="utf-8")
         if line.strip()
     ]
     gold = {j["query_id"]: {g["doc"] for g in j["gold"]} for j in judgments}
@@ -58,10 +83,10 @@ async def main():
         store = await SQLiteMetadataStore.open(index_dir=tmp, collection="scifact")
         try:
             idx = Indexer(
-                store=store, loader=FileLoader(allowed_base_dir=CORPUS), chunking_config=CFG
+                store=store, loader=FileLoader(allowed_base_dir=_corpus()), chunking_config=CFG
             )
             t0 = time.perf_counter()
-            rep = await idx.index_directory(str(CORPUS))
+            rep = await idx.index_directory(str(_corpus()))
             ingest = time.perf_counter() - t0
             t0 = time.perf_counter()
             r = await Retriever.open(store=store)
@@ -105,4 +130,8 @@ async def main():
     await store.close()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    # Guarded so the scoring helpers above can be imported and checked
+    # without running the whole benchmark -- verifying the MRR cutoff
+    # change required extracting them by AST because this ran at import.
+    asyncio.run(main())

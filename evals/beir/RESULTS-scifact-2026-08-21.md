@@ -13,6 +13,30 @@ originally read `0.0000` now read `< 0.0002`: a Monte Carlo estimate over
 scripts apply the standard `(r+1)/(B+1)` finite-sample correction and can no
 longer print an exact zero. No effect size, interval or verdict changed.
 
+**Every MRR figure below was computed without a rank cutoff, and needs
+regenerating.** The scripts searched the whole distinct-document list for the
+first relevant document while every other column stopped at 10. That list is
+collapsed from up to 50 retrieved chunks, so its depth depends on how many
+chunks a document produced — roughly 50 entries at whole-document chunking
+against roughly 37 at 512/64. Two consequences, and they are not equally bad:
+
+- **MRR comparisons *across chunking configurations* are compromised**, because
+  the configurations were not measured at the same depth. That covers the
+  headline table's three rows, the sweep, and the chunker-fix table's MRR row
+  (25,028 chunks against 20,219 is a different chunks-per-document ratio, so
+  the depth differs there too). Treat those MRR numbers as unusable, not merely
+  imprecise. **Every nDCG@10, R@10 and R@1 figure is unaffected** — those
+  always applied the cutoff — and they are what the document's conclusions
+  actually rest on.
+- **MRR comparisons *within one chunking configuration* are internally
+  consistent**, just mislabelled: the embedding bake-off holds chunking fixed
+  across all five models, so its MRR column ranks the models correctly while
+  not being MRR@10.
+
+The scripts now cap at `k` (`SCORING_VERSION` 3, which invalidates every cached
+score). The figures here predate that and were not regenerated: the adapted
+SciFact corpus lived in a temporary directory and no longer exists.
+
 ## Headline: the BM25 implementation is correct
 
 | configuration | chunks | nDCG@10 | MRR | R@10 | R@1 |

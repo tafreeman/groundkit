@@ -10,6 +10,7 @@ import json
 import math
 import sys
 import tempfile
+from functools import cache
 from pathlib import Path
 
 from groundkit.config import ChunkingConfig, RetrievalConfig
@@ -18,8 +19,25 @@ from groundkit.indexer import Indexer
 from groundkit.ingestion.loaders import FileLoader
 from groundkit.retrieval.search import Retriever
 
-BASE = Path(sys.argv[1])
-CORPUS = BASE / "corpus"
+
+@cache
+def _base() -> Path:
+    """The adapted BEIR directory, from argv.
+
+    Read through a function rather than at module scope so importing this file
+    -- to check one of the scoring helpers, say -- neither raises on a missing
+    argument nor silently defaults to somewhere unhelpful.
+    """
+    if len(sys.argv) < 2:
+        raise SystemExit(f"usage: {Path(sys.argv[0]).name} <adapted-beir-dir>")
+    return Path(sys.argv[1])
+
+
+@cache
+def _corpus() -> Path:
+    return _base() / "corpus"
+
+
 CAND = 50
 SEPS = ["\n\n", "\n", ". ", " ", ""]
 
@@ -27,7 +45,8 @@ SEPS = ["\n\n", "\n", ". ", " ", ""]
 def score(order, gold, k=10):
     dcg = sum(1 / math.log2(i + 2) for i, d in enumerate(order[:k]) if d in gold)
     idcg = sum(1 / math.log2(i + 2) for i in range(min(len(gold), k)))
-    rr = next((1 / i for i, d in enumerate(order, 1) if d in gold), 0.0)
+    # Capped at k, like the other metrics -- see embed_bakeoff.score_ranking.
+    rr = next((1 / i for i, d in enumerate(order[:k], 1) if d in gold), 0.0)
     return (
         dcg / idcg if idcg else 0.0,
         rr,
@@ -48,12 +67,12 @@ async def run(judgments, gold, chunk_size, overlap, k1, b, store_cache, root):
         st = await SQLiteMetadataStore.open(index_dir=tmp, collection="s")
         idx = Indexer(
             store=st,
-            loader=FileLoader(allowed_base_dir=CORPUS),
+            loader=FileLoader(allowed_base_dir=_corpus()),
             chunking_config=ChunkingConfig(
                 chunk_size=chunk_size, chunk_overlap=overlap, separators=SEPS
             ),
         )
-        rep = await idx.index_directory(str(CORPUS))
+        rep = await idx.index_directory(str(_corpus()))
         store_cache[key] = (st, rep.chunks_written)
     st, nchunks = store_cache[key]
     r = await Retriever.open(store=st, config=RetrievalConfig(bm25_k1=k1, bm25_b=b))
@@ -75,7 +94,7 @@ async def run(judgments, gold, chunk_size, overlap, k1, b, store_cache, root):
 async def main():
     judgments = [
         json.loads(line)
-        for line in (BASE / "judgments.jsonl").open(encoding="utf-8")
+        for line in (_base() / "judgments.jsonl").open(encoding="utf-8")
         if line.strip()
     ]
     gold = {j["query_id"]: {g["doc"] for g in j["gold"]} for j in judgments}
@@ -112,4 +131,8 @@ async def main():
         await st.close()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    # Guarded so the scoring helpers above can be imported and checked
+    # without running the whole benchmark -- verifying the MRR cutoff
+    # change required extracting them by AST because this ran at import.
+    asyncio.run(main())

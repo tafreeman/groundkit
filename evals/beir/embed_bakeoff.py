@@ -82,7 +82,11 @@ CANDIDATES = 50
 #:    identity is otherwise unchanged, so without this bump an existing
 #:    ``--work`` directory would keep serving that zero and never receive the
 #:    correction -- the fix would apply only to caches nobody had yet built.
-SCORING_VERSION = 2
+#: 3: ``mrr`` was reciprocal rank over the *whole* distinct-document list while
+#:    every other metric used the ``k`` cutoff. Cached entries therefore hold
+#:    MRR values that are not MRR@k and are not comparable across chunking
+#:    configurations, since the list's depth varies with chunks-per-document.
+SCORING_VERSION = 3
 
 #: Base seed every per-contrast generator is derived from (see ``contrast_rng``).
 BOOTSTRAP_SEED = 7
@@ -121,14 +125,25 @@ METRICS = ("ndcg_at_10", "mrr", "recall_at_1", "recall_at_10")
 
 
 def score_ranking(order: list[str], gold: set[str], k: int = 10) -> dict[str, float]:
-    """Binary-relevance IR metrics over a document ranking.
+    """Binary-relevance IR metrics over a document ranking, all at depth ``k``.
 
     Binary is correct here rather than a simplification: SciFact's qrels score
     every judged pair ``1``, so graded gain would have nothing to grade.
+
+    The ``mrr`` key is reciprocal rank at ``k``, not over the full ranking. The
+    name is kept short because every metric here shares the one cutoff, but it
+    is a cutoff metric like the rest.
     """
     dcg = sum(1 / math.log2(i + 2) for i, d in enumerate(order[:k]) if d in gold)
     idcg = sum(1 / math.log2(i + 2) for i in range(min(len(gold), k)))
-    rank = next((i for i, d in enumerate(order, 1) if d in gold), None)
+    # Capped at `k` like every other metric here. `order` is distinct documents
+    # collapsed from up to CANDIDATES chunks, so its depth depends on how many
+    # chunks a document produced -- ~50 entries at whole-document chunking
+    # against ~37 at 512/64. Searching it uncapped let one configuration earn
+    # reciprocal-rank credit at depths another structurally could not reach,
+    # which is not a difference in retrieval quality and is exactly the
+    # comparison RESULTS-scifact draws.
+    rank = next((i for i, d in enumerate(order[:k], 1) if d in gold), None)
     return {
         "ndcg_at_10": dcg / idcg if idcg else 0.0,
         "mrr": 1.0 / rank if rank else 0.0,
