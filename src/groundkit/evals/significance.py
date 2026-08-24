@@ -169,10 +169,26 @@ def compare_report_stages(
 
 
 def _query_scores(query_results: Sequence[QueryResult], metric: MetricName) -> dict[str, float]:
+    """Map query id to one metric value, refusing a duplicate id.
+
+    ``QueryResult.query_id`` is documented as unique but nothing in the schema
+    enforces it across a stage's ``queries`` list. Assigning into a dict would
+    silently keep the last of a duplicated pair, which is worse than it
+    sounds: the bootstrap would then run over a *smaller* query set than the
+    report claims, and the effect would depend on the order the duplicates
+    happened to appear in. This module's whole premise is that pairing by
+    query id is checked rather than assumed, so a report that cannot be paired
+    unambiguously is rejected instead of quietly averaged.
+    """
     scores: dict[str, float] = {}
     for result in query_results:
         if result.metrics is None:
             continue
+        if result.query_id in scores:
+            raise EvalError(
+                f"duplicate query id {result.query_id!r} in a stage's results; "
+                "query ids must be unique for a paired comparison to mean anything"
+            )
         value = (
             result.metrics.reciprocal_rank if metric == "mrr" else getattr(result.metrics, metric)
         )

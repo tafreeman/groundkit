@@ -300,3 +300,23 @@ def test_compare_report_stages_rejects_a_stage_the_report_does_not_contain() -> 
 
     with pytest.raises(EvalError, match="does not contain stage 'dense'"):
         compare_report_stages(report, baseline="bm25", candidate="dense", metric="ndcg_at_10")
+
+
+def test_compare_report_stages_rejects_duplicate_query_ids() -> None:
+    """``QueryResult.query_id`` is documented as unique but nothing in the
+    schema enforces it. Assigning into a dict would silently keep the last of
+    a duplicated pair, so the bootstrap would run over a smaller query set
+    than the report claims and the effect would depend on their order."""
+    report = _report(
+        [
+            _stage(
+                "bm25",
+                [_query("q-1", ndcg=0.2), _query("q-1", ndcg=0.9)],
+                is_baseline=True,
+            ),
+            _stage("dense", [_query("q-1", ndcg=0.6)], is_baseline=False),
+        ]
+    )
+
+    with pytest.raises(EvalError, match="duplicate query id"):
+        compare_report_stages(report, baseline="bm25", candidate="dense", metric="ndcg_at_10")

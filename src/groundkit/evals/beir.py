@@ -150,6 +150,8 @@ def adapt_beir_dataset(
             "would reject on load."
         )
 
+    _reject_case_colliding_document_ids(texts)
+
     corpus_dir = destination / "corpus"
     _require_empty_corpus_dir(corpus_dir)
     corpus_dir.mkdir(parents=True, exist_ok=True)
@@ -188,6 +190,35 @@ def adapt_beir_dataset(
         corpus_dir=str(corpus_dir),
         judgments_path=str(judgments_path),
     )
+
+
+def _reject_case_colliding_document_ids(texts: dict[str, str]) -> None:
+    """Refuse document ids that are distinct keys but the same file name.
+
+    ``_SAFE_IDENTIFIER`` admits upper case, so ``DOC-1`` and ``doc-1`` are two
+    dictionary entries with two different texts -- and one file on Windows and
+    on the default macOS filesystem. The second write silently overwrites the
+    first, while the judgments still reference both names with both quotes, so
+    one of them resolves against the wrong document's text.
+
+    Refused on every platform, not only the case-insensitive ones. This is a
+    benchmark adapter, and a corpus that adapts one way on Linux and another
+    way on a laptop is not reproducible; a dataset whose meaning depends on
+    the filesystem it landed on should fail loudly rather than differ quietly.
+    Case folding catches the realistic collision class here (BEIR ids are
+    ASCII); it does not attempt Unicode normalization forms.
+    """
+    by_folded: defaultdict[str, list[str]] = defaultdict(list)
+    for document_id in texts:
+        by_folded[document_id.casefold()].append(document_id)
+    collisions = sorted(sorted(group) for group in by_folded.values() if len(group) > 1)
+    if collisions:
+        raise EvalError(
+            "BEIR document ids collide when case is folded, so they would share one "
+            f"file on a case-insensitive filesystem: {collisions}. Each would overwrite "
+            "the other while the judgments still reference both, leaving quotes resolved "
+            "against the wrong document. Rename or map these ids before adapting."
+        )
 
 
 def _require_empty_corpus_dir(corpus_dir: Path) -> None:

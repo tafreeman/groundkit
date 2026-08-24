@@ -273,3 +273,29 @@ def test_invalid_utf8_in_the_qrels_is_an_eval_error_not_a_traceback(tmp_path: Pa
 
     with pytest.raises(EvalError, match="not valid UTF-8"):
         adapt_beir_dataset(source, tmp_path / "adapted")
+
+
+def test_document_ids_colliding_only_by_case_are_refused(tmp_path: Path) -> None:
+    """``DOC-1`` and ``doc-1`` are two dict keys and one file on Windows and
+    macOS: the second write overwrites the first while the judgments still
+    reference both, so one quote resolves against the wrong document's text.
+
+    Refused on every platform, deliberately -- a corpus that adapts one way on
+    Linux and another on a laptop is not a reproducible benchmark input.
+    """
+    source = tmp_path / "beir"
+    output = tmp_path / "adapted"
+    _write_beir(source)
+    (source / "corpus.jsonl").write_text(
+        json.dumps({"_id": "doc-1", "title": "Lower", "text": "lower body"})
+        + "\n"
+        + json.dumps({"_id": "DOC-1", "title": "Upper", "text": "upper body"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(EvalError, match="collide when case is folded"):
+        adapt_beir_dataset(source, output)
+
+    # And nothing may have been written before the refusal.
+    assert not (output / "corpus").exists()

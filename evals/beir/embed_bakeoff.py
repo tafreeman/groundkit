@@ -30,6 +30,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -192,20 +193,28 @@ async def index_and_score(
     slug = model.replace(":", "-").replace("/", "-")
     index_dir = work / "index" / slug
     lance_dir = index_dir / "lance"
-    index_dir.mkdir(parents=True, exist_ok=True)
 
     sentinel_inputs = _sentinel_inputs(corpus, model, dims)
     fresh = not _sentinel_valid(index_dir, sentinel_inputs)
     if fresh:
-        # Drop the old sentinel *before* touching the store, not after the
-        # rebuild succeeds. Indexing mutates an existing store in place, so a
-        # rebuild that dies partway leaves it holding a mix of the old corpus
-        # and the new one. If the previous corpus were then restored, a
-        # surviving sentinel would match it again and this run would skip
-        # repair, scoring and caching the mixed index as if it were clean.
-        # Removing it first makes any interrupted rebuild fail closed: the
-        # worst case is a re-index nobody needed.
-        (index_dir / SENTINEL_NAME).unlink(missing_ok=True)
+        # Discard the whole directory, not just the sentinel. Two reasons, and
+        # deleting the sentinel alone fixes only the second:
+        #
+        # 1. `Indexer` cannot re-embed into a collection whose ADR-0004
+        #    manifest names a different embedding identity -- `_verify_identity`
+        #    refuses it before any work, by design. So invalidating the
+        #    sentinel on a dims change makes the run *try* to rebuild and then
+        #    raise `IndexIdentityError`, which `one_model` catches and turns
+        #    into a FAILED line: the model drops out of the leaderboard instead
+        #    of being rebuilt. Delete-and-re-ingest is ADR-0004 decision 5's
+        #    stated remedy for exactly this, and it is what the directory
+        #    removal performs.
+        # 2. Indexing mutates an existing store, so a rebuild that dies partway
+        #    leaves a mix of the old corpus and the new one. Removing the
+        #    directory first makes an interrupted rebuild fail closed; the
+        #    worst case is a re-index nobody needed.
+        shutil.rmtree(index_dir, ignore_errors=True)
+    index_dir.mkdir(parents=True, exist_ok=True)
 
     store = await SQLiteMetadataStore.open(index_dir=index_dir, collection="beir")
     embedder = build_embedder(EmbeddingConfig(provider="ollama", model_name=model, dimensions=dims))
