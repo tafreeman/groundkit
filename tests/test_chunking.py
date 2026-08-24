@@ -281,3 +281,76 @@ class TestOversizedNeighborDoesNotOrphanShortLeadingPart:
         chunks = RecursiveChunker().chunk(doc, config=config)
 
         assert all(len(chunk.content) <= config.chunk_size for chunk in chunks)
+
+
+class TestNestedRecursionDoesNotRepeatAPrefix:
+    """A flush must not emit a chunk that the next one wholly contains.
+
+    The oversized-neighbor branch handles the case where the *incoming* part
+    exceeds ``chunk_size`` on its own. It does not handle the second way the
+    same duplication arises, which shows up one level down in the recursion:
+    the incoming part fits, so the run is flushed -- but ``_carry_overlap``
+    then retains *all* of what was just flushed, so the next span begins where
+    that chunk began and repeats it verbatim.
+
+    The reported reproduction is exact rather than illustrative: before the
+    fix, ``"Title here\n1234567. tailxx"`` at 13/6 produced spans
+    ``(0, 5), (0, 13), (7, 18), (20, 26)`` -- ``"Title"`` orphaned at ``(0, 5)``
+    and then repeated inside ``(0, 13)``, which is the very shape
+    ``TestOversizedNeighborDoesNotOrphanShortLeadingPart`` exists to prevent.
+    """
+
+    TEXT = "Title here\n1234567. tailxx"
+    CONFIG = ChunkingConfig(chunk_size=13, chunk_overlap=6)
+
+    def _chunks(self) -> tuple[Document, list[Chunk]]:
+        document = Document(source="t.md", content=self.TEXT)
+        return document, RecursiveChunker().chunk(document, config=self.CONFIG)
+
+    def test_the_short_prefix_is_not_emitted_alone(self) -> None:
+        document, chunks = self._chunks()
+
+        assert [c.content for c in chunks] != ["Title"], "sanity: expected several chunks"
+        assert "Title" not in [c.content for c in chunks], (
+            "'Title' was emitted as its own chunk and is repeated inside the next one -- "
+            "the carry-retains-everything branch in _merge_parts is missing"
+        )
+        _assert_offset_invariant(document, chunks)
+        _assert_sequential_index(chunks)
+
+    def test_no_chunk_is_wholly_contained_in_another(self) -> None:
+        """The general property the reported case violates.
+
+        Overlapping neighbours are expected and fine; one chunk *containing*
+        another is never useful -- it is a duplicate embedding and a duplicate
+        retrieval candidate.
+        """
+        _, chunks = self._chunks()
+        spans = [(c.start_offset, c.end_offset) for c in chunks]
+
+        contained = [
+            (inner, outer)
+            for index, inner in enumerate(spans)
+            for outer in spans[index + 1 :]
+            if outer[0] <= inner[0] and inner[1] <= outer[1]
+        ]
+        assert contained == [], f"chunks contained in a later chunk: {contained}"
+
+    def test_the_property_holds_at_the_configuration_evals_actually_use(self) -> None:
+        """512/64 is ``EVAL_CHUNKING_CONFIG``'s shape, and the one every
+        published number was produced at."""
+        text = "Title here\n\n" + "sentence body. " * 80
+        document = Document(source="t.md", content=text)
+        chunks = RecursiveChunker().chunk(
+            document, config=ChunkingConfig(chunk_size=512, chunk_overlap=64)
+        )
+        spans = [(c.start_offset, c.end_offset) for c in chunks]
+
+        contained = [
+            (inner, outer)
+            for index, inner in enumerate(spans)
+            for outer in spans[index + 1 :]
+            if outer[0] <= inner[0] and inner[1] <= outer[1]
+        ]
+        assert contained == []
+        _assert_offset_invariant(document, chunks)

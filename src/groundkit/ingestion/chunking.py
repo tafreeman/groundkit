@@ -197,21 +197,28 @@ class RecursiveChunker:
         for part in parts:
             part_len = (part[1] - part[0]) + (sep_len if current else 0)
             if current and self._span_len(current) + part_len > chunk_size:
-                if (part[1] - part[0]) > chunk_size:
-                    # ``part`` overflows on its own, so :meth:`_flush` re-splits it
-                    # at a finer separator whatever we do here. Flushing ``current``
-                    # first therefore buys no smaller output -- it only guarantees
-                    # ``current`` is emitted alone. Folding it in lets the recursion
-                    # place its text at the head of the first sub-chunk instead.
-                    # ``_carry_overlap`` correctly returns nothing afterwards: an
-                    # oversized part alone exceeds ``overlap``, and the recursion
-                    # has already applied overlap within the span it split.
+                carry = self._carry_overlap(current, sep_len, overlap)
+                if (part[1] - part[0]) > chunk_size or carry == current:
+                    # Two ways a flush here would emit a chunk that is wholly
+                    # contained in the next one, which is duplication rather
+                    # than chunking:
+                    #
+                    # 1. ``part`` overflows on its own, so :meth:`_flush`
+                    #    re-splits it at a finer separator whatever we do.
+                    #    Flushing ``current`` first buys no smaller output; it
+                    #    only guarantees ``current`` is emitted alone.
+                    # 2. The overlap carry would retain *all* of ``current``,
+                    #    so the next span starts exactly where this one does
+                    #    and the chunk we are about to emit is its prefix.
+                    #
+                    # Folding ``part`` in instead lets the recursion place the
+                    # accumulated text at the head of the first sub-chunk.
                     current.append(part)
                     self._flush(text, current, next_separators, chunk_size, overlap, results)
                     current = self._carry_overlap(current, sep_len, overlap)
                     continue
                 self._flush(text, current, next_separators, chunk_size, overlap, results)
-                current = self._carry_overlap(current, sep_len, overlap)
+                current = carry
             current.append(part)
 
         if current:
