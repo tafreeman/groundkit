@@ -199,45 +199,61 @@ class RecursiveChunker:
             if current and self._span_len(current) + part_len > chunk_size:
                 carry = self._carry_overlap(current, sep_len, overlap)
                 if (part[1] - part[0]) > chunk_size or carry == current:
-                    # Two ways a flush here would emit a chunk that is wholly
-                    # contained in the next one, which is duplication rather
-                    # than chunking:
+                    # Two ways flushing ``current`` alone would emit a chunk the
+                    # next one wholly contains, which is duplication rather than
+                    # chunking:
                     #
                     # 1. ``part`` overflows on its own, so :meth:`_flush`
                     #    re-splits it at a finer separator whatever we do.
-                    #    Flushing ``current`` first buys no smaller output; it
-                    #    only guarantees ``current`` is emitted alone.
-                    # 2. The overlap carry would retain *all* of ``current``,
-                    #    so the next span starts exactly where this one does
-                    #    and the chunk we are about to emit is its prefix.
+                    #    Flushing first buys no smaller output; it only
+                    #    guarantees ``current`` is emitted alone.
+                    # 2. The overlap carry would retain *all* of ``current``, so
+                    #    the next span starts exactly where this one does and the
+                    #    chunk we are about to emit is its prefix.
                     #
                     # Folding ``part`` in instead lets the recursion place the
-                    # accumulated text at the head of the first sub-chunk.
-                    #
-                    # ``current`` is then cleared rather than carried. :meth:`_flush`
-                    # has just emitted this whole span -- recursively when it is
-                    # oversized, which is the only way to reach case 1 and the usual
-                    # way to reach case 2 -- and that recursion already applied
-                    # overlap *within* what it split. Carrying a tail on top of that
-                    # re-emits text the recursion has covered: the next flush starts
-                    # inside the span just written, so the chunk it produces runs
-                    # backwards and contains its predecessor. Case 1 always cleared
-                    # it in practice (a part larger than ``chunk_size`` also exceeds
-                    # ``overlap``, so the carry came back empty), but by accident
-                    # rather than by intent; case 2 admits parts smaller than
-                    # ``overlap``, where the accident does not hold.
+                    # accumulated text at the head of the first sub-chunk. The
+                    # combined span always exceeds ``chunk_size`` here (that is
+                    # what put us in this branch), so the flush below always
+                    # recurses and ``_carry_after`` always clears.
                     current.append(part)
-                    self._flush(text, current, next_separators, chunk_size, overlap, results)
-                    current = []
+                    recursed = self._flush(
+                        text, current, next_separators, chunk_size, overlap, results
+                    )
+                    current = self._carry_after(recursed, carry=[])
                     continue
-                self._flush(text, current, next_separators, chunk_size, overlap, results)
-                current = carry
+                recursed = self._flush(text, current, next_separators, chunk_size, overlap, results)
+                current = self._carry_after(recursed, carry=carry)
             current.append(part)
 
         if current:
             self._flush(text, current, next_separators, chunk_size, overlap, results)
 
         return results
+
+    @staticmethod
+    def _carry_after(recursed: bool, *, carry: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """What to keep after a flush: ``carry``, or nothing if it recursed.
+
+        **Overlap is applied once, by whoever emitted the chunks.** When
+        :meth:`_flush` emits ``current`` directly, this loop owns the overlap
+        and carries a tail forward. When ``current`` was oversized, ``_flush``
+        recursed instead, and that recursion already applied overlap *within*
+        the span it split -- so a tail carried on top of it re-emits text
+        already covered. The next flush then begins inside the span just
+        written, producing a chunk that runs backwards and contains one of its
+        predecessors.
+
+        This is one rule, and it was previously three guesses at it. The
+        oversized branch cleared the carry by accident (a part larger than
+        ``chunk_size`` also exceeds ``overlap``, so ``_carry_overlap`` returned
+        nothing); the carry-retains-everything branch had to be taught to clear
+        explicitly; and this branch -- the ordinary one, where ``current`` is
+        merely oversized -- was still carrying across a recursion. Deciding
+        from what ``_flush`` actually did, rather than from which branch called
+        it, covers all three and anything shaped like them.
+        """
+        return [] if recursed else carry
 
     def _flush(
         self,
@@ -247,15 +263,24 @@ class RecursiveChunker:
         chunk_size: int,
         overlap: int,
         results: list[tuple[int, int]],
-    ) -> None:
-        """Emit the accumulated ``current`` span, recursing if still oversized."""
+    ) -> bool:
+        """Emit the accumulated ``current`` span, recursing if still oversized.
+
+        Returns:
+            Whether it recursed. The caller needs this to decide the overlap
+            carry: a recursion has already applied overlap inside the span it
+            split, so carrying a tail on top of it re-emits covered text. See
+            :meth:`_carry_after`, which is the only intended consumer.
+        """
         seg_start, seg_end = current[0][0], current[-1][1]
         if seg_end - seg_start > chunk_size:
             results.extend(
                 self._split_range(text, seg_start, seg_end, next_separators, chunk_size, overlap)
             )
-        elif text[seg_start:seg_end].strip():
+            return True
+        if text[seg_start:seg_end].strip():
             results.append((seg_start, seg_end))
+        return False
 
     @staticmethod
     def _span_len(parts: list[tuple[int, int]]) -> int:

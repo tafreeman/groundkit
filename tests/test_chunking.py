@@ -423,3 +423,87 @@ class TestFoldedFlushDoesNotRepeatItsOwnTail:
             if char.strip() and char not in separators and index not in covered
         ]
         assert missing == [], f"content characters dropped at offsets {missing}"
+
+
+class TestOverlapIsAppliedOnceNotTwice:
+    """A carry may never survive a flush that recursed.
+
+    Whoever emits the chunks owns the overlap. When ``_flush`` emits ``current``
+    directly, this loop applies it. When ``current`` was oversized, ``_flush``
+    recursed and the recursion applied overlap *within* the span it split -- so
+    a tail carried on top re-emits covered text, and the next flush starts
+    inside the span just written.
+
+    Three reports were the same rule seen from three branches: the oversized
+    branch cleared the carry by accident, the carry-retains-everything branch
+    had to be taught to, and the ordinary branch was still carrying across a
+    recursion. Deciding from what ``_flush`` did, rather than which branch
+    called it, is what makes the property hold generally.
+
+    Reported reproduction, exact: ``"  \n . ... bbb\n..bb b\n"`` at 13/11
+    produced ``(0,13), (3,16), (5,18), (19,20), (14,21)`` -- the last chunk
+    running backwards and containing ``(19,20)``.
+    """
+
+    TEXT = "  \n . ... bbb\n..bb b\n"
+    CONFIG = ChunkingConfig(chunk_size=13, chunk_overlap=11)
+
+    def _chunks(self) -> tuple[Document, list[Chunk]]:
+        document = Document(source="t.md", content=self.TEXT)
+        return document, RecursiveChunker().chunk(document, config=self.CONFIG)
+
+    def test_starts_never_move_backwards(self) -> None:
+        _, chunks = self._chunks()
+        starts = [c.start_offset for c in chunks]
+
+        assert starts == sorted(starts), (
+            f"chunk starts run backwards ({starts}) -- an outer carry survived a "
+            "flush whose recursion had already emitted it"
+        )
+
+    def test_no_chunk_contains_another(self) -> None:
+        document, chunks = self._chunks()
+        spans = [(c.start_offset, c.end_offset) for c in chunks]
+
+        contained = [
+            (a, b)
+            for index, a in enumerate(spans)
+            for b in spans[index + 1 :]
+            if (b[0] <= a[0] and a[1] <= b[1]) or (a[0] <= b[0] and b[1] <= a[1])
+        ]
+        assert contained == [], f"chunks repeat one another: {contained}"
+        _assert_offset_invariant(document, chunks)
+        _assert_sequential_index(chunks)
+
+    @pytest.mark.parametrize(
+        ("text", "size", "overlap", "separators"),
+        [
+            ("  \n . ... bbb\n..bb b\n", 13, 11, ["\n\n", "\n", ". ", " ", ""]),
+            ("aa\n a", 4, 3, ["\n", " ", ""]),
+            ("Title here\n1234567. tailxx", 13, 6, ["\n\n", "\n", ". ", " ", ""]),
+            ("a\nword.bbb\n\nword\n\n . \n\n", 8, 6, ["\n", " ", ""]),
+        ],
+    )
+    def test_every_reported_shape_holds_both_properties(
+        self, text: str, size: int, overlap: int, separators: list[str]
+    ) -> None:
+        """Each of these came from a separate review round, and each was a
+        different branch reaching the same defect. Pinned together so a future
+        change to one branch cannot quietly reopen another."""
+        document = Document(source="t.md", content=text)
+        chunks = RecursiveChunker().chunk(
+            document,
+            config=ChunkingConfig(chunk_size=size, chunk_overlap=overlap, separators=separators),
+        )
+        spans = [(c.start_offset, c.end_offset) for c in chunks]
+        starts = [s for s, _ in spans]
+
+        assert starts == sorted(starts), f"backward starts for {text!r}: {spans}"
+        contained = [
+            (a, b)
+            for index, a in enumerate(spans)
+            for b in spans[index + 1 :]
+            if (b[0] <= a[0] and a[1] <= b[1]) or (a[0] <= b[0] and b[1] <= a[1])
+        ]
+        assert contained == [], f"contained spans for {text!r}: {contained}"
+        _assert_offset_invariant(document, chunks)
