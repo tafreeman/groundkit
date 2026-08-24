@@ -113,7 +113,7 @@ def adapt_beir_dataset(
     texts: dict[str, str] = {}
     for position, record in enumerate(corpus_records, start=1):
         document_id = _required_string(record, "_id", context=f"corpus row {position}")
-        _validate_identifier(document_id, subject="document")
+        _validate_identifier(document_id, subject="document", becomes_a_filename=True)
         if document_id in texts:
             raise EvalError(f"duplicate BEIR document id {document_id!r}")
         title = _optional_string(record, "title", context=f"corpus row {position}").strip()
@@ -126,7 +126,7 @@ def adapt_beir_dataset(
     queries: dict[str, str] = {}
     for position, record in enumerate(query_records, start=1):
         query_id = _required_string(record, "_id", context=f"query row {position}")
-        _validate_identifier(query_id, subject="query")
+        _validate_identifier(query_id, subject="query", becomes_a_filename=False)
         if query_id in queries:
             raise EvalError(f"duplicate BEIR query id {query_id!r}")
         query = _required_string(record, "text", context=f"query row {position}").strip()
@@ -309,8 +309,8 @@ def _load_qrels(path: Path) -> dict[str, set[str]]:
         if len(row) < 3:
             raise EvalError(f"invalid BEIR qrels row at {path} line {line_number}")
         query_id, document_id, raw_score = row[:3]
-        _validate_identifier(query_id, subject="query")
-        _validate_identifier(document_id, subject="document")
+        _validate_identifier(query_id, subject="query", becomes_a_filename=False)
+        _validate_identifier(document_id, subject="document", becomes_a_filename=True)
         try:
             score = int(raw_score)
         except ValueError as exc:
@@ -354,12 +354,23 @@ def _optional_string(record: dict[str, Any], key: str, *, context: str) -> str:
     return value
 
 
-def _validate_identifier(value: str, *, subject: str) -> None:
+def _validate_identifier(value: str, *, subject: str, becomes_a_filename: bool) -> None:
+    """Validate one BEIR identifier.
+
+    ``becomes_a_filename`` gates the checks that are only about the
+    filesystem. A document id is written as ``<id>.txt``; a query id is only
+    ever a JSON string inside ``judgments.jsonl`` and never reaches a path
+    join, so applying a filesystem-specific rule to it would reject datasets
+    that are perfectly usable. It is a required keyword rather than a default
+    so that a new call site has to state which kind it is passing.
+    """
     if not _SAFE_IDENTIFIER.fullmatch(value) or value in {".", ".."}:
         raise EvalError(
             f"unsafe BEIR {subject} id {value!r}; expected letters, digits, dot, "
             "underscore, or hyphen"
         )
+    if not becomes_a_filename:
+        return
     # `CON`, `NUL`, `COM1` and friends name devices rather than files in the
     # Win32 namespace, and the reservation applies to the stem, so `CON.txt`
     # is reserved too. How that manifests depends on the Windows build --

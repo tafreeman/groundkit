@@ -395,3 +395,29 @@ def test_a_symlinked_corpus_directory_is_refused(tmp_path: Path) -> None:
         adapt_beir_dataset(source, output)
 
     assert list(elsewhere.iterdir()) == []
+
+
+def test_a_reserved_device_name_is_allowed_as_a_query_id(tmp_path: Path) -> None:
+    """The device-name rule is about filenames, and a query id never becomes
+    one -- it is only ever a JSON string inside ``judgments.jsonl``.
+
+    ``con`` also satisfies the harness's kebab-case contract, so rejecting it
+    would turn a filesystem quirk into a refusal of an otherwise admissible
+    dataset. The document-side guard is asserted in the same test so the two
+    cannot drift into agreeing.
+    """
+    source = tmp_path / "beir"
+    output = tmp_path / "adapted"
+    _write_beir(source)
+    (source / "queries.jsonl").write_text(
+        json.dumps({"_id": "con", "text": "What is in the body?"}) + "\n", encoding="utf-8"
+    )
+    (source / "qrels" / "test.tsv").write_text(
+        "query-id\tcorpus-id\tscore\ncon\tdoc-1\t1\n", encoding="utf-8"
+    )
+
+    report = adapt_beir_dataset(source, output)
+
+    assert report.query_count == 1
+    judgments = load_judgments(output / "judgments.jsonl")
+    assert judgments[0].query_id == "con"

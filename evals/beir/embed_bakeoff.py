@@ -109,6 +109,27 @@ def score_ranking(order: list[str], gold: set[str], k: int = 10) -> dict[str, fl
     }
 
 
+def model_slug(model: str) -> str:
+    """A filesystem-safe key for one model that cannot collide with another's.
+
+    A plain ``replace(":", "-")`` flattens ``foo:bar`` and ``foo-bar`` onto the
+    same name, and that name keys *both* the index directory and the score
+    cache file. The consequence is not merely a shared cache: a stale sentinel
+    now deletes the index directory, so two colliding models would take turns
+    destroying each other's index and re-embedding it -- hours per cycle,
+    every run, with nothing in the output saying why.
+
+    A short digest of the exact name is appended only when flattening actually
+    changed something, so every model in ``WAVES`` today (none contains ``:``
+    or ``/``) keeps the readable directory it already has and no existing
+    cache is invalidated by this fix.
+    """
+    flattened = model.replace(":", "-").replace("/", "-")
+    if flattened == model:
+        return flattened
+    return f"{flattened}-{hashlib.sha256(model.encode('utf-8')).hexdigest()[:8]}"
+
+
 def corpus_fingerprint(corpus: Path) -> str:
     """A content hash over every file in the adapted corpus directory.
 
@@ -190,8 +211,7 @@ async def index_and_score(
     model: str, dims: int, corpus: Path, work: Path, judgments: list[dict], gold: dict
 ) -> dict:
     """Build (or reuse) this model's index, then score every query against it."""
-    slug = model.replace(":", "-").replace("/", "-")
-    index_dir = work / "index" / slug
+    index_dir = work / "index" / model_slug(model)
     lance_dir = index_dir / "lance"
 
     sentinel_inputs = _sentinel_inputs(corpus, model, dims)
@@ -367,16 +387,20 @@ async def main() -> None:
 
     async def one_model(model: str, dims: int) -> dict | None:
         """Index and score a single model, caching the result. Never raises."""
-        cached = scores_dir / f"{model.replace(':', '-')}.json"
+        cached = scores_dir / f"{model_slug(model)}.json"
+        # The exact model name, not just its dimensions and not just the slug
+        # the filename is derived from. `model_slug` now makes a collision
+        # unrepresentable, but recording the name is what lets an entry
+        # written by an *older* build of this script -- when the slug was
+        # lossy -- be recognised as belonging to a different embedder rather
+        # than accepted on a dimension match.
+        identity = {**experiment, "model": model, "dims": dims}
         if cached.exists():
             try:
                 payload = json.loads(cached.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 payload = None
-            if isinstance(payload, dict) and payload.get("experiment") == {
-                **experiment,
-                "dims": dims,
-            }:
+            if isinstance(payload, dict) and payload.get("experiment") == identity:
                 print(f"{model:26s} cached", flush=True)
                 return dict(payload["result"])
             print(f"{model:26s} cache stale (inputs changed), rescoring", flush=True)
@@ -391,7 +415,7 @@ async def main() -> None:
         tmp_path = cached.with_suffix(".tmp")
         tmp_path.write_text(
             json.dumps(
-                {"experiment": {**experiment, "dims": dims}, "result": result},
+                {"experiment": identity, "result": result},
                 indent=2,
             ),
             encoding="utf-8",
