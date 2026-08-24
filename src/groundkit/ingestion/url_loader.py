@@ -53,7 +53,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from groundkit import extraction
+from groundkit import extraction, snapshots
 from groundkit.contracts import Document
 from groundkit.errors import IngestionError
 from groundkit.utils.path_safety import (
@@ -473,8 +473,8 @@ class UrlLoader:
             OSError: The write failed for any other reason (propagated
                 unchanged -- only the symlink refusal is reinterpreted).
         """
-        candidate = self._snapshot_dir / document_id
         try:
+            candidate = snapshots.snapshot_path_for(self._snapshot_dir, document_id)
             path = ensure_within_base(candidate, self._snapshot_dir)
         except ValueError as exc:
             raise IngestionError(

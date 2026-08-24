@@ -11,6 +11,19 @@ it scored.
 
 ## [Unreleased]
 
+### Fixed
+
+- A snapshot `document_id` containing a path separator is now refused rather
+  than resolved. `O_NOFOLLOW` (GK-030) refuses a symlink at the *final* path
+  component only, so a nested id such as `sub/evil` — which escapes nothing,
+  and therefore passed containment — introduced an intermediate directory that
+  the write side then created with `mkdir(parents=True)`, reopening the
+  containment-check-to-open race one level above where the flag can see it.
+  Production never produced such an id (`Document.document_id` defaults to
+  `uuid.uuid4().hex`), so this enforces a property that was previously only
+  assumed. Refused in one place, `snapshots.snapshot_path_for`, which the
+  write, read and removal paths now all route through.
+
 ### Security
 
 - `Host` is now validated on both service transports, closing inbound DNS

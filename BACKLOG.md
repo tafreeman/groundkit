@@ -313,7 +313,21 @@ of its findings landed as fixes in the same branch - a partial
 class, and `EMLINK` being reported as a planted symlink on platforms where it means "too
 many links" - each with a regression test shown to fail first. The third — the snapshot
 read path's symlink race — was carried forward as GK-030 and has since landed on
-`fix/gk-030-snapshot-read-nofollow`, so nothing from this review remains open.
+`fix/gk-030-snapshot-read-nofollow`.
+
+Every item this review raised is now addressed, with **one platform carve-out that is not
+closed and is not closeable this way**: `O_NOFOLLOW` does not exist on Windows, where it
+degrades to a no-op, so the snapshot write and read remain exactly as racy there as they
+were before. Both regression tests skip rather than passing vacuously, and CI runs Linux,
+where the guard is real. `KNOWN_LIMITATIONS.md` carries this as a live limitation. Read
+"GK-030 is closed" as "closed on POSIX", never as "closed everywhere".
+
+A follow-up found separately, and closed alongside it: `O_NOFOLLOW` guards only the
+*final* path component, so a `document_id` containing a separator would have reintroduced
+the same race one directory up, where the flag cannot see it — on POSIX *and* Windows.
+`snapshots.snapshot_path_for` now refuses any `document_id` that is not a single path
+component. Being pure path arithmetic rather than an open flag, that check is the one part
+of this whose guarantee does hold on every platform.
 
 Closing it turned up a second defect on the same line of code, which is why the read is
 now a byte read and its own decode rather than only an `O_NOFOLLOW` open:
