@@ -213,9 +213,22 @@ class RecursiveChunker:
                     #
                     # Folding ``part`` in instead lets the recursion place the
                     # accumulated text at the head of the first sub-chunk.
+                    #
+                    # ``current`` is then cleared rather than carried. :meth:`_flush`
+                    # has just emitted this whole span -- recursively when it is
+                    # oversized, which is the only way to reach case 1 and the usual
+                    # way to reach case 2 -- and that recursion already applied
+                    # overlap *within* what it split. Carrying a tail on top of that
+                    # re-emits text the recursion has covered: the next flush starts
+                    # inside the span just written, so the chunk it produces runs
+                    # backwards and contains its predecessor. Case 1 always cleared
+                    # it in practice (a part larger than ``chunk_size`` also exceeds
+                    # ``overlap``, so the carry came back empty), but by accident
+                    # rather than by intent; case 2 admits parts smaller than
+                    # ``overlap``, where the accident does not hold.
                     current.append(part)
                     self._flush(text, current, next_separators, chunk_size, overlap, results)
-                    current = self._carry_overlap(current, sep_len, overlap)
+                    current = []
                     continue
                 self._flush(text, current, next_separators, chunk_size, overlap, results)
                 current = carry

@@ -354,3 +354,72 @@ class TestNestedRecursionDoesNotRepeatAPrefix:
         ]
         assert contained == []
         _assert_offset_invariant(document, chunks)
+
+
+class TestFoldedFlushDoesNotRepeatItsOwnTail:
+    """After folding a part in and recursing, nothing may be carried forward.
+
+    ``_flush`` has already emitted the whole combined span, and its recursion
+    applied overlap *within* what it split. Carrying a tail on top of that
+    re-emits text the recursion covered: the next chunk starts inside the span
+    just written, so it runs backwards and contains its predecessor.
+
+    The oversized branch always cleared the carry in practice -- a part larger
+    than ``chunk_size`` also exceeds ``overlap``, so ``_carry_overlap`` came
+    back empty -- but by accident rather than intent. The carry-retains-
+    everything branch admits parts *smaller* than ``overlap``, where that
+    accident does not hold, which is what this pins.
+
+    Reported reproduction, exact: ``"aa\n a"`` at 4/3 with separators
+    ``["\n", " ", ""]`` produced ``(0,3), (4,5), (3,5)`` -- the final chunk
+    moving backward and wholly repeating the one before it.
+    """
+
+    TEXT = "aa\n a"
+    CONFIG = ChunkingConfig(chunk_size=4, chunk_overlap=3, separators=["\n", " ", ""])
+
+    def _chunks(self) -> tuple[Document, list[Chunk]]:
+        document = Document(source="t.md", content=self.TEXT)
+        return document, RecursiveChunker().chunk(document, config=self.CONFIG)
+
+    def test_chunk_starts_never_move_backwards(self) -> None:
+        _, chunks = self._chunks()
+        starts = [c.start_offset for c in chunks]
+
+        assert starts == sorted(starts), (
+            f"chunk starts run backwards ({starts}) -- a folded flush carried a tail "
+            "its own recursion had already emitted"
+        )
+
+    def test_no_chunk_repeats_one_already_emitted(self) -> None:
+        document, chunks = self._chunks()
+        spans = [(c.start_offset, c.end_offset) for c in chunks]
+
+        contained = [
+            (a, b)
+            for index, a in enumerate(spans)
+            for b in spans[index + 1 :]
+            if (b[0] <= a[0] and a[1] <= b[1]) or (a[0] <= b[0] and b[1] <= a[1])
+        ]
+        assert contained == [], f"chunks repeat one another: {contained}"
+        _assert_offset_invariant(document, chunks)
+        _assert_sequential_index(chunks)
+
+    def test_every_non_separator_character_is_still_covered(self) -> None:
+        """Clearing the carry must drop duplicates, never content.
+
+        Separator characters are consumed by the split and are legitimately
+        absent from every chunk, so they are excluded from the check.
+        """
+        document, chunks = self._chunks()
+        covered: set[int] = set()
+        for chunk in chunks:
+            covered.update(range(chunk.start_offset, chunk.end_offset))
+        separators = set("".join(s for s in self.CONFIG.separators if s))
+
+        missing = [
+            index
+            for index, char in enumerate(document.content)
+            if char.strip() and char not in separators and index not in covered
+        ]
+        assert missing == [], f"content characters dropped at offsets {missing}"
