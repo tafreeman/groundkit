@@ -20,6 +20,17 @@ Scoring is **document-level**: the chunk ranking is collapsed to first-seen dist
 documents before scoring, because BEIR's qrels and published numbers are per
 document. Scoring chunks directly against document-level gold understates every
 system (see RESULTS-scifact-2026-08-21.md).
+
+**Known limitation: re-pulling an Ollama tag is invisible to both caches.** The
+index sentinel and the score cache bind to the corpus content, the chunking
+config, the model *tag* and its dimensions -- not to the weights behind the tag.
+``ollama pull nomic-embed-text`` can replace those weights while the tag stays
+identical, and both caches would then serve vectors and scores produced by the
+previous model. Binding to the manifest digest would close this; it is not done
+here because it needs a live daemon to resolve and could not be verified when
+this was written. **Until it is: delete ``--work`` after re-pulling any model in
+WAVES.** Everything else that can silently change under a cache -- corpus edits,
+renames, chunking changes, a corrected dimension -- is already detected.
 """
 
 from __future__ import annotations
@@ -179,19 +190,43 @@ def _sentinel_inputs(corpus: Path, model: str, dims: int) -> dict:
     }
 
 
-def _sentinel_valid(index_dir: Path, expected: dict) -> bool:
-    """True only if a completion sentinel exists and matches the current inputs."""
+def _read_sentinel(index_dir: Path) -> dict | None:
+    """The parsed sentinel, or ``None`` if absent or unreadable."""
     sentinel = index_dir / SENTINEL_NAME
     if not sentinel.exists():
-        return False
+        return None
     try:
-        recorded = json.loads(sentinel.read_text(encoding="utf-8"))
+        parsed = json.loads(sentinel.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _sentinel_build(index_dir: Path) -> dict:
+    """What the run that built this index measured while building it.
+
+    Kept beside the identity rather than mixed into it: these are *outputs* of
+    the build, so comparing them would make every sentinel mismatch itself.
+    Empty when the sentinel predates this field, which reads as "not measured"
+    rather than as zero.
+    """
+    recorded = _read_sentinel(index_dir)
+    build = recorded.get("build") if recorded else None
+    return build if isinstance(build, dict) else {}
+
+
+def _sentinel_valid(index_dir: Path, expected: dict) -> bool:
+    """True only if a completion sentinel exists and matches the current inputs."""
+    recorded = _read_sentinel(index_dir)
+    if recorded is None:
+        return False
+    recorded = recorded.get("inputs")  # type: ignore[assignment]
+    if not isinstance(recorded, dict):
         return False
     return recorded == expected
 
 
-def _write_sentinel(index_dir: Path, inputs: dict) -> None:
+def _write_sentinel(index_dir: Path, inputs: dict, build: dict) -> None:
     """Write the completion sentinel atomically.
 
     A plain ``write_text`` can be interrupted mid-write (process kill, power
@@ -200,10 +235,14 @@ def _write_sentinel(index_dir: Path, inputs: dict) -> None:
     forces a re-index) -- but the truncated-then-trusted case is the one worth
     closing. Writing to a ``.tmp`` file and ``os.replace``-ing it over the real
     name means the sentinel is only ever fully-written or absent, never partial.
+
+    ``inputs`` is the identity ``_sentinel_valid`` compares; ``build`` is what
+    that build measured, carried so a later rescore against a reused index can
+    still report the embedding cost rather than inventing a zero for it.
     """
     sentinel = index_dir / SENTINEL_NAME
     tmp_path = sentinel.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(inputs, indent=2), encoding="utf-8")
+    tmp_path.write_text(json.dumps({"inputs": inputs, "build": build}, indent=2), encoding="utf-8")
     os.replace(tmp_path, sentinel)
 
 
@@ -254,7 +293,9 @@ async def index_and_score(
     embedder = build_embedder(EmbeddingConfig(provider="ollama", model_name=model, dimensions=dims))
     vectors = await LanceDBVectorStore.open(db_path=lance_dir)
 
-    embed_seconds = 0.0
+    # `None`, not 0.0: an unmeasured cost and a zero cost are different claims,
+    # and only one of them is ever true here.
+    embed_seconds: float | None = None
     chunks = 0
     try:
         if fresh:
@@ -271,18 +312,25 @@ async def index_and_score(
             embed_seconds = time.perf_counter() - started
             chunks = report.chunks_written
             # Only recorded once indexing has actually finished -- an
-            # interrupted run must not leave a sentinel a later run would trust.
-            _write_sentinel(index_dir, sentinel_inputs)
+            # interrupted run must not leave a sentinel a later run would
+            # trust. The build cost travels with it so a later rescore can
+            # report it rather than re-measure it.
+            _write_sentinel(
+                index_dir, sentinel_inputs, {"embed_seconds": embed_seconds, "chunks": chunks}
+            )
         else:
-            # Read the real size off the store rather than leaving the counter
-            # at its initial zero. The score cache and the index sentinel have
-            # different identities on purpose -- changing the judgments, the
-            # candidate depth or SCORING_VERSION invalidates the scores while
-            # the index stays valid -- so this branch runs whenever a rescore
-            # reuses an index, and reporting `"chunks": 0` there would
-            # overwrite the model's real index size in both the cached entry
-            # and summary.json with a number no run ever measured.
+            # The score cache and the index sentinel have different identities
+            # on purpose -- changing the judgments, the candidate depth or
+            # SCORING_VERSION invalidates the scores while the index stays
+            # valid -- so this branch runs whenever a rescore reuses an index.
+            # Both numbers below describe the *build*, and this run did not
+            # build anything, so neither may be reported as zero: the chunk
+            # count would understate the index and the embed time would erase
+            # the ingest cost that is one of this bake-off's headline
+            # comparisons. The count is authoritative from the store; the
+            # timing can only come from the run that measured it.
             chunks = await store.count_chunks()
+            embed_seconds = _sentinel_build(index_dir).get("embed_seconds")
 
         retriever = await Retriever.open(
             store=store, embedder=embedder, vector_store=vectors, collection="beir"
@@ -311,7 +359,10 @@ async def index_and_score(
         "dimensions": dims,
         "chunks": chunks,
         "reused_index": not fresh,
-        "embed_minutes": round(embed_seconds / 60, 2),
+        # `null` rather than 0.0 when this run reused an index built before the
+        # sentinel carried timings -- a reader can tell "not measured" from
+        # "measured as free", which a zero cannot.
+        "embed_minutes": None if embed_seconds is None else round(embed_seconds / 60, 2),
         "query_p50_ms": round(latencies[len(latencies) // 2], 1),
         "query_p95_ms": round(latencies[int(len(latencies) * 0.95)], 1),
         "vector_store_mb": round(vector_bytes / 1e6, 1),
@@ -444,9 +495,14 @@ async def main() -> None:
     ):
         pq = r["per_query"]
         cells = [np.mean([v[m] for v in pq.values()]) for m in METRICS]
+        # `embed_minutes` is None when this run reused an index whose sentinel
+        # predates the recorded build timing. Printed as `--`, which a reader
+        # will not mistake for a measurement, and which also keeps the format
+        # spec from raising on None.
+        embed_cell = "    -- " if r["embed_minutes"] is None else f"{r['embed_minutes']:5.1f}m "
         print(
             f"{r['model']:26s} {r['dimensions']:5d} | {cells[0]:8.4f} {cells[1]:6.3f} "
-            f"{cells[3]:6.3f} {cells[2]:6.3f} | {r['embed_minutes']:5.1f}m "
+            f"{cells[3]:6.3f} {cells[2]:6.3f} | {embed_cell}"
             f"{r['query_p50_ms']:6.0f}ms {r['vector_store_mb']:7.0f}MB"
         )
 
