@@ -299,3 +299,33 @@ def test_document_ids_colliding_only_by_case_are_refused(tmp_path: Path) -> None
 
     # And nothing may have been written before the refusal.
     assert not (output / "corpus").exists()
+
+
+@pytest.mark.parametrize("reserved", ["CON", "nul", "COM1", "LPT9", "aux"])
+def test_windows_reserved_device_names_are_refused(tmp_path: Path, reserved: str) -> None:
+    """``CON``/``NUL``/``COM1`` name devices, not files, in the Win32 namespace,
+    and the reservation covers the stem so ``CON.txt`` is reserved too.
+
+    How it manifests is build-dependent -- on Windows 11 26340 the write does
+    not raise, and ``NUL`` accepts it and reads back empty, silently losing the
+    document. Refused everywhere so the adapted corpus does not depend on the
+    OS it was produced on.
+    """
+    source = tmp_path / "beir"
+    _write_beir(source, document_id=reserved)
+
+    with pytest.raises(EvalError, match="reserved Windows device name"):
+        adapt_beir_dataset(source, tmp_path / "adapted")
+
+
+def test_a_document_id_merely_starting_with_a_device_name_is_allowed(tmp_path: Path) -> None:
+    """The reservation is the whole stem, not a prefix -- ``CONTEXT`` and
+    ``COM10`` are ordinary names and must not be caught by the guard."""
+    source = tmp_path / "beir"
+    output = tmp_path / "adapted"
+    _write_beir(source, document_id="CONTEXT")
+
+    report = adapt_beir_dataset(source, output)
+
+    assert report.document_count == 1
+    assert (output / "corpus" / "CONTEXT.txt").exists()

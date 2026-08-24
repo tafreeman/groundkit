@@ -53,48 +53,53 @@ async def groundkit_per_query():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         store = await SQLiteMetadataStore.open(index_dir=tmp, collection="gk")
-        emb = build_embedder(
-            EmbeddingConfig(provider="ollama", model_name="nomic-embed-text", dimensions=768)
-        )
-        vs = await LanceDBVectorStore.open(db_path=tmp / "lance")
-        idx = Indexer(
-            store=store,
-            loader=FileLoader(allowed_base_dir=ROOT),
-            chunking_config=ChunkingConfig(
-                chunk_size=512, chunk_overlap=64, separators=["\n\n", "\n", ". ", " ", ""]
-            ),
-            embedder=emb,
-            vector_store=vs,
-            collection="gk",
-        )
-        await idx.index_directory(str(ROOT / "evals/corpus"))
-        r = await Retriever.open(store=store, embedder=emb, vector_store=vs, collection="gk")
-        # IDCG is taken over the relevant-*chunk* count, so groundkit's own
-        # chunk set has to be enumerated -- it cannot be derived from a
-        # ranking, and it differs from the generic pipeline's because the two
-        # chunk differently. Both sides are normalized the same way, which is
-        # what makes the comparison mean anything.
-        sources = await store.get_document_sources()
-        gk_chunks = [
-            {
-                "doc": Path(sources[c.document_id]).name,
-                "start": c.start_offset,
-                "end": c.end_offset,
-            }
-            for c in await store.get_chunks()
-        ]
-        out = {}
-        for j in answerable:
-            resp = await r.search(j["query"], top_k=TOP_K, mode="hybrid")
-            ranked = [
-                {"doc": Path(x.source).name, "start": x.start_offset, "end": x.end_offset}
-                for x in resp.results
-            ]
-            spans = gold[j["query_id"]]
-            out[j["query_id"]] = score(
-                ranked, spans, TOP_K, total_relevant=relevant_chunk_count(gk_chunks, spans)
+        try:
+            emb = build_embedder(
+                EmbeddingConfig(provider="ollama", model_name="nomic-embed-text", dimensions=768)
             )
-        await store.close()
+            vs = await LanceDBVectorStore.open(db_path=tmp / "lance")
+            idx = Indexer(
+                store=store,
+                loader=FileLoader(allowed_base_dir=ROOT),
+                chunking_config=ChunkingConfig(
+                    chunk_size=512, chunk_overlap=64, separators=["\n\n", "\n", ". ", " ", ""]
+                ),
+                embedder=emb,
+                vector_store=vs,
+                collection="gk",
+            )
+            await idx.index_directory(str(ROOT / "evals/corpus"))
+            r = await Retriever.open(store=store, embedder=emb, vector_store=vs, collection="gk")
+            # IDCG is taken over the relevant-*chunk* count, so groundkit's own
+            # chunk set has to be enumerated -- it cannot be derived from a
+            # ranking, and it differs from the generic pipeline's because the two
+            # chunk differently. Both sides are normalized the same way, which is
+            # what makes the comparison mean anything.
+            sources = await store.get_document_sources()
+            gk_chunks = [
+                {
+                    "doc": Path(sources[c.document_id]).name,
+                    "start": c.start_offset,
+                    "end": c.end_offset,
+                }
+                for c in await store.get_chunks()
+            ]
+            out = {}
+            for j in answerable:
+                resp = await r.search(j["query"], top_k=TOP_K, mode="hybrid")
+                ranked = [
+                    {"doc": Path(x.source).name, "start": x.start_offset, "end": x.end_offset}
+                    for x in resp.results
+                ]
+                spans = gold[j["query_id"]]
+                out[j["query_id"]] = score(
+                    ranked, spans, TOP_K, total_relevant=relevant_chunk_count(gk_chunks, spans)
+                )
+        finally:
+            # Same Windows constraint as `generic_per_query` below: an open
+            # SQLite handle blocks the TemporaryDirectory cleanup, so the
+            # close must happen even when scoring raises.
+            await store.close()
         return out
 
 
@@ -105,27 +110,35 @@ def generic_per_query(size, overlap):
     ids = [c["id"] for c in chunks]
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        con = sqlite3.connect(tmp / "g.sqlite3")
-        con.execute("CREATE VIRTUAL TABLE chunks USING fts5(chunk_id UNINDEXED, text)")
-        con.executemany(
-            "INSERT INTO chunks(chunk_id,text) VALUES (?,?)",
-            ((c["id"], c["text"]) for c in chunks),
-        )
-        con.commit()
-        mat = embed([c["text"] for c in chunks])
-        qv = embed([j["query"] for j in answerable])
-        out = {}
-        for i, j in enumerate(answerable):
-            b = bm25_search(con, j["query"], TOP_K)
-            d = dense_search(mat, ids, qv[i], TOP_K)
-            f = rrf([b, d], RRF_K)[:TOP_K]
-            spans = gold[j["query_id"]]
-            out[j["query_id"]] = score(
-                [by_id[c] for c, _ in f],
-                spans,
-                TOP_K,
-                total_relevant=relevant_chunk_count(chunks, spans),
+        con = None
+        try:
+            con = sqlite3.connect(tmp / "g.sqlite3")
+            con.execute("CREATE VIRTUAL TABLE chunks USING fts5(chunk_id UNINDEXED, text)")
+            con.executemany(
+                "INSERT INTO chunks(chunk_id,text) VALUES (?,?)",
+                ((c["id"], c["text"]) for c in chunks),
             )
+            con.commit()
+            mat = embed([c["text"] for c in chunks])
+            qv = embed([j["query"] for j in answerable])
+            out = {}
+            for i, j in enumerate(answerable):
+                b = bm25_search(con, j["query"], TOP_K)
+                d = dense_search(mat, ids, qv[i], TOP_K)
+                f = rrf([b, d], RRF_K)[:TOP_K]
+                spans = gold[j["query_id"]]
+                out[j["query_id"]] = score(
+                    [by_id[c] for c, _ in f],
+                    spans,
+                    TOP_K,
+                    total_relevant=relevant_chunk_count(chunks, spans),
+                )
+        finally:
+            # An open FTS5 handle blocks TemporaryDirectory cleanup on Windows
+            # (PermissionError, WinError 32), which would surface after the
+            # comparison ran but before its caller could use the result.
+            if con is not None:
+                con.close()
     return out, len(chunks)
 
 

@@ -147,6 +147,18 @@ def compare_report_stages(
 ) -> BootstrapResult:
     """Compare two stages from the same eval artifact."""
 
+    # `EvalReport`'s validator pins exactly one baseline, at position zero,
+    # named "bm25" -- but nothing stops two later stages sharing a name. A
+    # dict comprehension would keep the last silently, so which `dense` stage
+    # a comparison actually measured would depend on their order in the file.
+    duplicate_stages = sorted(
+        {stage.stage for stage in report.stages if _count_stage(report, stage.stage) > 1}
+    )
+    if duplicate_stages:
+        raise EvalError(
+            f"report contains more than one stage named {duplicate_stages}; a comparison "
+            "cannot say which of them it measured"
+        )
     stages = {stage.stage: stage for stage in report.stages}
     try:
         baseline_stage = stages[baseline]
@@ -166,6 +178,10 @@ def compare_report_stages(
         seed=seed,
         confidence_level=confidence_level,
     )
+
+
+def _count_stage(report: EvalReport, name: StageName) -> int:
+    return sum(1 for stage in report.stages if stage.stage == name)
 
 
 def _query_scores(query_results: Sequence[QueryResult], metric: MetricName) -> dict[str, float]:

@@ -320,3 +320,19 @@ def test_compare_report_stages_rejects_duplicate_query_ids() -> None:
 
     with pytest.raises(EvalError, match="duplicate query id"):
         compare_report_stages(report, baseline="bm25", candidate="dense", metric="ndcg_at_10")
+
+
+def test_compare_report_stages_rejects_duplicate_stage_names() -> None:
+    """``EvalReport`` pins exactly one baseline at position zero, but nothing
+    stops two later stages sharing a name. A dict comprehension would keep the
+    last silently, making the comparison depend on their order in the file."""
+    report = _report(
+        [
+            _stage("bm25", [_query("q-1", ndcg=0.2)], is_baseline=True),
+            _stage("dense", [_query("q-1", ndcg=0.6)], is_baseline=False),
+            _stage("dense", [_query("q-1", ndcg=0.9)], is_baseline=False),
+        ]
+    )
+
+    with pytest.raises(EvalError, match="more than one stage named"):
+        compare_report_stages(report, baseline="bm25", candidate="dense", metric="ndcg_at_10")

@@ -47,6 +47,14 @@ _HARNESS_QUERY_ID = re.compile(_QUERY_ID_PATTERN)
 #: (``qrels/<split>.tsv``), so the same character-class discipline applies.
 _SAFE_SPLIT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+#: Stems Windows reserves for devices. The reservation applies to the stem, so
+#: ``CON.txt`` is reserved as surely as ``CON``.
+_WINDOWS_RESERVED_STEMS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{digit}" for digit in range(1, 10)}
+    | {f"LPT{digit}" for digit in range(1, 10)}
+)
+
 _TITLE_SEPARATOR = "\n\n"
 
 
@@ -316,4 +324,19 @@ def _validate_identifier(value: str, *, subject: str) -> None:
         raise EvalError(
             f"unsafe BEIR {subject} id {value!r}; expected letters, digits, dot, "
             "underscore, or hyphen"
+        )
+    # `CON`, `NUL`, `COM1` and friends name devices rather than files in the
+    # Win32 namespace, and the reservation applies to the stem, so `CON.txt`
+    # is reserved too. How that manifests depends on the Windows build --
+    # measured on Windows 11 26340 it does not raise at all, and `NUL` instead
+    # *accepts* the write and reads back empty, silently losing the document's
+    # text. Refused on every platform for the same reason case-colliding ids
+    # are: a benchmark corpus whose contents depend on the OS it was adapted
+    # on is not a reproducible input, and a silent truncation is worse than a
+    # refusal.
+    if value.split(".", 1)[0].upper() in _WINDOWS_RESERVED_STEMS:
+        raise EvalError(
+            f"BEIR {subject} id {value!r} is a reserved Windows device name; it cannot "
+            "be a file there, and on some builds the write silently succeeds while "
+            "discarding the content. Rename or map this id before adapting."
         )

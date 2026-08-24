@@ -53,61 +53,74 @@ def main() -> None:
     # including on an exception raised anywhere in the block below.
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        t0 = time.perf_counter()
-        con = sqlite3.connect(tmp / "g.sqlite3")
-        con.execute("CREATE VIRTUAL TABLE chunks USING fts5(chunk_id UNINDEXED, text)")
-        con.executemany(
-            "INSERT INTO chunks(chunk_id, text) VALUES (?,?)",
-            ((c["id"], c["text"]) for c in chunks),
-        )
-        con.commit()
-        t_fts = time.perf_counter() - t0
+        con = con2 = None
+        try:
+            t0 = time.perf_counter()
+            con = sqlite3.connect(tmp / "g.sqlite3")
+            con.execute("CREATE VIRTUAL TABLE chunks USING fts5(chunk_id UNINDEXED, text)")
+            con.executemany(
+                "INSERT INTO chunks(chunk_id, text) VALUES (?,?)",
+                ((c["id"], c["text"]) for c in chunks),
+            )
+            con.commit()
+            t_fts = time.perf_counter() - t0
 
-        t0 = time.perf_counter()
-        mat = embed([c["text"] for c in chunks])
-        t_embed = time.perf_counter() - t0
-        print(
-            f"index: FTS5 {t_fts * 1000:.0f} ms  |  embed {len(chunks)} chunks {t_embed:.1f}s "
-            f"({len(chunks) / t_embed:.0f} chunks/s)"
-        )
+            t0 = time.perf_counter()
+            mat = embed([c["text"] for c in chunks])
+            t_embed = time.perf_counter() - t0
+            print(
+                f"index: FTS5 {t_fts * 1000:.0f} ms  |  embed {len(chunks)} chunks {t_embed:.1f}s "
+                f"({len(chunks) / t_embed:.0f} chunks/s)"
+            )
 
-        t0 = time.perf_counter()
-        con2 = sqlite3.connect(tmp / "g.sqlite3")
-        con2.execute("SELECT count(*) FROM chunks").fetchone()
-        mat2 = np.array(mat)
-        print(f"open: {(time.perf_counter() - t0) * 1000:.1f} ms (FTS5 + vectors already built)")
+            t0 = time.perf_counter()
+            con2 = sqlite3.connect(tmp / "g.sqlite3")
+            con2.execute("SELECT count(*) FROM chunks").fetchone()
+            mat2 = np.array(mat)
+            print(
+                f"open: {(time.perf_counter() - t0) * 1000:.1f} ms (FTS5 + vectors already built)"
+            )
 
-        qvecs = embed([j["query"] for j in judgments])
-        qv = {j["query_id"]: qvecs[i] for i, j in enumerate(judgments)}
+            qvecs = embed([j["query"] for j in judgments])
+            qv = {j["query_id"]: qvecs[i] for i, j in enumerate(judgments)}
 
-        results = {"bm25": [], "dense": [], "fusion": []}
-        lat = {"bm25": [], "dense": [], "fusion": []}
-        abstain = {"bm25": 0, "dense": 0, "fusion": 0}
+            results = {"bm25": [], "dense": [], "fusion": []}
+            lat = {"bm25": [], "dense": [], "fusion": []}
+            abstain = {"bm25": 0, "dense": 0, "fusion": 0}
 
-        for j in judgments:
-            qid = j["query_id"]
-            runs = {}
-            for stage in ("bm25", "dense", "fusion"):
-                t0 = time.perf_counter()
-                if stage == "bm25":
-                    r = bm25_search(con2, j["query"], TOP_K)
-                elif stage == "dense":
-                    r = dense_search(mat2, ids, qv[qid], TOP_K)
-                else:
-                    r = rrf([runs["bm25"], runs["dense"]], RRF_K)[:TOP_K]
-                lat[stage].append((time.perf_counter() - t0) * 1000)
-                runs[stage] = r
-                if j["gold"]:
-                    results[stage].append(
-                        score(
-                            [by_id[c] for c, _ in r],
-                            gold[qid],
-                            TOP_K,
-                            total_relevant=relevant_chunk_count(chunks, gold[qid]),
+            for j in judgments:
+                qid = j["query_id"]
+                runs = {}
+                for stage in ("bm25", "dense", "fusion"):
+                    t0 = time.perf_counter()
+                    if stage == "bm25":
+                        r = bm25_search(con2, j["query"], TOP_K)
+                    elif stage == "dense":
+                        r = dense_search(mat2, ids, qv[qid], TOP_K)
+                    else:
+                        r = rrf([runs["bm25"], runs["dense"]], RRF_K)[:TOP_K]
+                    lat[stage].append((time.perf_counter() - t0) * 1000)
+                    runs[stage] = r
+                    if j["gold"]:
+                        results[stage].append(
+                            score(
+                                [by_id[c] for c, _ in r],
+                                gold[qid],
+                                TOP_K,
+                                total_relevant=relevant_chunk_count(chunks, gold[qid]),
+                            )
                         )
-                    )
-                elif not r:
-                    abstain[stage] += 1
+                    elif not r:
+                        abstain[stage] += 1
+        finally:
+            # Windows refuses to remove a file that still has an open handle,
+            # so an unclosed FTS5 connection turns TemporaryDirectory's cleanup
+            # into a PermissionError (WinError 32) that surfaces *after* the
+            # benchmark ran but *before* it printed anything. Reproduced on
+            # this machine; closing here is what makes the cleanup safe.
+            for connection in (con, con2):
+                if connection is not None:
+                    connection.close()
 
     print()
     print(

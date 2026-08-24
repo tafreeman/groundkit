@@ -239,6 +239,16 @@ async def index_and_score(
             # Only recorded once indexing has actually finished -- an
             # interrupted run must not leave a sentinel a later run would trust.
             _write_sentinel(index_dir, sentinel_inputs)
+        else:
+            # Read the real size off the store rather than leaving the counter
+            # at its initial zero. The score cache and the index sentinel have
+            # different identities on purpose -- changing the judgments, the
+            # candidate depth or SCORING_VERSION invalidates the scores while
+            # the index stays valid -- so this branch runs whenever a rescore
+            # reuses an index, and reporting `"chunks": 0` there would
+            # overwrite the model's real index size in both the cached entry
+            # and summary.json with a number no run ever measured.
+            chunks = await store.count_chunks()
 
         retriever = await Retriever.open(
             store=store, embedder=embedder, vector_store=vectors, collection="beir"
