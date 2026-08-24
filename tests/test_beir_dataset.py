@@ -421,3 +421,55 @@ def test_a_reserved_device_name_is_allowed_as_a_query_id(tmp_path: Path) -> None
     assert report.query_count == 1
     judgments = load_judgments(output / "judgments.jsonl")
     assert judgments[0].query_id == "con"
+
+
+def test_a_document_id_too_long_for_a_filename_is_refused(tmp_path: Path) -> None:
+    """252 characters plus ``.txt`` is 256 bytes, past the 255-byte component
+    limit ext4, APFS and NTFS all enforce.
+
+    Refused during validation rather than discovered at ``write_text``: the
+    documents are written in sorted order, so an id failing there would raise
+    only after every alphabetically earlier document had already landed --
+    exactly the half-populated output this module validates up front to avoid.
+    """
+    source = tmp_path / "beir"
+    output = tmp_path / "adapted"
+    _write_beir(source, document_id="a" * 252)
+
+    with pytest.raises(EvalError, match="filename limit"):
+        adapt_beir_dataset(source, output)
+
+    assert not (output / "corpus").exists()
+
+
+def test_a_document_id_that_just_fits_is_accepted(tmp_path: Path) -> None:
+    """251 + 4 = 255 is exactly the limit and must still work -- the bound is
+    off-by-one sensitive in the direction that would reject valid corpora."""
+    source = tmp_path / "beir"
+    output = tmp_path / "adapted"
+    document_id = "a" * 251
+    _write_beir(source, document_id=document_id)
+
+    report = adapt_beir_dataset(source, output)
+
+    assert report.document_count == 1
+    assert (output / "corpus" / f"{document_id}.txt").exists()
+
+
+def test_a_long_query_id_is_not_refused(tmp_path: Path) -> None:
+    """The bound is about filenames, and a query id never becomes one."""
+    source = tmp_path / "beir"
+    output = tmp_path / "adapted"
+    long_query = "q-" + "a" * 300
+    _write_beir(source)
+    (source / "queries.jsonl").write_text(
+        json.dumps({"_id": long_query, "text": "What is in the body?"}) + "\n",
+        encoding="utf-8",
+    )
+    (source / "qrels" / "test.tsv").write_text(
+        f"query-id\tcorpus-id\tscore\n{long_query}\tdoc-1\t1\n", encoding="utf-8"
+    )
+
+    report = adapt_beir_dataset(source, output)
+
+    assert report.query_count == 1

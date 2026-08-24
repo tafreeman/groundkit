@@ -63,6 +63,18 @@ Artifacts: `evals/results/baseline-bm25-2026-08-21.json` · `baseline-dense-2026
 
 All columns are `min` of repeated runs (3 ingests, 5 query batteries); the JSON carries median, max and spread.
 
+**The `db MB` column understates, and needs a re-run.** It was measured by
+`stat()`-ing `<collection>.sqlite3` *before* closing the store. The store runs in
+WAL mode, so a large share of the committed pages were still in the `-wal` file
+and not yet checkpointed into the file being measured — the figure therefore
+depended on whatever the auto-checkpoint happened to have folded in. Reproduced
+on a 2,000-chunk store: 1,806,336 bytes measured before the close against
+1,978,368 after, an **8.7% understatement**, with 4.2 MB still outstanding in the
+`-wal` at that moment. `bench_pipeline.py` now measures after the close, which
+checkpoints and removes the WAL. Treat the three `db MB` values above as lower
+bounds. **Every other column is unaffected** — they are timings, not file sizes,
+and the ingest they measure had already completed.
+
 - validation vs `model_construct`: **4.33×**
 - metadata guard share of `Chunk(...)`: **56.0%** — held
   0.54–0.66 across every run in this session, so this is the robust micro claim. The

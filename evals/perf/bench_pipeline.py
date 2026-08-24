@@ -220,8 +220,18 @@ async def pipeline_benchmarks() -> list[dict[str, object]]:
                 ingest_wall.append(time.perf_counter() - w0)
                 ingest_cpu.append(time.process_time() - c0)
                 chunks_written = report.chunks_written
-                db_bytes = (tmp / f"{name}.sqlite3").stat().st_size
                 await store.close()
+                # Measured *after* the close, not before. The store runs in WAL
+                # mode, so at the end of an ingest a large share of the
+                # committed pages are still in `<name>.sqlite3-wal` and have not
+                # been checkpointed into the main file. Stat-ing before the
+                # close therefore reports whatever the auto-checkpoint happened
+                # to have folded in -- measured here at 1,806,336 bytes against
+                # a true 1,978,368 for 2,000 chunks, an 8.7% understatement,
+                # with 4.2 MB still outstanding in the -wal at that moment.
+                # Closing checkpoints and removes the WAL, so the main file is
+                # then the whole database.
+                db_bytes = (tmp / f"{name}.sqlite3").stat().st_size
 
             # Reopen the last-written collection for the query battery.
             open_wall: list[float] = []

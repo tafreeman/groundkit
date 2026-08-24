@@ -47,6 +47,19 @@ _HARNESS_QUERY_ID = re.compile(_QUERY_ID_PATTERN)
 #: (``qrels/<split>.tsv``), so the same character-class discipline applies.
 _SAFE_SPLIT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+#: Suffix every adapted document file carries. Named once so the length bound
+#: in ``_validate_identifier`` and the writers below cannot disagree about what
+#: the final filename is.
+_DOCUMENT_SUFFIX = ".txt"
+
+#: Longest filename, in bytes, this adapter will produce. 255 is the component
+#: limit on ext4, APFS and NTFS alike; a corpus needing more is malformed for
+#: every target, not just this one. Bounded here rather than discovered at
+#: ``write_text``, which would raise mid-loop after the alphabetically earlier
+#: documents had already been written -- exactly the half-populated output this
+#: module validates up front to avoid.
+_MAX_FILENAME_BYTES = 255
+
 #: Stems Windows reserves for devices. The reservation applies to the stem, so
 #: ``CON.txt`` is reserved as surely as ``CON``.
 _WINDOWS_RESERVED_STEMS = frozenset(
@@ -175,7 +188,8 @@ def adapt_beir_dataset(
         # `_require_empty_corpus_dir` refuses such a link outright; this is the
         # independent second barrier, and the one that stays correct if that
         # check is ever relaxed.
-        document_path = ensure_within_base(corpus_dir / f"{document_id}.txt", destination)
+        filename = f"{document_id}{_DOCUMENT_SUFFIX}"
+        document_path = ensure_within_base(corpus_dir / filename, destination)
         document_path.write_text(text, encoding="utf-8", newline="\n")
 
     judgments_path = ensure_within_base(destination / "judgments.jsonl", destination)
@@ -186,7 +200,7 @@ def adapt_beir_dataset(
                 "query": queries[query_id],
                 "category": "normal",
                 "gold": [
-                    {"doc": f"{document_id}.txt", "quote": texts[document_id]}
+                    {"doc": f"{document_id}{_DOCUMENT_SUFFIX}", "quote": texts[document_id]}
                     for document_id in sorted(qrels[query_id])
                 ],
             }
@@ -371,6 +385,14 @@ def _validate_identifier(value: str, *, subject: str, becomes_a_filename: bool) 
         )
     if not becomes_a_filename:
         return
+    encoded = len(f"{value}{_DOCUMENT_SUFFIX}".encode())
+    if encoded > _MAX_FILENAME_BYTES:
+        raise EvalError(
+            f"BEIR {subject} id {value[:32]!r}... is {len(value)} characters; with "
+            f"{_DOCUMENT_SUFFIX!r} that is {encoded} bytes, past the {_MAX_FILENAME_BYTES}-byte "
+            "filename limit every common filesystem enforces. Refused here rather than at "
+            "the write, which would fail partway through an otherwise-valid corpus."
+        )
     # `CON`, `NUL`, `COM1` and friends name devices rather than files in the
     # Win32 namespace, and the reservation applies to the stem, so `CON.txt`
     # is reserved too. How that manifests depends on the Windows build --
