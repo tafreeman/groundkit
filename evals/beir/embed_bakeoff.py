@@ -29,8 +29,12 @@ identical, and both caches would then serve vectors and scores produced by the
 previous model. Binding to the manifest digest would close this; it is not done
 here because it needs a live daemon to resolve and could not be verified when
 this was written. **Until it is: delete ``--work`` after re-pulling any model in
-WAVES.** Everything else that can silently change under a cache -- corpus edits,
-renames, chunking changes, a corrected dimension -- is already detected.
+WAVES.** Everything else that can silently change under a cache is detected:
+corpus edits and renames, a corrected dimension, the chunking *configuration*,
+and -- since it is a distinct input, not the same one -- the chunker's
+*behaviour* at an unchanged configuration. That last one is not theoretical:
+this repository's own record shows 512/64 producing 25,028 spans before the
+``_merge_parts`` fix and 20,219 after.
 """
 
 from __future__ import annotations
@@ -44,14 +48,17 @@ import os
 import shutil
 import sys
 import time
+from functools import cache
 from pathlib import Path
 
 import numpy as np
 
 from groundkit.config import ChunkingConfig, EmbeddingConfig
+from groundkit.contracts import Document
 from groundkit.index.dense import LanceDBVectorStore
 from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.indexer import Indexer
+from groundkit.ingestion.chunking import RecursiveChunker
 from groundkit.ingestion.loaders import FileLoader
 from groundkit.providers.embeddings import build_embedder
 from groundkit.retrieval.search import Retriever
@@ -151,6 +158,7 @@ def model_slug(model: str) -> str:
     return f"{flattened}-{hashlib.sha256(model.encode('utf-8')).hexdigest()[:8]}"
 
 
+@cache
 def corpus_fingerprint(corpus: Path) -> str:
     """A content hash over every file in the adapted corpus directory.
 
@@ -169,6 +177,39 @@ def corpus_fingerprint(corpus: Path) -> str:
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
+    return digest.hexdigest()
+
+
+@cache
+def chunk_fingerprint(corpus: Path) -> str:
+    """A hash of the chunk boundaries this chunker produces for this corpus *now*.
+
+    ``chunking_config`` records the 512/64 values, not the algorithm that
+    turns them into boundaries, and the two are not the same input. This
+    repository's own benchmark record is the proof: at an unchanged 512/64,
+    SciFact chunked to 25,028 spans before the ``_merge_parts`` fix and 20,219
+    after (``RESULTS-scifact-2026-08-21.md``). A ``--work`` directory carried
+    across that upgrade would have matched on config, reused the pre-fix index
+    and the pre-fix scores, and published them as current -- the one failure
+    this whole cache-identity effort exists to prevent.
+
+    Fingerprinting the produced spans rather than a hand-maintained revision
+    constant is deliberate: a constant only works if whoever changes the
+    chunker remembers to bump it, and the change that motivated this was made
+    in a different pull request by someone not looking at this file. Spans
+    cannot forget.
+
+    Costs one chunking pass over the corpus -- seconds against index builds
+    measured in tens of minutes -- and is memoized, so a run pays it once
+    rather than once per model.
+    """
+    chunker = RecursiveChunker()
+    digest = hashlib.sha256()
+    for path in sorted(p for p in corpus.rglob("*") if p.is_file()):
+        name = path.relative_to(corpus).as_posix()
+        document = Document(source=name, content=path.read_text(encoding="utf-8"))
+        for chunk in chunker.chunk(document, config=CFG):
+            digest.update(f"{name}:{chunk.start_offset}:{chunk.end_offset}\0".encode())
     return digest.hexdigest()
 
 
@@ -195,6 +236,7 @@ def _sentinel_inputs(corpus: Path, model: str, dims: int) -> dict:
         "corpus_path": str(resolved),
         "corpus_fingerprint": corpus_fingerprint(resolved),
         "chunking_config": CFG.model_dump(),
+        "chunk_fingerprint": chunk_fingerprint(resolved),
         "model": model,
         "dims": dims,
     }
@@ -465,6 +507,7 @@ async def main() -> None:
             (args.data / "judgments.jsonl").read_bytes()
         ).hexdigest(),
         "chunking_config": CFG.model_dump(),
+        "chunk_fingerprint": chunk_fingerprint(corpus.resolve()),
         "candidates": CANDIDATES,
     }
 
