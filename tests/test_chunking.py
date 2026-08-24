@@ -507,3 +507,57 @@ class TestOverlapIsAppliedOnceNotTwice:
         ]
         assert contained == [], f"contained spans for {text!r}: {contained}"
         _assert_offset_invariant(document, chunks)
+
+
+class TestBlankPrefixIsDroppedNotPromoted:
+    """A whitespace-only run must never be folded into an oversized part.
+
+    ``_part_offsets`` keeps blank parts like any other, so ``current`` can hold
+    nothing but separators and indentation. ``_flush`` drops such a span by its
+    own blank check -- but the fold bypasses ``_flush``'s judgement and
+    *prepends* the blank run to the part's first sub-chunk, promoting a
+    droppable gap into content and shifting every boundary after it.
+
+    Reported reproduction, exact: 99 spaces, then ``". "``, then 101 ``x``, at
+    100/0 produced ``(0,100), (100,200), (200,202)`` -- a leading chunk whose
+    entire content is one full stop. ``main`` produced the two body chunks and
+    nothing else, so this was introduced by this branch's first commit.
+    """
+
+    TEXT = " " * 99 + ". " + "x" * 101
+    CONFIG = ChunkingConfig(chunk_size=100, chunk_overlap=0)
+
+    def _chunks(self) -> tuple[Document, list[Chunk]]:
+        document = Document(source="t.md", content=self.TEXT)
+        return document, RecursiveChunker().chunk(document, config=self.CONFIG)
+
+    def test_no_chunk_is_only_punctuation_and_whitespace(self) -> None:
+        _, chunks = self._chunks()
+
+        empty = [c.content for c in chunks if not c.content.strip(" \t\n.")]
+        assert empty == [], (
+            f"chunks carrying no content: {empty!r} -- a blank prefix was folded "
+            "into the oversized part instead of dropped"
+        )
+
+    def test_the_leading_blank_run_is_not_prepended_to_the_body(self) -> None:
+        document, chunks = self._chunks()
+
+        assert chunks[0].start_offset == 101, (
+            f"first chunk starts at {chunks[0].start_offset}, not at the body -- "
+            "the blank run was promoted into content"
+        )
+        _assert_offset_invariant(document, chunks)
+        _assert_sequential_index(chunks)
+
+    def test_a_non_blank_prefix_is_still_folded(self) -> None:
+        """The guard must not disable the fold this branch exists for: a real
+        heading beside an oversized body still gets merged in."""
+        heading = "Sodium intake and blood pressure"
+        document = Document(source="t.md", content=f"{heading}\n\n{'x' * 1000}")
+        chunks = RecursiveChunker().chunk(
+            document, config=ChunkingConfig(chunk_size=512, chunk_overlap=64)
+        )
+
+        assert chunks[0].content != heading
+        assert heading in chunks[0].content

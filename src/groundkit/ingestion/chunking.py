@@ -198,7 +198,19 @@ class RecursiveChunker:
             part_len = (part[1] - part[0]) + (sep_len if current else 0)
             if current and self._span_len(current) + part_len > chunk_size:
                 carry = self._carry_overlap(current, sep_len, overlap)
-                if (part[1] - part[0]) > chunk_size or carry == current:
+                if not text[current[0][0] : current[-1][1]].strip():
+                    # ``current`` is only separators and whitespace, which
+                    # ``_part_offsets`` keeps as parts like any other. Both
+                    # branches below are wrong for it: :meth:`_flush` would
+                    # drop it (its own blank check), while folding it into
+                    # ``part`` would *promote* it -- prepending the blank run
+                    # to the part's first sub-chunk, so a leading indent or a
+                    # run of newlines becomes a chunk whose only content is the
+                    # punctuation that followed it, and every boundary after it
+                    # shifts. Dropped instead, which is what happened before
+                    # the fold existed.
+                    current = []
+                elif (part[1] - part[0]) > chunk_size or carry == current:
                     # Two ways flushing ``current`` alone would emit a chunk the
                     # next one wholly contains, which is duplication rather than
                     # chunking:
@@ -222,8 +234,15 @@ class RecursiveChunker:
                     )
                     current = self._carry_after(recursed, carry=[])
                     continue
-                recursed = self._flush(text, current, next_separators, chunk_size, overlap, results)
-                current = self._carry_after(recursed, carry=carry)
+                else:
+                    # Reached only when ``current`` has content and neither
+                    # fold condition applies. It must be an ``else``: the blank
+                    # branch above leaves ``current`` empty, and ``_flush``
+                    # indexes ``current[0]``.
+                    recursed = self._flush(
+                        text, current, next_separators, chunk_size, overlap, results
+                    )
+                    current = self._carry_after(recursed, carry=carry)
             current.append(part)
 
         if current:
