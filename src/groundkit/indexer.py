@@ -712,20 +712,25 @@ class Indexer:
         would fail an otherwise-complete ingest over cleanup of a file that
         no longer matters.
 
-        **Containment-checked** (ADR-0023 decision 4).
-        :func:`~groundkit.snapshots.snapshot_path_for` performs no check and
-        says so: ``document_id`` is a plain string field with no character
-        class, so it is attacker-influenced in principle. The read side
-        already guards this (``resolve_citation`` runs the same path through
-        ``ensure_within_base``), and unlinking is strictly more dangerous
-        than reading. ``is_within_base`` rather than ``ensure_within_base``
-        so an escape is refused and logged rather than raised, matching this
-        method's non-fatal contract.
+        **Containment-checked** (ADR-0023 decision 4). ``document_id`` is a
+        plain string field with no character class, so it is
+        attacker-influenced in principle, and unlinking is strictly more
+        dangerous than reading. Two guards apply, in order:
+        :func:`~groundkit.snapshots.snapshot_path_for` refuses a
+        ``document_id`` that is not a single path component, and
+        ``is_within_base`` then refuses a path that escapes the root.
+        ``is_within_base`` rather than ``ensure_within_base``, and the shape
+        refusal caught rather than propagated, so either rejection is logged
+        rather than raised -- matching this method's non-fatal contract.
         """
         snapshot_dir = self._snapshot_dir
         if snapshot_dir is None:
             return
-        path = snapshots.snapshot_path_for(snapshot_dir, document_id)
+        try:
+            path = snapshots.snapshot_path_for(snapshot_dir, document_id)
+        except ValueError as exc:
+            logger.warning("Refusing to remove a snapshot for document %s: %s", document_id, exc)
+            return
         if not is_within_base(path, snapshot_dir):
             logger.warning(
                 "Refusing to remove a snapshot path outside %s for document %s",

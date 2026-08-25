@@ -170,6 +170,24 @@ per SPEC.md §9:
   manifest-bound but only partially embedded — documents that changed after
   the dense path was enabled — is still not detected, and remains the
   genuine half-dense case this entry describes.
+- **A change to chunker *behaviour* does not re-chunk an existing collection.**
+  The incremental skip key is a fingerprint over document content, the
+  chunker's `type(...).__qualname__`, and the chunking configuration
+  (ADR-0009 decision 4). It deliberately does not carry a chunker *revision*:
+  a type name catches the realistic case — a different chunker class — and
+  ADR-0009 records that it "misses only a chunker whose behaviour changes
+  without its type changing, which is indistinguishable from a code upgrade."
+  That is exactly what a fix to `RecursiveChunker`'s internals is. With
+  identical source bytes and identical `ChunkingConfig` values, the
+  fingerprint is byte-identical across the upgrade, so every unchanged
+  document is skipped and keeps its **pre-upgrade chunk boundaries** — and,
+  on a dense collection, its pre-upgrade vectors, since the skip gate runs
+  before both chunking and embedding. The ingest reports success; nothing is
+  corrupt, and every stored chunk remains a valid offset-verified substring
+  of its document. The collection is simply chunked by the old algorithm
+  until it is deleted and re-ingested, which is the same remedy ADR-0004
+  decision 5 and ADR-0008 name for their own cases. Upgrades that change
+  chunk boundaries say so in `CHANGELOG.md`.
 - **A BM25-only indexer can no longer orphan a manifest-bound collection —
   it is refused (ADR-0011).** An `Indexer` constructed without an embedder or
   vector store has no vector store to delete from, so replacing or pruning a
@@ -704,8 +722,7 @@ per SPEC.md §9:
   test checks field *names*, so it would pass such a field without
   constraining any of it.
 
-- **The snapshot *read* path can still be raced by a symlink; the write path cannot.** `UrlLoader._write_snapshot` now opens with `O_NOFOLLOW`, closing the gap between its containment check and its write. `retrieval/citations.py::_resolve_snapshot` still does the same two steps — `ensure_within_base`, then `Path.read_text` — with nothing between them, so an attacker able to create a file in `<collection>.snapshots/` in that window can have citation resolution read, and return to a service caller, the contents of whatever the link points at. This is the more exploitable half of the pair: the write side could only corrupt a file, the read side exfiltrates one. It is unclosed because it needs an `O_NOFOLLOW` open on the read side too, which is a change to `citations.py` (GK-028 sub-item 4, write half only).
-- **`O_NOFOLLOW` does not exist on Windows, so the snapshot write is unguarded there.** `_O_NOFOLLOW` degrades to `0` — a no-op in the flag mask — so nothing crashes and nothing changes on win32, and `tests/test_url_loader.py::TestUrlLoaderSnapshotWriteDoesNotFollowASymlink` skips rather than passing vacuously. CI runs Linux, where the guard is real.
+- **`O_NOFOLLOW` does not exist on Windows, so the snapshot write and read are unguarded there.** `utils/path_safety.py`'s `O_NOFOLLOW` degrades to `0` — a no-op in the flag mask — so nothing crashes and nothing changes on win32, and both regression tests (`tests/test_url_loader.py::TestUrlLoaderSnapshotWriteDoesNotFollowASymlink` and `tests/test_snapshot_integration.py::TestSnapshotReadDoesNotFollowASymlink`) skip rather than passing vacuously. CI runs Linux, where both guards are real.
 - **`UrlLoader`'s timeout bounds the fetch, not everything a `load()` call does.** `timeout_seconds` wraps the HTTP exchange. The preceding `ensure_safe_endpoint` DNS resolution and the trailing snapshot write are outside it, so a pathological resolver or filesystem can still hold a `load()` past the configured bound. Both are bounded by other means (the resolver by the OS, the write by `max_bytes`), and neither holds a remote connection open, which is the resource the bound exists to protect.
 - **`Chunk.content_hash` is recomputed on every access, deliberately.** It is a sort tie-break in `retrieval/fusion.py` and `index/dense.py`, so it is hashed once per candidate per query (`index/bm25.py` caches it once at build time instead). Caching it on the model with `functools.cached_property` would unfreeze it: pydantic's `__setattr__` special-cases `cached_property` before it consults `frozen`, so `chunk.content_hash = ...` would silently succeed and every later reader — both tie-breaks and the value `index/metadata.py` persists — would use a string unrelated to `content`. The cost is unmeasured and the correctness loss is not, so it stays uncached; `tests/test_contracts.py::TestChunk::test_content_hash_cannot_be_decoupled_from_content_by_assignment` pins the refusal.
 

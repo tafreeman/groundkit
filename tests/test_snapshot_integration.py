@@ -19,6 +19,9 @@ module docstring).
 from __future__ import annotations
 
 import asyncio
+import errno
+import os
+import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Final
@@ -553,3 +556,143 @@ def test_snapshot_cleanup_is_inert_when_no_snapshot_dir_is_configured(tmp_path: 
             await store.close()
 
     asyncio.run(attempt())
+
+
+# -- The snapshot READ does not follow a symlink planted after the containment
+# -- check, and does not translate line endings on the way back in (GK-030). --
+
+
+class TestSnapshotReadDoesNotFollowASymlink:
+    """The read side of the gap ``GK-028`` closed on the write side.
+
+    ``ensure_within_base`` resolves symlinks, so a snapshot path that is
+    *already* a link out of the root is refused by the check itself. What the
+    check cannot see is a link created after it returned and before the file
+    is opened. This is the more exploitable half of the pair: the write side
+    could corrupt a file, the read side returns whatever the link points at
+    to a service caller through ``fetch_chunk``.
+
+    The race is driven from the code path itself rather than from a second
+    thread, exactly as ``tests/test_url_loader.py``'s write-side sibling does:
+    the containment check is wrapped so that planting the symlink is the last
+    thing it does before returning. That makes the interleaving deterministic
+    instead of timing-dependent, and it is the only way to reach the window at
+    all -- a symlink planted before the call is caught by the check, and one
+    planted after the read is too late to matter.
+    """
+
+    def test_a_symlink_planted_after_the_containment_check_is_not_followed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if not hasattr(os, "O_NOFOLLOW"):
+            pytest.skip("O_NOFOLLOW does not exist on this platform (Windows)")
+
+        secret = tmp_path / "secret.txt"
+        secret.write_text("SECRET-EXFILTRATED", encoding="utf-8")
+        probe = tmp_path / "symlink-probe"
+        try:
+            probe.symlink_to(secret)
+        except OSError:
+            pytest.skip("this platform or user cannot create symlinks")
+        probe.unlink()
+
+        snapshot_dir = tmp_path / "default.snapshots"
+        snapshot_dir.mkdir()
+        citation = _citation(
+            "https://example.com/raced",
+            document_id="doc-raced",
+            source_class="snapshot",
+            start_offset=0,
+            end_offset=18,
+        )
+        # Bind the real function from its defining module, not from
+        # ``citations``' re-export: the monkeypatch below replaces the latter.
+        real_ensure_within_base = ensure_within_base
+
+        def _plant_symlink_after_checking(path: str | Path, base_dir: str | Path) -> Path:
+            resolved = real_ensure_within_base(path, base_dir)
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.symlink_to(secret)
+            return resolved
+
+        monkeypatch.setattr(citations_module, "ensure_within_base", _plant_symlink_after_checking)
+
+        async def run() -> None:
+            with pytest.raises(RetrievalError) as excinfo:
+                await resolve_citation(citation, tmp_path, snapshot_dir=snapshot_dir)
+            assert excinfo.value.verdict == "unresolvable"
+            assert "symbolic link" in str(excinfo.value)
+            # The whole point: the linked-to bytes never became the answer.
+            assert "SECRET-EXFILTRATED" not in str(excinfo.value)
+
+        asyncio.run(run())
+
+    @pytest.mark.skipif(
+        sys.platform.startswith(("freebsd", "netbsd", "openbsd", "dragonfly")),
+        reason="EMLINK legitimately means 'symlinked final component' on these BSDs",
+    )
+    def test_emlink_is_not_reported_as_a_symlink_attack(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``EMLINK`` is "Too many links" off the BSDs, not a planted symlink.
+
+        The read side classifies with the same shared ``SYMLINK_ERRNOS`` the
+        write side uses, so this pins that the sharing did not widen it: an
+        unrelated I/O failure must still read as a plain unresolvable, never
+        as "something replaced the file under us".
+        """
+        snapshot_dir = tmp_path / "default.snapshots"
+        snapshot_dir.mkdir()
+        citation = _citation(
+            "https://example.com/emlink", document_id="doc-emlink", source_class="snapshot"
+        )
+        (snapshot_dir / citation.document_id).write_text("content", encoding="utf-8")
+
+        def _raise_emlink(*_args: object, **_kwargs: object) -> int:
+            raise OSError(errno.EMLINK, "Too many links")
+
+        monkeypatch.setattr("groundkit.retrieval.citations.os.open", _raise_emlink)
+
+        async def run() -> None:
+            with pytest.raises(RetrievalError) as excinfo:
+                await resolve_citation(citation, tmp_path, snapshot_dir=snapshot_dir)
+            assert excinfo.value.verdict == "unresolvable"
+            assert "symbolic link" not in str(excinfo.value)
+
+        asyncio.run(run())
+
+
+def test_a_crlf_snapshot_resolves_to_the_span_that_was_indexed(tmp_path: Path) -> None:
+    """Offsets are measured against the decoded ``content``; the read must not
+    translate line endings back out from under them.
+
+    ``UrlLoader`` decodes the response body and writes it byte-for-byte, so a
+    source served with CRLF line endings has real CRLFs in both ``content``
+    and the snapshot. ``Path.read_text`` defaults to universal-newline mode, which
+    turns each of those into a bare LF -- one character shorter -- shifting
+    every offset after the first line break. The failure is silent: the span
+    comes back wrong rather than refused, or the citation is reported
+    ``drifted`` when nothing drifted (GK-030).
+    """
+    index_dir = tmp_path / ".groundkit"
+    body = b"first line\r\nsecond line\r\nthird line"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=body, headers={"content-type": "text/plain; charset=utf-8"}
+        )
+
+    asyncio.run(_ingest_url(index_dir, "default", "https://example.com/crlf", handler))
+    citation = asyncio.run(_first_chunk_citation(index_dir, "default"))
+    snapshot_dir = snapshots.snapshot_dir_for(index_dir, "default")
+
+    # What the chunk actually holds, straight off the decoded body the
+    # indexer saw -- derived, never a hand-copied literal.
+    expected = body.decode("utf-8")[citation.start_offset : citation.end_offset]
+    assert "\r\n" in expected, "the fixture stopped exercising CRLF"
+
+    async def run() -> None:
+        resolved = await resolve_citation(citation, tmp_path, snapshot_dir=snapshot_dir)
+        assert resolved == expected
+
+    asyncio.run(run())
