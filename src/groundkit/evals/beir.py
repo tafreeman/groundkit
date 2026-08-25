@@ -180,6 +180,15 @@ def adapt_beir_dataset(
     # half-written dataset, from the one module whose contract is that a
     # rejected input leaves nothing behind.
     _require_absent_or_file(destination / "judgments.jsonl", "judgments")
+    # Resolved *here* too, not at the open() below. Containment was the last
+    # check standing between a symlinked judgments path and the filesystem, and
+    # it ran after the corpus loop -- so the escape it caught, it caught with
+    # every document already on disk, and reported as a raw ValueError rather
+    # than an EvalError. Both halves of that are wrong for a module whose
+    # contract is that a rejected input writes nothing. Binding the path now
+    # makes the ordering structural instead of resting on the argument that a
+    # literal filename cannot escape.
+    judgments_path = _contained(destination / "judgments.jsonl", destination, "judgments")
 
     corpus_dir = destination / "corpus"
     _require_empty_corpus_dir(corpus_dir)
@@ -197,10 +206,9 @@ def adapt_beir_dataset(
         # independent second barrier, and the one that stays correct if that
         # check is ever relaxed.
         filename = f"{document_id}{_DOCUMENT_SUFFIX}"
-        document_path = ensure_within_base(corpus_dir / filename, destination)
+        document_path = _contained(corpus_dir / filename, destination, "document")
         document_path.write_text(text, encoding="utf-8", newline="\n")
 
-    judgments_path = ensure_within_base(destination / "judgments.jsonl", destination)
     with judgments_path.open("w", encoding="utf-8", newline="\n") as handle:
         for query_id in sorted(qrels):
             row = {
@@ -275,8 +283,40 @@ def _require_directory_or_absent(path: Path, label: str) -> None:
         )
 
 
+def _contained(candidate: Path, base: Path, label: str) -> Path:
+    """Resolve *candidate* under *base*, reporting an escape as an ``EvalError``.
+
+    ``ensure_within_base`` raises ``ValueError``. Everywhere else in this module
+    a rejected input produces an ``EvalError`` carrying what to do about it, and
+    a caller catching the documented type saw a bare ``ValueError`` escape from
+    the one check that fires on an actively hostile path.
+    """
+    try:
+        return ensure_within_base(candidate, base)
+    except ValueError as exc:
+        raise EvalError(
+            f"BEIR {label} path {str(candidate)!r} resolves outside the output directory "
+            f"{str(base)!r}; refused. Nothing was written."
+        ) from exc
+
+
 def _require_absent_or_file(path: Path, label: str) -> None:
-    """Refuse a path that exists as something other than a regular file."""
+    """Refuse a path that is a symlink, or exists as something other than a file.
+
+    ``is_symlink`` is checked first and deliberately: ``exists()`` and
+    ``is_file()`` both *follow* links, so a symlink pointing outside the
+    destination looks like an ordinary file here and a dangling one looks
+    absent. Either way this preflight passed, the whole corpus was written,
+    and only then did ``ensure_within_base`` resolve the link and raise -- a
+    raw ``ValueError``, not even an ``EvalError``, on top of a half-written
+    dataset. Same treatment the corpus directory already gets.
+    """
+    if path.is_symlink():
+        raise EvalError(
+            f"BEIR {label} path {str(path)!r} is a symbolic link; refused rather than "
+            "followed, because it can point outside the output directory you named. "
+            "Remove the link and re-run."
+        )
     if path.exists() and not path.is_file():
         raise EvalError(
             f"BEIR {label} path {str(path)!r} exists but is not a regular file. Remove it, "

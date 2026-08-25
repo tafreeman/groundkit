@@ -52,6 +52,7 @@ from functools import cache
 from pathlib import Path
 
 import numpy as np
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from groundkit.config import ChunkingConfig, EmbeddingConfig
 from groundkit.contracts import Document
@@ -123,49 +124,69 @@ WAVES: list[list[tuple[str, int]]] = [
 
 METRICS = ("ndcg_at_10", "mrr", "recall_at_1", "recall_at_10")
 
-#: Every field `index_and_score` writes into a result and some later consumer
-#: reads back unconditionally. Named here so `usable_result` and the writer
-#: cannot drift: a cached entry missing any of these crashes the leaderboard or
-#: the bootstrap, *outside* the per-model handler, taking the whole wave with
-#: it. `reused_index`, `chunks` and `query_p95_ms` are written too but only ever
-#: reported, so their absence is survivable and they are deliberately not here.
-RESULT_FIELDS = (
-    "model",
-    "dimensions",
-    "embed_minutes",
-    "query_p50_ms",
-    "vector_store_mb",
-    "per_query",
-)
+
+class CachedMetrics(BaseModel):
+    """One query's scores inside a cached result."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    ndcg_at_10: float = Field(allow_inf_nan=False)
+    mrr: float = Field(allow_inf_nan=False)
+    recall_at_1: float = Field(allow_inf_nan=False)
+    recall_at_10: float = Field(allow_inf_nan=False)
 
 
-def usable_result(result: object) -> bool:
-    """Whether a cached result carries everything its consumers will read.
+class CachedResult(BaseModel):
+    """Exactly what ``index_and_score`` returns and a later run reads back.
 
-    ``isinstance(result, dict)`` was not enough, which is what the fourth
-    round in this family established: ``{"result": {}}`` satisfied it, was
-    accepted as a cache hit, and then crashed the leaderboard on ``per_query``
-    -- again outside ``one_model``'s handler, so again through
-    ``asyncio.gather``.
+    Declared rather than hand-checked, and that is the point. Four rounds of
+    review found four different shapes a hand-written check let through --
+    a non-mapping, a missing ``result``, an empty ``{}``, and then values of
+    the wrong type -- because each check tested the layer the previous crash
+    happened at. A cache file is untrusted input read off disk, which is the
+    boundary this project validates with a model everywhere else.
 
-    The check is the *whole* shape the consumers need rather than one more
-    layer of it, because each previous fix moved the boundary a step outward
-    and the next round found what was behind it. ``per_query`` is checked down
-    to one metric row, since the leaderboard averages ``METRICS`` across its
-    values and an entry with empty or malformed rows fails exactly as loudly
-    as a missing key.
+    ``extra="forbid"`` makes the drift bidirectional: a field added to the
+    writer without being added here fails just as loudly as a field removed.
+    ``allow_inf_nan=False`` matters because a NaN metric does not raise
+    anywhere -- it silently poisons ``np.mean`` and every comparison drawn
+    from it, which is the failure this whole effort exists to prevent.
+
+    ``strict=True`` is not decoration either, and declaring the model without
+    it was not enough: Pydantic's default lax mode coerces ``"1"`` to ``1.0``,
+    so a JSON file whose metrics are strings still validated and still fed the
+    leaderboard. Strict mode keeps the widening that is lossless (an ``int``
+    where a ``float`` is declared, which is what JSON gives back for ``0``)
+    and refuses the conversions that are guesses -- ``"768"`` as a dimension
+    count, ``1`` as ``reused_index``.
     """
-    if not isinstance(result, dict):
+
+    model_config = ConfigDict(extra="forbid", strict=True, protected_namespaces=())
+
+    model: str
+    dimensions: int
+    chunks: int
+    reused_index: bool
+    embed_minutes: float | None = Field(default=None, allow_inf_nan=False)
+    query_p50_ms: float = Field(allow_inf_nan=False)
+    query_p95_ms: float = Field(allow_inf_nan=False)
+    vector_store_mb: float = Field(allow_inf_nan=False)
+    per_query: dict[str, CachedMetrics]
+
+
+def usable_result(result: object, expected_query_ids: set[str]) -> bool:
+    """Whether a cached result is safe to publish without rescoring.
+
+    Two checks, because the schema cannot express the second. The model above
+    settles shape, types and finiteness. ``expected_query_ids`` settles
+    *identity*: a result carrying the right shape for the wrong queries pairs
+    cleanly in the bootstrap and reports a comparison nobody ran.
+    """
+    try:
+        parsed = CachedResult.model_validate(result)
+    except ValidationError:
         return False
-    if any(field not in result for field in RESULT_FIELDS):
-        return False
-    per_query = result["per_query"]
-    if not isinstance(per_query, dict) or not per_query:
-        return False
-    return all(
-        isinstance(row, dict) and all(metric in row for metric in METRICS)
-        for row in per_query.values()
-    )
+    return set(parsed.per_query) == expected_query_ids
 
 
 def score_ranking(order: list[str], gold: set[str], k: int = 10) -> dict[str, float]:
@@ -638,7 +659,7 @@ async def main() -> None:
         if (
             payload is not None
             and payload.get("experiment") == identity
-            and usable_result(cached_result)
+            and usable_result(cached_result, set(gold))
         ):
             if index_ready:
                 print(f"{model:26s} cached", flush=True)

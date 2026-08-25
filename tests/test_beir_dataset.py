@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
+from groundkit import evals as _evals  # noqa: F401
 from groundkit.errors import EvalError
+from groundkit.evals import beir as beir_module
 from groundkit.evals.beir import adapt_beir_dataset
 from groundkit.evals.corpus import load_judgments
 
@@ -395,6 +398,57 @@ def test_a_symlinked_corpus_directory_is_refused(tmp_path: Path) -> None:
         adapt_beir_dataset(source, output)
 
     assert list(elsewhere.iterdir()) == []
+
+
+def test_a_symlinked_judgments_path_is_refused_before_the_corpus_is_written(
+    tmp_path: Path,
+) -> None:
+    """The judgments preflight used ``exists()``/``is_file()``, both of which
+    *follow* links: a symlink pointing outside the destination looked like an
+    ordinary file and a dangling one looked absent, so the check passed. The
+    corpus was then written in full before ``ensure_within_base`` resolved the
+    link and raised -- a raw ``ValueError``, on top of the half-written output
+    this module's whole validate-first structure exists to prevent.
+
+    Both halves are asserted: the typed error, and the empty corpus directory.
+    """
+    source = tmp_path / "beir"
+    output = tmp_path / "adapted"
+    _write_beir(source)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    output.mkdir()
+    try:
+        (output / "judgments.jsonl").symlink_to(elsewhere / "stolen.jsonl")
+    except (OSError, NotImplementedError):  # pragma: no cover - needs privilege
+        pytest.skip("creating a symlink is not permitted in this environment")
+
+    with pytest.raises(EvalError, match="symbolic link"):
+        adapt_beir_dataset(source, output)
+
+    assert not (output / "corpus").exists() or list((output / "corpus").iterdir()) == []
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_a_containment_failure_is_an_eval_error_not_a_bare_value_error(
+    tmp_path: Path,
+) -> None:
+    """``ensure_within_base`` raises ``ValueError``. Every other rejection in
+    this module is an ``EvalError`` carrying what to do about it, so a caller
+    catching the documented type saw a bare ``ValueError`` escape from the one
+    check that fires on an actively hostile path."""
+    source = tmp_path / "beir"
+    output = tmp_path / "adapted"
+    _write_beir(source)
+
+    def _escape(_candidate: Path, base: Path) -> Path:
+        raise ValueError(f"Path escapes base directory: {base}")
+
+    with (
+        mock.patch.object(beir_module, "ensure_within_base", _escape),
+        pytest.raises(EvalError, match="resolves outside the output directory"),
+    ):
+        adapt_beir_dataset(source, output)
 
 
 def test_a_reserved_device_name_is_allowed_as_a_query_id(tmp_path: Path) -> None:
