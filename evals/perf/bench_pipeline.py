@@ -214,13 +214,20 @@ async def pipeline_benchmarks() -> list[dict[str, object]]:
                 # the unchanged-fingerprint skip path and would time nothing.
                 name = f"c{ndocs}r{rep}"
                 store = await SQLiteMetadataStore.open(index_dir=tmp, collection=name)
-                indexer = Indexer(store=store, loader=FileLoader(allowed_base_dir=tmp))
-                w0, c0 = time.perf_counter(), time.process_time()
-                report = await indexer.index_directory(str(src))
-                ingest_wall.append(time.perf_counter() - w0)
-                ingest_cpu.append(time.process_time() - c0)
-                chunks_written = report.chunks_written
-                await store.close()
+                try:
+                    indexer = Indexer(store=store, loader=FileLoader(allowed_base_dir=tmp))
+                    w0, c0 = time.perf_counter(), time.process_time()
+                    report = await indexer.index_directory(str(src))
+                    ingest_wall.append(time.perf_counter() - w0)
+                    ingest_cpu.append(time.process_time() - c0)
+                    chunks_written = report.chunks_written
+                finally:
+                    # On Windows an open SQLite handle blocks the enclosing
+                    # TemporaryDirectory's cleanup, so a failure here would
+                    # surface as a PermissionError from the cleanup and bury
+                    # the benchmark's actual error. The other scripts in this
+                    # directory already close in `finally`; this one did not.
+                    await store.close()
                 # Measured *after* the close, not before. The store runs in WAL
                 # mode, so at the end of an ingest a large share of the
                 # committed pages are still in `<name>.sqlite3-wal` and have not
@@ -243,21 +250,23 @@ async def pipeline_benchmarks() -> list[dict[str, object]]:
                 store = await SQLiteMetadataStore.open(
                     index_dir=tmp, collection=f"c{ndocs}r{INGEST_REPEATS - 1}"
                 )
-                w0, c0 = time.perf_counter(), time.process_time()
-                retriever = await Retriever.open(store=store)
-                open_wall.append((time.perf_counter() - w0) * 1000)
-                open_cpu.append((time.process_time() - c0) * 1000)
+                try:
+                    w0, c0 = time.perf_counter(), time.process_time()
+                    retriever = await Retriever.open(store=store)
+                    open_wall.append((time.perf_counter() - w0) * 1000)
+                    open_cpu.append((time.process_time() - c0) * 1000)
 
-                await retriever.search(queries[0], top_k=10)  # warm
-                lat = []
-                for query in queries:
-                    t0 = time.perf_counter()
-                    await retriever.search(query, top_k=10)
-                    lat.append((time.perf_counter() - t0) * 1000)
-                lat.sort()
-                search_p50.append(lat[len(lat) // 2])
-                search_p95.append(lat[int(len(lat) * 0.95)])
-                await store.close()
+                    await retriever.search(queries[0], top_k=10)  # warm
+                    lat = []
+                    for query in queries:
+                        t0 = time.perf_counter()
+                        await retriever.search(query, top_k=10)
+                        lat.append((time.perf_counter() - t0) * 1000)
+                    lat.sort()
+                    search_p50.append(lat[len(lat) // 2])
+                    search_p95.append(lat[int(len(lat) * 0.95)])
+                finally:
+                    await store.close()
 
             rows.append(
                 {

@@ -583,10 +583,22 @@ async def main() -> None:
             _sentinel_inputs(corpus.resolve(), model, dims),
         )
         payload = read_cache_file(cached)
-        if payload is not None and payload.get("experiment") == identity:
+        # `read_cache_file` guarantees the *outer* object is a mapping and
+        # nothing more. An entry whose identity matches but whose `result` is
+        # missing or is not a mapping would raise KeyError or TypeError right
+        # here -- outside `one_model`'s handler, so through `asyncio.gather`
+        # and into every other model in the wave. Both halves are checked
+        # together, so "usable cache" is one condition rather than an
+        # assumption resting on a partial one.
+        cached_result = payload.get("result") if payload is not None else None
+        if (
+            payload is not None
+            and payload.get("experiment") == identity
+            and isinstance(cached_result, dict)
+        ):
             if index_ready:
                 print(f"{model:26s} cached", flush=True)
-                return dict(payload["result"])
+                return dict(cached_result)
             print(f"{model:26s} scores cached but index missing or stale, rebuilding", flush=True)
         elif cached.exists():
             # A file that is present but unusable -- damaged, or written under
