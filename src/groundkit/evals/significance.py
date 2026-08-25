@@ -197,14 +197,21 @@ def _query_scores(query_results: Sequence[QueryResult], metric: MetricName) -> d
     unambiguously is rejected instead of quietly averaged.
     """
     scores: dict[str, float] = {}
+    # Every id is recorded *before* the no-answer filter below. Checking
+    # duplicates against `scores` alone would miss the malformed shape where one
+    # id appears twice with two different meanings -- once no-answer, once
+    # answerable -- because the no-answer row never reaches `scores` to collide
+    # with. That stage is exactly as unpairable as two answerable rows.
+    seen: set[str] = set()
     for result in query_results:
-        if result.metrics is None:
-            continue
-        if result.query_id in scores:
+        if result.query_id in seen:
             raise EvalError(
                 f"duplicate query id {result.query_id!r} in a stage's results; "
                 "query ids must be unique for a paired comparison to mean anything"
             )
+        seen.add(result.query_id)
+        if result.metrics is None:
+            continue
         value = (
             result.metrics.reciprocal_rank if metric == "mrr" else getattr(result.metrics, metric)
         )

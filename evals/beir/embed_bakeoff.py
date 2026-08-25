@@ -536,15 +536,32 @@ async def main() -> None:
         # lossy -- be recognised as belonging to a different embedder rather
         # than accepted on a dimension match.
         identity = {**experiment, "model": model, "dims": dims}
+        # A cached score is only trustworthy while the index it was produced
+        # from is still there and still valid. The module docstring tells
+        # operators that deleting a model's index directory forces a re-embed --
+        # and it did not: this shortcut returned the cached scores without ever
+        # looking at the index, so an index deleted *because it was suspect*
+        # left its scores publishable and the rebuild never happened. Requiring
+        # the sentinel makes the documented remedy true.
+        index_ready = _sentinel_valid(
+            args.work / "index" / model_slug(model),
+            _sentinel_inputs(corpus.resolve(), model, dims),
+        )
         if cached.exists():
             try:
                 payload = json.loads(cached.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 payload = None
             if isinstance(payload, dict) and payload.get("experiment") == identity:
-                print(f"{model:26s} cached", flush=True)
-                return dict(payload["result"])
-            print(f"{model:26s} cache stale (inputs changed), rescoring", flush=True)
+                if index_ready:
+                    print(f"{model:26s} cached", flush=True)
+                    return dict(payload["result"])
+                print(
+                    f"{model:26s} scores cached but index missing or stale, rebuilding",
+                    flush=True,
+                )
+            else:
+                print(f"{model:26s} cache stale (inputs changed), rescoring", flush=True)
         started = time.perf_counter()
         try:
             result = await index_and_score(model, dims, corpus, args.work, judgments, gold)

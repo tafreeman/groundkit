@@ -336,3 +336,51 @@ def test_compare_report_stages_rejects_duplicate_stage_names() -> None:
 
     with pytest.raises(EvalError, match="more than one stage named"):
         compare_report_stages(report, baseline="bm25", candidate="dense", metric="ndcg_at_10")
+
+
+def test_one_query_id_appearing_as_both_no_answer_and_answerable_is_rejected() -> None:
+    """The duplicate check must run *before* the no-answer filter.
+
+    A stage holding one id twice -- once with ``metrics=None`` and once with
+    metrics -- is exactly as unpairable as two answerable rows, but the
+    no-answer row never reaches the score map to collide with, so checking
+    duplicates against that map alone accepts it silently.
+    """
+    report = _report(
+        [
+            _stage(
+                "bm25",
+                [_no_answer_query("q-1"), _query("q-1", ndcg=0.4)],
+                is_baseline=True,
+            ),
+            _stage("dense", [_query("q-1", ndcg=0.6)], is_baseline=False),
+        ]
+    )
+
+    with pytest.raises(EvalError, match="duplicate query id"):
+        compare_report_stages(report, baseline="bm25", candidate="dense", metric="ndcg_at_10")
+
+
+def test_distinct_no_answer_and_answerable_ids_still_pair() -> None:
+    """The guard must not reject an ordinary report: no-answer queries are
+    normal, they just carry no metrics and drop out of the pairing."""
+    report = _report(
+        [
+            _stage(
+                "bm25",
+                [_query("q-1", ndcg=0.2), _no_answer_query("q-2")],
+                is_baseline=True,
+            ),
+            _stage(
+                "dense",
+                [_query("q-1", ndcg=0.6), _no_answer_query("q-2")],
+                is_baseline=False,
+            ),
+        ]
+    )
+
+    result = compare_report_stages(
+        report, baseline="bm25", candidate="dense", metric="ndcg_at_10", resamples=100
+    )
+
+    assert result.query_count == 1

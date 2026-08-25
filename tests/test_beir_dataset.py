@@ -473,3 +473,17 @@ def test_a_long_query_id_is_not_refused(tmp_path: Path) -> None:
     report = adapt_beir_dataset(source, output)
 
     assert report.query_count == 1
+
+
+def test_a_corpus_path_that_is_a_regular_file_is_refused(tmp_path: Path) -> None:
+    """``exists()`` is true for a regular file, and ``iterdir()`` then raises
+    NotADirectoryError -- an OSError, so it escapes this module's EvalError
+    contract and reaches the CLI as a traceback."""
+    source = tmp_path / "beir"
+    output = tmp_path / "adapted"
+    _write_beir(source)
+    output.mkdir()
+    (output / "corpus").write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(EvalError, match="not a directory"):
+        adapt_beir_dataset(source, output)

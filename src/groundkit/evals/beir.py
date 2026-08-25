@@ -269,6 +269,17 @@ def _require_empty_corpus_dir(corpus_dir: Path) -> None:
             "rather than followed, because documents written through it would land "
             "outside the output directory you named. Remove the link and re-run."
         )
+    if corpus_dir.exists() and not corpus_dir.is_dir():
+        # `exists()` is true for a regular file, and `iterdir()` then raises
+        # NotADirectoryError -- an OSError, so it escapes this module's
+        # EvalError contract and reaches the CLI as a traceback. An ordinary
+        # destination conflict deserves the same catchable refusal as every
+        # other malformed input here.
+        raise EvalError(
+            f"BEIR output corpus path {str(corpus_dir)!r} exists but is not a directory. "
+            "Remove it, or choose an output directory that does not already hold a file "
+            "by that name."
+        )
     if not corpus_dir.exists():
         return
     existing = sorted(entry.name for entry in corpus_dir.iterdir())
