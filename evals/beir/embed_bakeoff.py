@@ -123,6 +123,50 @@ WAVES: list[list[tuple[str, int]]] = [
 
 METRICS = ("ndcg_at_10", "mrr", "recall_at_1", "recall_at_10")
 
+#: Every field `index_and_score` writes into a result and some later consumer
+#: reads back unconditionally. Named here so `usable_result` and the writer
+#: cannot drift: a cached entry missing any of these crashes the leaderboard or
+#: the bootstrap, *outside* the per-model handler, taking the whole wave with
+#: it. `reused_index`, `chunks` and `query_p95_ms` are written too but only ever
+#: reported, so their absence is survivable and they are deliberately not here.
+RESULT_FIELDS = (
+    "model",
+    "dimensions",
+    "embed_minutes",
+    "query_p50_ms",
+    "vector_store_mb",
+    "per_query",
+)
+
+
+def usable_result(result: object) -> bool:
+    """Whether a cached result carries everything its consumers will read.
+
+    ``isinstance(result, dict)`` was not enough, which is what the fourth
+    round in this family established: ``{"result": {}}`` satisfied it, was
+    accepted as a cache hit, and then crashed the leaderboard on ``per_query``
+    -- again outside ``one_model``'s handler, so again through
+    ``asyncio.gather``.
+
+    The check is the *whole* shape the consumers need rather than one more
+    layer of it, because each previous fix moved the boundary a step outward
+    and the next round found what was behind it. ``per_query`` is checked down
+    to one metric row, since the leaderboard averages ``METRICS`` across its
+    values and an entry with empty or malformed rows fails exactly as loudly
+    as a missing key.
+    """
+    if not isinstance(result, dict):
+        return False
+    if any(field not in result for field in RESULT_FIELDS):
+        return False
+    per_query = result["per_query"]
+    if not isinstance(per_query, dict) or not per_query:
+        return False
+    return all(
+        isinstance(row, dict) and all(metric in row for metric in METRICS)
+        for row in per_query.values()
+    )
+
 
 def score_ranking(order: list[str], gold: set[str], k: int = 10) -> dict[str, float]:
     """Binary-relevance IR metrics over a document ranking, all at depth ``k``.
@@ -594,7 +638,7 @@ async def main() -> None:
         if (
             payload is not None
             and payload.get("experiment") == identity
-            and isinstance(cached_result, dict)
+            and usable_result(cached_result)
         ):
             if index_ready:
                 print(f"{model:26s} cached", flush=True)

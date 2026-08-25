@@ -72,7 +72,16 @@ async def run(judgments, gold, chunk_size, overlap, k1, b, store_cache, root):
                 chunk_size=chunk_size, chunk_overlap=overlap, separators=SEPS
             ),
         )
-        rep = await idx.index_directory(str(_corpus()))
+        try:
+            rep = await idx.index_directory(str(_corpus()))
+        except BaseException:
+            # `st` is not in `store_cache` yet, so `main`'s finally cannot
+            # reach it -- and an open SQLite handle blocks the enclosing
+            # TemporaryDirectory cleanup on Windows, which would surface as a
+            # PermissionError and bury the indexing error that actually
+            # happened. Closed here, on the only path where nobody else can.
+            await st.close()
+            raise
         store_cache[key] = (st, rep.chunks_written)
     st, nchunks = store_cache[key]
     r = await Retriever.open(store=st, config=RetrievalConfig(bm25_k1=k1, bm25_b=b))

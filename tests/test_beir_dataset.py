@@ -516,3 +516,24 @@ def test_an_absent_output_path_is_still_created(tmp_path: Path) -> None:
 
     assert report.document_count == 1
     assert (output / "corpus" / "doc-1.txt").exists()
+
+
+def test_a_judgments_path_that_is_a_directory_is_refused_before_any_write(
+    tmp_path: Path,
+) -> None:
+    """``judgments.jsonl`` is opened only after the whole corpus has landed, so
+    a directory sitting at that path raised ``IsADirectoryError`` with the
+    output already populated -- a traceback *and* a half-written dataset, from
+    the one module whose contract is that a rejected input leaves nothing
+    behind.
+    """
+    source = tmp_path / "beir"
+    output = tmp_path / "adapted"
+    _write_beir(source)
+    output.mkdir()
+    (output / "judgments.jsonl").mkdir()
+
+    with pytest.raises(EvalError, match="not a regular file"):
+        adapt_beir_dataset(source, output)
+
+    assert not (output / "corpus").exists()

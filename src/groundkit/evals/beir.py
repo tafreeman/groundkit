@@ -173,6 +173,13 @@ def adapt_beir_dataset(
 
     _reject_case_colliding_document_ids(texts)
     _require_directory_or_absent(destination, "output")
+    # Checked here, beside the other destination checks and *before* any
+    # document is written. `judgments.jsonl` is opened only after the whole
+    # corpus has landed, so a directory sitting at that path raised
+    # IsADirectoryError with the output already populated -- a traceback and a
+    # half-written dataset, from the one module whose contract is that a
+    # rejected input leaves nothing behind.
+    _require_absent_or_file(destination / "judgments.jsonl", "judgments")
 
     corpus_dir = destination / "corpus"
     _require_empty_corpus_dir(corpus_dir)
@@ -265,6 +272,16 @@ def _require_directory_or_absent(path: Path, label: str) -> None:
         raise EvalError(
             f"BEIR {label} path {str(path)!r} exists but is not a directory. Remove it, "
             "or choose a path that does not already hold a file by that name."
+        )
+
+
+def _require_absent_or_file(path: Path, label: str) -> None:
+    """Refuse a path that exists as something other than a regular file."""
+    if path.exists() and not path.is_file():
+        raise EvalError(
+            f"BEIR {label} path {str(path)!r} exists but is not a regular file. Remove it, "
+            "or choose an output directory that does not already hold a directory by that "
+            "name."
         )
 
 
