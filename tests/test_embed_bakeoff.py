@@ -12,6 +12,8 @@ from typing import Any
 
 import pytest
 
+from groundkit.errors import EvalError
+
 _SCRIPT = Path(__file__).resolve().parents[1] / "evals" / "beir" / "embed_bakeoff.py"
 
 
@@ -430,3 +432,111 @@ def test_a_missing_parent_directory_reports_failure_instead_of_raising() -> None
         target = Path(directory) / "absent" / "cache.json"
 
         assert bakeoff.write_cache_file(target, {"experiment": 1, "result": {}}) is False
+
+
+def _write_judgments(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def _judgment(query_id: str, doc: str) -> dict[str, Any]:
+    return {
+        "query_id": query_id,
+        "query": f"query for {query_id}",
+        "category": "normal",
+        "gold": [{"doc": doc, "quote": "a quote"}],
+    }
+
+
+def test_a_repeated_query_id_is_refused_before_any_scoring() -> None:
+    """The two consumers of a raw-loaded judgments file disagreed about what a
+    repeated id meant. The gold map is a dict comprehension, so it kept only
+    the last row; the scoring loop iterated *every* row and wrote each result
+    under the same ``per_query`` key. The earlier query was scored against the
+    later row's relevance set and then overwritten, so the published aggregate
+    covered fewer queries than the ``n=len(judgments)`` printed beside it --
+    wrong in a way that reads as correct.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "judgments.jsonl"
+        _write_judgments(path, [_judgment("q-1", "a.txt"), _judgment("q-1", "b.txt")])
+
+        with pytest.raises(EvalError, match="duplicate query_id"):
+            bakeoff.load_bakeoff_judgments(path)
+
+
+def test_a_well_formed_judgments_file_pairs_every_id_with_its_gold() -> None:
+    """Guards the guard, and pins the pairing the scorer depends on: every
+    judgment must have an entry in the gold map, or ``score_ranking`` raises
+    ``KeyError`` mid-run."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "judgments.jsonl"
+        _write_judgments(path, [_judgment("q-1", "a.txt"), _judgment("q-2", "b.txt")])
+
+        judgments, gold = bakeoff.load_bakeoff_judgments(path)
+
+        assert [j.query_id for j in judgments] == ["q-1", "q-2"]
+        assert set(gold) == {j.query_id for j in judgments}
+        assert gold["q-2"] == {"b.txt"}
+
+
+def _sentinel_dir(root: Path, name: str, build: Any) -> Path:
+    index_dir = root / name
+    index_dir.mkdir()
+    (index_dir / bakeoff.SENTINEL_NAME).write_text(
+        json.dumps({"inputs": {}, "build": build}), encoding="utf-8"
+    )
+    return index_dir
+
+
+def test_a_usable_sentinel_timing_is_returned() -> None:
+    """Guards the guard: a reader that always reported "not measured" would
+    pass every negative case below while silently erasing the ingest cost that
+    is one of this bake-off's headline comparisons."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        assert bakeoff._sentinel_embed_seconds(_sentinel_dir(root, "a", {"embed_seconds": 120.0}))
+        assert (
+            bakeoff._sentinel_embed_seconds(_sentinel_dir(root, "b", {"embed_seconds": 120})) == 120
+        )
+        # 0.0 is a real measurement and must survive, not collapse to None.
+        assert (
+            bakeoff._sentinel_embed_seconds(_sentinel_dir(root, "c", {"embed_seconds": 0.0})) == 0.0
+        )
+
+
+def test_unusable_sentinel_timings_degrade_to_not_measured() -> None:
+    """``_sentinel_valid`` compares ``inputs`` and says nothing about
+    ``build``, so these reached the published result unchecked.
+
+    A negative value became a negative embedding time in the leaderboard --
+    impossible, and a value the cached-result schema would have caught had it
+    arrived through the cache instead of straight out of this run. A string
+    was worse: it raised at ``embed_seconds / 60``, inside ``one_model``'s
+    handler but *after* every query had been rescored, dropping the model
+    having already paid the full cost.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        for name, build in (
+            ("negative", {"embed_seconds": -60}),
+            ("string", {"embed_seconds": "x"}),
+            ("numeric_string", {"embed_seconds": "120"}),
+            ("nan", {"embed_seconds": math.nan}),
+            ("infinite", {"embed_seconds": math.inf}),
+        ):
+            index_dir = _sentinel_dir(root, name, build)
+            assert bakeoff._sentinel_embed_seconds(index_dir) is None, f"{name} was accepted"
+
+
+def test_a_sentinel_predating_timings_reads_as_not_measured_rather_than_zero() -> None:
+    """The distinction the result's ``null``-vs-``0.0`` split exists to keep:
+    an index built before this file recorded timings was not measured as free,
+    it was not measured at all."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        assert (
+            bakeoff._sentinel_embed_seconds(_sentinel_dir(root, "legacy", {"chunks": 10})) is None
+        )
+        missing = root / "no-sentinel"
+        missing.mkdir()
+        assert bakeoff._sentinel_embed_seconds(missing) is None

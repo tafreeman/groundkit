@@ -57,6 +57,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from groundkit.config import ChunkingConfig, EmbeddingConfig
 from groundkit.contracts import Document
+from groundkit.errors import EvalError
+from groundkit.evals.corpus import Judgment, load_judgments
 from groundkit.index.dense import LanceDBVectorStore
 from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.indexer import Indexer
@@ -484,7 +486,7 @@ def _write_sentinel(index_dir: Path, inputs: dict, build: dict) -> None:
 
 
 async def index_and_score(
-    model: str, dims: int, corpus: Path, work: Path, judgments: list[dict], gold: dict
+    model: str, dims: int, corpus: Path, work: Path, judgments: list[Judgment], gold: dict
 ) -> dict:
     """Build (or reuse) this model's index, then score every query against it."""
     index_dir = work / "index" / model_slug(model)
@@ -567,7 +569,7 @@ async def index_and_score(
             # comparisons. The count is authoritative from the store; the
             # timing can only come from the run that measured it.
             chunks = await store.count_chunks()
-            embed_seconds = _sentinel_build(index_dir).get("embed_seconds")
+            embed_seconds = _sentinel_embed_seconds(index_dir)
 
         retriever = await Retriever.open(
             store=store, embedder=embedder, vector_store=vectors, collection="beir"
@@ -576,7 +578,7 @@ async def index_and_score(
         latencies: list[float] = []
         for judgment in judgments:
             started = time.perf_counter()
-            response = await retriever.search(judgment["query"], top_k=CANDIDATES, mode="dense")
+            response = await retriever.search(judgment.query, top_k=CANDIDATES, mode="dense")
             latencies.append((time.perf_counter() - started) * 1000)
             seen: set[str] = set()
             order: list[str] = []
@@ -585,7 +587,7 @@ async def index_and_score(
                 if doc not in seen:
                     seen.add(doc)
                     order.append(doc)
-            per_query[judgment["query_id"]] = score_ranking(order, gold[judgment["query_id"]])
+            per_query[judgment.query_id] = score_ranking(order, gold[judgment.query_id])
     finally:
         await store.close()
 
@@ -605,6 +607,68 @@ async def index_and_score(
         "vector_store_mb": round(vector_bytes / 1e6, 1),
         "per_query": per_query,
     }
+
+
+class SentinelBuild(BaseModel):
+    """The ``build`` half of an index sentinel, as read back.
+
+    ``_sentinel_valid`` compares ``inputs`` and says nothing about ``build``,
+    so these values reached the published result unchecked. A negative
+    ``embed_seconds`` became a negative embedding time in the leaderboard --
+    an impossible number, and one the cached-result schema would have caught
+    had it come back through the cache instead of straight out of this run.
+    A string was worse: it raised at ``embed_seconds / 60``, inside
+    ``one_model``'s handler but *after* every query had been rescored, so the
+    model was dropped having already paid the full cost.
+
+    Lax about presence and strict about value, deliberately: a sentinel
+    written before this file recorded timings legitimately has no
+    ``embed_seconds``, which is why the result distinguishes ``null`` from
+    ``0.0`` in the first place.
+    """
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    embed_seconds: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+
+
+def _sentinel_embed_seconds(index_dir: Path) -> float | None:
+    """Build timing from *index_dir*'s sentinel, or ``None`` if unusable.
+
+    Degrades rather than raises. The index itself is already known good --
+    ``_sentinel_valid`` matched its ``inputs`` -- so a corrupt build stanza is
+    a lost measurement, not a lost model, and "not measured" is a state this
+    report can already represent.
+    """
+    try:
+        return SentinelBuild.model_validate(_sentinel_build(index_dir)).embed_seconds
+    except ValidationError:
+        return None
+
+
+def load_bakeoff_judgments(path: Path) -> tuple[list[Judgment], dict[str, set[str]]]:
+    """Judgments and their gold map, refusing anything the scorer cannot pair.
+
+    Loaded through the harness's own loader rather than ``json.loads`` per
+    line. The raw read accepted a repeated ``query_id``, and the two consumers
+    disagreed about what that meant: the gold map is a dict comprehension, so
+    it silently kept only the last row, while the scoring loop iterated
+    *every* row and wrote each result under the same ``per_query`` key. The
+    earlier query was therefore scored against the later row's relevance set
+    and then overwritten, leaving an aggregate over fewer queries than the
+    ``n=len(judgments)`` printed beside it -- wrong in a way that reads as
+    correct.
+
+    ``load_judgments`` already rejects duplicates, and enforces the ascending
+    order and id contract this file always assumed without checking. Same
+    argument as :func:`read_cache_file`: one loader, so the rules are not
+    re-decided -- and re-decided differently -- at each call site.
+
+    Raises:
+        EvalError: The file is missing, malformed, or repeats a ``query_id``.
+    """
+    judgments = load_judgments(path)
+    return judgments, {j.query_id: {g.doc for g in j.gold} for j in judgments}
 
 
 def contrast_rng(model: str) -> np.random.Generator:
@@ -670,12 +734,11 @@ async def main() -> None:
     args = parser.parse_args()
 
     corpus = args.data / "corpus"
-    judgments = [
-        json.loads(line)
-        for line in (args.data / "judgments.jsonl").open(encoding="utf-8")
-        if line.strip()
-    ]
-    gold = {j["query_id"]: {g["doc"] for g in j["gold"]} for j in judgments}
+    try:
+        judgments, gold = load_bakeoff_judgments(args.data / "judgments.jsonl")
+    except EvalError as exc:
+        parser.error(f"unusable judgments file: {exc}")
+
     scores_dir = args.work / "scores"
     scores_dir.mkdir(parents=True, exist_ok=True)
 
