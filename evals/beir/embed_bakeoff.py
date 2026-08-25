@@ -48,6 +48,7 @@ import os
 import shutil
 import sys
 import time
+from contextlib import suppress
 from functools import cache
 from pathlib import Path
 
@@ -201,19 +202,61 @@ class CachedResult(BaseModel):
         return self
 
 
-def usable_result(result: object, expected_query_ids: set[str]) -> bool:
+def usable_result(
+    result: object, expected_query_ids: set[str], *, model: str, dimensions: int
+) -> bool:
     """Whether a cached result is safe to publish without rescoring.
 
-    Two checks, because the schema cannot express the second. The model above
-    settles shape, types and finiteness. ``expected_query_ids`` settles
-    *identity*: a result carrying the right shape for the wrong queries pairs
-    cleanly in the bootstrap and reports a comparison nobody ran.
+    Shape, then identity, because the schema cannot express identity. The
+    model above settles types, ranges and finiteness. The rest is what a
+    valid-looking result can still be wrong *about*:
+
+    ``expected_query_ids`` -- a result carrying the right shape for the wrong
+    queries pairs cleanly in the bootstrap and reports a comparison nobody ran.
+
+    ``model``/``dimensions`` -- the sentinel already binds both, but it binds
+    them in ``payload["experiment"]``, which is written beside the result and
+    not derived from it. So a body disagreeing with its own sentinel passes
+    every check there was. It is then published under whatever name it
+    carries, and since the paired bootstrap finds its baseline by
+    ``r["model"] == args.baseline``, a wrong name there does not fail loudly
+    -- it makes the baseline look absent and skips every comparison in the
+    run.
     """
     try:
         parsed = CachedResult.model_validate(result)
     except ValidationError:
         return False
+    if parsed.model != model or parsed.dimensions != dimensions:
+        return False
     return set(parsed.per_query) == expected_query_ids
+
+
+def write_cache_file(path: Path, payload: dict) -> bool:
+    """Write *payload* atomically. ``True`` on success, ``False`` if it could not be.
+
+    The counterpart to :func:`read_cache_file`, and total for the same reason
+    it is. This ran *outside* ``one_model``'s ``except Exception`` and after
+    scoring had already succeeded, so a stale ``.tmp`` directory, a locked
+    target (routine on Windows, where a reader holds the file open) or a full
+    disk did not merely lose this model's cache -- it propagated through
+    ``asyncio.gather`` and cancelled the other models' index builds in the
+    same wave, discarding tens of minutes of embedding work over a failed
+    write of a file whose entire purpose is to save time on the *next* run.
+
+    A failed write is therefore a rescore next run, never a lost wave. The
+    temporary file is cleaned up on the way out so a failure does not leave
+    the debris that makes the next attempt fail the same way.
+    """
+    tmp_path = path.with_suffix(".tmp")
+    try:
+        tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp_path, path)
+    except (OSError, TypeError, ValueError):
+        with suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def score_ranking(order: list[str], gold: set[str], k: int = 10) -> dict[str, float]:
@@ -686,7 +729,7 @@ async def main() -> None:
         if (
             payload is not None
             and payload.get("experiment") == identity
-            and usable_result(cached_result, set(gold))
+            and usable_result(cached_result, set(gold), model=model, dimensions=dims)
         ):
             if index_ready:
                 print(f"{model:26s} cached", flush=True)
@@ -704,16 +747,10 @@ async def main() -> None:
             print(f"{model:26s} FAILED: {type(exc).__name__}: {str(exc)[:160]}", flush=True)
             return None
         # Written atomically and stamped with the inputs it was produced
-        # from, so a later run can tell whether it still applies.
-        tmp_path = cached.with_suffix(".tmp")
-        tmp_path.write_text(
-            json.dumps(
-                {"experiment": identity, "result": result},
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        os.replace(tmp_path, cached)
+        # from, so a later run can tell whether it still applies. A failure
+        # here costs a rescore next run; it must not cost this run's siblings.
+        if not write_cache_file(cached, {"experiment": identity, "result": result}):
+            print(f"{model:26s} scored, but its cache could not be written", flush=True)
         print(f"{model:26s} done in {(time.perf_counter() - started) / 60:.1f} min", flush=True)
         return result
 

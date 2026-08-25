@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import random
 import sys
+import tempfile
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -54,13 +56,39 @@ def _valid_result() -> dict[str, Any]:
 _IDS: set[str] = {"q-1"}
 
 
+def _usable(
+    result: Any,
+    ids: set[str] | None = None,
+    *,
+    model: str | None = None,
+    dimensions: int | None = None,
+) -> bool:
+    """``usable_result`` with the identity arguments defaulted to the result.
+
+    Defaulted *from the result* rather than to fixed constants, deliberately:
+    with constants, mutating ``dimensions`` to ``0`` would trip the identity
+    check as well as the ``gt=0`` bound, and every range test below would pass
+    for a reason other than the one it names. Tests that are about identity
+    pass ``model``/``dimensions`` explicitly instead.
+    """
+    body = result if isinstance(result, dict) else {}
+    return bool(
+        bakeoff.usable_result(
+            result,
+            _IDS if ids is None else ids,
+            model=body.get("model", "nomic-embed-text") if model is None else model,
+            dimensions=body.get("dimensions", 768) if dimensions is None else dimensions,
+        )
+    )
+
+
 def test_a_valid_result_is_accepted_as_the_positive_control() -> None:
     """Guards the guard: a validator that rejects everything would still pass
     every negative test below, for the wrong reason. This pins that a
     genuinely well-formed cache entry is still usable, so the rejections
     that follow are meaningful.
     """
-    assert bakeoff.usable_result(_valid_result(), _IDS) is True
+    assert _usable(_valid_result()) is True
 
 
 def test_a_non_numeric_dimensions_is_rejected() -> None:
@@ -72,7 +100,7 @@ def test_a_non_numeric_dimensions_is_rejected() -> None:
     """
     result = _valid_result()
     result["dimensions"] = "x"
-    assert bakeoff.usable_result(result, _IDS) is False
+    assert _usable(result) is False
 
 
 def test_a_numeric_string_is_rejected_rather_than_coerced() -> None:
@@ -88,11 +116,11 @@ def test_a_numeric_string_is_rejected_rather_than_coerced() -> None:
     """
     quoted_dimensions = _valid_result()
     quoted_dimensions["dimensions"] = "768"
-    assert bakeoff.usable_result(quoted_dimensions, _IDS) is False
+    assert _usable(quoted_dimensions) is False
 
     quoted_metric = _valid_result()
     quoted_metric["per_query"]["q-1"]["ndcg_at_10"] = "0.5"
-    assert bakeoff.usable_result(quoted_metric, _IDS) is False
+    assert _usable(quoted_metric) is False
 
 
 def test_an_integer_reused_index_is_rejected_rather_than_coerced() -> None:
@@ -101,7 +129,7 @@ def test_an_integer_reused_index_is_rejected_rather_than_coerced() -> None:
     field that decides whether an embedding run is skipped."""
     result = _valid_result()
     result["reused_index"] = 1
-    assert bakeoff.usable_result(result, _IDS) is False
+    assert _usable(result) is False
 
 
 def test_a_metric_value_that_is_a_string_is_rejected() -> None:
@@ -112,7 +140,7 @@ def test_a_metric_value_that_is_a_string_is_rejected() -> None:
     """
     result = _valid_result()
     result["per_query"]["q-1"]["ndcg_at_10"] = "bad"
-    assert bakeoff.usable_result(result, _IDS) is False
+    assert _usable(result) is False
 
 
 def test_an_integer_metric_is_accepted_because_json_returns_ints_for_whole_numbers() -> None:
@@ -122,7 +150,7 @@ def test_an_integer_metric_is_accepted_because_json_returns_ints_for_whole_numbe
     result = _valid_result()
     result["per_query"]["q-1"]["recall_at_1"] = 0
     result["per_query"]["q-1"]["recall_at_10"] = 1
-    assert bakeoff.usable_result(result, _IDS) is True
+    assert _usable(result) is True
 
 
 def test_a_nan_metric_is_rejected_because_it_poisons_every_average() -> None:
@@ -132,7 +160,7 @@ def test_a_nan_metric_is_rejected_because_it_poisons_every_average() -> None:
     """
     result = _valid_result()
     result["per_query"]["q-1"]["recall_at_1"] = math.nan
-    assert bakeoff.usable_result(result, _IDS) is False
+    assert _usable(result) is False
 
 
 def test_an_infinite_metric_is_rejected() -> None:
@@ -142,7 +170,7 @@ def test_an_infinite_metric_is_rejected() -> None:
     """
     result = _valid_result()
     result["per_query"]["q-1"]["mrr"] = math.inf
-    assert bakeoff.usable_result(result, _IDS) is False
+    assert _usable(result) is False
 
 
 def test_per_query_with_wrong_query_ids_is_rejected_because_it_pairs_falsely_in_bootstrap() -> None:
@@ -154,7 +182,7 @@ def test_per_query_with_wrong_query_ids_is_rejected_because_it_pairs_falsely_in_
     """
     result = _valid_result()
     result["per_query"] = {"q-999": result["per_query"]["q-1"]}
-    assert bakeoff.usable_result(result, _IDS) is False
+    assert _usable(result) is False
 
 
 def test_per_query_missing_one_of_several_expected_ids_is_rejected() -> None:
@@ -168,7 +196,7 @@ def test_per_query_missing_one_of_several_expected_ids_is_rejected() -> None:
         "q-1": {"ndcg_at_10": 0.5, "mrr": 0.5, "recall_at_1": 0.0, "recall_at_10": 1.0},
         "q-2": {"ndcg_at_10": 0.4, "mrr": 0.4, "recall_at_1": 0.0, "recall_at_10": 1.0},
     }
-    assert bakeoff.usable_result(result, {"q-1", "q-2", "q-3"}) is False
+    assert _usable(result, {"q-1", "q-2", "q-3"}) is False
 
 
 def test_a_result_with_an_extra_unknown_key_is_rejected() -> None:
@@ -179,7 +207,7 @@ def test_a_result_with_an_extra_unknown_key_is_rejected() -> None:
     """
     result = _valid_result()
     result["unexpected_field"] = "surprise"
-    assert bakeoff.usable_result(result, _IDS) is False
+    assert _usable(result) is False
 
 
 def test_a_result_missing_a_required_key_is_rejected() -> None:
@@ -190,7 +218,7 @@ def test_a_result_missing_a_required_key_is_rejected() -> None:
     """
     result = _valid_result()
     del result["chunks"]
-    assert bakeoff.usable_result(result, _IDS) is False
+    assert _usable(result) is False
 
 
 @pytest.mark.parametrize("non_dict", [None, [], {}], ids=["none", "empty_list", "empty_dict"])
@@ -200,7 +228,7 @@ def test_a_non_dict_result_is_rejected(non_dict: object) -> None:
     propagate through ``asyncio.gather`` and abort every other model in the
     wave, rather than just dropping this one model from the leaderboard.
     """
-    assert bakeoff.usable_result(non_dict, _IDS) is False
+    assert _usable(non_dict) is False
 
 
 def test_embed_minutes_none_is_accepted_because_it_is_legitimately_optional() -> None:
@@ -211,7 +239,7 @@ def test_embed_minutes_none_is_accepted_because_it_is_legitimately_optional() ->
     """
     result = _valid_result()
     result["embed_minutes"] = None
-    assert bakeoff.usable_result(result, _IDS) is True
+    assert _usable(result) is True
 
 
 def test_cached_result_fields_match_the_writer_dict_exactly() -> None:
@@ -246,7 +274,7 @@ def test_a_negative_metric_is_rejected() -> None:
     through the leaderboard, while ``-1.0`` prints as a plausible number."""
     result = _valid_result()
     result["per_query"]["q-1"]["ndcg_at_10"] = -1.0
-    assert bakeoff.usable_result(result, _IDS) is False
+    assert _usable(result) is False
 
 
 def test_a_metric_above_one_is_rejected() -> None:
@@ -254,7 +282,7 @@ def test_a_metric_above_one_is_rejected() -> None:
     that does is a corrupt file rather than a good run."""
     result = _valid_result()
     result["per_query"]["q-1"]["recall_at_10"] = 2.0
-    assert bakeoff.usable_result(result, _IDS) is False
+    assert _usable(result) is False
 
 
 def test_the_unit_interval_endpoints_are_still_accepted() -> None:
@@ -263,11 +291,11 @@ def test_the_unit_interval_endpoints_are_still_accepted() -> None:
     an exclusive bound would reject good runs and silently force a rescore."""
     perfect = _valid_result()
     perfect["per_query"]["q-1"] = dict.fromkeys(bakeoff.METRICS, 1.0)
-    assert bakeoff.usable_result(perfect, _IDS) is True
+    assert _usable(perfect) is True
 
     missed = _valid_result()
     missed["per_query"]["q-1"] = dict.fromkeys(bakeoff.METRICS, 0.0)
-    assert bakeoff.usable_result(missed, _IDS) is True
+    assert _usable(missed) is True
 
 
 def test_impossible_scalars_are_rejected() -> None:
@@ -281,11 +309,10 @@ def test_impossible_scalars_are_rejected() -> None:
         ("query_p95_ms", -5.0),
         ("vector_store_mb", -1.0),
         ("embed_minutes", -3.0),
-        ("model", ""),
     ):
         result = _valid_result()
         result[field] = value
-        assert bakeoff.usable_result(result, _IDS) is False, f"{field}={value!r} was accepted"
+        assert _usable(result) is False, f"{field}={value!r} was accepted"
 
 
 def test_a_zero_embed_minutes_is_still_accepted() -> None:
@@ -293,7 +320,7 @@ def test_a_zero_embed_minutes_is_still_accepted() -> None:
     written before the build-timing fix legitimately carry ``0.0``."""
     result = _valid_result()
     result["embed_minutes"] = 0.0
-    assert bakeoff.usable_result(result, _IDS) is True
+    assert _usable(result) is True
 
 
 def test_a_p95_below_p50_is_rejected_but_an_equal_pair_is_not() -> None:
@@ -303,11 +330,11 @@ def test_a_p95_below_p50_is_rejected_but_an_equal_pair_is_not() -> None:
     pair, by contrast, is ordinary on a short or uniform battery."""
     swapped = _valid_result()
     swapped["query_p50_ms"], swapped["query_p95_ms"] = 9.0, 2.0
-    assert bakeoff.usable_result(swapped, _IDS) is False
+    assert _usable(swapped) is False
 
     equal = _valid_result()
     equal["query_p50_ms"] = equal["query_p95_ms"] = 4.0
-    assert bakeoff.usable_result(equal, _IDS) is True
+    assert _usable(equal) is True
 
 
 def test_every_ranking_score_ranking_can_produce_validates() -> None:
@@ -327,3 +354,79 @@ def test_every_ranking_score_ranking_can_produce_validates() -> None:
         order = docs[:]
         rng.shuffle(order)
         bakeoff.CachedMetrics.model_validate(bakeoff.score_ranking(order, gold))
+
+
+def test_a_result_whose_body_names_another_model_is_rejected() -> None:
+    """The sentinel binds the model, but it binds it in ``payload["experiment"]``,
+    written *beside* the result and not derived from it -- so a body disagreeing
+    with its own sentinel passed every check there was.
+
+    The consequence is not a crash. ``main`` finds the bootstrap baseline with
+    ``r["model"] == args.baseline``, so a wrong name there makes the baseline
+    look absent and silently skips every paired comparison in the run.
+    """
+    assert _usable(_valid_result(), model="bge-m3") is False
+
+
+def test_a_result_whose_body_disagrees_on_dimensions_is_rejected() -> None:
+    """Same cross-field gap one field over. A body claiming 1024 dimensions
+    for a 768-dimension run is published under the wrong metadata, and the
+    dimension is exactly what the leaderboard reports as the model's cost."""
+    assert _usable(_valid_result(), dimensions=1024) is False
+
+
+def test_an_empty_model_name_is_rejected() -> None:
+    """Belt and braces with the identity check above: a body carrying no model
+    name at all cannot match any requested model, and would be unattributable
+    in the leaderboard even if it did."""
+    result = _valid_result()
+    result["model"] = ""
+    assert _usable(result, model="") is False
+
+
+def test_write_cache_file_round_trips_a_payload() -> None:
+    """Guards the guard: a writer that always reported failure would pass every
+    negative test below for the wrong reason."""
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory) / "cache.json"
+        assert (
+            bakeoff.write_cache_file(target, {"experiment": 1, "result": _valid_result()}) is True
+        )
+        assert json.loads(target.read_text(encoding="utf-8"))["result"]["dimensions"] == 768
+
+
+def test_a_blocked_cache_write_reports_failure_instead_of_raising() -> None:
+    """This ran outside ``one_model``'s handler and *after* scoring succeeded,
+    so a stale ``.tmp`` directory or a locked target did not merely lose this
+    model's cache -- it propagated through ``asyncio.gather`` and cancelled the
+    other models' index builds in the same wave, discarding tens of minutes of
+    embedding work over a failed write of a file whose only purpose is to save
+    time on the *next* run.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory) / "cache.json"
+        (Path(directory) / "cache.tmp").mkdir()  # a directory where the temp file goes
+
+        assert bakeoff.write_cache_file(target, {"experiment": 1, "result": {}}) is False
+        assert not target.exists()
+
+
+def test_an_unserialisable_payload_reports_failure_and_leaves_no_debris() -> None:
+    """``json.dumps`` raises ``TypeError``, not ``OSError``, so an ``OSError``
+    clause alone would still have let this through. The temp file must not
+    survive either, or the next attempt fails the same way for a new reason."""
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory) / "cache.json"
+
+        assert bakeoff.write_cache_file(target, {"result": {1, 2}}) is False
+        assert not (Path(directory) / "cache.tmp").exists()
+        assert not target.exists()
+
+
+def test_a_missing_parent_directory_reports_failure_instead_of_raising() -> None:
+    """The remaining ordinary I/O failure: the cache directory was never
+    created, or was removed under a long run."""
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory) / "absent" / "cache.json"
+
+        assert bakeoff.write_cache_file(target, {"experiment": 1, "result": {}}) is False
