@@ -487,3 +487,32 @@ def test_a_corpus_path_that_is_a_regular_file_is_refused(tmp_path: Path) -> None
 
     with pytest.raises(EvalError, match="not a directory"):
         adapt_beir_dataset(source, output)
+
+
+def test_an_output_path_that_is_a_regular_file_is_refused(tmp_path: Path) -> None:
+    """The check must cover ``output_dir`` itself, not only ``<output>/corpus``.
+
+    When the output path is a file, the ``corpus`` child does not exist, so the
+    emptiness check passes and ``mkdir(parents=True)`` raises a raw OSError --
+    ``FileExistsError`` on Windows, ``NotADirectoryError`` on POSIX -- either
+    of which escapes this module's ``EvalError`` contract.
+    """
+    source = tmp_path / "beir"
+    output = tmp_path / "adapted"
+    _write_beir(source)
+    output.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(EvalError, match="not a directory"):
+        adapt_beir_dataset(source, output)
+
+
+def test_an_absent_output_path_is_still_created(tmp_path: Path) -> None:
+    """The guard must not reject the ordinary case of a fresh destination."""
+    source = tmp_path / "beir"
+    output = tmp_path / "nested" / "adapted"
+    _write_beir(source)
+
+    report = adapt_beir_dataset(source, output)
+
+    assert report.document_count == 1
+    assert (output / "corpus" / "doc-1.txt").exists()

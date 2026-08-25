@@ -172,6 +172,7 @@ def adapt_beir_dataset(
         )
 
     _reject_case_colliding_document_ids(texts)
+    _require_directory_or_absent(destination, "output")
 
     corpus_dir = destination / "corpus"
     _require_empty_corpus_dir(corpus_dir)
@@ -247,6 +248,23 @@ def _reject_case_colliding_document_ids(texts: dict[str, str]) -> None:
             f"file on a case-insensitive filesystem: {collisions}. Each would overwrite "
             "the other while the judgments still reference both, leaving quotes resolved "
             "against the wrong document. Rename or map these ids before adapting."
+        )
+
+
+def _require_directory_or_absent(path: Path, label: str) -> None:
+    """Refuse a path that exists as something other than a directory.
+
+    Checked on ``output_dir`` itself, not only on the ``corpus`` child. When
+    the output path is a regular file, that child does not exist, so the
+    emptiness check passes and ``mkdir(parents=True)`` raises a raw OSError --
+    ``FileExistsError [WinError 183]`` on Windows, ``NotADirectoryError`` on
+    POSIX. Either escapes this module's EvalError contract and reaches a CLI
+    that catches only EvalError.
+    """
+    if path.exists() and not path.is_dir():
+        raise EvalError(
+            f"BEIR {label} path {str(path)!r} exists but is not a directory. Remove it, "
+            "or choose a path that does not already hold a file by that name."
         )
 
 

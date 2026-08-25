@@ -258,13 +258,23 @@ def _sentinel_inputs(corpus: Path, model: str, dims: int) -> dict:
 
 
 def _read_sentinel(index_dir: Path) -> dict | None:
-    """The parsed sentinel, or ``None`` if absent or unreadable."""
+    """The parsed sentinel, or ``None`` if absent or unreadable for any reason.
+
+    Total by design: a damaged sentinel means "this index is not known-good",
+    which is a rebuild, never a crash. ``UnicodeDecodeError`` is listed
+    explicitly because it is a ``ValueError``, not an ``OSError``, so the
+    other two clauses do not cover it -- and this function is now called from
+    the score-cache gate, *outside* ``one_model``'s ``except Exception``. One
+    model with a corrupt sentinel would otherwise propagate through
+    ``asyncio.gather`` and abort every other model in the wave rather than
+    rebuilding just its own index.
+    """
     sentinel = index_dir / SENTINEL_NAME
     if not sentinel.exists():
         return None
     try:
         parsed = json.loads(sentinel.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return parsed if isinstance(parsed, dict) else None
 
