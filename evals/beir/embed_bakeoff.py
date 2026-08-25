@@ -222,7 +222,18 @@ def chunk_fingerprint(corpus: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(p for p in corpus.rglob("*") if p.is_file()):
         name = path.relative_to(corpus).as_posix()
-        document = Document(source=name, content=path.read_text(encoding="utf-8"))
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            # Deliberately *not* the treatment `read_cache_file` gives a bad
+            # cache. A damaged cache belongs to one model and means rebuild;
+            # an unreadable corpus file is shared by every model in the run and
+            # there is nothing to fall back to, so aborting is right. What is
+            # not right is a bare UnicodeDecodeError -- it names the byte and
+            # not the file, and it surfaces through `asyncio.gather` with no
+            # indication of which document is at fault.
+            raise RuntimeError(f"cannot read corpus file {name!r}: {exc}") from exc
+        document = Document(source=name, content=content)
         for chunk in chunker.chunk(document, config=CFG):
             digest.update(f"{name}:{chunk.start_offset}:{chunk.end_offset}\0".encode())
     return digest.hexdigest()
@@ -257,26 +268,40 @@ def _sentinel_inputs(corpus: Path, model: str, dims: int) -> dict:
     }
 
 
-def _read_sentinel(index_dir: Path) -> dict | None:
-    """The parsed sentinel, or ``None`` if absent or unreadable for any reason.
+def read_cache_file(path: Path) -> dict | None:
+    """A cache file parsed as a JSON object, or ``None`` if it is unusable.
 
-    Total by design: a damaged sentinel means "this index is not known-good",
-    which is a rebuild, never a crash. ``UnicodeDecodeError`` is listed
-    explicitly because it is a ``ValueError``, not an ``OSError``, so the
-    other two clauses do not cover it -- and this function is now called from
-    the score-cache gate, *outside* ``one_model``'s ``except Exception``. One
-    model with a corrupt sentinel would otherwise propagate through
-    ``asyncio.gather`` and abort every other model in the wave rather than
-    rebuilding just its own index.
+    **Every cache read in this module goes through here**, and the reason is
+    that the two readers drifted apart twice. Both the index sentinel and the
+    per-model score file are read *outside* ``one_model``'s ``except
+    Exception`` -- the score-cache gate needs the sentinel before that handler
+    is entered -- so anything either read raises propagates through
+    ``asyncio.gather`` and aborts every other model in the wave, rather than
+    rebuilding the one model whose cache is damaged.
+
+    Total, therefore, and for all three ways a file resists being read:
+    ``OSError`` for I/O, ``UnicodeDecodeError`` for bytes that are not UTF-8
+    (a ``ValueError``, so an ``OSError`` clause does not cover it), and
+    ``JSONDecodeError`` for text that is not JSON. A non-object payload is
+    ``None`` too: every caller wants a mapping, and a bare list or string is
+    no more usable than a truncated file.
+
+    "Unusable cache" is a rebuild in every case this module has, never a
+    crash. Sharing one reader is what stops that from being re-decided, and
+    re-decided differently, at each call site.
     """
-    sentinel = index_dir / SENTINEL_NAME
-    if not sentinel.exists():
+    if not path.exists():
         return None
     try:
-        parsed = json.loads(sentinel.read_text(encoding="utf-8"))
+        parsed = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _read_sentinel(index_dir: Path) -> dict | None:
+    """The parsed completion sentinel for one model's index, or ``None``."""
+    return read_cache_file(index_dir / SENTINEL_NAME)
 
 
 def _sentinel_build(index_dir: Path) -> dict:
@@ -557,21 +582,17 @@ async def main() -> None:
             args.work / "index" / model_slug(model),
             _sentinel_inputs(corpus.resolve(), model, dims),
         )
-        if cached.exists():
-            try:
-                payload = json.loads(cached.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                payload = None
-            if isinstance(payload, dict) and payload.get("experiment") == identity:
-                if index_ready:
-                    print(f"{model:26s} cached", flush=True)
-                    return dict(payload["result"])
-                print(
-                    f"{model:26s} scores cached but index missing or stale, rebuilding",
-                    flush=True,
-                )
-            else:
-                print(f"{model:26s} cache stale (inputs changed), rescoring", flush=True)
+        payload = read_cache_file(cached)
+        if payload is not None and payload.get("experiment") == identity:
+            if index_ready:
+                print(f"{model:26s} cached", flush=True)
+                return dict(payload["result"])
+            print(f"{model:26s} scores cached but index missing or stale, rebuilding", flush=True)
+        elif cached.exists():
+            # A file that is present but unusable -- damaged, or written under
+            # different inputs -- is worth announcing. An absent one is the
+            # ordinary first run and says nothing.
+            print(f"{model:26s} cache unusable or stale, rescoring", flush=True)
         started = time.perf_counter()
         try:
             result = await index_and_score(model, dims, corpus, args.work, judgments, gold)
