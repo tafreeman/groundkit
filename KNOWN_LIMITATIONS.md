@@ -170,6 +170,24 @@ per SPEC.md §9:
   manifest-bound but only partially embedded — documents that changed after
   the dense path was enabled — is still not detected, and remains the
   genuine half-dense case this entry describes.
+- **A change to chunker *behaviour* does not re-chunk an existing collection.**
+  The incremental skip key is a fingerprint over document content, the
+  chunker's `type(...).__qualname__`, and the chunking configuration
+  (ADR-0009 decision 4). It deliberately does not carry a chunker *revision*:
+  a type name catches the realistic case — a different chunker class — and
+  ADR-0009 records that it "misses only a chunker whose behaviour changes
+  without its type changing, which is indistinguishable from a code upgrade."
+  That is exactly what a fix to `RecursiveChunker`'s internals is. With
+  identical source bytes and identical `ChunkingConfig` values, the
+  fingerprint is byte-identical across the upgrade, so every unchanged
+  document is skipped and keeps its **pre-upgrade chunk boundaries** — and,
+  on a dense collection, its pre-upgrade vectors, since the skip gate runs
+  before both chunking and embedding. The ingest reports success; nothing is
+  corrupt, and every stored chunk remains a valid offset-verified substring
+  of its document. The collection is simply chunked by the old algorithm
+  until it is deleted and re-ingested, which is the same remedy ADR-0004
+  decision 5 and ADR-0008 name for their own cases. Upgrades that change
+  chunk boundaries say so in `CHANGELOG.md`.
 - **A BM25-only indexer can no longer orphan a manifest-bound collection —
   it is refused (ADR-0011).** An `Indexer` constructed without an embedder or
   vector store has no vector store to delete from, so replacing or pruning a

@@ -11,6 +11,23 @@ it scored.
 
 ## [Unreleased]
 
+### Changed
+
+- `RecursiveChunker` no longer strands a short leading part next to an
+  oversized neighbour. When the incoming part exceeds `chunk_size` on its own
+  it is re-split at a finer separator regardless, so flushing the accumulated
+  run first bought no smaller output — it only guaranteed that run was emitted
+  alone. For the `heading\n\nlong body` shape every Markdown document has, the
+  bare heading became its own chunk. It is now folded into the oversized part
+  so the recursion places it at the head of the first sub-chunk.
+
+  **This changes chunk boundaries, and existing collections do not pick it up
+  automatically.** The incremental skip key fingerprints content, chunker type
+  and chunking configuration, none of which this change alters (ADR-0009
+  decision 4), so unchanged documents are skipped and keep their old
+  boundaries. Delete and re-ingest any collection that should use the new
+  ones. See `KNOWN_LIMITATIONS.md`.
+
 ### Fixed
 
 - A snapshot `document_id` containing a path separator is now refused rather
