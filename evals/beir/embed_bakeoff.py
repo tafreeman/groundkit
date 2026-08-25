@@ -176,7 +176,11 @@ class CachedResult(BaseModel):
 
     model: str = Field(min_length=1)
     dimensions: int = Field(gt=0)
-    chunks: int = Field(ge=0)
+    # `gt`, not `ge`. A zero-chunk result is not a cheap edge case, it is the
+    # signature of an empty corpus: every judgment scores as a miss, so the row
+    # is all zeros, every zero is individually in range, and the whole thing
+    # publishes as "this model scored 0.000" rather than "nothing was indexed".
+    chunks: int = Field(gt=0)
     reused_index: bool
     # `ge=0.0`, not `gt`: SCORING_VERSION 2's note records that entries written
     # before the build-timing fix legitimately carry `embed_minutes: 0.0`.
@@ -764,6 +768,40 @@ def _sentinel_embed_seconds(index_dir: Path) -> float | None:
         return None
 
 
+def require_a_usable_corpus(corpus: Path) -> int:
+    """Number of documents in *corpus*, refusing a directory that has none.
+
+    Checked before the waves rather than discovered after them, because an
+    empty corpus does not fail anywhere downstream -- it succeeds, wrongly, at
+    every step. Both fingerprints hash an empty set (to `e3b0c442...`, the
+    digest of nothing, which makes any two empty corpora indistinguishable to
+    the cache identity), `index_directory` accepts an empty directory and
+    builds a zero-chunk index, every judgment then scores as a miss, and the
+    all-zero row that comes out is individually in range at every field. It
+    would be cached and published as this model's measured performance.
+
+    So the guard has to be here. The failure this prevents is not a crash, it
+    is a number.
+
+    Raises:
+        EvalError: The directory is missing, is not a directory, or holds no
+            document the adapter produces.
+    """
+    if not corpus.is_dir():
+        raise EvalError(
+            f"BEIR corpus directory {str(corpus)!r} does not exist. Adapt a dataset into "
+            "it first with adapt_beir.py."
+        )
+    documents = [p for p in corpus.rglob("*") if p.is_file() and p.suffix.lower() == ".txt"]
+    if not documents:
+        raise EvalError(
+            f"BEIR corpus directory {str(corpus)!r} contains no .txt documents. Indexing it "
+            "would succeed with zero chunks and score every judgment as a miss, publishing "
+            "an all-zero row as though it were measured performance. Re-adapt the dataset."
+        )
+    return len(documents)
+
+
 def load_bakeoff_judgments(path: Path) -> tuple[list[Judgment], dict[str, set[str]]]:
     """Judgments and their gold map, refusing anything the scorer cannot pair.
 
@@ -853,9 +891,11 @@ async def main() -> None:
 
     corpus = args.data / "corpus"
     try:
+        document_count = require_a_usable_corpus(corpus)
         judgments, gold = load_bakeoff_judgments(args.data / "judgments.jsonl")
     except EvalError as exc:
-        parser.error(f"unusable judgments file: {exc}")
+        parser.error(str(exc))
+    print(f"corpus: {document_count} documents", flush=True)
 
     scores_dir = args.work / "scores"
     scores_dir.mkdir(parents=True, exist_ok=True)

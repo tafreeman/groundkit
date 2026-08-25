@@ -859,3 +859,68 @@ def test_index_and_score_closes_the_store_when_setup_after_it_fails(
 
     assert len(created) == 1
     assert created[0].closed is True
+
+
+def test_a_zero_chunk_result_is_refused_because_it_is_an_empty_corpus() -> None:
+    """The failure this prevents is a number, not a crash.
+
+    An empty corpus does not fail anywhere downstream -- it succeeds, wrongly,
+    at every step. Indexing an empty directory builds a zero-chunk index, every
+    judgment then scores as a miss, and the all-zero row that results is
+    individually in range at every single field. Without this bound it is
+    cached and published as this model's measured performance.
+    """
+    empty_run = _valid_result()
+    empty_run["chunks"] = 0
+    empty_run["per_query"]["q-1"] = dict.fromkeys(bakeoff.METRICS, 0.0)
+    assert _usable(empty_run) is False
+
+    # An all-zero row is legitimate when something WAS indexed -- a model can
+    # genuinely miss every query -- so the chunk count is what distinguishes
+    # "measured badly" from "measured nothing".
+    real_run = _valid_result()
+    real_run["per_query"]["q-1"] = dict.fromkeys(bakeoff.METRICS, 0.0)
+    assert _usable(real_run) is True
+
+
+def test_a_corpus_with_no_documents_is_refused_before_any_wave_starts() -> None:
+    """Checked up front rather than discovered afterwards, because by then the
+    run has spent its embedding budget to produce a number that means nothing.
+
+    Both fingerprints hash an empty set to the digest of nothing, so two
+    different empty corpora are not even distinguishable to the cache identity.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        corpus = Path(directory) / "corpus"
+        corpus.mkdir()
+
+        with pytest.raises(EvalError, match=r"no \.txt documents"):
+            bakeoff.require_a_usable_corpus(corpus)
+
+        # A directory holding only non-documents is the same failure: the
+        # adapter writes .txt and nothing else is indexed.
+        (corpus / "notes.md").write_text("not a corpus document", encoding="utf-8")
+        with pytest.raises(EvalError, match=r"no \.txt documents"):
+            bakeoff.require_a_usable_corpus(corpus)
+
+
+def test_a_missing_corpus_directory_is_refused_with_a_typed_error() -> None:
+    """Distinguished from the empty case so the message can say what to do:
+    a missing directory means the dataset was never adapted."""
+    with (
+        tempfile.TemporaryDirectory() as directory,
+        pytest.raises(EvalError, match="does not exist"),
+    ):
+        bakeoff.require_a_usable_corpus(Path(directory) / "never-adapted")
+
+
+def test_a_populated_corpus_reports_its_document_count() -> None:
+    """Guards the guard: a preflight that refused everything would satisfy the
+    negative tests above and block every real run."""
+    with tempfile.TemporaryDirectory() as directory:
+        corpus = Path(directory) / "corpus"
+        corpus.mkdir()
+        (corpus / "doc-1.txt").write_text("one", encoding="utf-8")
+        (corpus / "doc-2.txt").write_text("two", encoding="utf-8")
+
+        assert bakeoff.require_a_usable_corpus(corpus) == 2
