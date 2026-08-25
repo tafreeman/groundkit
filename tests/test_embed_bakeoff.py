@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import random
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -237,3 +238,92 @@ def test_cached_result_fields_match_the_writer_dict_exactly() -> None:
         "per_query",
     }
     assert set(bakeoff.CachedResult.model_fields) == writer_keys
+
+
+def test_a_negative_metric_is_rejected() -> None:
+    """``allow_inf_nan=False`` alone admitted this. An out-of-range float is
+    as unpublishable as a NaN and quieter about it: a NaN propagates visibly
+    through the leaderboard, while ``-1.0`` prints as a plausible number."""
+    result = _valid_result()
+    result["per_query"]["q-1"]["ndcg_at_10"] = -1.0
+    assert bakeoff.usable_result(result, _IDS) is False
+
+
+def test_a_metric_above_one_is_rejected() -> None:
+    """No metric ``score_ranking`` computes can exceed 1.0, so a cached value
+    that does is a corrupt file rather than a good run."""
+    result = _valid_result()
+    result["per_query"]["q-1"]["recall_at_10"] = 2.0
+    assert bakeoff.usable_result(result, _IDS) is False
+
+
+def test_the_unit_interval_endpoints_are_still_accepted() -> None:
+    """The bound must be inclusive at both ends. A perfect ranking scores
+    exactly 1.0 and a miss scores exactly 0.0 -- both are the common case, so
+    an exclusive bound would reject good runs and silently force a rescore."""
+    perfect = _valid_result()
+    perfect["per_query"]["q-1"] = dict.fromkeys(bakeoff.METRICS, 1.0)
+    assert bakeoff.usable_result(perfect, _IDS) is True
+
+    missed = _valid_result()
+    missed["per_query"]["q-1"] = dict.fromkeys(bakeoff.METRICS, 0.0)
+    assert bakeoff.usable_result(missed, _IDS) is True
+
+
+def test_impossible_scalars_are_rejected() -> None:
+    """The same defect class as an out-of-range metric, one field out. A
+    negative latency, a negative store size or a zero-dimension embedding are
+    all finite, all impossible, and all published without complaint before."""
+    for field, value in (
+        ("dimensions", 0),
+        ("dimensions", -8),
+        ("query_p50_ms", -5.0),
+        ("query_p95_ms", -5.0),
+        ("vector_store_mb", -1.0),
+        ("embed_minutes", -3.0),
+        ("model", ""),
+    ):
+        result = _valid_result()
+        result[field] = value
+        assert bakeoff.usable_result(result, _IDS) is False, f"{field}={value!r} was accepted"
+
+
+def test_a_zero_embed_minutes_is_still_accepted() -> None:
+    """``ge``, not ``gt``: SCORING_VERSION 2's note records that entries
+    written before the build-timing fix legitimately carry ``0.0``."""
+    result = _valid_result()
+    result["embed_minutes"] = 0.0
+    assert bakeoff.usable_result(result, _IDS) is True
+
+
+def test_a_p95_below_p50_is_rejected_but_an_equal_pair_is_not() -> None:
+    """Both percentiles are read out of one sorted latency array at monotone
+    indices and rounded to the same precision, so p95 below p50 cannot happen
+    in a run the writer produced -- it is proof the file was edited. An equal
+    pair, by contrast, is ordinary on a short or uniform battery."""
+    swapped = _valid_result()
+    swapped["query_p50_ms"], swapped["query_p95_ms"] = 9.0, 2.0
+    assert bakeoff.usable_result(swapped, _IDS) is False
+
+    equal = _valid_result()
+    equal["query_p50_ms"] = equal["query_p95_ms"] = 4.0
+    assert bakeoff.usable_result(equal, _IDS) is True
+
+
+def test_every_ranking_score_ranking_can_produce_validates() -> None:
+    """Ties the model to the writer rather than to my reading of it.
+
+    If a bound here is tighter than what ``score_ranking`` actually returns,
+    real runs start failing validation and rescoring forever. Fuzzing the
+    scorer and validating each row is the check that catches that, and it is
+    the direction the per-field tests above cannot cover.
+    """
+    # S311: fuzzing the scorer, seeded so a failure is reproducible.
+    rng = random.Random(7)  # noqa: S311
+    for _ in range(2000):
+        size = rng.randint(1, 12)
+        docs = [f"d{i}" for i in range(size)]
+        gold = set(rng.sample(docs, rng.randint(1, size)))
+        order = docs[:]
+        rng.shuffle(order)
+        bakeoff.CachedMetrics.model_validate(bakeoff.score_ranking(order, gold))

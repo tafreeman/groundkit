@@ -52,7 +52,7 @@ from functools import cache
 from pathlib import Path
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from groundkit.config import ChunkingConfig, EmbeddingConfig
 from groundkit.contracts import Document
@@ -126,14 +126,22 @@ METRICS = ("ndcg_at_10", "mrr", "recall_at_1", "recall_at_10")
 
 
 class CachedMetrics(BaseModel):
-    """One query's scores inside a cached result."""
+    """One query's scores inside a cached result.
+
+    Bounded to the unit interval, matching ``evals.schema.QueryMetrics`` --
+    the authoritative statement of what a groundkit metric is -- and matching
+    what ``score_ranking`` can actually return. ``allow_inf_nan=False`` alone
+    admitted ``-1.0`` and ``2.0``, which are as unpublishable as a NaN and
+    quieter: a NaN at least propagates visibly through the leaderboard, while
+    an out-of-range float prints as a plausible number.
+    """
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    ndcg_at_10: float = Field(allow_inf_nan=False)
-    mrr: float = Field(allow_inf_nan=False)
-    recall_at_1: float = Field(allow_inf_nan=False)
-    recall_at_10: float = Field(allow_inf_nan=False)
+    ndcg_at_10: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    mrr: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    recall_at_1: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    recall_at_10: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
 
 
 class CachedResult(BaseModel):
@@ -163,15 +171,34 @@ class CachedResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, protected_namespaces=())
 
-    model: str
-    dimensions: int
-    chunks: int
+    model: str = Field(min_length=1)
+    dimensions: int = Field(gt=0)
+    chunks: int = Field(ge=0)
     reused_index: bool
-    embed_minutes: float | None = Field(default=None, allow_inf_nan=False)
-    query_p50_ms: float = Field(allow_inf_nan=False)
-    query_p95_ms: float = Field(allow_inf_nan=False)
-    vector_store_mb: float = Field(allow_inf_nan=False)
+    # `ge=0.0`, not `gt`: SCORING_VERSION 2's note records that entries written
+    # before the build-timing fix legitimately carry `embed_minutes: 0.0`.
+    embed_minutes: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    query_p50_ms: float = Field(ge=0.0, allow_inf_nan=False)
+    query_p95_ms: float = Field(ge=0.0, allow_inf_nan=False)
+    vector_store_mb: float = Field(ge=0.0, allow_inf_nan=False)
     per_query: dict[str, CachedMetrics]
+
+    @model_validator(mode="after")
+    def _percentiles_are_ordered(self) -> CachedResult:
+        """p95 cannot be below p50.
+
+        Both are read out of one sorted latency array at monotone indices and
+        rounded to the same precision, so this holds for every run the writer
+        can produce -- which makes a violation proof the file was edited or
+        truncated, not evidence of a slow run. Checked because a swapped pair
+        is exactly the finite-but-impossible shape the bounds above close, and
+        no per-field constraint can see it.
+        """
+        if self.query_p95_ms < self.query_p50_ms:
+            raise ValueError(
+                f"query_p95_ms ({self.query_p95_ms}) is below query_p50_ms ({self.query_p50_ms})"
+            )
+        return self
 
 
 def usable_result(result: object, expected_query_ids: set[str]) -> bool:
