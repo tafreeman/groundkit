@@ -6,9 +6,10 @@ claim that it did. An eval harness (short for "evaluation harness") is a
 fixed, checked-in set of test questions with known-correct answers, scored
 automatically; it is what turns "I think this is better" into a number
 anyone can reproduce and check. By the end of this page you will know what
-groundkit measures, how to regenerate any number it reports yourself, and
-which of its checks are advisory only — meaning they report a result but
-must never be mistaken for a pass/fail gate.
+groundkit measures, how to regenerate any number it reports yourself, how far
+one of those numbers can honestly be carried, and which of its checks are
+advisory only — meaning they report a result but must never be mistaken for a
+pass/fail gate.
 
 Retrieval quality is a measurement here, not a claim. The harness landed in
 Phase 2 — before hybrid retrieval and before rerank — so that every retrieval
@@ -26,6 +27,16 @@ to `evals/results/latest.json`.
 
 That path is gitignored. Reports are regenerated, never committed — a report
 in git is a number that was true once (SPEC.md §2).
+
+Two directories in the repository do hold committed artifacts —
+`evals/perf/` and `evals/beir/` — and they are a narrow, argued exception
+rather than a hole in that rule. Each is dated evidence for one specific
+argument: a performance baseline a refactor is judged against, and a single
+external-benchmark validation run. For those, comparing across runs is the
+whole point of the artifact rather than the hazard, and evidence that exists
+only on one machine is not evidence. Neither is a live report, and no number
+from either is quoted on this site or in the README — they are read by
+opening the file, beside the commit and corpus hash it was generated from.
 
 ## What is measured
 
@@ -58,6 +69,73 @@ unique IDs, category coverage, and a size floor. **The floor is asserted in
 the test, not in a document** — the test is the authoritative number, so prose
 that drifts cannot weaken the gate.
 
+## Running the harness over another corpus
+
+The golden corpus is the default, not the only thing `grk eval` can score:
+`--corpus-dir` and `--judgments` point it at any directory of documents plus
+a judgments file that satisfies the contract in `evals/README.md`.
+
+`groundkit.evals.beir` converts a **BEIR** dataset — the standard public
+collection of retrieval benchmarks, each shipping documents, queries and
+relevance labels — into exactly that shape:
+
+```python
+from pathlib import Path
+
+from groundkit.evals.beir import adapt_beir_dataset
+
+report = adapt_beir_dataset(Path("./scifact"), Path("./scifact-gk"))
+```
+
+It writes `<output>/corpus/` and `<output>/judgments.jsonl`, which `grk eval`
+then scores through the same deterministic path the golden corpus goes
+through:
+
+```bash
+uv run grk eval \
+  --corpus-dir ./scifact-gk/corpus \
+  --judgments ./scifact-gk/judgments.jsonl
+```
+
+The adapter downloads nothing — you supply a BEIR directory you already have —
+and it is a library function with no `grk` verb, deliberately: adapting a
+dataset *writes* a corpus, and the CLI's eval surface reads one.
+
+Three mismatches it resolves in the open rather than papering over:
+
+- **BEIR relevance is per document; a groundkit judgment is a verbatim
+  quote.** Each adapted gold quote is set to the document's *entire* text, so
+  the harness resolves it at offset zero and counts every chunk of that
+  document relevant. That is document-level relevance expressed in the span
+  vocabulary — the quote really is a verbatim substring, simply the maximal
+  one — not an invention of span annotations BEIR does not provide.
+- **BEIR has no judgment categories**, so every adapted row is written
+  `normal` and the report's category breakdown collapses to a single bucket.
+  The golden corpus's no-answer, ambiguous and adversarial coverage does not
+  come along with the dataset; `no_answer` would need queries with no relevant
+  document, and BEIR's qrels assert relevance on every row.
+- **A BEIR corpus is an untrusted third-party download.** Every document id,
+  query id and split name is validated as a single path component before it
+  reaches a path join, each written path is containment-checked against the
+  output directory as a second independent barrier, and the whole dataset is
+  validated *before* a byte is written — so a dataset the harness would later
+  reject leaves nothing behind. Adapting into a corpus directory that already
+  holds files is refused rather than silently unioning two datasets into one
+  corpus scored against judgments that never mentioned half of it.
+
+!!! warning "A chunk-level score is not a document-level score"
+
+    BEIR's published numbers rank **documents**. `grk eval` ranks **chunks**,
+    and on an adapted set it computes the ideal ranking over every gold chunk
+    — so retrieving the right document and returning one chunk of it is scored
+    as though the rest were missed. The resulting figure is a valid
+    measurement of groundkit against itself across configurations, and it is
+    **not** comparable to a published BEIR number. Making the two mean the
+    same thing requires collapsing the chunk ranking to first-seen distinct
+    documents before scoring, which the harness deliberately does not do for
+    you: it would be a second scoring mode whose output looks identical to the
+    first.
+
 ## Baseline discipline
 
 BM25-only is the baseline. Every retrieval feature reports its delta against
@@ -82,6 +160,50 @@ uv run grk eval --dense --embed-model nomic-embed-text
     of quality, but not a measurement of quality at all — which is why the
     runner warns on it and the CLI stamps a caveat onto any report generated
     with it.
+
+## Is a delta real?
+
+A delta is the difference between two point estimates over one fixed set of
+queries. Over a few dozen of them, a small delta and "which queries happen to
+be in the set" are not distinguishable by looking at the number, and the
+report does not claim otherwise — it reports the difference it measured.
+
+`groundkit.evals.significance` is what separates the two. It runs a **paired
+bootstrap**: resample the queries with replacement, recompute the
+candidate-minus-baseline difference on each resample, and read an interval off
+the resulting distribution.
+
+```python
+from groundkit.evals.significance import compare_report_stages
+
+result = compare_report_stages(report, baseline="bm25", candidate="fusion", metric="ndcg_at_10")
+result.significant  # does the 95% confidence interval exclude zero?
+```
+
+Four properties of it are decisions rather than implementation details:
+
+- **The unit of resampling is a query, not an individual retrieved hit**, and
+  pairing is checked by query id — a missing or reordered query raises rather
+  than quietly becoming an unpaired comparison.
+- **`significant` is decided by the confidence interval, never by the
+  p-value.** The two are computed independently, and the interval is the
+  verdict.
+- **The p-value is an achieved significance level**, in the Smucker/Allan/
+  Carterette sense: the resamples are drawn from the observed deltas, not from
+  a null-centred distribution, so it is not a null-hypothesis p-value and is
+  not described as one. It carries a `(r + 1) / (B + 1)` finite-sample
+  correction and therefore has a floor — no finite resampling can support a
+  reported zero, and printing one would be a precision claim the method cannot
+  make.
+- **A result is reproducible and order-independent.** The generator is seeded
+  and built per call, so a comparison does not depend on what was compared
+  before it.
+
+`compare_report_stages` reads two stages out of one eval artifact and refuses
+a report containing two stages of the same name, since such a comparison
+cannot say which of them it measured. `paired_bootstrap` takes two
+`{query_id: score}` mappings directly, for comparing systems that are not two
+stages of one report.
 
 ## Rerank, synthesis, and the judge
 
@@ -152,3 +274,5 @@ that blocks a merge is a coin flip with authority.
 produces actually get used to decide something, including the hybrid-vs-BM25
 result referenced above. [Installation](../getting-started/installation.md)
 covers the `dense` and `rerank` extras that `--dense` and `--rerank` need.
+[Eval harness reference](../reference/evals.md) documents the two modules on
+this page that are called from Python rather than through `grk eval`.

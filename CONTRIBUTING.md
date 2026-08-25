@@ -344,6 +344,18 @@ targets `~DEFAULT_BRANCH` only — any other long-lived branch is unprotected.
   and gitignored `results/`. This is the harness SPEC.md §8 calls "before
   features" — it landed ahead of hybrid retrieval and rerank specifically so
   every later feature reports a measured delta against it.
+
+  Alongside it sit `evals/baseline/`, `evals/beir/` and `evals/perf/`:
+  benchmark tooling against external datasets and a synthetic corpus, rather
+  than corpus content. Note the convention differs from `results/` on purpose.
+  Those directories are **tracked**, artifacts included, because each dated
+  report is the evidence behind a claim made elsewhere — and evidence that
+  exists only on the machine that produced it is not evidence. `results/`
+  stays gitignored for the opposite reason: `stages[0]` is the intra-run
+  baseline, so an eval delta is never meant to be compared across runs.
+  Nothing under these three directories may be cited as a retrieval-quality
+  number in a tracked doc unless it was produced by a real provider — the
+  `InMemoryEmbedder` numbers are hash-derived noise (SPEC.md §2).
 - `infra/` — Dockerfile, compose stack, Kubernetes manifests, Terraform
   module (Phase 6). Not scaffolding: each path is exercised by CI's `infra`
   job or has been verified by hand, with the verification recorded in

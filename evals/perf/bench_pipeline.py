@@ -1,6 +1,6 @@
 """Reproducible performance baseline for the pipeline-simplification work.
 
-UNTRACKED, local-only. ``grk eval`` measures retrieval *quality*; this measures
+Tracked, artifacts included. ``grk eval`` measures retrieval *quality*; this measures
 the *cost* of producing it, which is the axis the simplification work moves.
 Run it before and after each change and diff the JSON:
 

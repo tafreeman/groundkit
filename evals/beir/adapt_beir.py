@@ -1,6 +1,6 @@
 """Adapt a BEIR dataset into the shape groundkit's eval harness already reads.
 
-UNTRACKED, local-only, alongside ``evals/perf/``. Run it once per dataset:
+Tracked, alongside ``evals/perf/``. Run it once per dataset:
 
     uv run --no-sync python evals/beir/adapt_beir.py --src <dir>/scifact --out <dir>/scifact-gk
 

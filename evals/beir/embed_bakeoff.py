@@ -1,6 +1,6 @@
 """Compare embedding models on an adapted BEIR set — one persisted index per model.
 
-UNTRACKED, local-only, alongside the rest of ``evals/beir/``.
+Tracked, alongside the rest of ``evals/beir/``.
 
     uv run --no-sync python evals/beir/embed_bakeoff.py --data <dir>/scifact-gk --work <dir>/bakeoff
 
@@ -204,14 +204,62 @@ class CachedResult(BaseModel):
         return self
 
 
+def validated_result(
+    result: dict, expected_query_ids: set[str], *, model: str, dimensions: int
+) -> dict:
+    """The one place a result is judged fit to publish. Raises on anything unfit.
+
+    A cache read only ever reached the leaderboard through ``usable_result`` --
+    shape via ``CachedResult``, then the three identity checks below. A
+    freshly-computed result from ``index_and_score`` reached the exact same
+    leaderboard -- the same format strings, the same paired bootstrap -- through
+    no check at all: it was a dict literal, returned, and trusted. Eight rounds
+    of review on this file kept finding variations on that one asymmetry --
+    a metric out of range, a wrong model name, a dimension mismatch, a
+    per-query id set that didn't match the judgments -- each one invisible
+    because the fresh path and the cache-read path were validated by two
+    different amounts of code.
+
+    This is now the only amount there is. ``usable_result`` (for a cache read)
+    and ``assemble_result`` (for a fresh score) both call *this* function and
+    nothing else, so the two paths cannot drift apart again -- there is no
+    longer a second, weaker check for either of them to fall back onto.
+
+    Raises:
+        ValidationError: ``result`` does not have ``CachedResult``'s shape --
+            a missing or extra field, a wrong type, or a metric outside its
+            declared range.
+        ValueError: ``result`` is shaped correctly but disagrees with what was
+            asked for -- the wrong model, the wrong dimensions, or scored
+            against a different set of query ids than ``expected_query_ids``.
+    """
+    parsed = CachedResult.model_validate(result)
+    if parsed.model != model:
+        raise ValueError(f"result names model {parsed.model!r}, expected {model!r}")
+    if parsed.dimensions != dimensions:
+        raise ValueError(f"result claims {parsed.dimensions} dimensions, expected {dimensions}")
+    actual_ids = set(parsed.per_query)
+    if actual_ids != expected_query_ids:
+        missing = sorted(expected_query_ids - actual_ids)
+        extra = sorted(actual_ids - expected_query_ids)
+        raise ValueError(
+            f"result's per_query ids disagree with the judgment set "
+            f"(missing={missing!r}, extra={extra!r})"
+        )
+    return result
+
+
 def usable_result(
     result: object, expected_query_ids: set[str], *, model: str, dimensions: int
 ) -> bool:
     """Whether a cached result is safe to publish without rescoring.
 
-    Shape, then identity, because the schema cannot express identity. The
-    model above settles types, ranges and finiteness. The rest is what a
-    valid-looking result can still be wrong *about*:
+    A thin wrapper over :func:`validated_result` -- deliberately thin, because
+    the two policies a result can be put to (a cache miss just means rescore;
+    a validation failure on a *fresh* result means fail loudly, see
+    ``assemble_result``) must read the same judgment, or they will eventually
+    disagree about what "fit to publish" means. Sharing one function is what
+    makes that structurally impossible rather than merely intended.
 
     ``expected_query_ids`` -- a result carrying the right shape for the wrong
     queries pairs cleanly in the bootstrap and reports a comparison nobody ran.
@@ -225,13 +273,13 @@ def usable_result(
     -- it makes the baseline look absent and skips every comparison in the
     run.
     """
+    if not isinstance(result, dict):
+        return False
     try:
-        parsed = CachedResult.model_validate(result)
-    except ValidationError:
+        validated_result(result, expected_query_ids, model=model, dimensions=dimensions)
+    except (ValidationError, ValueError):
         return False
-    if parsed.model != model or parsed.dimensions != dimensions:
-        return False
-    return set(parsed.per_query) == expected_query_ids
+    return True
 
 
 def write_cache_file(path: Path, payload: dict) -> bool:
@@ -528,15 +576,29 @@ async def index_and_score(
             )
     index_dir.mkdir(parents=True, exist_ok=True)
 
+    # Opened before the `try` on purpose, and everything after it is not: a
+    # store left open on the way out of this function is not this function's
+    # problem to solve twice, so exactly one `finally` covers every exit,
+    # including the two lines right below that can themselves raise before
+    # any of them ever ran. `build_embedder` can fail on a bad dimension and
+    # `LanceDBVectorStore.open` can fail on a corrupt or inaccessible Lance
+    # directory -- both were previously evaluated *before* this `try` began,
+    # so either one raising leaked the SQLite handle for the rest of the
+    # multi-model process. On Windows that handle blocks deleting the very
+    # index directory an operator would reach for to recover from the failure
+    # that leaked it -- `PermissionError: [WinError 32]` -- until the whole
+    # process exits.
     store = await SQLiteMetadataStore.open(index_dir=index_dir, collection="beir")
-    embedder = build_embedder(EmbeddingConfig(provider="ollama", model_name=model, dimensions=dims))
-    vectors = await LanceDBVectorStore.open(db_path=lance_dir)
-
     # `None`, not 0.0: an unmeasured cost and a zero cost are different claims,
     # and only one of them is ever true here.
     embed_seconds: float | None = None
     chunks = 0
     try:
+        embedder = build_embedder(
+            EmbeddingConfig(provider="ollama", model_name=model, dimensions=dims)
+        )
+        vectors = await LanceDBVectorStore.open(db_path=lance_dir)
+
         if fresh:
             indexer = Indexer(
                 store=store,
@@ -591,13 +653,68 @@ async def index_and_score(
     finally:
         await store.close()
 
-    latencies.sort()
     vector_bytes = sum(p.stat().st_size for p in lance_dir.rglob("*") if p.is_file())
-    return {
+    return assemble_result(
+        model=model,
+        dimensions=dims,
+        chunks=chunks,
+        reused_index=not fresh,
+        embed_seconds=embed_seconds,
+        latencies=latencies,
+        vector_bytes=vector_bytes,
+        per_query=per_query,
+        expected_query_ids=set(gold),
+    )
+
+
+def assemble_result(
+    *,
+    model: str,
+    dimensions: int,
+    chunks: int,
+    reused_index: bool,
+    embed_seconds: float | None,
+    latencies: list[float],
+    vector_bytes: int,
+    per_query: dict[str, dict[str, float]],
+    expected_query_ids: set[str],
+) -> dict:
+    """Build one model's published result and validate it before returning.
+
+    This is the write side of the asymmetry :func:`validated_result` closes.
+    Everything above it in ``index_and_score`` measures; this is where the
+    measurements become the dict that gets cached, printed and fed to the
+    bootstrap -- and it is handed to ``validated_result`` before it goes back
+    to the caller, the same check a cache read has to pass. A fresh result
+    used to skip that check entirely on the theory that it was just computed
+    and therefore trustworthy, which is exactly backwards: it is the one
+    result in the whole run that has never been checked by anything.
+
+    ``latencies`` is sorted into a new list rather than in place and rather
+    than trusted pre-sorted, so this function is idempotent -- calling it
+    twice on the same measurements (a retry, a test) produces byte-identical
+    output instead of depending on a mutation the caller already made.
+
+    The rounding is unchanged from the dict literal this replaces: two
+    decimal places for embed minutes, one for millisecond and megabyte
+    figures, matching what a human comparing models in the printed table
+    actually reads. Do not change it here without re-checking every cached
+    score file's precision assumptions.
+
+    Raises:
+        ValidationError: The assembled dict does not have ``CachedResult``'s
+            shape -- this would mean the arithmetic above produced a value
+            outside a metric's declared range, since every field here is
+            otherwise well-typed by construction.
+        ValueError: The assembled dict disagrees with ``model``, ``dimensions``
+            or ``expected_query_ids`` -- see :func:`validated_result`.
+    """
+    latencies = sorted(latencies)
+    result = {
         "model": model,
-        "dimensions": dims,
+        "dimensions": dimensions,
         "chunks": chunks,
-        "reused_index": not fresh,
+        "reused_index": reused_index,
         # `null` rather than 0.0 when this run reused an index built before the
         # sentinel carried timings -- a reader can tell "not measured" from
         # "measured as free", which a zero cannot.
@@ -607,6 +724,7 @@ async def index_and_score(
         "vector_store_mb": round(vector_bytes / 1e6, 1),
         "per_query": per_query,
     }
+    return validated_result(result, expected_query_ids, model=model, dimensions=dimensions)
 
 
 class SentinelBuild(BaseModel):

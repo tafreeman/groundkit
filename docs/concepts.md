@@ -274,7 +274,18 @@ report. "Beat the baseline by this much" and "didn't beat the baseline"
 are both acceptable things for the report to say; a feature that shipped
 unmeasured is not.
 
-See [Eval harness](guides/evals.md) for how to run it yourself.
+A delta is not automatically a result, though. The golden corpus holds a few
+dozen questions, and over a set that small a modest difference can just as
+easily reflect which questions happen to be in it. groundkit ships a separate
+tool for telling those apart — it re-runs the comparison over thousands of
+resampled versions of the question set and reports the range the difference
+falls in, so "this helped" can be distinguished from "this set of questions
+liked it." The same harness will also score a corpus other than the one
+shipped with it, including a public retrieval benchmark converted into its
+format, which is how the search implementation gets checked against an
+external reference rather than only against itself.
+
+See [Eval harness](guides/evals.md) for how to run all of it yourself.
 
 ## MCP: how an assistant like Claude searches your documents
 

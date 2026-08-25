@@ -33,7 +33,22 @@ evals/
   corpus/*.md         documents only — nothing else, see above
   judgments.jsonl      one Judgment per line, sorted by query_id
   results/             generated eval output — gitignored, never committed
+
+  baseline/            benchmark tooling, not corpus content: a minimal
+  beir/                comparison RAG, BEIR adapters, and pipeline-cost
+  perf/                benchmarks, each with dated committed artifacts
 ```
+
+The last three are **tracked, artifacts included**, which is the opposite of
+`results/` and deliberate. A dated report there is the evidence behind an
+argument made elsewhere, and evidence that exists only on the machine that
+produced it is not evidence. `results/` stays gitignored for the opposite
+reason: `stages[0]` is the intra-run baseline (SPEC.md §8), so an eval delta
+was never meant to be compared across runs.
+
+Nothing in those three directories may be quoted as a retrieval-quality number
+unless a real provider produced it — an `InMemoryEmbedder` figure is
+hash-derived noise, not a measurement (SPEC.md §2).
 
 ## The JSONL record schema
 
