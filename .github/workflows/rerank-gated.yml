@@ -80,14 +80,30 @@ jobs:
       # failure mode SPEC.md §3 is guarding against. Assert the tests actually
       # ran. Both gated files are checked: a skip in either one is the same
       # false-green risk, so neither can hide behind the other passing.
+      # `-v` is load-bearing, and its absence made this whole step inert.
+      # `pyproject.toml` sets `addopts = "-q"`, so the `-q` these commands used
+      # to pass stacked into pytest's DOUBLE-quiet mode, which suppresses the
+      # "N passed, M skipped" summary line altogether. The greps below had
+      # nothing to match, so the step reported success no matter what the run
+      # did — a safety net against a false green that was itself falsely green.
       - name: Fail if the gate skipped instead of running
         run: |
           uv run pytest tests/test_rerank_gated.py tests/test_eval_rerank_gated.py -q --collect-only >/dev/null
-          if uv run pytest tests/test_rerank_gated.py -q 2>&1 | grep -qE '[0-9]+ skipped'; then
+
+          # Every test here needs only RERANK_GATED, so any skip means the gate
+          # did not open.
+          if uv run pytest tests/test_rerank_gated.py -v 2>&1 | grep -qE '[0-9]+ skipped'; then
             echo "Gated rerank tests skipped despite RERANK_GATED=1 — the gate did not open." >&2
             exit 1
           fi
-          if uv run pytest tests/test_eval_rerank_gated.py -q 2>&1 | grep -qE '[0-9]+ skipped'; then
-            echo "Gated rerank eval tests skipped despite RERANK_GATED=1 — the gate did not open." >&2
+
+          # This file is deliberately two-tier: the rerank-over-fusion group
+          # additionally needs EVAL_GATED (a real embedder for the fusion
+          # input), which this workflow does not set, so those tests SKIP by
+          # design. Asserting "nothing skipped" here would therefore fail every
+          # correct run. Assert instead that tests actually executed — which is
+          # the property the step exists to defend.
+          if ! uv run pytest tests/test_eval_rerank_gated.py -v 2>&1 | grep -qE '[0-9]+ passed'; then
+            echo "No gated rerank eval test ran despite RERANK_GATED=1 — the gate did not open." >&2
             exit 1
           fi

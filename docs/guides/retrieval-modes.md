@@ -37,6 +37,15 @@ reproducible in a single command:
 uv run grk eval --dense --embed-model nomic-embed-text
 ```
 
+Read that for what it is: a point estimate over a few dozen queries on one
+small corpus, not a general result about hybrid retrieval. On a query set that
+size, a modest delta and the particular queries in the set are not
+distinguishable by inspecting the number — `groundkit.evals.significance` is
+what separates them, and the [eval harness guide](evals.md#is-a-delta-real)
+shows how to put a confidence interval around a stage comparison rather than
+reading the difference alone. The tradeoff below is what should actually
+decide the choice for your corpus.
+
 ## Why BM25 is still the default
 
 Because the default path is not permitted to require a model server.

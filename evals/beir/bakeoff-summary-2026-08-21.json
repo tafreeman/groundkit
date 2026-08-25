@@ -1,0 +1,52 @@
+[
+  {
+    "model": "nomic-embed-text",
+    "dimensions": 768,
+    "chunks": 20219,
+    "reused_index": false,
+    "embed_minutes": 28.21,
+    "query_p50_ms": 917.9,
+    "query_p95_ms": 1034.1,
+    "vector_store_mb": 1361.2
+  },
+  {
+    "model": "bge-m3",
+    "dimensions": 1024,
+    "chunks": 20219,
+    "reused_index": false,
+    "embed_minutes": 45.89,
+    "query_p50_ms": 1348.8,
+    "query_p95_ms": 1597.2,
+    "vector_store_mb": 1386.1
+  },
+  {
+    "model": "mxbai-embed-large",
+    "dimensions": 1024,
+    "chunks": 20219,
+    "reused_index": false,
+    "embed_minutes": 43.68,
+    "query_p50_ms": 1050.4,
+    "query_p95_ms": 1212.0,
+    "vector_store_mb": 1386.1
+  },
+  {
+    "model": "snowflake-arctic-embed2",
+    "dimensions": 1024,
+    "chunks": 20219,
+    "reused_index": false,
+    "embed_minutes": 51.67,
+    "query_p50_ms": 1129.0,
+    "query_p95_ms": 1331.1,
+    "vector_store_mb": 1386.1
+  },
+  {
+    "model": "qwen3-embedding",
+    "dimensions": 4096,
+    "chunks": 20219,
+    "reused_index": false,
+    "embed_minutes": 126.33,
+    "query_p50_ms": 1065.0,
+    "query_p95_ms": 1193.0,
+    "vector_store_mb": 1636.3
+  }
+]

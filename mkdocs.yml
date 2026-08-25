@@ -133,6 +133,7 @@ nav:
       - Answer: reference/answer.md
       - Service: reference/service.md
       - Telemetry: reference/telemetry.md
+      - Eval harness: reference/evals.md
       - Errors: reference/errors.md
   - Decisions:
       - Overview: adr/index.md

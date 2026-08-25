@@ -79,6 +79,8 @@ Declined section with the reason)
 | ID | Item | Sev | Phase | Effort | Status | Depends on |
 |---|---|---|---|---|---|---|
 | GK-020 | The staleness cache stops working during an ingest | MED | G | L | todo | — |
+| GK-031 | Published eval figures are known-stale and need regenerating | LOW | — | S | todo | — |
+| GK-032 | Untested cleanup-on-error and URL-shape guards | MED | — | M | todo | — |
 
 ---
 
@@ -340,6 +342,34 @@ to the write side because that side already pinned byte-exactness with `newline=
 item: a round trip is only verified by a fixture that differs between the two
 representations.
 
+## Net-new from the eval-testbed branch (BEIR adapter, significance, benchmarks)
+
+### GK-031 — Published eval figures are known-stale and need regenerating
+
+- **Severity** LOW · **Effort** S · **ADR** no · **Verified**
+- **Where** `evals/perf/README.md` (the `db MB` column); `evals/beir/RESULTS-scifact-2026-08-21.md`
+  (every MRR figure)
+
+Both documents already flag their own numbers as unreliable, and this branch fixed the two
+measurement defects that produced them: `evals/perf/bench_pipeline.py` now stats the SQLite file
+*after* `close()` instead of while pages are still outstanding in the WAL, and the BEIR scorers
+now cap MRR at `k` (`SCORING_VERSION` 3) instead of searching the whole distinct-document list.
+Nobody has re-run either script to produce a corrected artifact — the published numbers are still
+the pre-fix ones, correctly labelled as such in-place.
+
+**Acceptance criteria**
+
+- [ ] `evals/perf/bench_pipeline.py` re-run (local, no external data) and the three `db MB`
+      values in `evals/perf/README.md`'s pipeline-cost table replaced with post-checkpoint
+      measurements, dated.
+- [ ] The BEIR SciFact corpus re-adapted (the one behind the current figures lived in a
+      temporary directory and no longer exists) and `evals/beir/scifact_sweep.py` /
+      `scifact_doclevel.py` / `embed_bakeoff.py` re-run under `SCORING_VERSION` 3, with every
+      MRR figure in `evals/beir/RESULTS-scifact-2026-08-21.md` — the headline table, the sweep,
+      and the chunker-fix table — replaced, or the document superseded by a new dated file. The
+      nDCG@10/R@10/R@1 figures in that document are unaffected by the MRR bug and do not need to
+      move.
+
 ## Declined
 
 Nothing yet. Items moved here keep their ID and gain a one-line reason.
@@ -368,3 +398,39 @@ Recorded so the earlier work order is not re-followed as written.
   The egress inventory, the deployment guide's Jaeger paragraph, `KNOWN_LIMITATIONS.md`'s
   internal contradiction, and the installation dependency list are all current. What
   survives is GK-005, GK-006 and GK-007.
+
+
+### GK-032 — Untested cleanup-on-error and URL-shape guards
+
+- **Severity** MED · **Effort** M · **ADR** no · **Verified**
+
+Coverage sits comfortably above both gates, which is exactly what makes these invisible: the
+uncovered lines are concentrated in the failure classes this repo has a documented history of
+getting wrong — crash windows, cleanup invoked from an exception handler, and credential
+handling — while the percentage is padded by trivial guards. The two worth doing first:
+
+- `index/metadata.py` — the lock release on task-creation failure in `_run`. The lock is
+  normally freed by the done-callback attached to the worker task, but that callback is only
+  attached *after* the task is created. If `ensure_future`/`to_thread` itself raises, this
+  branch is the only thing that frees it, and a regression deadlocks the store permanently:
+  every later read or write on that connection blocks forever, with no exception and no log
+  line. Its sibling rollback branch two lines up is already regression-tested; this one is the
+  gap in an otherwise careful design.
+- `ingestion/url_loader.py` — `_reject_unsafe_url_shape`, which runs on every fetch *before*
+  the SSRF guard. It refuses a non-http(s) scheme, an empty host, and userinfo credentials in
+  the URL. None of the three has a direct test. The credential case matters most: the URL is
+  persisted verbatim as `Document.source`, so a regression silently writes `user:pass@host`
+  into SQLite and into every citation built from that document.
+
+Also uncovered and worth closing with them: `runtime.py`'s registry-closed guard and its
+cleanup-on-construction-failure path, `index/metadata.py`'s schema-application rollback,
+`retrieval/search.py`'s snapshot-filter give-up branch, and `retrieval/rerank.py`'s genuine
+"`groundkit[rerank]` is not installed" message — the single most common real-world failure for
+that feature, and reachable with no mocking on a machine without the extra.
+
+**Acceptance criteria**
+
+- [ ] The two headline guards have regression tests, each shown to fail against the reverted
+      source per SPEC.md §8.
+- [ ] The remaining paths above are either tested or explicitly argued as unreachable in a
+      comment, so a later reader does not re-triage them from scratch.

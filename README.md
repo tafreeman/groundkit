@@ -72,7 +72,11 @@ default. Term by term:
   known-correct answers, scored by recall@k, MRR and nDCG@k computed by
   deterministic, unit-tested code, so a change can be measured instead of
   guessed at. BM25-only is the baseline every feature must beat (or the
-  report says it didn't).
+  report says it didn't). It is not confined to the corpus shipped with it:
+  it scores any corpus and judgment set, `groundkit.evals.beir` adapts a
+  public BEIR benchmark into the format it reads, and
+  `groundkit.evals.significance` puts a confidence interval around a delta
+  rather than leaving it a bare difference between two point estimates.
 - **Local-first** — Ollama embeddings and a file-based index by default; cloud
   providers are opt-in, and cloud chat egress sits behind a redaction
   boundary (the embedding boundary deliberately does not — see below).
@@ -153,6 +157,27 @@ builds a throwaway index over the corpus and scores it with the same
 deterministic BM25 retrieval path `grk search` uses. BM25-only is the
 baseline every later retrieval feature (hybrid, rerank) reports its delta
 against, in the same report.
+
+Two things extend that beyond a single corpus and a bare difference, both
+library API rather than CLI verbs:
+
+- `groundkit.evals.beir` adapts a BEIR dataset you already have on disk into
+  the corpus + judgments format the harness reads, so `grk eval`'s
+  `--corpus-dir` / `--judgments` flags score it through the same
+  deterministic path as the golden corpus. It resolves BEIR's document-level
+  relevance into the harness's quote vocabulary rather than pretending BEIR
+  ships span annotations, and treats the dataset as the untrusted
+  third-party download it is. One limit is load-bearing: BEIR ranks
+  documents and `grk eval` ranks chunks, so a score from an adapted set is
+  **not** comparable to a published BEIR number.
+- `groundkit.evals.significance` compares two systems — or two stages of one
+  report — with a paired bootstrap over per-query score deltas. The verdict is
+  the confidence interval, never the p-value; the p-value is an achieved
+  significance level with a finite-sample correction, so it has a floor and is
+  never reported as zero.
+
+Both are documented at
+<https://tafreeman.github.io/groundkit/guides/evals/>.
 
 ## Which retrieval mode should I use?
 

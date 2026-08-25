@@ -43,7 +43,10 @@ default. Term by term:
 - **A retrieval eval harness** — a fixed set of test questions with
   known-correct answers, scored against a labelled golden corpus by
   deterministic, unit-tested metric code. BM25-only is the baseline every
-  feature reports a delta against, including when the delta is negative.
+  feature reports a delta against, including when the delta is negative. It
+  is not confined to that corpus: it scores any corpus and judgment set,
+  including a public BEIR benchmark adapted into its format, and a delta can
+  be given a confidence interval instead of being read as a bare difference.
 - **Local by default** — Ollama embeddings and a file-based index. `grk` works
   end to end with zero cloud credentials.
 

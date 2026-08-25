@@ -300,6 +300,104 @@ it scored.
 
 ### Added
 
+- `groundkit.evals.significance` — paired-bootstrap comparison of two systems
+  over per-query score deltas, with a percentile confidence interval and a
+  two-sided achieved significance level. Pairing is checked by query id, so a
+  missing or reordered query cannot silently become an unpaired comparison,
+  and a seeded RNG built per call makes a result reproducible and independent
+  of call order. `significant` is decided by the confidence interval, never by
+  the p-value; the p-value carries a `(r+1)/(B+1)` finite-sample correction so
+  it is never reported as exactly zero, which no finite resampling can
+  support. `compare_report_stages` runs the same comparison between two stages
+  of one eval artifact.
+- `groundkit.evals.beir` — adapts a BEIR dataset into the harness's
+  quote-anchored corpus and judgment format. BEIR qrels are document-level, so
+  each gold quote is the whole adapted document: `resolve_gold_span` finds it
+  at offset zero and every chunk of that document counts as relevant, which is
+  document-level relevance expressed in the span vocabulary without pretending
+  BEIR provides span annotations. A BEIR corpus is an untrusted third-party
+  download, so every identifier — document ids, query ids, and the `split`,
+  which is interpolated into a path — is validated as a single path component
+  before it reaches a path join, each written path is containment-checked as
+  an independent second barrier, and query ids are checked against the
+  harness's own stricter contract *before* anything is written, so a dataset
+  the harness would reject leaves nothing on disk. Adapting into a corpus
+  directory that already holds files is refused rather than silently unioning
+  two datasets.
+- `evals/beir/embed_bakeoff.py` (repo tooling, not part of the installed
+  package) runs an embedding-model bake-off: it indexes a BEIR corpus once
+  per candidate model, scores each with the harness's own metrics, and
+  reports a paired-bootstrap comparison against a chosen baseline model. A
+  `--work` directory's index and score caches are bound to what they
+  actually depend on rather than to a filename: the score cache's identity
+  carries a fingerprint over the corpus files' own bytes and over the chunk
+  boundaries the current chunker produces for them — not just the configured
+  chunk size/overlap, which can stay unchanged while the algorithm that
+  turns it into boundaries changes independently, as this repository's own
+  chunker fix demonstrated — plus the exact model name (not a lossy
+  `:`-to-`-` slug two differently-named models could collide on), the
+  embedding dimension, and the scoring version. The index sentinel is
+  removed before a rebuild starts rather than after a successful one, so an
+  interrupted rebuild can never be mistaken for a valid index on the next
+  run.
+- A damaged or malformed cache file anywhere in the bake-off — truncated
+  JSON, invalid UTF-8, a result missing a field, an out-of-range or NaN
+  metric — now degrades to "rescore this one model" instead of escaping the
+  per-model error handling and aborting every other model running
+  concurrently in the same batch, discarding embedding work the others had
+  already paid for. Every cache read goes through one reader that is total
+  over how a file can resist being read or fail to be the shape it claims,
+  and every cached or freshly scored result is validated against a full
+  schema — bounded to the unit interval, internally consistent, no NaN or
+  infinity — before it is trusted, the same no-silent-coercion discipline
+  the rest of the package applies to untrusted input.
+- Adapting a BEIR dataset (`evals/beir/adapt_beir.py`, now a thin wrapper
+  over `groundkit.evals.beir` rather than a second implementation) refuses
+  more of what an untrusted third-party download can contain: a symlinked
+  judgments path or corpus directory, two document ids differing only by
+  case (which collide on Windows and on the default macOS filesystem and
+  silently overwrite one another), a Windows-reserved filename stem, a
+  document id too long to be a filename, and graded relevance scores
+  (TREC-COVID, FiQA, NFCorpus) that the harness's binary `GoldSpan` format
+  cannot represent and previously flattened to relevant/irrelevant without
+  saying so. Each is refused before any file is written, so a rejected
+  dataset leaves nothing on disk — the property the module already held for
+  validation now holds for the write loop too.
+- MRR is now capped at the same rank depth as recall@1, recall@10 and
+  nDCG@10 across the BEIR scorers and the bake-off, instead of searching the
+  full ranked list for the first relevant hit. Two chunking configurations
+  produce different numbers of chunks per document, so an uncapped MRR let
+  one configuration earn reciprocal-rank credit at depths another could not
+  structurally reach — not a difference in retrieval quality, and comparing
+  chunking configurations is exactly what these scripts do.
+  `evals/beir/RESULTS-scifact-2026-08-21.md` flags its own cross-configuration
+  MRR figures as needing a re-run for this reason; its nDCG@10, recall@1 and
+  recall@10 figures already applied the cutoff and are unaffected.
+- `evals/baseline/` adds a from-scratch generic-RAG comparison
+  (`generic_rag.py`, `run_generic.py`) that groundkit's own retrieval is
+  measured against. Its nDCG now normalizes by the number of relevant
+  *chunks*, matching `groundkit.evals.metrics.ndcg_at_k`, rather than by the
+  number of authored gold *spans* — a span split across a chunk boundary
+  could previously earn gain from two chunks against an ideal ranking of
+  one, scoring above the metric's own maximum.
+- The paired-bootstrap comparison in `evals/baseline/significance.py` (a
+  standalone script, distinct from the `groundkit.evals.significance`
+  library module above) and the bake-off's per-model comparison now build an
+  independent seeded generator for each contrast instead of sharing one
+  across every comparison in a run. A shared generator made a model's
+  confidence interval depend on which other comparisons had already
+  consumed it — reordering an unrelated run, or losing an earlier model,
+  changed a survivor's interval even though its own paired inputs were
+  unchanged.
+- `evals/perf/bench_pipeline.py` benchmarks ingest and query-path cost
+  across corpus sizes, and now closes its stores in `finally` rather than
+  only on the happy path — an open SQLite handle blocks Windows from
+  cleaning up the temporary directory the benchmark runs in, which
+  previously turned a benchmark failure into a cleanup `PermissionError`
+  that buried the real error. `evals/perf/README.md`'s `db MB` column is
+  flagged as a lower bound: it was measured before the store's WAL
+  checkpoint, which folds outstanding committed pages into the file being
+  measured; every timing column in that table is unaffected.
 - `index_status` now reports what the ADR-0013 staleness cache actually *does*,
   not only that it is switched on: `retriever_acquires`, `retriever_rebuilds`,
   `rebuild_seconds_total` and `last_rebuild_seconds` (ADR-0026). `cache_enabled:

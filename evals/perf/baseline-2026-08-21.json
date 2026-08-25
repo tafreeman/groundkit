@@ -1,0 +1,169 @@
+{
+  "provenance": {
+    "captured_at": "2026-08-21T11:50:22.415080+00:00",
+    "commit": "88fe5701e34182694d5d50daf5a19b2284b7ca33",
+    "branch": "fix/gk-030-snapshot-read-nofollow",
+    "dirty_files": [
+      "evals/perf/"
+    ],
+    "python": "3.11.9",
+    "platform": "win32"
+  },
+  "config": {
+    "seed": 7,
+    "ingest_repeats": 3,
+    "query_repeats": 5,
+    "corpus_sizes": [
+      30,
+      120,
+      480
+    ]
+  },
+  "micro_us_per_op": {
+    "chunk_validated_us": 6.933579999895301,
+    "chunk_model_construct_us": 1.599674999306444,
+    "metadata_guard_us": 3.8810250000096858,
+    "content_hash_us": 0.6963899999391288,
+    "citation_rebuild_us": 1.6199249999772292
+  },
+  "micro_ratios": {
+    "validation_overhead_x": 4.33,
+    "metadata_guard_share": 0.56
+  },
+  "measurement_floor": {
+    "ingest_cpu_s@30000": "7-11% over three runs; ~10% floor -- gate",
+    "search_p50_ms@30000": "6-10% over three runs; ~10% floor -- gate",
+    "any_metric@<30000_chunks": "to 50% -- not a gate, too short to be stable",
+    "open_cpu_ms": "12-91%, quantized by 15.625ms process_time -- not a gate",
+    "micro_us_per_op": "25-75% absolute -- not a gate; use micro_ratios",
+    "micro_ratios.metadata_guard_share": "~23% -- the usable micro claim"
+  },
+  "pipeline": [
+    {
+      "documents": 30,
+      "chunks": 1886,
+      "corpus_mb": 0.84,
+      "db_mb": 1.7,
+      "ingest_wall_s": {
+        "min": 0.176,
+        "median": 0.183,
+        "max": 0.286,
+        "spread_pct": 62.8
+      },
+      "ingest_cpu_s": {
+        "min": 0.156,
+        "median": 0.203,
+        "max": 0.219,
+        "spread_pct": 40.0
+      },
+      "open_wall_ms": {
+        "min": 95.383,
+        "median": 114.857,
+        "max": 142.186,
+        "spread_pct": 49.1
+      },
+      "open_cpu_ms": {
+        "min": 93.75,
+        "median": 109.375,
+        "max": 140.625,
+        "spread_pct": 50.0
+      },
+      "search_p50_ms": {
+        "min": 3.652,
+        "median": 4.511,
+        "max": 5.241,
+        "spread_pct": 43.5
+      },
+      "search_p95_ms": {
+        "min": 5.518,
+        "median": 6.208,
+        "max": 7.896,
+        "spread_pct": 43.1
+      }
+    },
+    {
+      "documents": 120,
+      "chunks": 7543,
+      "corpus_mb": 3.37,
+      "db_mb": 6.45,
+      "ingest_wall_s": {
+        "min": 1.215,
+        "median": 1.292,
+        "max": 1.314,
+        "spread_pct": 8.2
+      },
+      "ingest_cpu_s": {
+        "min": 1.094,
+        "median": 1.188,
+        "max": 1.219,
+        "spread_pct": 11.4
+      },
+      "open_wall_ms": {
+        "min": 445.571,
+        "median": 521.158,
+        "max": 572.108,
+        "spread_pct": 28.4
+      },
+      "open_cpu_ms": {
+        "min": 453.125,
+        "median": 515.625,
+        "max": 546.875,
+        "spread_pct": 20.7
+      },
+      "search_p50_ms": {
+        "min": 6.404,
+        "median": 7.893,
+        "max": 9.041,
+        "spread_pct": 41.2
+      },
+      "search_p95_ms": {
+        "min": 8.603,
+        "median": 10.811,
+        "max": 11.996,
+        "spread_pct": 39.4
+      }
+    },
+    {
+      "documents": 480,
+      "chunks": 30180,
+      "corpus_mb": 13.47,
+      "db_mb": 27.44,
+      "ingest_wall_s": {
+        "min": 5.9,
+        "median": 6.012,
+        "max": 6.251,
+        "spread_pct": 5.9
+      },
+      "ingest_cpu_s": {
+        "min": 5.094,
+        "median": 5.297,
+        "max": 5.469,
+        "spread_pct": 7.4
+      },
+      "open_wall_ms": {
+        "min": 2116.785,
+        "median": 2233.21,
+        "max": 2314.212,
+        "spread_pct": 9.3
+      },
+      "open_cpu_ms": {
+        "min": 2031.25,
+        "median": 2187.5,
+        "max": 2281.25,
+        "spread_pct": 12.3
+      },
+      "search_p50_ms": {
+        "min": 22.447,
+        "median": 23.496,
+        "max": 23.812,
+        "spread_pct": 6.1
+      },
+      "search_p95_ms": {
+        "min": 27.881,
+        "median": 30.151,
+        "max": 34.822,
+        "spread_pct": 24.9
+      }
+    }
+  ]
+}
