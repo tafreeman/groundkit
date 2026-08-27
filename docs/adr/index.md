@@ -55,6 +55,7 @@ ingest is invalidating it.
 | [ADR-0010](ADR-0010-ingestion-pipeline-is-not-the-ingest-path.md) | `IngestionPipeline` is a load→chunk utility, not the ingest path | Accepted |
 | [ADR-0013](ADR-0013-collection-runtime-persisted-staleness-marker.md) | A cached `CollectionRuntime` whose validity is a marker persisted in SQLite | Accepted |
 | [ADR-0026](ADR-0026-measure-the-rebuild-cliff-before-rebuilding-incrementally.md) | Measure the rebuild cliff before rebuilding incrementally, and re-defer ADR-0002's persisted postings against a trigger the measurement can satisfy | Accepted |
+| [ADR-0027](ADR-0027-the-rebuild-cliff-reading-selects-persisted-postings.md) | The rebuild-cliff reading selects persisted postings, and retires GK-020's incremental rebuild | Accepted |
 
 ## Extracted & remote sources
 

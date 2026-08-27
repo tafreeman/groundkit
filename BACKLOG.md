@@ -78,7 +78,7 @@ Declined section with the reason)
 
 | ID | Item | Sev | Phase | Effort | Status | Depends on |
 |---|---|---|---|---|---|---|
-| GK-020 | The staleness cache stops working during an ingest | MED | G | L | todo | — |
+| GK-033 | Decide whether to adopt ADR-0002's persisted postings | MED | G | L | todo | — |
 | GK-031 | Published eval figures are known-stale and need regenerating | LOW | — | S | todo | — |
 | GK-032 | Untested cleanup-on-error and URL-shape guards | MED | — | M | todo | — |
 
@@ -223,124 +223,30 @@ chunks in two ways, both recorded in `KNOWN_LIMITATIONS.md`: an unselective
 query has most of the corpus in its postings union, and `BM25Index.from_store`
 still rebuilds in O(corpus) at open.
 
-### GK-020 — The staleness cache stops working during an ingest
+## GK-020 — closed 2026-08-27, as measured rather than as built
 
-- **Severity** MEDIUM · **Effort** L (criteria 2-3 only) - **ADR** ADR-0026
-  (Accepted) · **Verified**
-- **Where** `src/groundkit/index/metadata.py` (bump per document);
-  `src/groundkit/runtime.py` (cache validity)
+Deleted per the rule above. Its consequences live in ADR-0026 (the counters),
+ADR-0027 (the reading and the decision), and `KNOWN_LIMITATIONS.md`, whose rebuild-cliff
+entry this work corrected.
 
-**Criteria 1 and 4 landed 2026-08-20; the cliff itself is not fixed.**
-`index_status` now reports `retriever_acquires`, `retriever_rebuilds`,
-`rebuild_seconds_total` and `last_rebuild_seconds`, so the hit rate is read
-rather than inferred from latency, and ADR-0026 records the decision and
-re-defers ADR-0002's persisted-postings alternative against a trigger the new
-measurement can satisfy.
+ADR-0026 gated criteria 2-3 behind a trigger — a reading of `index_status`'s counters
+from a real corpus under a real workload — and made that reading *choose* between two
+remedies rather than merely unblock one. Taking it was the work the item owed; the
+reading selected ADR-0002's persisted postings, so criteria 2-3 were **withdrawn, not
+deferred**. They attack the invalidation rate, and the rate is not the binding cost.
 
-The defect is unchanged: the generation bumps once per *document* and any bump
-invalidates the cache, so an ingest over N changed files commits N
-invalidations, and each rebuild is a full-corpus `get_chunks()` holding the same
-lock the ingest writer needs. During an ingest the hit rate approaches zero and
-the fallback is the reopen-per-request baseline ADR-0013 rejected on
-measurement, plus contention that also slows the ingest.
-
-Criteria 2 and 3 were deliberately **not attempted** rather than half-landed.
-`SCHEMA_VERSION` is at 3, and v3 adds columns to an existing table, which
-`CREATE TABLE IF NOT EXISTS` cannot supply to an older store - which is why it
-refuses *writes* on a pre-v3 store. A watermark column has exactly that shape,
-so a partial v4 would strand real indexes. The other hard half is
-`remove_document` on the lexical index: a watermark cannot represent a row that
-is *gone*, and `BM25Index`'s postings map is keyed by position in its chunk
-list, so removing a chunk renumbers every posting after it - an index redesign
-carrying GK-018's score-identity obligation, not an added method.
-
-**Acceptance criteria**
-
-- [x] Observability first: a rebuild counter and duration visible via
-      `index_status`, so the cliff is measurable rather than inferred.
-- [ ] Then incremental rebuild: a monotonic per-document watermark
-      (`ingested_at` is a wall-clock string and unsuitable), a
-      `get_chunks_since`, and a `remove_document` on the lexical index, which
-      does not exist today - `index_chunks` is accumulate-only.
-- [ ] A schema bump, with the delete-and-re-ingest consequence recorded per
-      ADR-0004 decision 5.
-- [x] ADR recording the decision and closing out ADR-0002's deferred
-      alternative explicitly - ADR-0026 re-defers it against a new trigger: a
-      recorded reading of `index_status`'s counters under a concurrent ingest.
-
-**Start here:** take the reading before building anything. The counters and the
-measurement script both exist so that the next attempt is triggered by a
-measurement rather than by this file's argument.
-
----
-
-## Phase H — closed 2026-08-20
-
-GK-021, GK-022, GK-024, GK-025, GK-026, GK-027 and GK-028 all landed and are
-deleted from this file per the rule above. Notes on the three that did not land
-exactly as scoped:
-
-- **GK-025 was decided, not built.** Option (b): the seam is recorded in
-  `KNOWN_LIMITATIONS.md` with the trigger that would justify wiring it up, and
-  no source file changed. The argument for not exposing it is worth keeping:
-  `index/bm25.py` has no filter at all, so a surface-level `metadata_filter`
-  would apply in `dense` mode, have nothing to apply to in the default `bm25`
-  mode, and in `hybrid` mode filter one candidate list while RRF fused the
-  survivors with an unfiltered lexical list - excluded chunks re-entering the
-  ranking by a depth-dependent amount. A filter honoured by one of three modes
-  and silently leaky in a second is worse than an unexposed seam. The item's own
-  "**Where** `index/dense.py` only" was wrong as a change footprint: the
-  footprint was documentation.
-- **GK-028 sub-item 2 was declined**, with the reason recorded in
-  `contracts.py` rather than only here. `content_hash` stays an uncached
-  `computed_field`. The instruction was to justify a change on correctness
-  rather than an unmeasured performance claim, and correctness argues the other
-  way: on a frozen model, assignment to a `cached_property` succeeds and writes
-  into `__dict__`, where assignment to a field raises `ValidationError`. Caching
-  would open a way to decouple the hash from the content it hashes. Pinned by
-  `tests/test_contracts.py::test_content_hash_cannot_be_decoupled_from_content_by_assignment`.
-- **GK-028 sub-item 4 landed on the write side only.** The snapshot *read* path
-  kept the same check-then-use gap, and it was the more exploitable half - the
-  write side could corrupt a file, the read side returns one to a service
-  caller. Carried forward as GK-030 and closed on
-  `fix/gk-030-snapshot-read-nofollow`.
-
----
-
-## Net-new from the Phase G/H review
-
-Found by the adversarial review of this fan-out rather than by the original audit. Two
-of its findings landed as fixes in the same branch - a partial
-`DocumentRecordStoreProtocol` implementer being silently downgraded to the `text` source
-class, and `EMLINK` being reported as a planted symlink on platforms where it means "too
-many links" - each with a regression test shown to fail first. The third — the snapshot
-read path's symlink race — was carried forward as GK-030 and has since landed on
-`fix/gk-030-snapshot-read-nofollow`.
-
-Every item this review raised is now addressed, with **one platform carve-out that is not
-closed and is not closeable this way**: `O_NOFOLLOW` does not exist on Windows, where it
-degrades to a no-op, so the snapshot write and read remain exactly as racy there as they
-were before. Both regression tests skip rather than passing vacuously, and CI runs Linux,
-where the guard is real. `KNOWN_LIMITATIONS.md` carries this as a live limitation. Read
-"GK-030 is closed" as "closed on POSIX", never as "closed everywhere".
-
-A follow-up found separately, and closed alongside it: `O_NOFOLLOW` guards only the
-*final* path component, so a `document_id` containing a separator would have reintroduced
-the same race one directory up, where the flag cannot see it — on POSIX *and* Windows.
-`snapshots.snapshot_path_for` now refuses any `document_id` that is not a single path
-component. Being pure path arithmetic rather than an open flag, that check is the one part
-of this whose guarantee does hold on every platform.
-
-Closing it turned up a second defect on the same line of code, which is why the read is
-now a byte read and its own decode rather than only an `O_NOFOLLOW` open:
-`Path.read_text` defaults to universal-newline mode, so a snapshot served with CRLF came
-back one character shorter per line break and every offset past the first was wrong —
-`fetch_chunk` returning a shifted span, or `drifted` on a snapshot that had not drifted.
-It was invisible to every existing test because the fixtures are LF-only, and invisible
-to the write side because that side already pinned byte-exactness with `newline=""` and
-`O_BINARY` — the asymmetry was the bug. Recorded here because the lesson outlives the
-item: a round trip is only verified by a fixture that differs between the two
-representations.
+**The reusable lesson is about instruments, and it is the third of its kind in this
+file.** GK-020's premise — "during an ingest the hit rate approaches zero" — was read
+off `measure_retriever_open.py --sections acquire`, which commits back to back with no
+intervening work and therefore reports a contention *floor*. Its own docstring said so.
+A real ingest interleaves loading and chunking between commits, and measured that way the
+hit rate stayed high while the rebuild count ignored the number of changed documents
+entirely. Both measurements were correct; only one answered the question the decision
+table branches on. That script now says which is which, so the next reader cannot repeat
+it. Phase A's lesson was a fix whose predicate disagreed with its own premise; Phase D's
+was a finding whose premise disagreed with the running code; this one is a premise that
+disagreed with the instrument it came from — all three visible only by executing
+something rather than reading about it.
 
 ## Net-new from the eval-testbed branch (BEIR adapter, significance, benchmarks)
 
@@ -434,3 +340,35 @@ that feature, and reachable with no mocking on a machine without the extra.
       source per SPEC.md §8.
 - [ ] The remaining paths above are either tested or explicitly argued as unreachable in a
       comment, so a later reader does not re-triage them from scratch.
+
+### GK-033 — Decide whether to adopt ADR-0002's persisted postings
+
+- **Severity** MEDIUM · **Effort** L · **ADR** required (reverses ADR-0002) ·
+  **Indicated by** ADR-0027's reading
+- **Where** `src/groundkit/index/bm25.py` (`from_store`); ADR-0002 decision 2
+
+ADR-0027 established which remedy the rebuild cliff calls for and deliberately stopped
+short of adopting it: rebuild *count* is low and flat in write volume, rebuild *cost*
+grows with the corpus, and at the larger corpus measured the ingest window's rebuilds
+outlasted the ingest itself. Persisted postings is what that indicates.
+
+It is a genuine reversal, not an optimisation, which is why it needs its own record.
+ADR-0002 chose rebuild-at-open precisely so that no second on-disk structure could drift
+from the chunk set it derives from — the guard against repeating ARP's `memory.py`
+`_key_map` drift. Any adoption has to say how a persisted postings table is kept
+honest, and "pure function of the persisted chunk set" (ADR-0002 decision 2) has to
+survive it, tie-break included.
+
+**Acceptance criteria**
+
+- [ ] Re-take ADR-0027's reading first. It is one machine and two corpus sizes, and
+      ADR-0027 says re-taking should precede any postings work. Cheap now that the
+      counters exist.
+- [ ] An ADR that either adopts persisted postings — with drift, tie-break identity and
+      the schema question argued — or records that at the corpus sizes this project
+      targets neither remedy earns its complexity. ADR-0026 explicitly permits the
+      second outcome: "that is a result, not a failure."
+- [ ] If adopted: score-identical to a full rebuild over the golden corpus, including
+      the insertion-order tie-break, demonstrated by test rather than asserted.
+- [ ] `KNOWN_LIMITATIONS.md` and the `acquire` section's docstring updated to match
+      whichever way it goes.

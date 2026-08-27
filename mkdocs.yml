@@ -163,6 +163,7 @@ nav:
       - "ADR-0024 — Host header validation on both transports": adr/ADR-0024-host-header-validation-on-both-transports.md
       - "ADR-0025 — Library constructors default Host validation on": adr/ADR-0025-library-constructors-default-host-validation-on.md
       - "ADR-0026 — Measure the rebuild cliff before rebuilding incrementally": adr/ADR-0026-measure-the-rebuild-cliff-before-rebuilding-incrementally.md
+      - "ADR-0027 — The rebuild-cliff reading selects persisted postings": adr/ADR-0027-the-rebuild-cliff-reading-selects-persisted-postings.md
   - Project:
       - Security: security.md
       - Known limitations: limitations.md
