@@ -626,29 +626,45 @@ per SPEC.md §9:
   searches is unaffected, but the read is "live per search", not "live per
   hit".
 
-- **The staleness cache's rebuild cliff is now measurable, and is not fixed.**
-  `index_status` reports `retriever_acquires`, `retriever_rebuilds`,
-  `rebuild_seconds_total` and `last_rebuild_seconds` (ADR-0026), so the cache's
-  hit rate can be read rather than inferred from latency. What an operator will
-  see during a concurrent `grk ingest` is the defect itself: ADR-0013 bumps the
-  generation once per commit and `grk ingest` commits once per document, so an
-  ingest over N changed files publishes N generations, fails the cache's equality
-  predicate N times, and costs N full `BM25Index.from_store` rebuilds — each
-  serialized against the ingest writer on the metadata store's single lock, and
-  each waited through rather than served stale by every concurrent request
-  (ADR-0013 decision 5). For the duration of an ingest the fallback is the
-  reopen-per-request baseline ADR-0013 rejected on measurement, and the
-  contention runs both ways: the reads slow the ingest that is invalidating them.
+- **The staleness cache's rebuild cliff has been measured. It is real, and it is
+  not the shape this entry used to claim.** `index_status` reports
+  `retriever_acquires`, `retriever_rebuilds`, `rebuild_seconds_total` and
+  `last_rebuild_seconds` (ADR-0026), and ADR-0027 quotes a reading taken through
+  those counters under a real `grk ingest`.
+
+  This entry previously said an ingest over N changed files "costs N full
+  `BM25Index.from_store` rebuilds". **It does not.** ADR-0013 does bump the
+  generation once per commit, but a rebuild costs only an *acquire that lands
+  after a bump*, and a real ingest spends most of its wall time loading, chunking
+  and hashing, with the commits in a short burst. Measured across two corpus
+  sizes, the rebuild count stayed flat when the number of changed documents was
+  more than doubled, and the cache-hit rate stayed high throughout — see ADR-0027
+  for the reading itself, which is not restated here.
+
+  What *is* costly is each individual rebuild, and that grows with the corpus
+  rather than with the write volume: at the larger corpus measured, the ingest
+  window's rebuilds cost more wall time than the ingest that provoked them, and
+  concurrent request throughput fell accordingly, because ADR-0013 decision 5
+  forbids serving a waiter stale. The contention still runs both ways — the reads
+  slow the ingest that is invalidating them.
+
   The incremental remedy — a monotonic per-document watermark, a
   `get_chunks_since`, and a `remove_document` on the lexical index, behind a
-  `SCHEMA_VERSION` bump — is deliberately not built. `remove_document` is the
-  hard half: a watermark cannot represent a row that is *gone*, and
-  `BM25Index`'s postings map is keyed by position in its chunk list, so removing
-  a chunk from the middle invalidates every position above it. Whatever replaces
-  it must be score-identical to a full rebuild, including the insertion-order
-  tie-break, or ADR-0002 decision 2's "pure function of the persisted chunk set"
-  invariant becomes false — and that invariant is the guard against repeating
-  ARP's `memory.py` `_key_map` drift.
+  `SCHEMA_VERSION` bump — is **withdrawn rather than unbuilt** (ADR-0027). It
+  attacks the invalidation *rate*, and the rate is not the binding cost; a
+  handful of rebuilds per ingest would remain a handful, only cheaper. ADR-0002's
+  persisted postings is what the reading indicates instead, and it is *indicated,
+  not adopted*: adopting it reverses ADR-0002's choice that SQLite is the sole
+  durable truth, which needs its own record.
+
+  Worth keeping for whoever writes that record, because it is why the withdrawn
+  remedy was expensive: `remove_document` was the hard half. A watermark cannot
+  represent a row that is *gone*, and `BM25Index`'s postings map is keyed by
+  position in its chunk list, so removing a chunk from the middle invalidates
+  every position above it. Whatever replaces it must be score-identical to a full
+  rebuild, including the insertion-order tie-break, or ADR-0002 decision 2's
+  "pure function of the persisted chunk set" invariant becomes false — and that
+  invariant is the guard against repeating ARP's `memory.py` `_key_map` drift.
 - **The rebuild counters are process-local and reset without saying so.** They
   describe one `CollectionRuntime` object's history, not the collection's, and
   are deliberately not persisted (persisting them would need a schema bump, would

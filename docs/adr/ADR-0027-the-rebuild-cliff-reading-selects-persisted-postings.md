@@ -1,12 +1,12 @@
 # ADR-0027 — The rebuild-cliff reading selects persisted postings, and retires GK-020's incremental rebuild
 
-- **Status:** Proposed (2026-08-27)
+- **Status:** Accepted (owner, 2026-08-27)
 - **Acts on:** ADR-0026 decision 5's trigger, which required a reading before either
   remedy could be chosen
 - **Amends:** ADR-0026's re-deferral of ADR-0002's persisted postings; re-scopes
   `BACKLOG.md`'s GK-020
 - **Date:** 2026-08-27
-- **Deciders:** owner (pending)
+- **Deciders:** Andy Freeman (owner)
 
 ## Context
 
@@ -112,7 +112,8 @@ carrying GK-018's score-identity obligation. None of that is now owed.
 
 ### 2. Persisted postings is *indicated*, not adopted here
 
-This record does not adopt it. Adopting it reverses ADR-0002's central choice — that
+This record does not adopt it, and accepting this record does not adopt it either.
+Adopting it reverses ADR-0002's central choice — that
 SQLite is the sole durable truth and BM25 postings are never persisted, precisely so no
 second on-disk structure can drift from the chunk set — and that reversal deserves its
 own record with its own alternatives, not a paragraph inside a measurement report.

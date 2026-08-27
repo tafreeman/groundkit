@@ -78,7 +78,7 @@ Declined section with the reason)
 
 | ID | Item | Sev | Phase | Effort | Status | Depends on |
 |---|---|---|---|---|---|---|
-| GK-020 | Rebuild cliff: reading taken, ADR-0027 awaiting owner decision | MED | G | XS | blocked | owner |
+| GK-033 | Decide whether to adopt ADR-0002's persisted postings | MED | G | L | todo | — |
 | GK-031 | Published eval figures are known-stale and need regenerating | LOW | — | S | todo | — |
 | GK-032 | Untested cleanup-on-error and URL-shape guards | MED | — | M | todo | — |
 
@@ -223,57 +223,30 @@ chunks in two ways, both recorded in `KNOWN_LIMITATIONS.md`: an unselective
 query has most of the corpus in its postings union, and `BM25Index.from_store`
 still rebuilds in O(corpus) at open.
 
-### GK-020 — The staleness cache's rebuild cliff: reading taken, remedy selected
+## GK-020 — closed 2026-08-27, as measured rather than as built
 
-- **Severity** MEDIUM · **Effort** — (criteria 2-3 withdrawn) · **ADR** ADR-0026
-  (Accepted), ADR-0027 (Proposed) · **Verified by measurement**
-- **Where** `src/groundkit/runtime.py` (cache validity); `src/groundkit/index/bm25.py`
-  (rebuild cost)
+Deleted per the rule above. Its consequences live in ADR-0026 (the counters),
+ADR-0027 (the reading and the decision), and `KNOWN_LIMITATIONS.md`, whose rebuild-cliff
+entry this work corrected.
 
-**Criteria 1 and 4 landed 2026-08-20. The reading they existed to make possible was
-taken 2026-08-27, and it retires criteria 2-3 rather than unblocking them.**
+ADR-0026 gated criteria 2-3 behind a trigger — a reading of `index_status`'s counters
+from a real corpus under a real workload — and made that reading *choose* between two
+remedies rather than merely unblock one. Taking it was the work the item owed; the
+reading selected ADR-0002's persisted postings, so criteria 2-3 were **withdrawn, not
+deferred**. They attack the invalidation rate, and the rate is not the binding cost.
 
-ADR-0026 decision 5 gated the incremental rebuild behind a trigger — a recorded reading
-of `index_status`'s counters from a real corpus under a real workload — and made that
-reading *choose* between two remedies. The reading is quoted in full in ADR-0027. In
-summary, across two corpus sizes under a real `grk ingest` of genuinely changed
-documents:
-
-- Rebuilds stayed at **two** whether 40 or 100 documents changed, so they do not track
-  the bump count; the cache-hit rate held above 97%.
-- Each rebuild grew with the corpus, and at the larger size the window's two rebuilds
-  cost more wall time than the ingest that provoked them.
-
-That is ADR-0026's "few invalidations, each expensive" row, which points at ADR-0002's
-**persisted postings** — not at the watermark this item used to describe.
-
-**GK-020's original premise was wrong**, and the reason is worth keeping: it read
-"during an ingest the hit rate approaches zero" from
-`scripts/measure_retriever_open.py --sections acquire`, which commits back to back with
-no intervening work and therefore reports a contention *floor*, not an expected-case
-rate. A real ingest interleaves loading and chunking between commits. Both measurements
-are correct about different things; only one of them answers the question ADR-0026
-branches on.
-
-**Acceptance criteria**
-
-- [x] Observability first: rebuild counters visible via `index_status`.
-- [x] ADR recording the decision and closing out ADR-0002's deferred alternative —
-      ADR-0026, re-deferred against a trigger the new counters can satisfy.
-- [x] The trigger discharged: reading taken and quoted (ADR-0027).
-- [ ] **Owner accepts or rejects ADR-0027.** It is Proposed, not Accepted — it retires
-      criteria 2-3 and names persisted postings as indicated without adopting it, since
-      adopting it reverses ADR-0002's central choice and deserves its own record.
-- [ ] If accepted: `KNOWN_LIMITATIONS.md` stops implying the ingest-time hit rate
-      collapses, and `measure_retriever_open.py`'s `acquire` docstring says it reports a
-      contention floor rather than an expected-case rate.
-- [ ] ~~A monotonic per-document watermark, `get_chunks_since`, and `remove_document` on
-      the lexical index~~ — **withdrawn**, not deferred. They attack the invalidation
-      rate, which the reading shows is not the binding cost.
-- [ ] ~~A schema bump~~ — **withdrawn** with the watermark that required it. Worth
-      noting what this avoids: a v4 adding a column has the same shape as v3, which
-      `CREATE TABLE IF NOT EXISTS` cannot supply to an existing store, so it would have
-      forced delete-and-re-ingest on every collection under ADR-0004 decision 5.
+**The reusable lesson is about instruments, and it is the third of its kind in this
+file.** GK-020's premise — "during an ingest the hit rate approaches zero" — was read
+off `measure_retriever_open.py --sections acquire`, which commits back to back with no
+intervening work and therefore reports a contention *floor*. Its own docstring said so.
+A real ingest interleaves loading and chunking between commits, and measured that way the
+hit rate stayed high while the rebuild count ignored the number of changed documents
+entirely. Both measurements were correct; only one answered the question the decision
+table branches on. That script now says which is which, so the next reader cannot repeat
+it. Phase A's lesson was a fix whose predicate disagreed with its own premise; Phase D's
+was a finding whose premise disagreed with the running code; this one is a premise that
+disagreed with the instrument it came from — all three visible only by executing
+something rather than reading about it.
 
 ## Net-new from the eval-testbed branch (BEIR adapter, significance, benchmarks)
 
@@ -367,3 +340,35 @@ that feature, and reachable with no mocking on a machine without the extra.
       source per SPEC.md §8.
 - [ ] The remaining paths above are either tested or explicitly argued as unreachable in a
       comment, so a later reader does not re-triage them from scratch.
+
+### GK-033 — Decide whether to adopt ADR-0002's persisted postings
+
+- **Severity** MEDIUM · **Effort** L · **ADR** required (reverses ADR-0002) ·
+  **Indicated by** ADR-0027's reading
+- **Where** `src/groundkit/index/bm25.py` (`from_store`); ADR-0002 decision 2
+
+ADR-0027 established which remedy the rebuild cliff calls for and deliberately stopped
+short of adopting it: rebuild *count* is low and flat in write volume, rebuild *cost*
+grows with the corpus, and at the larger corpus measured the ingest window's rebuilds
+outlasted the ingest itself. Persisted postings is what that indicates.
+
+It is a genuine reversal, not an optimisation, which is why it needs its own record.
+ADR-0002 chose rebuild-at-open precisely so that no second on-disk structure could drift
+from the chunk set it derives from — the guard against repeating ARP's `memory.py`
+`_key_map` drift. Any adoption has to say how a persisted postings table is kept
+honest, and "pure function of the persisted chunk set" (ADR-0002 decision 2) has to
+survive it, tie-break included.
+
+**Acceptance criteria**
+
+- [ ] Re-take ADR-0027's reading first. It is one machine and two corpus sizes, and
+      ADR-0027 says re-taking should precede any postings work. Cheap now that the
+      counters exist.
+- [ ] An ADR that either adopts persisted postings — with drift, tie-break identity and
+      the schema question argued — or records that at the corpus sizes this project
+      targets neither remedy earns its complexity. ADR-0026 explicitly permits the
+      second outcome: "that is a result, not a failure."
+- [ ] If adopted: score-identical to a full rebuild over the golden corpus, including
+      the insertion-order tie-break, demonstrated by test rather than asserted.
+- [ ] `KNOWN_LIMITATIONS.md` and the `acquire` section's docstring updated to match
+      whichever way it goes.

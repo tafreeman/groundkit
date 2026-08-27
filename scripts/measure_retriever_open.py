@@ -54,6 +54,22 @@ is whatever a run prints on the machine and corpus it was run against.
     generation, and it is *cheaper* than a real one (no chunk rows), so the
     contention it shows is a floor.
 
+    **The cache-hit rate this section reports is a contention floor, not an
+    expected-case rate, and reading it as the latter is a mistake this repo has
+    already made once.** The commits here run back to back with no intervening
+    work, so essentially every acquire lands between two bumps and the hit rate
+    collapses to zero at every corpus size. A real ``grk ingest`` interleaves
+    loading, chunking and hashing between its commits, so the window in which an
+    acquire is guaranteed to find a bumped generation is a small fraction of the
+    ingest — measured through ``index_status``'s counters under a real ingest,
+    the hit rate stayed high and the rebuild count did not track the number of
+    changed documents at all (ADR-0027). Backlog item GK-020 was written on the
+    zero from this section and had its premise refuted by that reading.
+
+    So: trust this section for **cost per rebuild** and for the worst-case
+    contention bound. Do not infer **invalidation rate** from it — that needs the
+    ``index_status`` counters ADR-0026 added, driven by a real ingest.
+
 Method: for each corpus size, synthesize documents of fixed shape into a temp
 directory, ingest them BM25-only — and, when the ``open`` section is selected,
 a second time dense-enabled with the in-memory hash embedder, since semantic
