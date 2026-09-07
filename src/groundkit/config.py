@@ -150,6 +150,13 @@ def resolve_embedding_config(
 #: means one thing: two runs under this default exercised the same weights.
 DEFAULT_CHAT_MODEL: str = "llama3.2:3b"
 
+#: Default per-request timeout for the chat provider, seconds. Double
+#: :class:`EmbeddingConfig`'s default: chat completions legitimately run
+#: longer than an embedding batch. A CPU-only backend (no GPU, e.g. a CI
+#: runner) can still exceed this comfortably — ``--chat-timeout-seconds``
+#: exists precisely so that case is a flag, not a source edit.
+DEFAULT_CHAT_TIMEOUT_SECONDS: float = 60.0
+
 
 class ChatConfig(BaseModel):
     """Configuration for the chat/completion provider (Phase 5, ADR-0017).
@@ -176,7 +183,7 @@ class ChatConfig(BaseModel):
     model_name: str = DEFAULT_CHAT_MODEL
     base_url: str = DEFAULT_OLLAMA_BASE_URL
     api_key_env: str = "GROUNDKIT_OPENAI_API_KEY"
-    timeout_seconds: float = Field(default=60.0, gt=0)
+    timeout_seconds: float = Field(default=DEFAULT_CHAT_TIMEOUT_SECONDS, gt=0)
 
 
 def resolve_chat_config(
@@ -185,12 +192,19 @@ def resolve_chat_config(
     model_name: str | None,
     base_url: str | None,
     api_key_env: str | None,
+    timeout_seconds: float | None = None,
 ) -> ChatConfig:
     """Build a :class:`ChatConfig`, defaulting any ``None`` field.
 
     The same boundary-translation shape as :func:`resolve_embedding_config`,
     for the same reasons — see its docstring for the typing rationale and why
     the ``ValidationError`` is translated exactly here.
+
+    Args:
+        timeout_seconds: Per-request timeout override, or ``None`` to keep
+            :data:`DEFAULT_CHAT_TIMEOUT_SECONDS`. Keyword-only with a default
+            so every existing positional-by-keyword call site (there is no
+            positional form) keeps working unchanged.
 
     Raises:
         ConfigurationError: A supplied value violates a :class:`ChatConfig`
@@ -203,6 +217,9 @@ def resolve_chat_config(
             model_name=model_name if model_name is not None else defaults.model_name,
             base_url=base_url if base_url is not None else defaults.base_url,
             api_key_env=api_key_env if api_key_env is not None else defaults.api_key_env,
+            timeout_seconds=(
+                timeout_seconds if timeout_seconds is not None else defaults.timeout_seconds
+            ),
         )
     except ValidationError as exc:
         details = "; ".join(

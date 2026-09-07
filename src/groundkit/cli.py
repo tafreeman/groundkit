@@ -65,6 +65,7 @@ from groundkit import __version__, snapshots
 from groundkit.answer import AnswerPipeline, AnswerReport
 from groundkit.config import (
     DEFAULT_CHAT_MODEL,
+    DEFAULT_CHAT_TIMEOUT_SECONDS,
     ChatConfig,
     EmbeddingConfig,
     RetrievalConfig,
@@ -169,6 +170,7 @@ _CHAT_FLAG_ATTRS: tuple[str, ...] = (
     "chat_model",
     "chat_base_url",
     "chat_api_key_env",
+    "chat_timeout_seconds",
 )
 
 
@@ -538,7 +540,7 @@ def _add_embedding_args(parser: argparse.ArgumentParser) -> None:
 def _add_chat_args(parser: argparse.ArgumentParser) -> None:
     """Add the ``--chat-*`` flags shared by ``answer`` and ``eval --synthesis``.
 
-    All four default to ``None`` and are resolved into a
+    All five default to ``None`` and are resolved into a
     :class:`~groundkit.config.ChatConfig` (falling back to its own defaults)
     by :func:`_resolve_chat_config`, the same shape the ``--embed-*`` flags
     follow. The cloud path's egress is always redaction-wrapped by
@@ -572,6 +574,17 @@ def _add_chat_args(parser: argparse.ArgumentParser) -> None:
             "at call time, never stored or logged (SPEC.md §7)."
         ),
     )
+    parser.add_argument(
+        "--chat-timeout-seconds",
+        type=float,
+        default=None,
+        help=(
+            f"Per-request timeout for the chat provider in seconds "
+            f"(default: {DEFAULT_CHAT_TIMEOUT_SECONDS}). Raise this for a slow or "
+            "CPU-only inference backend — a completion that legitimately takes longer "
+            "than the default should widen this flag, not the retrieval-quality gate."
+        ),
+    )
 
 
 def _embed_flags_supplied(args: argparse.Namespace) -> bool:
@@ -596,6 +609,7 @@ def _resolve_chat_config(args: argparse.Namespace) -> ChatConfig:
         model_name=args.chat_model,
         base_url=args.chat_base_url,
         api_key_env=args.chat_api_key_env,
+        timeout_seconds=args.chat_timeout_seconds,
     )
 
 

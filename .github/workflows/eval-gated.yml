@@ -78,6 +78,19 @@ jobs:
       # it — so there is no second endpoint to wait on or configure, and no
       # API key or secret: 'ollama' is local by construction.
       GROUNDKIT_EVAL_CHAT_MODEL: llama3.2:3b
+      # 2026-09-07 (run 34089391290): the default 60s client-side chat
+      # timeout (ChatConfig.timeout_seconds) has no margin on this runner.
+      # This job's own Ollama access log showed individual `/api/generate`
+      # calls costing 28-56s on this CPU-only, GPU-less runner (no batching,
+      # no warm cache benefit — every query is one cold forward pass), and
+      # one call needed just over 60s: the client gave up with ReadTimeout,
+      # Ollama logged the abandoned request as a 500 after exactly 1m0s.
+      # That is a runner-speed/timeout-margin failure, not a retrieval- or
+      # answer-quality one — nothing here changes what is scored or how.
+      # 180s (~3x the slowest observed call) is comfortably inside this
+      # job's 60-minute budget: 49 sequential chat calls at even the
+      # slowest observed pace (56s) total under 46 minutes.
+      GROUNDKIT_EVAL_CHAT_TIMEOUT_SECONDS: "180"
 
     steps:
       - uses: actions/checkout@v7
@@ -155,7 +168,8 @@ jobs:
             --judge \
             --chat-provider ollama \
             --chat-model "$GROUNDKIT_EVAL_CHAT_MODEL" \
-            --chat-base-url "$GROUNDKIT_EVAL_EMBED_BASE_URL"
+            --chat-base-url "$GROUNDKIT_EVAL_EMBED_BASE_URL" \
+            --chat-timeout-seconds "$GROUNDKIT_EVAL_CHAT_TIMEOUT_SECONDS"
 
       - name: Upload the eval report
         uses: actions/upload-artifact@v4

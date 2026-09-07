@@ -134,10 +134,10 @@ class TestResolveEmbeddingConfig:
 class TestResolveChatConfig:
     """Tests for ``resolve_chat_config`` -- the exact peer of
     ``resolve_embedding_config`` (its own docstring), ported from
-    ``TestResolveEmbeddingConfig`` above field-for-field. ``dimensions`` has
-    no chat equivalent (``ChatConfig`` carries no numeric bound resolvable
-    from these four flags), so its override/invalid-value cases are played
-    by ``api_key_env`` and ``provider`` respectively.
+    ``TestResolveEmbeddingConfig`` above field-for-field.
+    ``timeout_seconds`` (added so a slow/CPU-only chat backend can widen its
+    own timeout without a source edit -- see its override test below) is
+    this resolver's equivalent of ``dimensions``'s ``gt=0`` bound.
     """
 
     def test_all_none_gives_defaults(self) -> None:
@@ -186,18 +186,44 @@ class TestResolveChatConfig:
         assert resolved.model_name == defaults.model_name
         assert resolved.base_url == defaults.base_url
 
+    def test_timeout_seconds_override(self) -> None:
+        """A slow/CPU-only chat backend needs more than the 60s default (2026-09-07:
+        groundkit's own ``eval-gated`` CI job failed with ``ReadTimeout`` at exactly
+        that default against a CPU-only runner)."""
+        resolved = resolve_chat_config(
+            provider=None,
+            model_name=None,
+            base_url=None,
+            api_key_env=None,
+            timeout_seconds=180.0,
+        )
+        defaults = ChatConfig()
+        assert resolved.timeout_seconds == 180.0
+        assert resolved.provider == defaults.provider
+        assert resolved.model_name == defaults.model_name
+        assert resolved.base_url == defaults.base_url
+        assert resolved.api_key_env == defaults.api_key_env
+
+    def test_timeout_seconds_none_keeps_default(self) -> None:
+        resolved = resolve_chat_config(
+            provider=None, model_name=None, base_url=None, api_key_env=None, timeout_seconds=None
+        )
+        assert resolved.timeout_seconds == ChatConfig().timeout_seconds
+
     def test_all_fields_override_together(self) -> None:
         resolved = resolve_chat_config(
             provider="openai_compatible",
             model_name="gpt-4o-mini",
             base_url="https://api.example.com",
             api_key_env="MY_CHAT_KEY",
+            timeout_seconds=120.0,
         )
         assert resolved == ChatConfig(
             provider="openai_compatible",
             model_name="gpt-4o-mini",
             base_url="https://api.example.com",
             api_key_env="MY_CHAT_KEY",
+            timeout_seconds=120.0,
         )
 
     def test_invalid_provider_translates_to_configuration_error(self) -> None:
@@ -208,11 +234,11 @@ class TestResolveChatConfig:
         ``ValidationError`` is not a ``GroundkitError``, so ``cli.main``'s
         handler would never catch it and the command would exit on a raw
         pydantic traceback instead of a one-line ``error:`` message.
-        ``ChatConfig`` has no numeric bound reachable from these four
-        parameters, so ``provider``'s ``Literal`` is what stands in for
-        ``dimensions``'s ``gt=0`` here -- argparse's own ``choices=`` blocks
-        this value on the real CLI path, but ``resolve_chat_config`` is
-        called directly here, bypassing that.
+        ``provider``'s ``Literal`` is exercised here rather than
+        ``timeout_seconds``'s ``gt=0`` bound (covered by the test below)
+        because argparse's own ``choices=`` blocks this value on the real
+        CLI path, but ``resolve_chat_config`` is called directly here,
+        bypassing that.
         """
         with pytest.raises(ConfigurationError, match="provider") as excinfo:
             resolve_chat_config(
@@ -220,6 +246,23 @@ class TestResolveChatConfig:
                 model_name=None,
                 base_url=None,
                 api_key_env=None,
+            )
+        assert isinstance(excinfo.value.__cause__, ValidationError)
+
+    def test_invalid_timeout_seconds_translates_to_configuration_error(self) -> None:
+        """A non-positive ``timeout_seconds`` must raise ``ConfigurationError``, not
+        ``ValidationError`` -- the same translation the test above covers for
+        ``provider``, exercised here through ``ChatConfig.timeout_seconds``'s own
+        ``gt=0`` bound (``--chat-timeout-seconds`` carries no argparse-level bound,
+        so this translation is this field's only fail-closed check on the CLI path).
+        """
+        with pytest.raises(ConfigurationError, match="timeout_seconds") as excinfo:
+            resolve_chat_config(
+                provider=None,
+                model_name=None,
+                base_url=None,
+                api_key_env=None,
+                timeout_seconds=0.0,
             )
         assert isinstance(excinfo.value.__cause__, ValidationError)
 
