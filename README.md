@@ -49,6 +49,24 @@ development — see the Quickstart below.
 
 **Documentation: <https://tafreeman.github.io/groundkit/>**
 
+## Quickstart
+
+```bash
+pip install groundkit
+grk ingest ./docs
+grk search "your query" --json
+```
+
+For development from a clone, use `uv sync` and prefix each command with
+`uv run` instead.
+
+Ingestion is incremental (unchanged files are skipped by content hash), the
+index persists under `.groundkit/` and survives restarts, and every result
+carries a citation — source path plus character offsets — that
+`groundkit.retrieval.verify_citation` can check against the source file.
+No cloud credentials are required for any of this. Full documentation
+(guides, API reference, ADRs): <https://tafreeman.github.io/groundkit/>.
+
 ## What this is
 
 Grounded, citation-verifiable hybrid retrieval: a persisted BM25 + dense
@@ -123,23 +141,22 @@ provider at a cloud endpoint.
 > [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for everything deliberately
 > out of scope or presently broken — it is honest and current, including
 > about defects.
-
-## Quickstart
-
-```bash
-pip install groundkit
-grk ingest ./docs
-grk search "your query" --json
-```
-
-For development from a clone, use `uv sync` and prefix each command with
-`uv run` instead.
-
-Ingestion is incremental (unchanged files are skipped by content hash), the
-index persists under `.groundkit/` and survives restarts, and every result
-carries a citation — source path plus character offsets — that
-`groundkit.retrieval.verify_citation` can check against the source file.
-No cloud credentials are required for any of this.
+>
+> **Everything in "Since then" above is unreleased.** `pip install groundkit`
+> installs **v0.1.0 only** — the repository default branch has since moved
+> ahead of that tag (see [CHANGELOG.md](CHANGELOG.md)'s `[Unreleased]`
+> section for the full, commit-traceable list) and that gap includes real
+> security hardening, most notably closing inbound DNS rebinding via `Host`
+> validation on both the REST and MCP transports ([ADR-0024](docs/adr/ADR-0024-host-header-validation-on-both-transports.md)).
+> **v0.1.0 does not have that validation.** To be precise about what that
+> does and does not mean: it means the *feature* is absent from the released
+> wheel, not that v0.1.0 has a demonstrated, exploitable vulnerability — its
+> `127.0.0.1`-by-default bind is still real access control, and DNS rebinding
+> is a browser-mediated attack path, not something reachable from a bare
+> network scan. If that hardening matters for your deployment, install from
+> a `main` checkout rather than PyPI until the next release ships. See
+> [SECURITY.md](SECURITY.md#version-scope) for the full, version-scoped
+> statement.
 
 ## Eval harness
 

@@ -420,6 +420,15 @@ it scored.
   while it takes the rebuild lock and does an O(corpus) read on every request.
   `handle_index_status` builds no retriever, so reading the meter cannot move it,
   and a test asserts two consecutive calls leave `retriever_acquires` unchanged.
+- `--chat-timeout-seconds` (`grk answer`, `grk eval --synthesis`) makes the chat
+  provider's per-request timeout a flag instead of a fixed 60-second constant
+  (`ChatConfig.timeout_seconds`, now `DEFAULT_CHAT_TIMEOUT_SECONDS`). Found via
+  `eval-gated.yml`'s own CI failing with `ReadTimeout` against a CPU-only
+  runner: its Ollama access log showed individual `/api/generate` calls costing
+  28-56 seconds with no GPU to shorten them, and the run eventually needed just
+  over 60. That is a runner-speed problem, not a retrieval- or answer-quality
+  one, so the fix widens the timeout rather than anything the eval harness
+  scores; `eval-gated.yml` now passes `--chat-timeout-seconds 180`.
 
 ### Removed
 
