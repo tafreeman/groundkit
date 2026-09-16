@@ -1,5 +1,10 @@
 # groundkit
 
+This repository owns the public GroundKit retrieval service and its REST/MCP APIs.
+A separate private offline evaluation testbed is used for retrieval research; it
+is not a replacement release of this service. Keep their virtual environments
+separate while both use the `groundkit` import name.
+
 <!-- Badges are live endpoints only, never hand-written values (SPEC.md §2:
      "Real data only ... numbers come from generated eval artifacts or dynamic
      badges, or are omitted"). A badge showing a stale value is the failure the
