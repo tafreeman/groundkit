@@ -74,13 +74,23 @@ def _is_url_source(source: str) -> bool:
     (``groundkit.cli``'s dispatch to :class:`~groundkit.ingestion.url_loader.UrlLoader`
     vs :class:`~groundkit.ingestion.loaders.FileLoader`) and is deliberately
     a second, tiny copy rather than an import of it: this one exists only so
-    :meth:`Indexer._prune_emptied_source` can decide whether a stored
-    ``source`` is comparable via ``os.path.realpath`` at all — a URL's
-    ``source`` field is never realpath-resolved (:class:`UrlLoader` stores it
-    verbatim, exactly as fetched — ADR-0016 decision 4), so realpath-resolving
-    it before comparing would produce a string that could never match the
-    literal URL actually stored, silently defeating the emptied-source prune
-    for every URL whose content later becomes empty.
+    the two prune paths can decide whether a stored ``source`` may be treated
+    as a filesystem path at all. A URL's ``source`` field is never
+    realpath-resolved (:class:`UrlLoader` stores it verbatim, exactly as
+    fetched — ADR-0016 decision 4), and ``os.path.realpath`` turns a URL
+    string into a relative path under the cwd, so each prune path has to ask
+    before any path logic runs:
+
+    - :meth:`Indexer._prune_emptied_source` compares a URL literally, since a
+      realpath-resolved URL could never match the literal one stored.
+    - :meth:`Indexer._prune_missing` skips URLs outright. Without that,
+      ``is_within_base`` passed for every URL whenever the walked root was
+      the cwd or one of its ancestors, and re-ingesting such a directory
+      deleted every URL-ingested document.
+
+    The prune paths read bare source strings rather than the recorded
+    ``source_class`` so they keep working against pre-ADR-0016 stores (see
+    ``SQLiteMetadataStore.get_document_sources``).
     """
     return urlsplit(source).scheme in {"http", "https"}
 
@@ -801,6 +811,9 @@ class Indexer:
         count (ADR-0004 decision 6) — the sweep that forgets a document in
         SQLite must not strand its dense rows.
 
+        URL sources are never candidates: they are not files, so a directory
+        walk can neither find nor miss them.
+
         Args:
             root: The directory just walked — the prune scope. A stored
                 document is only a deletion candidate when its source
@@ -823,6 +836,14 @@ class Indexer:
         pruned = 0
         vectors_deleted = 0
         for document_id, source in sources.items():
+            # A URL is never part of a directory walk, so it is never
+            # "missing" from one. It must be skipped before is_within_base:
+            # realpath resolves a URL string as a relative path under the
+            # cwd, so containment passes whenever ``root`` is the cwd or one
+            # of its ancestors, and the URL document was deleted as if its
+            # file had vanished (see _is_url_source).
+            if _is_url_source(source):
+                continue
             if source in current or not is_within_base(source, root):
                 continue
             _, vectors = await self._delete_document_everywhere(document_id)

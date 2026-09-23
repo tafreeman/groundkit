@@ -500,6 +500,68 @@ def test_pruning_a_document_removes_its_snapshot(tmp_path: Path) -> None:
     assert _snapshot_files(index_dir) == []
 
 
+@pytest.mark.parametrize(
+    ("cwd", "root"),
+    [
+        pytest.param("docs", ".", id="root-is-the-cwd"),
+        pytest.param("docs/sub", "..", id="root-is-an-ancestor-of-the-cwd"),
+    ],
+)
+def test_directory_reingest_never_prunes_a_url_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cwd: str, root: str
+) -> None:
+    """``Indexer._prune_missing`` skips URL sources, as ``_prune_emptied_source`` does.
+
+    A URL's ``source`` is stored verbatim, and ``os.path.realpath`` resolves a
+    URL string as a relative path under the current directory
+    (``test_source_class.py`` pins that hazard). So when the directory being
+    indexed was the cwd or one of its ancestors, the URL "resolved under" it,
+    was absent from the file set just walked, and was deleted as a missing
+    file, snapshot and all, with nothing reported but a prune count. Found by
+    the 2026-09-03 audit and still open at the 2026-09-22 one.
+
+    The second run deletes a real file, so the test also fails if the prune
+    pass is simply switched off rather than taught to skip URLs.
+    """
+    index_dir = tmp_path / ".groundkit"
+    docs = tmp_path / "docs"
+    (docs / "sub").mkdir(parents=True)
+    (docs / "alpha.md").write_text("A local file that stays on disk.", encoding="utf-8")
+    (docs / "beta.md").write_text("A local file that is later deleted.", encoding="utf-8")
+    url = "https://example.com/doc"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"Remote content that must survive.")
+
+    asyncio.run(_ingest_url(index_dir, "default", url, handler))
+    monkeypatch.chdir(tmp_path / cwd)
+
+    async def index_directory() -> tuple[int, set[str]]:
+        store = await SQLiteMetadataStore.open(index_dir, "default")
+        try:
+            indexer = Indexer(
+                store,
+                FileLoader(allowed_base_dir=docs),
+                collection="default",
+                snapshot_dir=snapshots.snapshot_dir_for(index_dir, "default"),
+            )
+            report = await indexer.index_directory(root)
+            return report.documents_pruned, set((await store.get_document_sources()).values())
+        finally:
+            await store.close()
+
+    pruned, sources = asyncio.run(index_directory())
+    assert pruned == 0
+    assert url in sources
+    assert len(sources) == 3
+
+    (docs / "beta.md").unlink()
+    pruned, sources = asyncio.run(index_directory())
+    assert pruned == 1
+    assert sources == {url, os.path.realpath(docs / "alpha.md")}
+    assert len(_snapshot_files(index_dir)) == 1
+
+
 def test_a_document_id_escaping_the_snapshot_dir_is_never_unlinked(tmp_path: Path) -> None:
     """ADR-0023 decision 4.
 

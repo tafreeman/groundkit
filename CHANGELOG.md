@@ -11,6 +11,18 @@ it scored.
 
 ## [Unreleased]
 
+### Fixed
+
+- Re-ingesting a directory no longer deletes URL-ingested documents. The
+  missing-file prune pass compared every stored source against the walked
+  root with `is_within_base`, and `os.path.realpath` resolves a URL string as
+  a relative path under the current directory. So when the root was the
+  current directory or one of its ancestors, as in `grk ingest .`, every URL
+  document in the collection counted as a vanished file and was deleted along
+  with its snapshot. The report showed only a prune count. The prune pass now
+  skips URL sources before any path check, the same guard the emptied-source
+  prune already had. Affected 0.1.0 and 0.2.0.
+
 ## [0.2.0] - 2026-09-23
 
 ### Changed
