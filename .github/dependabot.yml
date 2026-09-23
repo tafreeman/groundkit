@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # uv.lock is the single source of dependency truth (CI installs with
+  # `uv sync --locked`), so Dependabot updates it directly. Minor and patch
+  # bumps arrive as one grouped PR; majors stay separate so each gets a
+  # deliberate review.
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # No docker entry: infra/docker/Dockerfile takes its base-image versions from
+  # build ARGs (UV_VERSION, PYTHON_VERSION), which Dependabot cannot update.
