@@ -110,7 +110,7 @@ provider at a cloud endpoint.
 
 ## Status
 
-> **v0.1.0 released 2026-08-18.** All seven phases are done: `pip install
+> **v0.2.0 released 2026-09-23.** All seven phases are done: `pip install
 > groundkit` works.
 > BM25 retrieval, a persisted index, citation-bearing search, and a
 > retrieval eval harness work end-to-end locally with no cloud credentials —
@@ -121,15 +121,18 @@ provider at a cloud endpoint.
 > like every other retrieval feature ([ADR-0012](docs/adr/ADR-0012-rerank-eval-stage-reorders-upstream-stage.md));
 > it is not part of `grk search`.
 >
-> Since then: the **MCP server and REST API** ship over one runtime
-> (`grk serve`, `grk serve-mcp`), the **LLM boundary** is built — optional
-> query rewrite, cited synthesis that may cite only retrieved spans, a
-> redaction pass on cloud chat egress with no operator opt-out, and an
-> advisory faithfulness judge — and the **IaC** is real and exercised
-> (Dockerfile, compose with an OTel collector and Jaeger, Kubernetes
-> manifests, and a Terraform module that has been applied and destroyed
-> against a live account). OpenTelemetry spans cover ingest, retrieve and
-> synthesize.
+> The **MCP server and REST API** ship over one runtime (`grk serve`,
+> `grk serve-mcp`), the **LLM boundary** is built — optional query rewrite,
+> cited synthesis that may cite only retrieved spans, a redaction pass on
+> cloud chat egress with no operator opt-out, and an advisory faithfulness
+> judge — and the **IaC** is real and exercised (Dockerfile, compose with an
+> OTel collector and Jaeger, Kubernetes manifests, and a Terraform module
+> that has been applied and destroyed against a live account). OpenTelemetry
+> spans cover ingest, retrieve and synthesize. **v0.2.0 also closes inbound
+> DNS rebinding** via `Host` validation on both the REST and MCP transports
+> ([ADR-0024](docs/adr/ADR-0024-host-header-validation-on-both-transports.md)) —
+> see [SECURITY.md](SECURITY.md#version-scope) for the version-scoped
+> statement.
 >
 > **groundkit is on PyPI.** One v1 scope item is deliberately unbuilt and
 > named as such — **PDF/HTML ingestion**, whose extractors and citation
@@ -140,23 +143,8 @@ provider at a cloud endpoint.
 > userinfo or query string rather than storing one. See
 > [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for everything deliberately
 > out of scope or presently broken — it is honest and current, including
-> about defects.
->
-> **Everything in "Since then" above is unreleased.** `pip install groundkit`
-> installs **v0.1.0 only** — the repository default branch has since moved
-> ahead of that tag (see [CHANGELOG.md](CHANGELOG.md)'s `[Unreleased]`
-> section for the full, commit-traceable list) and that gap includes real
-> security hardening, most notably closing inbound DNS rebinding via `Host`
-> validation on both the REST and MCP transports ([ADR-0024](docs/adr/ADR-0024-host-header-validation-on-both-transports.md)).
-> **v0.1.0 does not have that validation.** To be precise about what that
-> does and does not mean: it means the *feature* is absent from the released
-> wheel, not that v0.1.0 has a demonstrated, exploitable vulnerability — its
-> `127.0.0.1`-by-default bind is still real access control, and DNS rebinding
-> is a browser-mediated attack path, not something reachable from a bare
-> network scan. If that hardening matters for your deployment, install from
-> a `main` checkout rather than PyPI until the next release ships. See
-> [SECURITY.md](SECURITY.md#version-scope) for the full, version-scoped
-> statement.
+> about defects. See [CHANGELOG.md](CHANGELOG.md)'s `[0.2.0]` section for the
+> full, commit-traceable list of what changed since v0.1.0.
 
 ## Eval harness
 

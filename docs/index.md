@@ -52,7 +52,7 @@ default. Term by term:
 
 ## Status
 
-!!! note "All seven phases done; v0.1.0 released 2026-08-18"
+!!! note "All seven phases done; v0.2.0 released 2026-09-23"
 
     The deterministic core, the persisted index, hybrid retrieval, the eval
     harness, the LLM boundary (query rewrite, synthesis, redaction), the MCP
@@ -63,19 +63,16 @@ default. Term by term:
     [Known limitations](limitations.md) is the authoritative list of what
     does not work.
 
-!!! warning "This site describes `main`, which is ahead of the PyPI release"
+!!! note "This release closes inbound DNS rebinding"
 
-    This documentation is built and published from `main` on every push, so it
-    describes the code as it exists there today — not necessarily what
-    `pip install groundkit` gives you. **v0.1.0 (2026-08-18) is still the only
-    published release**, and `main` has since gained real security hardening —
-    most notably inbound-DNS-rebinding closure via `Host` validation
-    ([ADR-0024](adr/ADR-0024-host-header-validation-on-both-transports.md)) —
-    that v0.1.0 does not have. See
+    v0.2.0 includes real security hardening landed since v0.1.0 — most
+    notably inbound-DNS-rebinding closure via `Host` validation
+    ([ADR-0024](adr/ADR-0024-host-header-validation-on-both-transports.md)),
+    which the v0.1.0 wheel did not have. See
     [Security](security.md#version-scope) for the precise, version-scoped
-    statement of what that means, and
+    statement, and
     [CHANGELOG.md](https://github.com/tafreeman/groundkit/blob/main/CHANGELOG.md)'s
-    `[Unreleased]` section for everything else that has landed since.
+    `[0.2.0]` section for everything else in this release.
 
 ## What makes it different from a RAG demo
 
