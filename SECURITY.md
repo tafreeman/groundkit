@@ -18,13 +18,13 @@ precise about what it does not guard.
 
 This page (like the rest of the published docs site) describes the `main`
 branch, not necessarily what `pip install groundkit` installs. **The
-published PyPI release is v0.2.0 (2026-09-23).** The inbound-DNS-rebinding
+published PyPI release is v0.2.1 (2026-09-23).** The inbound-DNS-rebinding
 closure (`Host` validation, ADR-0024, the "Inbound DNS rebinding is closed"
-claim further down) shipped in this release — the v0.1.0 wheel predated it
-and did not have it, but v0.2.0 does. See
+claim further down) shipped in v0.2.0 — the v0.1.0 wheel predated it and did
+not have it, but v0.2.0 and later do. See
 [CHANGELOG.md](https://github.com/tafreeman/groundkit/blob/main/CHANGELOG.md)'s
-`[0.2.0]` section for the authoritative, commit-traceable list of everything
-in this release.
+`[0.2.1]` and `[0.2.0]` sections for the authoritative, commit-traceable list
+of what each release contains.
 
 ## Reporting
 
