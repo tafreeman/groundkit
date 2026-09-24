@@ -110,7 +110,7 @@ provider at a cloud endpoint.
 
 ## Status
 
-> **v0.2.0 released 2026-09-23.** All seven phases are done: `pip install
+> **v0.2.1 released 2026-09-23.** All seven phases are done: `pip install
 > groundkit` works.
 > BM25 retrieval, a persisted index, citation-bearing search, and a
 > retrieval eval harness work end-to-end locally with no cloud credentials —
@@ -128,8 +128,8 @@ provider at a cloud endpoint.
 > judge — and the **IaC** is real and exercised (Dockerfile, compose with an
 > OTel collector and Jaeger, Kubernetes manifests, and a Terraform module
 > that has been applied and destroyed against a live account). OpenTelemetry
-> spans cover ingest, retrieve and synthesize. **v0.2.0 also closes inbound
-> DNS rebinding** via `Host` validation on both the REST and MCP transports
+> spans cover ingest, retrieve and synthesize. **Since v0.2.0, groundkit also
+> closes inbound DNS rebinding** via `Host` validation on both the REST and MCP transports
 > ([ADR-0024](docs/adr/ADR-0024-host-header-validation-on-both-transports.md)) —
 > see [SECURITY.md](SECURITY.md#version-scope) for the version-scoped
 > statement.
@@ -143,8 +143,8 @@ provider at a cloud endpoint.
 > userinfo or query string rather than storing one. See
 > [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for everything deliberately
 > out of scope or presently broken — it is honest and current, including
-> about defects. See [CHANGELOG.md](CHANGELOG.md)'s `[0.2.0]` section for the
-> full, commit-traceable list of what changed since v0.1.0.
+> about defects. See [CHANGELOG.md](CHANGELOG.md)'s `[0.2.1]` and `[0.2.0]`
+> sections for the full, commit-traceable list of what changed since v0.1.0.
 
 ## Eval harness
 

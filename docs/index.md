@@ -52,7 +52,7 @@ default. Term by term:
 
 ## Status
 
-!!! note "All seven phases done; v0.2.0 released 2026-09-23"
+!!! note "All seven phases done; v0.2.1 released 2026-09-23"
 
     The deterministic core, the persisted index, hybrid retrieval, the eval
     harness, the LLM boundary (query rewrite, synthesis, redaction), the MCP
@@ -63,7 +63,7 @@ default. Term by term:
     [Known limitations](limitations.md) is the authoritative list of what
     does not work.
 
-!!! note "This release closes inbound DNS rebinding"
+!!! note "Inbound DNS rebinding is closed since v0.2.0"
 
     v0.2.0 includes real security hardening landed since v0.1.0 — most
     notably inbound-DNS-rebinding closure via `Host` validation
@@ -72,7 +72,7 @@ default. Term by term:
     [Security](security.md#version-scope) for the precise, version-scoped
     statement, and
     [CHANGELOG.md](https://github.com/tafreeman/groundkit/blob/main/CHANGELOG.md)'s
-    `[0.2.0]` section for everything else in this release.
+    `[0.2.0]` section for everything else in that release.
 
 ## What makes it different from a RAG demo
 

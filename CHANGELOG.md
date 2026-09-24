@@ -11,6 +11,8 @@ it scored.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-23
+
 ### Fixed
 
 - Re-ingesting a directory no longer deletes URL-ingested documents. The
@@ -569,5 +571,7 @@ Named here because they are v1 scope that did not ship, not oversights.
 - No authentication, no rate limiting, and no multi-tenancy on the service
   surface.
 
-[Unreleased]: https://github.com/tafreeman/groundkit/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/tafreeman/groundkit/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/tafreeman/groundkit/releases/tag/v0.2.1
+[0.2.0]: https://github.com/tafreeman/groundkit/releases/tag/v0.2.0
 [0.1.0]: https://github.com/tafreeman/groundkit/releases/tag/v0.1.0
