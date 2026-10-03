@@ -210,11 +210,14 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
         answer.
 
     Note:
-        Documented divergence from :class:`LanceDBVectorStore` (verified
-        live against the pinned 0.37.1 client): LanceDB's cosine-metric
-        search silently *excludes* a zero-magnitude stored vector from
-        results entirely, rather than reporting it as a 0.0-similarity
-        match the way this function's guard does. A genuinely all-zero
+        Documented divergence from :class:`LanceDBVectorStore`, and one that
+        depends on the installed LanceDB (verified live): on 0.18-0.27 a
+        zero-magnitude stored vector is returned from a cosine-metric search
+        at similarity 0.0, matching this function's guard; from 0.29 (0.28
+        does not resolve) through the pinned 0.37.1 it is silently *excluded*
+        from results entirely. The supported range spans both, so callers
+        can rely only on the shared contract: it is never ranked above a
+        real match, and never scored above 0.0. A genuinely all-zero
         embedding essentially never occurs from a real embedding model, so
         this is left as a documented backend-specific edge case rather than
         worked around by computing norms outside LanceDB to force parity.

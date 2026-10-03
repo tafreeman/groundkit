@@ -583,22 +583,37 @@ def test_zero_vector_embedding_scores_zero_in_memory() -> None:
     assert results[0][1] == 0.0
 
 
-def test_zero_vector_embedding_lancedb_excludes_it(tmp_path: Path) -> None:
-    """LanceDB-specific, documented divergence (verified live against the
-    pinned 0.37.1 client): a zero-magnitude stored vector is silently
-    excluded from cosine-metric search results entirely, rather than
-    reported as a 0.0-similarity match the way InMemoryVectorStore's own
-    ``_cosine_similarity`` guard behaves. A genuinely all-zero embedding
-    essentially never occurs from a real embedding model, so this is
-    documented as a known backend-specific edge case (see dense.py's
-    ``_cosine_similarity`` docstring) rather than worked around."""
+def test_zero_vector_embedding_never_outranks_a_real_match_on_lancedb(tmp_path: Path) -> None:
+    """LanceDB-specific, documented divergence that depends on the installed
+    LanceDB (verified live): on 0.18-0.27 a zero-magnitude stored vector is
+    returned from a cosine search at similarity 0.0, matching
+    InMemoryVectorStore's ``_cosine_similarity`` guard; from 0.29 through the
+    pinned 0.37.1 it is silently excluded. The supported range
+    (``>=0.18,<1``) spans both, so this pins only what holds on every
+    version: the real match ranks first at full similarity, and the zero
+    vector, if returned at all, comes last at exactly 0.0. A genuinely
+    all-zero embedding essentially never occurs from a real embedding
+    model, so this stays a documented backend-specific edge case (see
+    dense.py's ``_cosine_similarity`` docstring) rather than worked around."""
 
     async def _run() -> list[tuple[Chunk, float]]:
         store = await LanceDBVectorStore.open(tmp_path / "lancedb")
-        await store.add([_make_chunk("zero", "doc-1", "no direction")], [[0.0, 0.0, 0.0, 0.0]])
+        await store.add(
+            [
+                _make_chunk("zero", "doc-1", "no direction"),
+                _make_chunk("real", "doc-2", "points along x"),
+            ],
+            [[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
+        )
         return await store.search([1.0, 0.0, 0.0, 0.0], top_k=5)
 
-    assert asyncio.run(_run()) == []
+    results = asyncio.run(_run())
+
+    assert results[0][0].chunk_id == "real"
+    assert results[0][1] == pytest.approx(1.0)
+    # Excluded (one result) or returned last at exactly 0.0 (two results).
+    assert [chunk.chunk_id for chunk, _ in results[1:]] in ([], ["zero"])
+    assert all(score == 0.0 for _, score in results[1:])
 
 
 @pytest.mark.parametrize("store_kind", _STORE_KINDS)
