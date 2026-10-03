@@ -31,6 +31,7 @@ import argparse
 import asyncio
 import sys
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 
 from groundkit.errors import GroundkitError
@@ -64,16 +65,37 @@ async def _check(index_dir: Path, collection: str, top_k: int, allowance: int) -
     return 0
 
 
+def _int_at_least(minimum: int) -> Callable[[str], int]:
+    """argparse type: an int >= ``minimum``. argparse exits 2 on rejection,
+    so an out-of-range value is an input error, never a fallback verdict."""
+
+    def parse(raw: str) -> int:
+        try:
+            value = int(raw)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{raw!r} is not an integer") from None
+        if value < minimum:
+            raise argparse.ArgumentTypeError(f"must be >= {minimum}, got {value}")
+        return value
+
+    return parse
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--index-dir", default=".groundkit", type=Path)
     parser.add_argument("--collection", default="default")
-    parser.add_argument("--top-k", type=int, default=5, help="the top_k the app searches with")
+    parser.add_argument(
+        "--top-k",
+        type=_int_at_least(1),
+        default=5,
+        help="the top_k the app searches with (>= 1)",
+    )
     parser.add_argument(
         "--max-unindexed-rows",
-        type=int,
+        type=_int_at_least(0),
         default=0,
-        help="rows allowed outside the index before failing (default: 0)",
+        help="rows allowed outside the index before failing (>= 0, default: 0)",
     )
     args = parser.parse_args()
     # Exit 1 must mean exactly one thing: a confirmed fallback, reported by
