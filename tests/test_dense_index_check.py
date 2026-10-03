@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import random
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -152,3 +154,35 @@ def test_filtered_search_scores_every_row_even_with_an_index(tmp_path: Path) -> 
     returned, plan = asyncio.run(run())
     assert returned == _ROWS // 2
     assert "ANNSubIndex" not in plan
+
+
+_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "check_dense_index.py"
+
+
+def _run_script(*args: str) -> int:
+    completed = subprocess.run(  # noqa: S603 - fixed interpreter and repo script, test args only
+        [sys.executable, str(_SCRIPT), *args], capture_output=True, text=True, check=False
+    )
+    return completed.returncode
+
+
+@pytest.mark.parametrize("bad_name", ["../escape", "has space", "a/b"])
+def test_script_exits_2_not_1_for_an_invalid_collection_name(bad_name: str, tmp_path: Path) -> None:
+    # Exit 1 is reserved for a confirmed fallback; an input error must not look like one.
+    assert _run_script("--index-dir", str(tmp_path), "--collection", bad_name) == 2
+
+
+def test_script_exits_2_when_the_collection_has_no_dense_store(tmp_path: Path) -> None:
+    assert _run_script("--index-dir", str(tmp_path), "--collection", "absent") == 2
+
+
+def test_script_exits_1_on_fallback_and_0_once_indexed(tmp_path: Path) -> None:
+    async def seed() -> LanceDBVectorStore:
+        store = await LanceDBVectorStore.open(tmp_path / "demo.lance")
+        await store.add([_chunk(i, group="a") for i in range(_ROWS)], _vectors(_ROWS, seed=3))
+        return store
+
+    store = asyncio.run(seed())
+    assert _run_script("--index-dir", str(tmp_path), "--collection", "demo") == 1
+    _build_index(store)
+    assert _run_script("--index-dir", str(tmp_path), "--collection", "demo") == 0

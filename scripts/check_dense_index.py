@@ -11,7 +11,9 @@ unit probe vector is used and no embedding provider is needed. Offline and
 credential-free.
 
 Exit codes: 0 the index serves the query; 1 it would fall back to scanning
-(the full plan is printed); 2 the collection has no dense store to check.
+(the full plan is printed); 2 the check could not run (no dense store, an
+invalid argument, or an unexpected error). Exit 1 is never used for anything
+but a confirmed fallback, so automation can trust it.
 
 Usage::
 
@@ -28,9 +30,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import traceback
 from pathlib import Path
 
-from groundkit.errors import StorageError
+from groundkit.errors import GroundkitError
 from groundkit.index.dense import (
     LanceDBVectorStore,
     VectorIndexFallbackError,
@@ -73,13 +76,21 @@ def main() -> int:
         help="rows allowed outside the index before failing (default: 0)",
     )
     args = parser.parse_args()
+    # Exit 1 must mean exactly one thing: a confirmed fallback, reported by
+    # _check. Anything else — a bad --collection (ConfigurationError), an
+    # unreadable store, an unexpected crash — is "could not check" (2), or
+    # automation would read an input error as a scan regression. An uncaught
+    # exception would otherwise exit 1 too.
     try:
         validate_collection_name(args.collection)
         return asyncio.run(
             _check(args.index_dir, args.collection, args.top_k, args.max_unindexed_rows)
         )
-    except StorageError as exc:
+    except GroundkitError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception:
+        traceback.print_exc()
         return 2
 
 
