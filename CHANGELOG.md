@@ -11,6 +11,24 @@ it scored.
 
 ## [Unreleased]
 
+### Added
+
+- `assert_search_uses_vector_index` and `scripts/check_dense_index.py`: fail
+  loudly (`VectorIndexFallbackError`, exit 1) when an unfiltered dense search
+  would brute-force scan instead of using an ANN index — no index, an index
+  built for the wrong metric, or rows added since the index was built. The
+  check reads LanceDB's plan for the exact query `LanceDBVectorStore.search`
+  runs, via the new `explain_search`. groundkit builds no ANN index yet, so
+  the script fails on every existing dense collection; that is the finding.
+
+### Fixed
+
+- A metadata-filtered dense search now bypasses any ANN index explicitly.
+  With an index present, the over-fetch (`limit=count_rows`) returned only
+  the rows in the probed partitions, so filter-then-truncate could come back
+  short. No index is built today, so behavior is unchanged; this keeps the
+  guarantee once one is.
+
 ## [0.2.1] - 2026-09-23
 
 ### Fixed
