@@ -961,6 +961,10 @@ async def verify_dense_side_present(
 #: Plan operator LanceDB emits when a search is served by an ANN index.
 #: Its absence means the whole table was brute-force scored.
 _ANN_PLAN_MARKER: Final[str] = "ANNSubIndex"
+#: The marker only counts as a plan *operator*: at the start of a plan line.
+#: A bare substring match is fooled by the dataset URI the plan prints, so a
+#: collection named ``ANNSubIndex`` would make an unindexed scan look healthy.
+_ANN_OPERATOR_RE: Final[re.Pattern[str]] = re.compile(rf"^\s*{_ANN_PLAN_MARKER}:", re.MULTILINE)
 
 
 class VectorIndexFallbackError(StorageError):
@@ -1034,13 +1038,19 @@ async def assert_search_uses_vector_index(
             "version this either brute-force scans every row or ranks results by the "
             f"wrong metric. Rebuild the index with {_DISTANCE_METRIC!r}. Plan:\n{plan}"
         )
-    if _ANN_PLAN_MARKER not in plan:
+    if stats is None:
         raise VectorIndexFallbackError(
             "Dense search would brute-force scan every row instead of using a vector "
             f"index: no index exists on the {_VECTOR_COLUMN!r} column. Plan:\n{plan}"
         )
-    unindexed = stats[1] if stats is not None else None
-    if unindexed is not None and unindexed > max_unindexed_rows:
+    if _ANN_OPERATOR_RE.search(plan) is None:
+        raise VectorIndexFallbackError(
+            f"A vector index exists on {_VECTOR_COLUMN!r} (metric {stats[0]!r}, "
+            f"{stats[1]} unindexed row(s)) but the query plan has no {_ANN_PLAN_MARKER} "
+            "operator, so search is not served by it. Plan:\n" + plan
+        )
+    unindexed = stats[1]
+    if unindexed > max_unindexed_rows:
         raise VectorIndexFallbackError(
             f"Vector index is stale: {unindexed} row(s) are outside it and are "
             f"brute-force scanned on every search (allowance: {max_unindexed_rows}). "

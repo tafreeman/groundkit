@@ -110,6 +110,18 @@ def test_fails_loudly_when_no_index_exists(tmp_path: Path) -> None:
     assert "KNNVectorDistance" in str(excinfo.value)  # the plan travels with the error
 
 
+def test_unindexed_table_whose_path_contains_the_marker_still_fails(tmp_path: Path) -> None:
+    # The plan prints the dataset URI; a collection literally named after the
+    # plan operator must not make a brute-force scan look like an ANN search.
+    async def run() -> None:
+        store = await LanceDBVectorStore.open(tmp_path / "ANNSubIndex")
+        await store.add([_chunk(i, group="a") for i in range(_ROWS)], _vectors(_ROWS, seed=1))
+        await assert_search_uses_vector_index(store, _query())
+
+    with pytest.raises(VectorIndexFallbackError, match="no index exists"):
+        asyncio.run(run())
+
+
 def test_fails_loudly_when_index_metric_does_not_match_the_query(tmp_path: Path) -> None:
     # An L2 index on a cosine query. LanceDB 0.37 logs a warning and scans;
     # 0.18 uses the L2 index and ranks by the wrong metric, with a plan that

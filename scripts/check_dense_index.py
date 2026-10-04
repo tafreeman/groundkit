@@ -34,13 +34,18 @@ import traceback
 from collections.abc import Callable
 from pathlib import Path
 
-from groundkit.errors import GroundkitError
-from groundkit.index.dense import (
-    LanceDBVectorStore,
-    VectorIndexFallbackError,
-    assert_search_uses_vector_index,
-)
-from groundkit.index.metadata import validate_collection_name
+try:
+    from groundkit.errors import GroundkitError
+    from groundkit.index.dense import (
+        LanceDBVectorStore,
+        VectorIndexFallbackError,
+        assert_search_uses_vector_index,
+    )
+    from groundkit.index.metadata import validate_collection_name
+except ImportError as _exc:  # e.g. run with a Python that is not the project venv
+    # An uncaught ImportError exits 1, which would read as a confirmed fallback.
+    print(f"error: cannot import groundkit ({_exc}); run via `uv run`", file=sys.stderr)
+    raise SystemExit(2) from None
 
 
 async def _check(index_dir: Path, collection: str, top_k: int, allowance: int) -> int:
@@ -82,7 +87,9 @@ def _int_at_least(minimum: int) -> Callable[[str], int]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description=(__doc__ or "").strip().splitlines()[0] if __doc__ else None
+    )
     parser.add_argument("--index-dir", default=".groundkit", type=Path)
     parser.add_argument("--collection", default="default")
     parser.add_argument(
@@ -117,4 +124,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        code = main()
+    except SystemExit:
+        raise
+    except BaseException:  # e.g. a native PanicException: never exit 1
+        traceback.print_exc()
+        code = 2
+    raise SystemExit(code)
