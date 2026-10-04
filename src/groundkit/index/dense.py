@@ -216,11 +216,17 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
         at similarity 0.0, matching this function's guard; from 0.29 (0.28
         does not resolve) through the pinned 0.37.1 it is silently *excluded*
         from results entirely. The supported range spans both, so callers
-        can rely only on the shared contract: it is never ranked above a
-        real match, and never scored above 0.0. A genuinely all-zero
-        embedding essentially never occurs from a real embedding model, so
-        this is left as a documented backend-specific edge case rather than
-        worked around by computing norms outside LanceDB to force parity.
+        can rely only on the shared contract: a zero vector is never scored
+        above 0.0, and when ``top_k`` covers every row it is returned last.
+        It is NOT guaranteed to rank below real matches at small ``top_k``:
+        on 0.18-0.27 LanceDB reports its distance as NaN, sorts NaN first and
+        truncates to ``top_k`` before :func:`_sort_by_score` runs, so
+        ``top_k=1`` returns the zero vector instead of the real match
+        (verified on 0.18.0 and 0.27.0; 0.29+ return the real match). A
+        genuinely all-zero embedding essentially never occurs from a real
+        embedding model, so this is left as a documented backend-specific
+        edge case rather than worked around by computing norms outside
+        LanceDB to force parity.
     """
     dot = sum(x * y for x, y in zip(a, b, strict=True))
     norm_a = math.sqrt(sum(x * x for x in a))
@@ -680,10 +686,12 @@ class LanceDBVectorStore:
             exhaustive: Bypass any ANN index and score every row exactly.
                 Set for filtered searches: an ANN index probes only some
                 partitions, so ``limit=count_rows`` would return a *subset*
-                of the table (measured: 637 of 2000 rows with a 64-partition
-                IVF_PQ index), and filter-then-truncate would silently come
-                back short. No index exists today, so this changes nothing
-                now; it keeps that guarantee true once one does.
+                of the table (a fraction that varies with the index's
+                partitions and training run; see
+                ``test_filtered_search_scores_every_row_even_with_an_index``),
+                and filter-then-truncate would silently come back short. No
+                index exists today, so this changes nothing now; it keeps
+                that guarantee true once one does.
         """
         query = (
             self._table.search(query_embedding, vector_column_name=_VECTOR_COLUMN)
@@ -992,6 +1000,11 @@ async def assert_search_uses_vector_index(
     Only the unfiltered path is checked. A filtered search is an exhaustive
     scan by design (see the module docstring's "Filter-then-truncate"
     section and :meth:`LanceDBVectorStore._build_query`).
+
+    The plan and the index stats are read under separate lock acquisitions,
+    so a concurrent ``add()`` can land between them and the two can describe
+    slightly different table states. That is harmless for a diagnostic
+    meant to run against a quiescent collection (CI, a deploy gate).
 
     Args:
         store: An opened LanceDB store with a populated table.

@@ -583,18 +583,22 @@ def test_zero_vector_embedding_scores_zero_in_memory() -> None:
     assert results[0][1] == 0.0
 
 
-def test_zero_vector_embedding_never_outranks_a_real_match_on_lancedb(tmp_path: Path) -> None:
+def test_zero_vector_embedding_is_excluded_or_last_at_zero_on_lancedb(tmp_path: Path) -> None:
     """LanceDB-specific, documented divergence that depends on the installed
     LanceDB (verified live): on 0.18-0.27 a zero-magnitude stored vector is
     returned from a cosine search at similarity 0.0, matching
     InMemoryVectorStore's ``_cosine_similarity`` guard; from 0.29 through the
     pinned 0.37.1 it is silently excluded. The supported range
-    (``>=0.18,<1``) spans both, so this pins only what holds on every
-    version: the real match ranks first at full similarity, and the zero
-    vector, if returned at all, comes last at exactly 0.0. A genuinely
-    all-zero embedding essentially never occurs from a real embedding
-    model, so this stays a documented backend-specific edge case (see
-    dense.py's ``_cosine_similarity`` docstring) rather than worked around."""
+    (``>=0.18,<1``) spans both, so with ``top_k`` covering every row this pins
+    only what holds on every version: the real match ranks first at full
+    similarity, and the zero vector, if returned at all, comes last at
+    exactly 0.0. It deliberately does NOT claim the zero vector ranks below
+    real matches at small ``top_k``: on 0.18-0.27 it does not (LanceDB sorts
+    its NaN distance first and truncates before groundkit sorts, so
+    ``top_k=1`` returns the zero vector). A genuinely all-zero embedding
+    essentially never occurs from a real embedding model, so this stays a
+    documented backend-specific edge case (see dense.py's
+    ``_cosine_similarity`` docstring) rather than worked around."""
 
     async def _run() -> list[tuple[Chunk, float]]:
         store = await LanceDBVectorStore.open(tmp_path / "lancedb")

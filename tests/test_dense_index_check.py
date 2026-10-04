@@ -15,6 +15,7 @@ Async methods are driven with ``asyncio.run()`` inside sync tests, matching
 from __future__ import annotations
 
 import asyncio
+import inspect
 import random
 import subprocess
 import sys
@@ -64,17 +65,19 @@ async def _seeded_store(tmp_path: Path, *, start: int = 0) -> LanceDBVectorStore
 
 def _build_index(store: LanceDBVectorStore, *, metric: str = "cosine", partitions: int = 2) -> None:
     # Test seam: product code builds no index yet. The `config=` signature
-    # arrived after the supported floor (lancedb 0.18), so fall back to the
-    # older keyword form there; both build the same IVF_PQ index.
+    # arrived after the supported floor (lancedb 0.18), so choose the call
+    # form by inspecting the signature rather than catching TypeError, which
+    # would silently reroute an unrelated error into the old form. Both build
+    # the same IVF_PQ index.
     table = store._table
-    try:
+    if "config" in inspect.signature(table.create_index).parameters:
         table.create_index(
             "vector",
             config=lancedb_index.IvfPq(
                 distance_type=metric, num_partitions=partitions, num_sub_vectors=2
             ),
         )
-    except TypeError:
+    else:
         table.create_index(
             metric=metric,
             vector_column_name="vector",
