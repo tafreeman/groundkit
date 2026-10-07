@@ -67,7 +67,7 @@ Changelog = "https://github.com/tafreeman/groundkit/blob/main/CHANGELOG.md"
 # actually exercise the backend rather than skip it: no job that is the sole
 # proof of a backend may be continue-on-error (SPEC.md §3).
 dense = [
-  "lancedb>=0.13,<1",
+  "lancedb>=0.18,<1",
 ]
 # Cross-encoder rerank (Phase 3 Wave D, ADR-0005 decision 4). Deliberately
 # *not* mirrored into the dev group, unlike `dense` above: torch is a
@@ -131,7 +131,7 @@ dev = [
   "pytest-cov>=5,<8",
   "pip-audit>=2.7,<3",
   "pre-commit>=4,<6",
-  "lancedb>=0.13,<1",
+  "lancedb>=0.18,<1",
   "opentelemetry-sdk>=1.27,<2",
   "opentelemetry-exporter-otlp-proto-http>=1.27,<2",
   "opentelemetry-exporter-otlp-proto-grpc>=1.27,<2",

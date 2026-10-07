@@ -1,0 +1,267 @@
+"""Tests for the dense vector-index usage check.
+
+``assert_search_uses_vector_index`` must pass only when the query
+``LanceDBVectorStore.search`` actually runs is served by an ANN index, and
+must fail loudly on every way that silently stops being true: no index, an
+index built for the wrong metric, and a stale index with unindexed rows.
+
+Also pins the companion guarantee: once an index exists, a *filtered* search
+still scores every row, so filter-then-truncate cannot come back short.
+
+Async methods are driven with ``asyncio.run()`` inside sync tests, matching
+``test_dense.py`` (pytest-asyncio is not configured in this repo).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import random
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from groundkit.contracts import Chunk
+from groundkit.errors import StorageError
+from groundkit.index.dense import (
+    LanceDBVectorStore,
+    VectorIndexFallbackError,
+    assert_search_uses_vector_index,
+)
+
+lancedb_index = pytest.importorskip("lancedb.index")
+
+#: Enough rows to train a tiny IVF_PQ index; small enough to stay fast.
+_ROWS: int = 512
+_DIMS: int = 16
+
+
+def _chunk(i: int, *, group: str) -> Chunk:
+    content = f"chunk {i}"
+    return Chunk(
+        chunk_id=f"c{i}",
+        document_id=f"d{i}",
+        chunk_index=0,
+        content=content,
+        start_offset=0,
+        end_offset=len(content),
+        metadata={"source": "doc.md", "group": group},
+    )
+
+
+def _vectors(n: int, seed: int) -> list[list[float]]:
+    rng = random.Random(seed)  # noqa: S311 - deterministic test vectors, not crypto
+    return [[rng.random() for _ in range(_DIMS)] for _ in range(n)]
+
+
+async def _seeded_store(tmp_path: Path, *, start: int = 0) -> LanceDBVectorStore:
+    store = await LanceDBVectorStore.open(tmp_path / "lancedb")
+    chunks = [_chunk(i, group="a" if i % 2 else "b") for i in range(start, start + _ROWS)]
+    await store.add(chunks, _vectors(_ROWS, seed=start))
+    return store
+
+
+def _build_index(store: LanceDBVectorStore, *, metric: str = "cosine", partitions: int = 2) -> None:
+    # Test seam: product code builds no index yet. The `config=` signature
+    # arrived after the supported floor (lancedb 0.18), so choose the call
+    # form by inspecting the signature rather than catching TypeError, which
+    # would silently reroute an unrelated error into the old form. Both build
+    # the same IVF_PQ index.
+    table = store._table
+    if "config" in inspect.signature(table.create_index).parameters:
+        table.create_index(
+            "vector",
+            config=lancedb_index.IvfPq(
+                distance_type=metric, num_partitions=partitions, num_sub_vectors=2
+            ),
+        )
+    else:
+        table.create_index(
+            metric=metric,
+            vector_column_name="vector",
+            num_partitions=partitions,
+            num_sub_vectors=2,
+        )
+
+
+def _query() -> list[float]:
+    return _vectors(1, seed=999)[0]
+
+
+def test_passes_when_search_is_served_by_a_cosine_index(tmp_path: Path) -> None:
+    async def run() -> str:
+        store = await _seeded_store(tmp_path)
+        _build_index(store)
+        return await assert_search_uses_vector_index(store, _query())
+
+    plan = asyncio.run(run())
+    assert "ANNSubIndex" in plan
+
+
+def test_fails_loudly_when_no_index_exists(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = await _seeded_store(tmp_path)
+        await assert_search_uses_vector_index(store, _query())
+
+    with pytest.raises(VectorIndexFallbackError, match="brute-force scan") as excinfo:
+        asyncio.run(run())
+    assert "KNNVectorDistance" in str(excinfo.value)  # the plan travels with the error
+
+
+def test_unindexed_table_whose_path_contains_the_marker_still_fails(tmp_path: Path) -> None:
+    # The plan prints the dataset URI; a collection literally named after the
+    # plan operator must not make a brute-force scan look like an ANN search.
+    async def run() -> None:
+        store = await LanceDBVectorStore.open(tmp_path / "ANNSubIndex")
+        await store.add([_chunk(i, group="a") for i in range(_ROWS)], _vectors(_ROWS, seed=1))
+        await assert_search_uses_vector_index(store, _query())
+
+    with pytest.raises(VectorIndexFallbackError, match="no index exists"):
+        asyncio.run(run())
+
+
+def test_fails_loudly_when_index_metric_does_not_match_the_query(tmp_path: Path) -> None:
+    # An L2 index on a cosine query. LanceDB 0.37 logs a warning and scans;
+    # 0.18 uses the L2 index and ranks by the wrong metric, with a plan that
+    # looks healthy. Both must fail, which is why the check reads the index
+    # metric from its stats rather than trusting the plan.
+    async def run() -> None:
+        store = await _seeded_store(tmp_path)
+        _build_index(store, metric="l2")
+        await assert_search_uses_vector_index(store, _query())
+
+    with pytest.raises(VectorIndexFallbackError, match="built for metric 'l2'"):
+        asyncio.run(run())
+
+
+def test_fails_loudly_when_rows_were_added_after_the_index(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = await _seeded_store(tmp_path)
+        _build_index(store)
+        await store.add([_chunk(10_000, group="a")], _vectors(1, seed=7))
+        await assert_search_uses_vector_index(store, _query())
+
+    with pytest.raises(VectorIndexFallbackError, match="1 row"):
+        asyncio.run(run())
+
+
+def test_unindexed_allowance_is_respected(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = await _seeded_store(tmp_path)
+        _build_index(store)
+        await store.add([_chunk(10_000, group="a")], _vectors(1, seed=7))
+        await assert_search_uses_vector_index(store, _query(), max_unindexed_rows=1)
+
+    asyncio.run(run())
+
+
+def test_error_is_a_storage_error_so_existing_handlers_catch_it() -> None:
+    assert issubclass(VectorIndexFallbackError, StorageError)
+
+
+def test_explain_search_requires_a_table(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = await LanceDBVectorStore.open(tmp_path / "empty")
+        await store.explain_search(_query())
+
+    with pytest.raises(StorageError, match="no table"):
+        asyncio.run(run())
+
+
+def test_filtered_search_scores_every_row_even_with_an_index(tmp_path: Path) -> None:
+    # Many partitions so an ANN probe would cover only part of the table.
+    # Without bypassing the index, limit=count_rows returns a subset and
+    # filter-then-truncate silently comes back short.
+    async def run() -> tuple[int, str]:
+        store = await _seeded_store(tmp_path)
+        _build_index(store, partitions=32)
+        results = await store.search(_query(), top_k=_ROWS, metadata_filter={"group": "a"})
+        plan = await store.explain_search(_query(), top_k=5, metadata_filter={"group": "a"})
+        return len(results), plan
+
+    returned, plan = asyncio.run(run())
+    assert returned == _ROWS // 2
+    assert "ANNSubIndex" not in plan
+
+
+_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "check_dense_index.py"
+
+
+def _run_script(*args: str) -> int:
+    completed = subprocess.run(  # noqa: S603 - fixed interpreter and repo script, test args only
+        [sys.executable, str(_SCRIPT), *args], capture_output=True, text=True, check=False
+    )
+    return completed.returncode
+
+
+@pytest.mark.parametrize("bad_name", ["../escape", "has space", "a/b"])
+def test_script_exits_2_not_1_for_an_invalid_collection_name(bad_name: str, tmp_path: Path) -> None:
+    # Exit 1 is reserved for a confirmed fallback; an input error must not look like one.
+    assert _run_script("--index-dir", str(tmp_path), "--collection", bad_name) == 2
+
+
+def test_script_exits_2_when_the_collection_has_no_dense_store(tmp_path: Path) -> None:
+    assert _run_script("--index-dir", str(tmp_path), "--collection", "absent") == 2
+
+
+def test_script_exits_1_on_fallback_and_0_once_indexed(tmp_path: Path) -> None:
+    async def seed() -> LanceDBVectorStore:
+        store = await LanceDBVectorStore.open(tmp_path / "demo.lance")
+        await store.add([_chunk(i, group="a") for i in range(_ROWS)], _vectors(_ROWS, seed=3))
+        return store
+
+    store = asyncio.run(seed())
+    assert _run_script("--index-dir", str(tmp_path), "--collection", "demo") == 1
+    _build_index(store)
+    assert _run_script("--index-dir", str(tmp_path), "--collection", "demo") == 0
+
+
+def _seed_unindexed_demo(tmp_path: Path) -> None:
+    async def seed() -> None:
+        store = await LanceDBVectorStore.open(tmp_path / "demo.lance")
+        await store.add([_chunk(i, group="a") for i in range(8)], _vectors(8, seed=5))
+
+    asyncio.run(seed())
+
+
+@pytest.mark.parametrize(
+    "bad_args",
+    [
+        ("--top-k", "0"),
+        ("--top-k", "-3"),
+        ("--max-unindexed-rows", "-1"),
+        ("--top-k", "five"),
+    ],
+)
+def test_script_exits_2_not_1_for_out_of_range_numbers(
+    bad_args: tuple[str, str], tmp_path: Path
+) -> None:
+    # Seeded and unindexed, so a wrongly accepted value would reach the plan
+    # check and report a fallback (exit 1) that the real search never runs.
+    _seed_unindexed_demo(tmp_path)
+    assert _run_script("--index-dir", str(tmp_path), "--collection", "demo", *bad_args) == 2
+
+
+@pytest.mark.parametrize("top_k", [0, -1])
+def test_explain_search_refuses_a_search_that_runs_no_query(top_k: int, tmp_path: Path) -> None:
+    async def run() -> None:
+        store = await _seeded_store(tmp_path)
+        await store.explain_search(_query(), top_k=top_k)
+
+    with pytest.raises(StorageError, match="top_k must be positive"):
+        asyncio.run(run())
+
+
+def test_assert_rejects_a_negative_unindexed_allowance(tmp_path: Path) -> None:
+    # Must be an input error, not a VectorIndexFallbackError: with -1, even a
+    # fully indexed table (0 unindexed rows) would be reported as stale.
+    async def run() -> None:
+        store = await _seeded_store(tmp_path)
+        _build_index(store)
+        await assert_search_uses_vector_index(store, _query(), max_unindexed_rows=-1)
+
+    with pytest.raises(StorageError, match="max_unindexed_rows") as excinfo:
+        asyncio.run(run())
+    assert not isinstance(excinfo.value, VectorIndexFallbackError)

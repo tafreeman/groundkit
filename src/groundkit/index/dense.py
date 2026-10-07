@@ -97,6 +97,7 @@ import asyncio
 import json
 import math
 import re
+from functools import partial
 from pathlib import Path
 from typing import Any, Final
 
@@ -209,14 +210,23 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
         answer.
 
     Note:
-        Documented divergence from :class:`LanceDBVectorStore` (verified
-        live against the pinned 0.37.1 client): LanceDB's cosine-metric
-        search silently *excludes* a zero-magnitude stored vector from
-        results entirely, rather than reporting it as a 0.0-similarity
-        match the way this function's guard does. A genuinely all-zero
-        embedding essentially never occurs from a real embedding model, so
-        this is left as a documented backend-specific edge case rather than
-        worked around by computing norms outside LanceDB to force parity.
+        Documented divergence from :class:`LanceDBVectorStore`, and one that
+        depends on the installed LanceDB (verified live): on 0.18-0.27 a
+        zero-magnitude stored vector is returned from a cosine-metric search
+        at similarity 0.0, matching this function's guard; from 0.29 (0.28
+        does not resolve) through the pinned 0.37.1 it is silently *excluded*
+        from results entirely. The supported range spans both, so callers
+        can rely only on the shared contract: a zero vector is never scored
+        above 0.0, and when ``top_k`` covers every row it is returned last.
+        It is NOT guaranteed to rank below real matches at small ``top_k``:
+        on 0.18-0.27 LanceDB reports its distance as NaN, sorts NaN first and
+        truncates to ``top_k`` before :func:`_sort_by_score` runs, so
+        ``top_k=1`` returns the zero vector instead of the real match
+        (verified on 0.18.0 and 0.27.0; 0.29+ return the real match). A
+        genuinely all-zero embedding essentially never occurs from a real
+        embedding model, so this is left as a documented backend-specific
+        edge case rather than worked around by computing norms outside
+        LanceDB to force parity.
     """
     dot = sum(x * y for x, y in zip(a, b, strict=True))
     norm_a = math.sqrt(sum(x * x for x in a))
@@ -663,15 +673,121 @@ class LanceDBVectorStore:
                 raise _dimension_mismatch_error("embedding", width, self._dimensions)
             await asyncio.to_thread(self._table.add, rows)
 
-    def _search_sync(self, query_embedding: list[float], limit: int) -> list[dict[str, Any]]:
-        """Blocking LanceDB vector search; run only via ``asyncio.to_thread``."""
+    def _build_query(self, query_embedding: list[float], limit: int, *, exhaustive: bool) -> Any:
+        """Build the LanceDB query :meth:`search` runs — the ONE place it is built.
+
+        :meth:`explain_search` calls this too, so a query-plan check inspects
+        the query the app actually executes rather than a hand-written copy
+        that could drift from it (a different metric, a missing limit).
+
+        Args:
+            query_embedding: The query vector.
+            limit: Rows to request.
+            exhaustive: Bypass any ANN index and score every row exactly.
+                Set for filtered searches: an ANN index probes only some
+                partitions, so ``limit=count_rows`` would return a *subset*
+                of the table (a fraction that varies with the index's
+                partitions and training run; see
+                ``test_filtered_search_scores_every_row_even_with_an_index``),
+                and filter-then-truncate would silently come back short. No
+                index exists today, so this changes nothing now; it keeps
+                that guarantee true once one does.
+        """
         query = (
             self._table.search(query_embedding, vector_column_name=_VECTOR_COLUMN)
             .metric(_DISTANCE_METRIC)
             .limit(limit)
         )
-        rows: list[dict[str, Any]] = query.to_list()
+        if exhaustive:
+            query = query.bypass_vector_index()
+        return query
+
+    def _search_sync(
+        self, query_embedding: list[float], limit: int, *, exhaustive: bool
+    ) -> list[dict[str, Any]]:
+        """Blocking LanceDB vector search; run only via ``asyncio.to_thread``."""
+        rows: list[dict[str, Any]] = self._build_query(
+            query_embedding, limit, exhaustive=exhaustive
+        ).to_list()
         return rows
+
+    async def _resolve_fetch_limit(
+        self, top_k: int, metadata_filter: dict[str, Any] | None
+    ) -> tuple[int, bool]:
+        """Return ``(rows to request, exhaustive?)`` for a search; caller holds the lock.
+
+        Shared by :meth:`search` and :meth:`explain_search` so the two can
+        never disagree about which query shape a given call produces.
+        """
+        # `not metadata_filter`, not `is None`: _matches_filter treats an
+        # empty dict as a no-op that matches everything, so treating {}
+        # as "filtering enabled" here would pay the O(N) count_rows
+        # over-fetch to apply a filter that cannot remove anything. The
+        # two must agree on what counts as a filter.
+        if not metadata_filter:
+            return top_k, False
+        return int(await asyncio.to_thread(self._table.count_rows)), True
+
+    async def explain_search(
+        self,
+        query_embedding: list[float],
+        top_k: int = 5,
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> str:
+        """Return LanceDB's physical plan for exactly the query :meth:`search` would run.
+
+        Built through :meth:`_resolve_fetch_limit` and :meth:`_build_query`,
+        the same two calls :meth:`search` makes, so the plan cannot describe
+        a different query than the app executes.
+
+        Raises:
+            StorageError: The table does not exist yet, ``query_embedding``'s
+                width disagrees with this store's established width, or the
+                call is one :meth:`search` answers with ``[]`` without running
+                any query (``top_k <= 0``, or a filtered search on an empty
+                table). There is no plan to report for those, and inventing
+                one would describe a scan that never happens.
+        """
+        async with self._lock:
+            if self._table is None:
+                raise StorageError("cannot explain a search on a store with no table yet")
+            if self._dimensions is not None and len(query_embedding) != self._dimensions:
+                raise _dimension_mismatch_error(
+                    "query embedding", len(query_embedding), self._dimensions
+                )
+            if top_k <= 0:
+                raise StorageError(
+                    f"top_k must be positive to explain a search; search(top_k={top_k}) "
+                    "returns [] without running a query"
+                )
+            limit, exhaustive = await self._resolve_fetch_limit(top_k, metadata_filter)
+            if limit <= 0:
+                raise StorageError(
+                    "search would return [] without running a query (empty table); "
+                    "there is no plan to explain"
+                )
+            query = self._build_query(query_embedding, limit, exhaustive=exhaustive)
+            plan: str = await asyncio.to_thread(query.explain_plan, True)
+        return plan
+
+    async def vector_index_stats(self) -> tuple[str, int] | None:
+        """``(distance_type, unindexed_rows)`` for the vector column's index, or ``None``.
+
+        ``distance_type`` is lower-cased (``"cosine"``, ``"l2"``, ...).
+        ``unindexed_rows`` counts rows added after the index was built: they
+        are scored by brute force and unioned with the ANN results — correct,
+        but a growing flat-scanned tail. Incremental ingest produces exactly
+        this.
+        """
+        async with self._lock:
+            if self._table is None:
+                return None
+            indices = await asyncio.to_thread(self._table.list_indices)
+            for index in indices:
+                if _VECTOR_COLUMN in index.columns:
+                    stats = await asyncio.to_thread(self._table.index_stats, index.name)
+                    return str(stats.distance_type).lower(), int(stats.num_unindexed_rows)
+        return None
 
     async def search(
         self,
@@ -716,18 +832,12 @@ class LanceDBVectorStore:
                 raise _dimension_mismatch_error(
                     "query embedding", len(query_embedding), self._dimensions
                 )
-            # `not metadata_filter`, not `is None`: _matches_filter treats an
-            # empty dict as a no-op that matches everything, so treating {}
-            # as "filtering enabled" here would pay the O(N) count_rows
-            # over-fetch to apply a filter that cannot remove anything. The
-            # two must agree on what counts as a filter.
-            if not metadata_filter:
-                fetch_limit = top_k
-            else:
-                fetch_limit = await asyncio.to_thread(self._table.count_rows)
+            fetch_limit, exhaustive = await self._resolve_fetch_limit(top_k, metadata_filter)
             if fetch_limit <= 0:
                 return []
-            rows = await asyncio.to_thread(self._search_sync, query_embedding, fetch_limit)
+            rows = await asyncio.to_thread(
+                partial(self._search_sync, exhaustive=exhaustive), query_embedding, fetch_limit
+            )
 
         scored: list[tuple[Chunk, float]] = []
         for row in rows:
@@ -750,7 +860,7 @@ class LanceDBVectorStore:
             rows before and after the delete (counted, not assumed) — never
             read off LanceDB's own delete-result object, which is not
             guaranteed present across this repo's supported ``lancedb``
-            version range (``>=0.13,<1``).
+            version range (``>=0.18,<1``).
 
         Raises:
             StorageError: ``document_id`` fails :func:`_validate_document_id`
@@ -846,3 +956,104 @@ async def verify_dense_side_present(
         "nothing, and return nothing from the dense side, silently. Rebuild the "
         "collection, or restore the vector store alongside its SQLite file."
     )
+
+
+#: Plan operator LanceDB emits when a search is served by an ANN index.
+#: Its absence means the whole table was brute-force scored.
+_ANN_PLAN_MARKER: Final[str] = "ANNSubIndex"
+#: The marker only counts as a plan *operator*: at the start of a plan line.
+#: A bare substring match is fooled by the dataset URI the plan prints, so a
+#: collection named ``ANNSubIndex`` would make an unindexed scan look healthy.
+_ANN_OPERATOR_RE: Final[re.Pattern[str]] = re.compile(rf"^\s*{_ANN_PLAN_MARKER}:", re.MULTILINE)
+
+
+class VectorIndexFallbackError(StorageError):
+    """An unfiltered dense search would not be served by the vector index.
+
+    Raised by :func:`assert_search_uses_vector_index`. A flat scan returns
+    correct results, so nothing else notices: latency grows with the corpus
+    and no test or log line fails. This error is the loud version.
+    """
+
+
+async def assert_search_uses_vector_index(
+    store: LanceDBVectorStore,
+    query_embedding: list[float],
+    top_k: int = 5,
+    *,
+    max_unindexed_rows: int = 0,
+) -> str:
+    """Fail loudly unless :meth:`LanceDBVectorStore.search` would use the ANN index.
+
+    Checks the plan of the query the app actually runs (via
+    :meth:`LanceDBVectorStore.explain_search`), not a hand-written one. Three
+    conditions must hold:
+
+    1. The vector index, if any, was built for the query's cosine metric.
+       Checked from the index's own stats, not the plan, because a mismatch
+       fails differently across the supported LanceDB range: 0.37 logs a
+       warning and brute-force scans, but 0.18 *uses* an L2 index for a
+       cosine query and ranks results by the wrong metric — verified live,
+       and the plan line there does not name the metric at all.
+    2. The plan contains an ANN index operator. It will not when no index
+       exists, or on a metric mismatch under newer LanceDB.
+    3. At most ``max_unindexed_rows`` rows sit outside the index. Rows added
+       after the index was built are brute-force scored and unioned in, so
+       a stale index degrades gradually rather than all at once.
+
+    Only the unfiltered path is checked. A filtered search is an exhaustive
+    scan by design (see the module docstring's "Filter-then-truncate"
+    section and :meth:`LanceDBVectorStore._build_query`).
+
+    The plan and the index stats are read under separate lock acquisitions,
+    so a concurrent ``add()`` can land between them and the two can describe
+    slightly different table states. That is harmless for a diagnostic
+    meant to run against a quiescent collection (CI, a deploy gate).
+
+    Args:
+        store: An opened LanceDB store with a populated table.
+        query_embedding: A representative query vector of the store's width.
+        top_k: The ``top_k`` the app searches with.
+        max_unindexed_rows: Unindexed-row allowance before the check fails.
+
+    Returns:
+        The verified plan, for logging.
+
+    Raises:
+        VectorIndexFallbackError: Either condition above fails. The message
+            carries the full plan.
+        StorageError: The store has no table, the query width is wrong,
+            ``top_k`` is not positive, or ``max_unindexed_rows`` is negative.
+            These are invalid inputs, never a fallback verdict: a negative
+            allowance would report zero unindexed rows as stale.
+    """
+    if max_unindexed_rows < 0:
+        raise StorageError(f"max_unindexed_rows must be >= 0, got {max_unindexed_rows}")
+    plan = await store.explain_search(query_embedding, top_k=top_k)
+    stats = await store.vector_index_stats()
+    if stats is not None and stats[0] != _DISTANCE_METRIC:
+        raise VectorIndexFallbackError(
+            f"Vector index on {_VECTOR_COLUMN!r} was built for metric {stats[0]!r}, but "
+            f"search queries with {_DISTANCE_METRIC!r}. Depending on the LanceDB "
+            "version this either brute-force scans every row or ranks results by the "
+            f"wrong metric. Rebuild the index with {_DISTANCE_METRIC!r}. Plan:\n{plan}"
+        )
+    if stats is None:
+        raise VectorIndexFallbackError(
+            "Dense search would brute-force scan every row instead of using a vector "
+            f"index: no index exists on the {_VECTOR_COLUMN!r} column. Plan:\n{plan}"
+        )
+    if _ANN_OPERATOR_RE.search(plan) is None:
+        raise VectorIndexFallbackError(
+            f"A vector index exists on {_VECTOR_COLUMN!r} (metric {stats[0]!r}, "
+            f"{stats[1]} unindexed row(s)) but the query plan has no {_ANN_PLAN_MARKER} "
+            "operator, so search is not served by it. Plan:\n" + plan
+        )
+    unindexed = stats[1]
+    if unindexed > max_unindexed_rows:
+        raise VectorIndexFallbackError(
+            f"Vector index is stale: {unindexed} row(s) are outside it and are "
+            f"brute-force scanned on every search (allowance: {max_unindexed_rows}). "
+            f"Rebuild or optimize the index. Plan:\n{plan}"
+        )
+    return plan
