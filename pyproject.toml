@@ -41,7 +41,7 @@ dependencies = [
   # generated input schemas through the low-level Server, and mounts
   # StreamableHTTPSessionManager on the FastAPI app). A lower floor would
   # advertise compatibility nothing checks.
-  "mcp>=1.29,<2",
+  "mcp>=1.29,<3",
   # OTel's own base/extra split (Phase 6, ADR-0022 decision 1): the API is pure
   # Python with no transport, and with no SDK configured every span it creates
   # is non-recording — no export, no collector, no error. Putting it here means
