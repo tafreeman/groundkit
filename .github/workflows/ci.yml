@@ -224,7 +224,7 @@ jobs:
           PY
 
       # -- terraform ----------------------------------------------------
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           # Pinned to the version the module was written and validated against.
           terraform_version: "1.15.8"
