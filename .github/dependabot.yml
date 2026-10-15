@@ -12,6 +12,12 @@ updates:
     groups:
       minor-and-patch:
         update-types: ["minor", "patch"]
+    ignore:
+      # mcp 2.x replaces the low-level Server decorator API with on_list_tools /
+      # on_call_tool callbacks, so it is a planned migration of the service
+      # surface, not a bump. pyproject caps mcp<2 until that work is scheduled.
+      - dependency-name: "mcp"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"
