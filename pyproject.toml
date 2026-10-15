@@ -79,7 +79,7 @@ dense = [
 # the sigmoid, the ordering, the contract re-validation, every failure path — is
 # pure and covered by the default suite.
 rerank = [
-  "sentence-transformers>=3,<6",
+  "sentence-transformers>=3,<7",
 ]
 # Tracing SDK + OTLP exporters (Phase 6, ADR-0022 decision 1). `opentelemetry-api`
 # stays a base dependency above so instrumentation sites need no guarded
