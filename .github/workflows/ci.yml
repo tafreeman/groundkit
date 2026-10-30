@@ -254,16 +254,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
+        with:
+          fetch-depth: 0
+      # An advisory published against an existing dependency is not caused by
+      # an unrelated PR, so on pull requests the audit gates only PRs that
+      # change the dependency set. Pushes to main always audit, and Dependabot
+      # security alerts cover the time in between. The job still reports, so
+      # the required `audit` check is satisfied when the steps are skipped.
+      - id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ] || git diff --name-only "$BASE_SHA...HEAD" | grep -qxE 'uv\.lock|pyproject\.toml'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::audit skipped: this PR does not change uv.lock or pyproject.toml"
+          fi
+      - if: steps.scope.outputs.run == 'true'
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.11"
-      - run: uv sync --locked --group dev
+      - if: steps.scope.outputs.run == 'true'
+        run: uv sync --locked --group dev
       # requirements-audit.txt is generated here and gitignored, never
       # committed: this export is the only copy pip-audit ever reads, so a
       # tracked one would be a second rendering of uv.lock that nothing
       # checks and nothing notices drifting (GK-028).
-      - run: uv export --no-emit-project --group dev --format requirements.txt -o requirements-audit.txt
-      - run: uv run pip-audit -r requirements-audit.txt --disable-pip
+      - if: steps.scope.outputs.run == 'true'
+        run: uv export --no-emit-project --group dev --format requirements.txt -o requirements-audit.txt
+      - if: steps.scope.outputs.run == 'true'
+        run: uv run pip-audit -r requirements-audit.txt --disable-pip
 
   secrets:
     runs-on: ubuntu-latest
