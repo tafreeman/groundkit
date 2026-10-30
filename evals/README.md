@@ -67,6 +67,11 @@ every PR (`.github/workflows/bm25-floor.yml`) and in `release-gates.yml`.
   down to four decimals), never edited by hand. Changing the corpus,
   judgments or chunking changes the measured values: re-baseline in the same
   reviewed change, and say why in the PR.
+- No-answer abstention is pinned as a count *and* a denominator
+  (`no_answer_abstained` of `no_answer_queries`), so adding a no-answer
+  judgment fails the check until it is re-baselined. The script exits 2 if the
+  floor file is missing a gated metric, has an extra one, or holds a value that
+  is not a finite number in [0, 1].
 - Whether `bm25-floor` is a *required* status check is a repository setting,
   not something this repo's files can enforce.
 

@@ -14,8 +14,8 @@ decimals), never typed in by hand. Real-model dense/fusion deltas stay in
 dataset download and so cannot run offline from committed data.
 
 Exit codes: 0 every metric is at or above its floor; 1 at least one metric
-regressed below it; 2 the check could not run (missing floor file, unreadable
-report, import failure).
+regressed below it; 2 the check could not run (missing or invalid floor file,
+unreadable report, import failure).
 
 Usage::
 
@@ -59,13 +59,54 @@ def floor_down(value: float, decimals: int = FLOOR_DECIMALS) -> float:
     return math.floor(value * scale + EPSILON) / scale
 
 
+def _non_negative_int(value: object, key: str) -> int:
+    # bool is an int subclass; a floor of `true` is a corrupt file, not 1.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{key} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def parse_floor(raw: object) -> tuple[dict[str, float], tuple[int, int]]:
+    """Validate a decoded floor file; raise ``ValueError`` if it cannot gate.
+
+    Every metric in :data:`GATED_METRICS` must be present (and nothing else), and
+    each value must be a finite number in ``[0, 1]``: a missing key would skip its
+    comparison and ``NaN`` makes every ``<`` comparison false, so either would let
+    the gate pass silently.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("floor file must be a JSON object")
+    metrics = raw.get("metrics")
+    if not isinstance(metrics, dict) or set(metrics) != set(GATED_METRICS):
+        got = sorted(metrics) if isinstance(metrics, dict) else metrics
+        raise ValueError(f"metrics must have exactly {sorted(GATED_METRICS)}, got {got!r}")
+    floors: dict[str, float] = {}
+    for name in GATED_METRICS:
+        value = metrics[name]
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError(f"metrics.{name} must be a number, got {value!r}")
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"metrics.{name} must be finite and in [0, 1], got {value!r}")
+        floors[name] = float(value)
+    abstained = _non_negative_int(raw.get("no_answer_abstained"), "no_answer_abstained")
+    total = _non_negative_int(raw.get("no_answer_queries"), "no_answer_queries")
+    if abstained > total:
+        raise ValueError(f"no_answer_abstained {abstained} > no_answer_queries {total}")
+    return floors, (abstained, total)
+
+
 def find_regressions(
     measured: dict[str, float],
     floors: dict[str, float],
     no_answer: tuple[int, int],
-    floor_abstain: int,
+    floor_no_answer: tuple[int, int],
 ) -> list[str]:
-    """Return one message per metric that is below its floor; empty means pass."""
+    """Return one message per metric that is below its floor; empty means pass.
+
+    ``no_answer`` and ``floor_no_answer`` are ``(abstained, total)``. The total is
+    pinned too: a count alone would accept 8/9 against a floor of 8/8, hiding a
+    new no-answer judgment that retrieves a result.
+    """
     problems: list[str] = []
     for name, floor in floors.items():
         if name not in measured:
@@ -73,8 +114,16 @@ def find_regressions(
         elif measured[name] + EPSILON < floor:
             problems.append(f"{name}: measured {measured[name]:.4f} < floor {floor:.4f}")
     abstained, total = no_answer
-    if abstained < floor_abstain:
-        problems.append(f"no_answer_abstained: {abstained}/{total} < floor {floor_abstain}")
+    floor_abstain, floor_total = floor_no_answer
+    if total != floor_total:
+        problems.append(
+            f"no_answer_queries: {total} != floor {floor_total} "
+            "(judgments changed; re-baseline with --write-floor)"
+        )
+    if abstained < floor_abstain or total - abstained > floor_total - floor_abstain:
+        problems.append(
+            f"no_answer_abstained: {abstained}/{total} < floor {floor_abstain}/{floor_total}"
+        )
     return problems
 
 
@@ -97,6 +146,7 @@ def _write_floor(measured: dict[str, float], no_answer: tuple[int, int]) -> None
         ),
         "metrics": {name: floor_down(value) for name, value in measured.items()},
         "no_answer_abstained": no_answer[0],
+        "no_answer_queries": no_answer[1],
     }
     with FLOOR_PATH.open("w", encoding="utf-8", newline="\n") as fh:
         fh.write(json.dumps(payload, indent=2) + "\n")
@@ -118,13 +168,11 @@ def main() -> int:
         _write_floor(measured, no_answer)
         return 0
     try:
-        floor = json.loads(FLOOR_PATH.read_text(encoding="utf-8"))
-        floors = {k: float(v) for k, v in floor["metrics"].items()}
-        floor_abstain = int(floor["no_answer_abstained"])
-    except (OSError, ValueError, KeyError) as exc:
-        print(f"error: cannot read {FLOOR_PATH}: {exc}", file=sys.stderr)
+        floors, floor_no_answer = parse_floor(json.loads(FLOOR_PATH.read_text(encoding="utf-8")))
+    except (OSError, ValueError) as exc:  # json.JSONDecodeError is a ValueError
+        print(f"error: invalid floor file {FLOOR_PATH}: {exc}", file=sys.stderr)
         return 2
-    problems = find_regressions(measured, floors, no_answer, floor_abstain)
+    problems = find_regressions(measured, floors, no_answer, floor_no_answer)
     if problems:
         print("BM25 retrieval quality regressed below the committed floor:", file=sys.stderr)
         for line in problems:

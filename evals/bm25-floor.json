@@ -6,5 +6,6 @@
     "recall_at_10": 0.8055,
     "mrr": 0.5525
   },
-  "no_answer_abstained": 8
+  "no_answer_abstained": 8,
+  "no_answer_queries": 8
 }
