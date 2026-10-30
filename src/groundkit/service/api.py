@@ -295,18 +295,40 @@ def _register_health(app: FastAPI, ctx: ServiceContext) -> None:
     one ``stat`` of the index directory — it answers "is the volume still
     mounted as a directory", which is the failure the old ``/v1/collections``
     probe could not see (an empty or missing directory listed as ``[]``).
+
+    Both carry ``X-Request-ID`` like every other response. A successful probe is
+    not access-logged (kubelet calls them every few seconds, which would drown
+    the tool lines); a ``/readyz`` 503 is logged at WARNING against its id so
+    the failed probe can be found in the server log.
     """
 
-    async def healthz() -> dict[str, str]:
-        return {"status": "ok"}
+    async def healthz() -> JSONResponse:
+        return JSONResponse({"status": "ok"}, headers={REQUEST_ID_HEADER: uuid.uuid4().hex})
 
     async def readyz() -> JSONResponse:
+        request_id = uuid.uuid4().hex
         # Off the event loop: a wedged network volume blocks ``stat``, and that
         # must stall this probe, not every in-flight search.
         ready = await asyncio.to_thread(ctx.index_dir.is_dir)
         if ready:
-            return JSONResponse({"status": "ready"})
-        return JSONResponse({"status": "not_ready"}, status_code=503)
+            return JSONResponse({"status": "ready"}, headers={REQUEST_ID_HEADER: request_id})
+        logger.warning(
+            "request_id=%s method=GET route=%s status=503 reason=index_dir_not_a_directory",
+            request_id,
+            READYZ_PATH,
+            extra={
+                "request_id": request_id,
+                "method": "GET",
+                "route": READYZ_PATH,
+                "status": 503,
+                "reason": "index_dir_not_a_directory",
+            },
+        )
+        return JSONResponse(
+            {"status": "not_ready"},
+            status_code=503,
+            headers={REQUEST_ID_HEADER: request_id},
+        )
 
     app.add_api_route(HEALTHZ_PATH, healthz, methods=["GET"], include_in_schema=False)
     app.add_api_route(READYZ_PATH, readyz, methods=["GET"], include_in_schema=False)

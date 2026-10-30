@@ -295,6 +295,31 @@ def test_readyz_reflects_the_index_directory_without_listing_it(
     assert not_ready.json() == {"status": "not_ready"}
 
 
+def _service_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    # TestClient's httpx logs each request at INFO; only the service's own lines count.
+    return [r for r in caplog.records if r.name.startswith("groundkit.service")]
+
+
+def test_probes_carry_a_request_id_and_a_readiness_failure_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    index_dir = tmp_path / "index"
+    app = create_app(_empty_context(index_dir), host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST)
+    with TestClient(app) as client, caplog.at_level(logging.INFO, logger="groundkit.service"):
+        live = client.get("/healthz")
+        ready = client.get("/readyz")
+        assert not _service_records(caplog)  # routine probes stay out of the log
+        index_dir.rmdir()
+        not_ready = client.get("/readyz")
+    for response in (live, ready, not_ready):
+        assert len(response.headers["X-Request-ID"]) == 32
+    request_id = not_ready.headers["X-Request-ID"]
+    [record] = _service_records(caplog)
+    assert record.levelno == logging.WARNING
+    assert f"request_id={request_id}" in record.getMessage()
+    assert "status=503" in record.getMessage()
+
+
 def test_probe_routes_are_not_in_the_openapi_document(tmp_path: Path) -> None:
     app = create_app(
         _empty_context(tmp_path / "index"), host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST
