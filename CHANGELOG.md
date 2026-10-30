@@ -13,6 +13,14 @@ it scored.
 
 ### Added
 
+- `GET /healthz` (static liveness) and `GET /readyz` (one `stat` of the index
+  directory, `503` when it is not a directory) on the service API. Read-only,
+  not in the OpenAPI document, excluded from the registry route-parity test by
+  exact `(path, method)` pair; the test fails if any other route appears.
+  `infra/k8s/deployment.yaml` probes now use them instead of listing the PVC
+  via `GET /v1/collections`. Both carry `X-Request-ID`; a successful probe is
+  not access-logged, and a `/readyz` 503 is logged at WARNING against its id.
+
 - `assert_search_uses_vector_index` and `scripts/check_dense_index.py`: fail
   loudly (`VectorIndexFallbackError`, exit 1) when an unfiltered dense search
   would brute-force scan instead of using an ANN index — no index, an index
