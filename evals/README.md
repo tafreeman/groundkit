@@ -50,6 +50,26 @@ Nothing in those three directories may be quoted as a retrieval-quality number
 unless a real provider produced it — an `InMemoryEmbedder` figure is
 hash-derived noise, not a measurement (SPEC.md §2).
 
+## The offline BM25 floor
+
+`evals/bm25-floor.json` is the committed regression floor for the BM25
+baseline stage over this corpus. `scripts/check_bm25_floor.py` re-runs the
+BM25-only eval (no embedder, no model, no network) and exits 1 if nDCG@10,
+recall@5, recall@10, MRR or no-answer abstention falls below it. It runs on
+every PR (`.github/workflows/bm25-floor.yml`) and in `release-gates.yml`.
+
+- It guards against regression, not quality: the opt-in, real-model
+  `eval-gated.yml` remains the only source of dense/fusion numbers.
+- The BEIR subset under `evals/beir/` is not used, because its dataset is
+  downloaded rather than committed and so cannot run offline.
+- The floor is computed by running the metric
+  (`uv run python scripts/check_bm25_floor.py --write-floor`, each value rounded
+  down to four decimals), never edited by hand. Changing the corpus,
+  judgments or chunking changes the measured values: re-baseline in the same
+  reviewed change, and say why in the PR.
+- Whether `bm25-floor` is a *required* status check is a repository setting,
+  not something this repo's files can enforce.
+
 ## The JSONL record schema
 
 One JSON object per non-blank line in `evals/judgments.jsonl`, mirroring
