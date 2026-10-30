@@ -185,16 +185,14 @@ at a time), so a second pod cannot mount it and a rolling update would hang
 on a Multi-Attach error rather than fail. Every deploy is honest downtime.
 
 The probes (Kubernetes' own automated health checks, used to decide whether
-to send traffic to a pod or restart it) target `GET /v1/collections`,
-because there is no health endpoint to target and adding one is a `src/`
-change with a real cost — ADR-0014's parity test asserts that the registered
-route set is exactly the four declared operations, and a fifth route means
-widening a security-relevant exclusion.
-`docs/specs/phase-6-iac-observability.md` §4.2 records the tradeoff and what
-the probe does and does not prove. In short: it proves the process is serving
-HTTP and the index directory is listable; it does **not** prove any collection
-is usable, because an empty or missing index directory returns `[]` rather than
-an error.
+to send traffic to a pod or restart it) target two dedicated read-only routes:
+`GET /healthz` for startup and liveness (static, no I/O) and `GET /readyz` for
+readiness (one `stat` of the index directory, `503` if it is not a directory).
+ADR-0014's parity test still asserts that the registered route set is exactly
+the four declared operations; it excludes these two `GET` pairs and nothing
+else. `docs/specs/phase-6-iac-observability.md` §4.2 records the history. They
+prove the process is serving HTTP and the index directory exists; they do
+**not** prove any collection is usable.
 
 Two one-shot manifests sit beside the base and are deliberately not part of it —
 a Job's pod template is immutable, so it would break the second `apply -k`, and

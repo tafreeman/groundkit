@@ -970,15 +970,14 @@ was executed.
   unauthenticated, content-bearing surface on every interface of the host, and
   the image cannot tell those cases from the safe one. What was a refusal in
   Phase 4 is a warning in a container.
-- **The Kubernetes probes target a real operation because there is no health
-  endpoint.** `GET /v1/collections` proves the process is serving HTTP and the
-  index directory is listable; it does **not** prove any collection is usable,
-  because `handle_list_collections` returns `[]` for a missing or empty index
-  directory rather than failing. A pod with an unmounted volume therefore
-  reports ready. Adding `/healthz` means widening ADR-0014 decision 2's
-  route-parity exclusion set — a security-relevant `src/` change deliberately
-  not taken in a change that touches no `src/` file
-  (`docs/specs/phase-6-iac-observability.md` §4.2, Q1).
+- **The Kubernetes probes use dedicated `/healthz` and `/readyz` routes, which
+  prove less than a search would.** `/healthz` proves only that the process
+  answers HTTP; `/readyz` proves the index directory still exists as a
+  directory (one `stat`, no listing). Neither proves any collection is
+  usable, and the Dockerfile `HEALTHCHECK` still targets `GET /v1/collections`.
+  The two routes are excluded from ADR-0014 decision 2's route-parity set by
+  exact `(path, method)` pair, and a test fails if the exclusion is any wider
+  (`docs/specs/phase-6-iac-observability.md` §4.2).
 - **The Kubernetes in-cluster boundary rests on a NetworkPolicy, which can be
   silently inert.** A `ClusterIP` Service closes the cluster's edge and nothing
   else — every pod in every namespace can dial one directly — so

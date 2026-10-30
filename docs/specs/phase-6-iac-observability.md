@@ -120,6 +120,18 @@ otherwise.
 
 ### 4.2 Probes have no health endpoint to point at, and inventing one is a `src/` decision this change does not take
 
+> **Superseded for the Kubernetes probes.** `service/api.py` now serves
+> read-only `GET /healthz` (static, no I/O) and `GET /readyz` (one `stat` of
+> the index directory, 503 when it is not a directory). Both are excluded from
+> the registry parity set **by `(path, method)` pair** via `HEALTH_ROUTES`, and
+> `tests/test_service_api.py` asserts that set is exactly those two `GET`s and
+> that any other extra route (including a `POST /healthz`) still fails parity.
+> `infra/k8s/deployment.yaml` points startup and liveness at `/healthz` and
+> readiness at `/readyz`. Q1 below is answered: widen the exclusion, narrowly,
+> rather than run a second app on a second port. The text that follows is the
+> original reasoning, kept as the record. The Dockerfile `HEALTHCHECK` still
+> targets `/v1/collections`.
+
 `ADR-0014` decision 2 check 2 is a parity test: the set of `(path, method)`
 pairs the app registers must equal the set the registry declares, with FastAPI's
 own documentation routes excluded by an explicit `DOC_PATHS` frozenset. That
