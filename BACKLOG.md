@@ -47,8 +47,10 @@ consequence is reflected in whichever of those two documents owns it.
    The core-subset gate is a second, separate `coverage report --include=...` step in
    `ci.yml`, parsed from `pyproject.toml`'s `[tool.groundkit.coverage].core_subset` at run
    time. Check it too if you touched anything in that list.
-5. Update `KNOWN_LIMITATIONS.md` if the item changes what is broken, `CHANGELOG.md` under
-   `[Unreleased]` if it changes behaviour, and **delete the item from this file**.
+5. Update `KNOWN_LIMITATIONS.md` if the item changes what is broken, and **delete the item
+   from this file**. Do not edit `CHANGELOG.md` in the PR (concurrent PRs all conflicted on
+   `[Unreleased]`): give it a clear `type(scope): subject` title instead. Release notes are
+   generated from those titles (`.github/release.yml`) and the changelog is written at release.
 
 ### Rules that apply to every item
 
