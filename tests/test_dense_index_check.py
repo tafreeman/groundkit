@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import random
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -265,3 +266,149 @@ def test_assert_rejects_a_negative_unindexed_allowance(tmp_path: Path) -> None:
     with pytest.raises(StorageError, match="max_unindexed_rows") as excinfo:
         asyncio.run(run())
     assert not isinstance(excinfo.value, VectorIndexFallbackError)
+
+
+# --- several indexes on the vector column -----------------------------------
+#
+# LanceDB serves a query from the first-*created* index and lists them
+# alphabetically, so the two can differ. The check must judge the index the
+# plan names, not the first one listed (issue #53).
+
+_PLAN_INDEX_RE = re.compile(r"^\s*ANNSubIndex:\s*name=([^,\s]+)", re.MULTILINE)
+
+
+def _add_named_index(store: LanceDBVectorStore, name: str, *, metric: str = "cosine") -> None:
+    config = lancedb_index.IvfPq(distance_type=metric, num_partitions=2, num_sub_vectors=2)
+    store._table.create_index("vector", config=config, name=name, replace=False)
+
+
+async def _planned_vs_listed(store: LanceDBVectorStore) -> tuple[list[str], list[str]]:
+    """``(names the plan reads, names list_indices() reports)``."""
+    plan = await store.explain_search(_query())
+    listed = [i.name for i in store._table.list_indices()]
+    return _PLAN_INDEX_RE.findall(plan), listed
+
+
+def test_stale_plan_selected_index_fails_even_when_first_listed_index_is_fresh(
+    tmp_path: Path,
+) -> None:
+    # 'old' is built first and so serves the query; the row added afterwards
+    # leaves it one row stale. 'new' is built after the row, is fresh, and
+    # sorts first in list_indices(), which is all the old check looked at.
+    async def run() -> None:
+        store = await _seeded_store(tmp_path)
+        _add_named_index(store, "old")
+        await store.add([_chunk(10_000, group="a")], _vectors(1, seed=7))
+        _add_named_index(store, "new")
+        # Preconditions: without them this test could pass for the wrong reason.
+        planned, listed = await _planned_vs_listed(store)
+        assert planned == ["old"]
+        assert listed[0] == "new"
+        assert await store.vector_index_stats_by_name() == {
+            "new": ("cosine", 0),
+            "old": ("cosine", 1),
+        }
+        await assert_search_uses_vector_index(store, _query())
+
+    with pytest.raises(VectorIndexFallbackError, match=r"'old' is stale: 1 row"):
+        asyncio.run(run())
+
+
+def test_fresh_plan_selected_index_passes_despite_a_wrong_metric_index_listed_first(
+    tmp_path: Path,
+) -> None:
+    # 'zz' (cosine, fresh) is built first and serves the query; 'aa' (l2) is
+    # built later, sorts first, and would have condemned a healthy setup when
+    # the check read the first-listed index.
+    async def run() -> str:
+        store = await _seeded_store(tmp_path)
+        _add_named_index(store, "zz")
+        _add_named_index(store, "aa", metric="l2")
+        planned, listed = await _planned_vs_listed(store)
+        assert planned == ["zz"]
+        assert listed[0] == "aa"
+        assert (await store.vector_index_stats_by_name())["aa"][0] == "l2"
+        return await assert_search_uses_vector_index(store, _query())
+
+    assert "ANNSubIndex: name=zz" in asyncio.run(run())
+
+
+def test_no_ann_operator_with_several_indexes_names_all_of_them(tmp_path: Path) -> None:
+    # An l2 index built first means the cosine query is not served by any
+    # index; the message must not attribute one index's metric silently.
+    async def run() -> None:
+        store = await _seeded_store(tmp_path)
+        _add_named_index(store, "aa", metric="l2")
+        _add_named_index(store, "zz")
+        planned, _ = await _planned_vs_listed(store)
+        assert planned == []
+        await assert_search_uses_vector_index(store, _query())
+
+    with pytest.raises(VectorIndexFallbackError) as excinfo:
+        asyncio.run(run())
+    message = str(excinfo.value)
+    assert "'aa': metric 'l2'" in message
+    assert "'zz': metric 'cosine'" in message
+
+
+@pytest.mark.parametrize(
+    "plan_lines",
+    [
+        pytest.param("ANNSubIndex: k=5, metric=Cosine", id="no-parseable-name"),
+        pytest.param(
+            "ANNSubIndex: name=old, k=5\n  ANNSubIndex: name=new, k=5", id="two-distinct-indexes"
+        ),
+        pytest.param("ANNSubIndex: name=ghost, k=5", id="index-not-in-list-indices"),
+    ],
+)
+def test_ambiguous_plan_is_refused_rather_than_guessed(plan_lines: str, tmp_path: Path) -> None:
+    async def run() -> None:
+        store = await _seeded_store(tmp_path)
+        _add_named_index(store, "old")
+        _add_named_index(store, "new")
+
+        async def fake_plan(*_: object, **__: object) -> str:
+            return "ProjectionExec\n  " + plan_lines
+
+        store.explain_search = fake_plan  # type: ignore[method-assign]
+        await assert_search_uses_vector_index(store, _query())
+
+    with pytest.raises(VectorIndexFallbackError, match="Cannot tell which vector index"):
+        asyncio.run(run())
+
+
+def test_vector_index_stats_by_name_selects_a_named_index(tmp_path: Path) -> None:
+    async def run() -> tuple[object, object, object]:
+        store = await _seeded_store(tmp_path)
+        _add_named_index(store, "old")
+        await store.add([_chunk(10_000, group="a")], _vectors(1, seed=7))
+        _add_named_index(store, "new")
+        return (
+            await store.vector_index_stats("old"),
+            await store.vector_index_stats("missing"),
+            await store.vector_index_stats(),
+        )
+
+    named, missing, first_listed = asyncio.run(run())
+    assert named == ("cosine", 1)
+    assert missing is None
+    assert first_listed == ("cosine", 0)  # 'new' is listed first: the legacy behaviour
+
+
+def test_unnamed_ann_plan_over_a_single_index_is_judged_from_that_index(tmp_path: Path) -> None:
+    # A plan with no `name=` (older LanceDB) is ambiguous only when several
+    # indexes exist; over a sole index it must be judged, not refused -- here
+    # the sole index is stale, so the staleness verdict proves it was judged.
+    async def run() -> None:
+        store = await _seeded_store(tmp_path)
+        _add_named_index(store, "only")
+        await store.add([_chunk(10_000, group="a")], _vectors(1, seed=7))
+
+        async def fake_plan(*_: object, **__: object) -> str:
+            return "ProjectionExec\n  ANNSubIndex: k=5, metric=Cosine"
+
+        store.explain_search = fake_plan  # type: ignore[method-assign]
+        await assert_search_uses_vector_index(store, _query())
+
+    with pytest.raises(VectorIndexFallbackError, match="'only' is stale: 1 row"):
+        asyncio.run(run())

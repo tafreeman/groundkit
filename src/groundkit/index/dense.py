@@ -770,24 +770,45 @@ class LanceDBVectorStore:
             plan: str = await asyncio.to_thread(query.explain_plan, True)
         return plan
 
-    async def vector_index_stats(self) -> tuple[str, int] | None:
-        """``(distance_type, unindexed_rows)`` for the vector column's index, or ``None``.
+    async def vector_index_stats(self, index_name: str | None = None) -> tuple[str, int] | None:
+        """``(distance_type, unindexed_rows)`` for a vector-column index, or ``None``.
 
         ``distance_type`` is lower-cased (``"cosine"``, ``"l2"``, ...).
         ``unindexed_rows`` counts rows added after the index was built: they
         are scored by brute force and unioned with the ANN results — correct,
         but a growing flat-scanned tail. Incremental ingest produces exactly
         this.
+
+        With ``index_name`` the stats are that index's, or ``None`` when no
+        vector-column index has that name. Without it they are those of the
+        *first-listed* vector index, which is arbitrary when several exist;
+        callers that must judge the index a query actually used should name
+        it (see :func:`assert_search_uses_vector_index`).
         """
+        all_stats = await self.vector_index_stats_by_name()
+        if index_name is not None:
+            return all_stats.get(index_name)
+        return next(iter(all_stats.values()), None)
+
+    async def vector_index_stats_by_name(self) -> dict[str, tuple[str, int]]:
+        """``{index_name: (distance_type, unindexed_rows)}`` for every vector-column index.
+
+        Insertion order is ``list_indices()`` order. Empty when there is no
+        table or no index on the vector column.
+        """
+        result: dict[str, tuple[str, int]] = {}
         async with self._lock:
             if self._table is None:
-                return None
+                return result
             indices = await asyncio.to_thread(self._table.list_indices)
             for index in indices:
                 if _VECTOR_COLUMN in index.columns:
                     stats = await asyncio.to_thread(self._table.index_stats, index.name)
-                    return str(stats.distance_type).lower(), int(stats.num_unindexed_rows)
-        return None
+                    result[index.name] = (
+                        str(stats.distance_type).lower(),
+                        int(stats.num_unindexed_rows),
+                    )
+        return result
 
     async def search(
         self,
@@ -966,6 +987,14 @@ _ANN_PLAN_MARKER: Final[str] = "ANNSubIndex"
 #: collection named ``ANNSubIndex`` would make an unindexed scan look healthy.
 _ANN_OPERATOR_RE: Final[re.Pattern[str]] = re.compile(rf"^\s*{_ANN_PLAN_MARKER}:", re.MULTILINE)
 
+#: The index a plan's ANN operator reads, e.g. ``ANNSubIndex: name=old, k=5, ...``
+#: (LanceDB 0.40). Stops at a comma or whitespace, so an index name containing
+#: either is parsed short and then fails the ``list_indices()`` membership
+#: check: a refusal, never a wrong attribution.
+_ANN_INDEX_NAME_RE: Final[re.Pattern[str]] = re.compile(
+    rf"^\s*{_ANN_PLAN_MARKER}:\s*name=([^,\s]+)", re.MULTILINE
+)
+
 
 class VectorIndexFallbackError(StorageError):
     """An unfiltered dense search would not be served by the vector index.
@@ -1001,6 +1030,13 @@ async def assert_search_uses_vector_index(
        after the index was built are brute-force scored and unioned in, so
        a stale index degrades gradually rather than all at once.
 
+    With several indexes on the vector column, metric and staleness are judged
+    from the index the plan *names* (``ANNSubIndex: name=...``), not from the
+    first one ``list_indices()`` returns: LanceDB serves a query from the
+    first-created index but lists them alphabetically, so the two can differ.
+    A plan that names no parseable index, several, or one the table does not
+    list is refused rather than guessed at.
+
     Only the unfiltered path is checked. A filtered search is an exhaustive
     scan by design (see the module docstring's "Filter-then-truncate"
     section and :meth:`LanceDBVectorStore._build_query`).
@@ -1030,29 +1066,62 @@ async def assert_search_uses_vector_index(
     if max_unindexed_rows < 0:
         raise StorageError(f"max_unindexed_rows must be >= 0, got {max_unindexed_rows}")
     plan = await store.explain_search(query_embedding, top_k=top_k)
-    stats = await store.vector_index_stats()
-    if stats is not None and stats[0] != _DISTANCE_METRIC:
-        raise VectorIndexFallbackError(
-            f"Vector index on {_VECTOR_COLUMN!r} was built for metric {stats[0]!r}, but "
-            f"search queries with {_DISTANCE_METRIC!r}. Depending on the LanceDB "
-            "version this either brute-force scans every row or ranks results by the "
-            f"wrong metric. Rebuild the index with {_DISTANCE_METRIC!r}. Plan:\n{plan}"
-        )
-    if stats is None:
+    all_stats = await store.vector_index_stats_by_name()
+    if not all_stats:
         raise VectorIndexFallbackError(
             "Dense search would brute-force scan every row instead of using a vector "
             f"index: no index exists on the {_VECTOR_COLUMN!r} column. Plan:\n{plan}"
         )
     if _ANN_OPERATOR_RE.search(plan) is None:
+        # No ANN operator, so no index served the query and no single index's
+        # stats can be attributed to it. With several indexes, name them all.
+        described = "; ".join(
+            f"{name!r}: metric {metric!r}, {rows} unindexed row(s)"
+            for name, (metric, rows) in all_stats.items()
+        )
+        wrong = [n for n, (metric, _) in all_stats.items() if metric != _DISTANCE_METRIC]
+        if wrong:
+            raise VectorIndexFallbackError(
+                f"Vector index {wrong[0]!r} on {_VECTOR_COLUMN!r} was built for metric "
+                f"{all_stats[wrong[0]][0]!r}, but search queries with {_DISTANCE_METRIC!r} "
+                f"(all indexes: {described}). Depending on the LanceDB version this either "
+                "brute-force scans every row or ranks results by the wrong metric. Rebuild "
+                f"the index with {_DISTANCE_METRIC!r}. Plan:\n{plan}"
+            )
         raise VectorIndexFallbackError(
-            f"A vector index exists on {_VECTOR_COLUMN!r} (metric {stats[0]!r}, "
-            f"{stats[1]} unindexed row(s)) but the query plan has no {_ANN_PLAN_MARKER} "
-            "operator, so search is not served by it. Plan:\n" + plan
+            f"Vector index(es) exist on {_VECTOR_COLUMN!r} ({described}) but the query plan "
+            f"has no {_ANN_PLAN_MARKER} operator, so search is not served by them. Plan:\n" + plan
+        )
+    # An ANN operator is present. Judge the index the plan names, never the
+    # first-listed one: with several indexes on the column those can differ,
+    # and a fresh bystander would vouch for a stale index actually in use.
+    used = sorted(set(_ANN_INDEX_NAME_RE.findall(plan)))
+    if not used and len(all_stats) == 1:
+        # A plan that prints no index name (older supported LanceDB releases
+        # may not) is still unambiguous when the column has exactly one index:
+        # that is the only index an ANN operator could have read. Refusing here
+        # would fail every single-index deployment on such a release.
+        used = list(all_stats)
+    if len(used) != 1 or used[0] not in all_stats:
+        raise VectorIndexFallbackError(
+            f"Cannot tell which vector index serves the query: the plan names "
+            f"{used or 'no parseable index'} while the column's indexes are "
+            f"{sorted(all_stats)}. Refusing to judge metric and staleness from a "
+            f"guessed index. Plan:\n{plan}"
+        )
+    stats = all_stats[used[0]]
+    if stats[0] != _DISTANCE_METRIC:
+        raise VectorIndexFallbackError(
+            f"Vector index {used[0]!r} on {_VECTOR_COLUMN!r} was built for metric "
+            f"{stats[0]!r}, but search queries with {_DISTANCE_METRIC!r}. Depending on "
+            "the LanceDB version this either brute-force scans every row or ranks "
+            f"results by the wrong metric. Rebuild the index with {_DISTANCE_METRIC!r}. "
+            f"Plan:\n{plan}"
         )
     unindexed = stats[1]
     if unindexed > max_unindexed_rows:
         raise VectorIndexFallbackError(
-            f"Vector index is stale: {unindexed} row(s) are outside it and are "
+            f"Vector index {used[0]!r} is stale: {unindexed} row(s) are outside it and are "
             f"brute-force scanned on every search (allowance: {max_unindexed_rows}). "
             f"Rebuild or optimize the index. Plan:\n{plan}"
         )
