@@ -403,6 +403,23 @@ def test_vector_index_stats_by_name_selects_a_named_index(tmp_path: Path) -> Non
     assert first_listed == ("cosine", 0)  # 'new' is listed first: the legacy behaviour
 
 
+def test_a_spaced_index_name_is_not_read_as_a_shorter_listed_one(tmp_path: Path) -> None:
+    # 'old extra' is built first, so it serves the query, and is left one row
+    # stale; 'old' is fresh. Cutting the plan's name at the space would judge
+    # 'old' and pass -- the issue #53 false pass by another route.
+    async def run() -> None:
+        store = await _seeded_store(tmp_path)
+        _add_named_index(store, "old extra")
+        await store.add([_chunk(10_000, group="a")], _vectors(1, seed=7))
+        _add_named_index(store, "old")
+        plan = await store.explain_search(_query())
+        assert "name=old extra," in plan  # precondition: the spaced index serves it
+        await assert_search_uses_vector_index(store, _query())
+
+    with pytest.raises(VectorIndexFallbackError, match="'old extra' is stale: 1 row"):
+        asyncio.run(run())
+
+
 def test_unnamed_ann_plan_over_a_single_index_is_judged_from_that_index(tmp_path: Path) -> None:
     # A plan with no `name=` (older LanceDB) is ambiguous only when several
     # indexes exist; over a sole index it must be judged, not refused -- here

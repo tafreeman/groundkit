@@ -97,6 +97,7 @@ import asyncio
 import json
 import math
 import re
+from collections.abc import Collection
 from functools import partial
 from pathlib import Path
 from typing import Any, Final
@@ -987,13 +988,40 @@ _ANN_PLAN_MARKER: Final[str] = "ANNSubIndex"
 #: collection named ``ANNSubIndex`` would make an unindexed scan look healthy.
 _ANN_OPERATOR_RE: Final[re.Pattern[str]] = re.compile(rf"^\s*{_ANN_PLAN_MARKER}:", re.MULTILINE)
 
-#: The index a plan's ANN operator reads, e.g. ``ANNSubIndex: name=old, k=5, ...``
-#: (LanceDB 0.40). Stops at a comma or whitespace, so an index name containing
-#: either is parsed short and then fails the ``list_indices()`` membership
-#: check: a refusal, never a wrong attribution.
-_ANN_INDEX_NAME_RE: Final[re.Pattern[str]] = re.compile(
-    rf"^\s*{_ANN_PLAN_MARKER}:\s*name=([^,\s]+)", re.MULTILINE
+#: One ANN operator line of a plan, e.g. ``ANNSubIndex: name=old, k=5, ...``
+#: (LanceDB 0.40). The group is everything after ``name=`` -- or ``None`` when
+#: the operator prints no name -- and is resolved against the table's actual
+#: index names by :func:`_plan_index_names`, never cut at a delimiter: index
+#: names may contain spaces or commas, and a cut-short ``old extra`` would
+#: otherwise be read as a different index that happens to be named ``old``.
+_ANN_OPERATOR_LINE_RE: Final[re.Pattern[str]] = re.compile(
+    rf"^\s*{_ANN_PLAN_MARKER}:\s*(?:name=(.*))?$", re.MULTILINE
 )
+
+
+def _plan_index_names(plan: str, known: Collection[str]) -> tuple[set[str], list[str]]:
+    """``(indexes the plan's ANN operators resolve to, operators that resolve to none)``.
+
+    An operator resolves to a known index only when its ``name=`` text is that
+    name exactly, followed by the end of the line or the next field's comma,
+    and to *no other* known name: two candidates (``a`` and ``a, k=5``, say)
+    is ambiguous, not a pick. An operator printing no name is unresolved
+    here; the caller decides whether a sole index makes that unambiguous.
+    """
+    resolved: set[str] = set()
+    unresolved: list[str] = []
+    for match in _ANN_OPERATOR_LINE_RE.finditer(plan):
+        text = match.group(1)
+        if text is None:
+            unresolved.append("<unnamed>")
+            continue
+        text = text.rstrip()
+        candidates = [n for n in known if text == n or text.startswith(n + ",")]
+        if len(candidates) == 1:
+            resolved.add(candidates[0])
+        else:
+            unresolved.append(text)
+    return resolved, unresolved
 
 
 class VectorIndexFallbackError(StorageError):
@@ -1095,17 +1123,18 @@ async def assert_search_uses_vector_index(
     # An ANN operator is present. Judge the index the plan names, never the
     # first-listed one: with several indexes on the column those can differ,
     # and a fresh bystander would vouch for a stale index actually in use.
-    used = sorted(set(_ANN_INDEX_NAME_RE.findall(plan)))
-    if not used and len(all_stats) == 1:
+    resolved, unresolved = _plan_index_names(plan, all_stats)
+    if len(all_stats) == 1 and not resolved and unresolved == ["<unnamed>"] * len(unresolved):
         # A plan that prints no index name (older supported LanceDB releases
         # may not) is still unambiguous when the column has exactly one index:
         # that is the only index an ANN operator could have read. Refusing here
         # would fail every single-index deployment on such a release.
-        used = list(all_stats)
-    if len(used) != 1 or used[0] not in all_stats:
+        resolved, unresolved = set(all_stats), []
+    used = sorted(resolved)
+    if unresolved or len(used) != 1:
         raise VectorIndexFallbackError(
             f"Cannot tell which vector index serves the query: the plan names "
-            f"{used or 'no parseable index'} while the column's indexes are "
+            f"{used + unresolved or 'no parseable index'} while the column's indexes are "
             f"{sorted(all_stats)}. Refusing to judge metric and staleness from a "
             f"guessed index. Plan:\n{plan}"
         )
