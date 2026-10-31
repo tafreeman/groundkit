@@ -1490,3 +1490,30 @@ def test_busy_timeout_is_this_module_s_value_not_the_connect_default(
             await store.close()
 
     asyncio.run(run())
+
+
+def test_open_refuses_a_case_only_alias_and_creates_nothing(tmp_path: Path) -> None:
+    """``Alpha`` then ``alpha``: refused on every filesystem, second spelling creates nothing."""
+
+    async def scenario() -> None:
+        first = await SQLiteMetadataStore.open(tmp_path, "Alpha")
+        await first.close()
+        before = sorted(p.name for p in tmp_path.iterdir())
+        with pytest.raises(ConfigurationError, match=r"'alpha'.*'Alpha'"):
+            await SQLiteMetadataStore.open(tmp_path, "alpha")
+        assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+        # Same spelling reopens; a distinct name coexists.
+        again = await SQLiteMetadataStore.open(tmp_path, "Alpha")
+        await again.close()
+        other = await SQLiteMetadataStore.open(tmp_path, "beta")
+        await other.close()
+
+    asyncio.run(scenario())
+
+
+def test_open_refuses_a_case_alias_of_a_lance_only_entry(tmp_path: Path) -> None:
+    (tmp_path / "Alpha.lance").mkdir()
+    with pytest.raises(ConfigurationError, match="differs only in letter case"):
+        asyncio.run(SQLiteMetadataStore.open(tmp_path, "alpha"))
+    assert not (tmp_path / "alpha.sqlite3").exists()
