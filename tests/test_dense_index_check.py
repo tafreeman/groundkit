@@ -278,6 +278,14 @@ _PLAN_INDEX_RE = re.compile(r"^\s*ANNSubIndex:\s*name=([^,\s]+)", re.MULTILINE)
 
 
 def _add_named_index(store: LanceDBVectorStore, name: str, *, metric: str = "cosine") -> None:
+    # Several named indexes on one column need `config=`, `name=` and
+    # `replace=`, none of which the supported floor (lancedb 0.18) has. Unlike
+    # `_build_index` there is no legacy equivalent to fall back to -- the old
+    # form builds one unnamed index and replaces it -- so skip instead of
+    # failing in setup. Chosen by signature, for the reason `_build_index` gives.
+    params = inspect.signature(store._table.create_index).parameters
+    if not {"config", "name", "replace"} <= params.keys():
+        pytest.skip("installed lancedb cannot create several named indexes on one column")
     config = lancedb_index.IvfPq(distance_type=metric, num_partitions=2, num_sub_vectors=2)
     store._table.create_index("vector", config=config, name=name, replace=False)
 
