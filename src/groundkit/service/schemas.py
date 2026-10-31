@@ -167,6 +167,10 @@ class IndexStatusResponse(BaseModel):
     dense_search_available: bool = False
     generation: int | None = None
     cache_enabled: bool = True
+    #: The selected collection's stamped ``PRAGMA user_version``, not the
+    #: running build's constant. Below the build's current version (0 for a
+    #: store that predates the stamp) the collection refuses writes until it
+    #: is re-ingested into a fresh one.
     schema_version: int = Field(ge=0)
     #: Retriever acquires served by this process for this collection. The
     #: denominator: the cache-hit fraction is ``1 - retriever_rebuilds /
