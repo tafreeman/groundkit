@@ -28,6 +28,20 @@ it scored.
   the rows in the probed partitions, so filter-then-truncate could come back
   short. No index is built today, so behavior is unchanged; this keeps the
   guarantee once one is.
+- URL ingest now refuses a credential-named parameter in the fragment
+  (`#access_token=…`), in a `;` path parameter, or after a `;` in the query.
+  Before, only `&`-separated query pairs were checked, and the others were
+  stored in `documents.source` and every citation.
+- A credentialed URL with a malformed port (`https://user:pw@host:abc/`) is
+  refused with a sanitized message. Before, formatting the refusal raised, and
+  the indexer echoed the raw URL, password included. The indexer's
+  loader-failure message is now sanitized like the pipeline's.
+- The SSRF guard resolves the host name httpx will connect to (IDNA2008),
+  not the stdlib's IDNA2003 reading of it, which named a different DNS name for
+  hosts such as `faß.example`. A host httpx cannot parse is refused before DNS.
+- The SSRF guard classifies 192.0.0.0/24 (except 192.0.0.9 and 192.0.0.10) and
+  3fff::/20 as private on every supported Python. On 3.11, `is_private` missed
+  most of both, so 192.0.0.192, a cloud metadata address, passed as public.
 
 ## [0.2.1] - 2026-09-23
 

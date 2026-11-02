@@ -852,12 +852,26 @@ class TestUrlLoaderRefusesQueryStringCredentials:
             "https://internal.example.com/export?api-key=sk-live-1",
             "https://internal.example.com/export?id=42&access_token=sk-live-1",
             "https://internal.example.com/x?password=hunter2",
+            # GK-3 F-GK3-1: outside the `&`-separated query.
+            "https://internal.example.com/doc#access_token=sk-live-1",
+            "https://internal.example.com/doc;key=sk-live-1",
+            "https://internal.example.com/doc?x=1;token=sk-live-1",
         ],
     )
     def test_a_credential_bearing_url_is_refused(self, tmp_path: Path, url: str) -> None:
         loader = UrlLoader(tmp_path, client=_client(self._boom))
-        with pytest.raises(IngestionError, match="credential in its query string"):
+        with pytest.raises(IngestionError, match="credential in its query string") as excinfo:
             _load(loader, url)
+        assert "sk-live-1" not in str(excinfo.value)
+
+    def test_a_malformed_port_refusal_does_not_echo_the_password(self, tmp_path: Path) -> None:
+        """GK-3 F-GK3-3: formatting the userinfo refusal read `.port`, which
+        raised a bare ValueError, so the refusal never happened and the
+        indexer's wrapper echoed the raw URL, password included."""
+        loader = UrlLoader(tmp_path, client=_client(self._boom))
+        with pytest.raises(IngestionError, match="port") as excinfo:
+            _load(loader, "https://user:hunter2@example.com:abc/x")
+        assert "hunter2" not in str(excinfo.value)
 
     def test_the_refusal_does_not_echo_the_credential(self, tmp_path: Path) -> None:
         """The message names the offending *parameter*, never its value -- a

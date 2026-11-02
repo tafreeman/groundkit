@@ -37,7 +37,9 @@ import re
 import socket
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Final
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
+
+import httpx
 
 from groundkit.errors import ConfigurationError
 
@@ -66,6 +68,22 @@ _LOOKS_LIKE_DOTTED_QUAD: Final[re.Pattern[str]] = re.compile(r"^\d+(\.\d+){3}$")
 #: unspecified) fire for it, so without this check a shared-address-space
 #: target would silently classify as safe.
 _SHARED_ADDRESS_SPACE: Final[ipaddress.IPv4Network] = ipaddress.IPv4Network("100.64.0.0/10")
+
+#: Ranges CPython 3.12+ counts as ``is_private`` and 3.11 does not, checked
+#: explicitly so the verdict does not depend on the interpreter (GK-3
+#: F-GK3-5). 3.11's ``is_private`` covers only 192.0.0.0/29 and
+#: 192.0.0.170/31 of the IETF protocol-assignments block, which leaves
+#: 192.0.0.192 -- a cloud instance-metadata address -- classified as safe.
+#: 3fff::/20 is the RFC 9637 documentation range. The exceptions are the two
+#: addresses IANA marks globally reachable, which 3.12+ also excludes.
+_PRIVATE_SINCE_312: Final[tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]] = (
+    ipaddress.IPv4Network("192.0.0.0/24"),
+    ipaddress.IPv6Network("3fff::/20"),
+)
+_PRIVATE_SINCE_312_EXCEPTIONS: Final[tuple[ipaddress.IPv4Network, ...]] = (
+    ipaddress.IPv4Network("192.0.0.9/32"),
+    ipaddress.IPv4Network("192.0.0.10/32"),
+)
 
 #: The only :func:`classify_address` verdicts :func:`ensure_safe_endpoint`
 #: will accept when the caller has set ``allow_private_endpoint=True``.
@@ -248,19 +266,42 @@ def credential_query_params(url: str) -> tuple[str, ...]:
     and for the same stated reason: naming the problem while the caller can
     still fix it beats silently storing something that will surprise them.
 
+    **Three places are inspected, not only the query** (GK-3 F-GK3-1): the
+    query, split on ``;`` as well as ``&`` (``parse_qsl`` stopped splitting on
+    ``;`` in 3.10, so ``?x=1;token=…`` read as one ``x`` pair); the fragment,
+    where an OAuth implicit flow puts ``#access_token=…``; and ``;`` path
+    parameters such as ``/doc;key=…``. A fragment never goes on the wire,
+    but the stored ``source`` is the whole URL. In the fragment and the path
+    only a ``name=value`` pair counts: a bare ``#signature`` is an ordinary
+    heading anchor, not a credential.
+
     Args:
         url: The URL to inspect.
 
     Returns:
         The offending parameter names, in the order they appear, spelled as
         the caller spelled them (not normalized) so a message can quote them
-        back recognizably. Empty when the query carries no credential.
+        back recognizably. Empty when the URL carries no credential.
     """
+    parsed = urlsplit(url)
+    candidates = [_param_name(piece) for piece in re.split(r"[&;]", parsed.query) if piece]
+    candidates += [
+        _param_name(piece) for piece in re.split(r"[&;]", parsed.fragment) if "=" in piece
+    ]
+    candidates += [
+        _param_name(piece)
+        for segment in parsed.path.split("/")
+        for piece in segment.split(";")[1:]
+        if "=" in piece
+    ]
     return tuple(
-        name
-        for name, _ in parse_qsl(urlsplit(url).query, keep_blank_values=True)
-        if _normalize_param_name(name) in CREDENTIAL_QUERY_PARAMS
+        name for name in candidates if _normalize_param_name(name) in CREDENTIAL_QUERY_PARAMS
     )
+
+
+def _param_name(piece: str) -> str:
+    """The decoded name of one ``name=value`` (or bare ``name``) piece."""
+    return unquote_plus(piece.split("=", 1)[0])
 
 
 def sanitize_url(url: str, secret: str | None = None) -> str:
@@ -306,11 +347,24 @@ def sanitize_url(url: str, secret: str | None = None) -> str:
         # An IPv6 literal — urlsplit().hostname strips the brackets, so they
         # must go back on or the rebuilt netloc is not a valid authority.
         host = f"[{host}]"
-    netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+    # `.port` raises on a malformed port (`host:abc`). This function runs while
+    # formatting a refusal, so raising here turned the refusal of
+    # `https://user:pw@host:abc/` into a bare ValueError that a caller then
+    # re-wrapped with the raw URL, password included (GK-3 F-GK3-3).
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    netloc = f"{host}:{port}" if port is not None else host
     if parsed.username is not None or parsed.password is not None:
         netloc = f"{REDACTED_PLACEHOLDER}@{netloc}"
+    # `;name=value` path parameters carry credentials too (F-GK3-1). Only for a
+    # URL: callers also pass filesystem paths, which have no such parameters.
+    path = parsed.path
+    if parsed.netloc:
+        path = re.sub(r";([^;/=]*)=[^;/]*", rf";\1={REDACTED_PLACEHOLDER}", path)
 
-    sanitized = urlunsplit((parsed.scheme, netloc, parsed.path, redacted_query, ""))
+    sanitized = urlunsplit((parsed.scheme, netloc, path, redacted_query, ""))
     if secret:
         sanitized = sanitized.replace(secret, REDACTED_PLACEHOLDER)
     return sanitized
@@ -379,6 +433,12 @@ def classify_address(literal: str) -> str | None:
         return "unspecified"
     if isinstance(addr, ipaddress.IPv4Address) and addr in _SHARED_ADDRESS_SPACE:
         return "shared_address_space"
+    # A version mismatch makes `in` False rather than raising, so one loop
+    # serves both families.
+    if any(addr in net for net in _PRIVATE_SINCE_312) and not any(
+        addr in net for net in _PRIVATE_SINCE_312_EXCEPTIONS
+    ):
+        return "private"
     if addr.is_private:
         return "private"
     return None
@@ -433,7 +493,16 @@ async def ensure_safe_endpoint(
             *allow_private_endpoint*. The message never echoes *url*, for the
             same reason :func:`validate_endpoint_shape`'s does not.
     """
-    host = urlsplit(url).hostname
+    # The host httpx will actually connect to, not urlsplit()'s reading of it
+    # (GK-3 F-GK3-4). For a non-ASCII name the two disagree: urlsplit keeps
+    # `faß.example`, which getaddrinfo encodes with the stdlib's IDNA2003 codec
+    # as `fass.example`, while httpx encodes IDNA2008 and connects to
+    # `xn--fa-hia.example` -- a different DNS name the guard never classified.
+    # Every caller of this guard sends its request through httpx.
+    try:
+        host = httpx.URL(url).raw_host.decode("ascii")
+    except (httpx.InvalidURL, ValueError):
+        raise ConfigurationError("endpoint URL has a host httpx cannot parse") from None
     if not host:
         raise ConfigurationError("embedding endpoint URL has no host to validate")
 

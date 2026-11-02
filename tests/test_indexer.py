@@ -1747,3 +1747,36 @@ def test_refused_bm25_only_ingest_leaves_the_dense_side_intact(
             await store.close()
 
     asyncio.run(run())
+
+
+class _ValueErrorLoader:
+    """A loader that fails with an untyped exception, as a URL parse can."""
+
+    @property
+    def supported_extensions(self) -> list[str]:
+        return []
+
+    async def load(self, source: str) -> list[Document]:
+        raise ValueError("boom")
+
+
+def test_loader_failure_message_does_not_echo_url_credentials(tmp_path: Path) -> None:
+    """GK-3 F-GK3-3: ``Indexer._process`` re-wrapped an untyped loader error
+    with the raw source, so a credential the loader never got far enough to
+    refuse reached the CLI. ``IngestionPipeline``'s twin site sanitizes; this
+    one must too."""
+
+    async def run() -> str:
+        store = await _open(tmp_path)
+        try:
+            indexer = Indexer(store, _ValueErrorLoader())
+            with pytest.raises(IngestionError, match="Loader failed") as excinfo:
+                await indexer.index_source("https://user:hunter2@example.com/x?token=sk-q")
+            return str(excinfo.value)
+        finally:
+            await store.close()
+
+    message = asyncio.run(run())
+    assert "hunter2" not in message
+    assert "sk-q" not in message
+    assert "example.com" in message

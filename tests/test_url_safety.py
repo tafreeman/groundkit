@@ -28,7 +28,9 @@ from groundkit.errors import ConfigurationError
 from groundkit.utils.url_safety import (
     DEFAULT_ALLOWED_SCHEMES,
     classify_address,
+    credential_query_params,
     ensure_safe_endpoint,
+    sanitize_url,
     validate_endpoint_shape,
 )
 
@@ -221,12 +223,33 @@ class TestClassifyAddressRejectsUnsafeLiterals:
         assert classify_address("::ffff:100.64.0.1") == "shared_address_space"
 
 
+class TestClassifyAddressIsInterpreterIndependent:
+    """GK-3 F-GK3-5: on CPython 3.11, ``is_private`` covers only part of
+    192.0.0.0/24 and none of 3fff::/20, so these addresses classified as safe
+    on the supported floor and as private on 3.12+. 192.0.0.192 is a cloud
+    instance-metadata address."""
+
+    @pytest.mark.parametrize(
+        "literal", ["192.0.0.8", "192.0.0.192", "192.0.0.255", "3fff::1", "::ffff:192.0.0.192"]
+    )
+    def test_refused_on_every_supported_version(self, literal: str) -> None:
+        assert classify_address(literal) == "private"
+
+
 class TestClassifyAddressAllowsSafeLiterals:
     @pytest.mark.parametrize(
         "literal",
         ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2001:4860:4860::8888"],
     )
     def test_allows(self, literal: str) -> None:
+        assert classify_address(literal) is None
+
+    @pytest.mark.parametrize("literal", ["192.0.0.9", "192.0.0.10"])
+    def test_the_two_globally_reachable_protocol_assignments_stay_allowed(
+        self, literal: str
+    ) -> None:
+        """IANA marks these two addresses in 192.0.0.0/24 globally reachable,
+        and CPython 3.12+ excludes them from ``is_private`` too."""
         assert classify_address(literal) is None
 
     def test_rfc1918_private_is_named_private_not_something_narrower(self) -> None:
@@ -344,21 +367,98 @@ class TestEnsureSafeEndpointResolvedHosts:
 
         _run(run())
 
-    def test_leading_zero_ipv4_hostname_is_rejected_via_the_resolver(self) -> None:
-        """Same mechanism as the decimal case, different ambiguous spelling:
-        ``ipaddress.ip_address("0177.0.0.1")`` raises (leading zeros are
-        rejected as octal-ambiguous), so it too falls through to hostname
-        resolution rather than being caught by the literal parser."""
+    def test_leading_zero_ipv4_hostname_is_refused_before_resolution(self) -> None:
+        """A different ambiguous spelling from the decimal case, and a different
+        path: the guard reads the host the way httpx does (F-GK3-4), and httpx
+        refuses ``0177.0.0.1`` as an invalid IPv4 address. No request could be
+        made to it, so the guard refuses it without consulting DNS."""
+
+        async def boom(_host: str) -> Sequence[str]:
+            raise AssertionError("resolver must not be called for an unparseable host")
+
+        async def run() -> None:
+            with pytest.raises(ConfigurationError, match="cannot parse"):
+                await ensure_safe_endpoint("http://0177.0.0.1/api/embed", resolver=boom)
+
+        _run(run())
+
+
+class TestEnsureSafeEndpointResolvesWhatHttpxConnectsTo:
+    """GK-3 F-GK3-4: the guard must classify the DNS name the client will
+    query. For ``faß.example`` the stdlib's IDNA2003 codec (what getaddrinfo
+    applies to ``urlsplit().hostname``) gives ``fass.example``, while httpx
+    connects to the IDNA2008 ``xn--fa-hia.example`` -- a different name, and
+    an attacker's zone can answer the two differently."""
+
+    def test_a_non_ascii_host_is_resolved_in_httpx_encoding(self) -> None:
+        seen: list[str] = []
 
         async def resolver(host: str) -> Sequence[str]:
-            assert host == "0177.0.0.1"
-            return ["127.0.0.1"]
+            seen.append(host)
+            return ["127.0.0.1"] if host == "xn--fa-hia.example" else ["93.184.216.34"]
 
         async def run() -> None:
             with pytest.raises(ConfigurationError, match="loopback"):
-                await ensure_safe_endpoint("http://0177.0.0.1/api/embed", resolver=resolver)
+                await ensure_safe_endpoint("https://faß.example/doc", resolver=resolver)
 
         _run(run())
+        assert seen == ["xn--fa-hia.example"]
+
+    @pytest.mark.parametrize("url", ["http://a\tb/x", "http://[::1/x"])
+    def test_a_host_httpx_cannot_parse_is_refused_without_dns(self, url: str) -> None:
+        async def boom(_host: str) -> Sequence[str]:
+            raise AssertionError("resolver must not be called for an unparseable host")
+
+        async def run() -> None:
+            with pytest.raises(ConfigurationError):
+                await ensure_safe_endpoint(url, resolver=boom)
+
+        _run(run())
+
+
+class TestCredentialParamsAndSanitize:
+    """GK-3 F-GK3-1 and F-GK3-3, at the helper level."""
+
+    @pytest.mark.parametrize(
+        ("url", "names"),
+        [
+            ("https://h.example/doc#access_token=FRAG", ("access_token",)),
+            ("https://h.example/doc#state=x&id_token=FRAG", ("id_token",)),
+            ("https://h.example/doc;key=PATH", ("key",)),
+            ("https://h.example/a;v=1/b;sig=PATH/c", ("sig",)),
+            ("https://h.example/doc?x=1;token=SEMI", ("token",)),
+            ("https://h.example/doc?token=Q", ("token",)),
+        ],
+    )
+    def test_credentials_are_found_outside_the_ampersand_query(
+        self, url: str, names: tuple[str, ...]
+    ) -> None:
+        assert credential_query_params(url) == names
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://h.example/doc#signature",
+            "https://h.example/doc#key",
+            "https://h.example/doc;jsessionid",
+            "https://h.example/doc?id=42#section-2",
+        ],
+    )
+    def test_ordinary_anchors_and_params_are_not_credentials(self, url: str) -> None:
+        assert credential_query_params(url) == ()
+
+    def test_sanitize_survives_a_malformed_port_and_drops_userinfo(self) -> None:
+        rendered = sanitize_url("https://user:hunter2@example.com:abc/x")
+        assert "hunter2" not in rendered
+        assert "example.com" in rendered
+
+    def test_sanitize_redacts_path_parameter_values(self) -> None:
+        rendered = sanitize_url("https://h.example/doc;key=PATHSECRET/x")
+        assert "PATHSECRET" not in rendered
+        assert rendered == "https://h.example/doc;key=***/x"
+
+    def test_sanitize_leaves_a_filesystem_path_alone(self) -> None:
+        assert sanitize_url("docs/sub;v=1/a.md") == "docs/sub;v=1/a.md"
 
 
 class TestEnsureSafeEndpointAllowPrivateEndpoint:
