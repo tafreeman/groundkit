@@ -36,8 +36,8 @@ from __future__ import annotations
 import asyncio
 import builtins
 import errno
-import logging
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -48,9 +48,11 @@ from typing import Any, Final
 import httpx
 import pytest
 
-from groundkit import extraction
+from groundkit import extraction, snapshots
 from groundkit.contracts import Document
 from groundkit.errors import ConfigurationError, IngestionError
+from groundkit.index.metadata import SQLiteMetadataStore
+from groundkit.indexer import Indexer
 from groundkit.ingestion import url_loader
 from groundkit.ingestion.protocols import LoaderProtocol
 from groundkit.ingestion.url_loader import DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT_SECONDS, UrlLoader
@@ -454,24 +456,27 @@ class TestUrlLoaderFetchAndSnapshot:
         assert len(doc.document_id) == 32
         assert all(c in "0123456789abcdef" for c in doc.document_id)
 
-    def test_empty_body_returns_empty_list_and_warns(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    @pytest.mark.parametrize(
+        ("body", "content_type"),
+        [
+            (b"", "text/plain"),
+            (b"   \n\t  ", "text/plain"),
+            (b"<html><body><script>var x = 1;</script></body></html>", "text/html"),
+        ],
+    )
+    def test_a_response_with_no_text_is_refused_and_snapshots_nothing(
+        self, tmp_path: Path, body: bytes, content_type: str
     ) -> None:
+        """GK-3 F-GK3-6: returning ``[]`` here told the indexer the source
+        was now empty, and it deleted the stored document."""
+
         def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, content=b"")
+            return httpx.Response(200, content=body, headers={"content-type": content_type})
 
         loader = UrlLoader(tmp_path, client=_client(handler))
-        with caplog.at_level(logging.WARNING):
-            docs = _load(loader, "https://example.com/empty")
-        assert docs == []
-        assert any("Empty or whitespace-only" in rec.message for rec in caplog.records)
-
-    def test_whitespace_only_body_returns_empty_list(self, tmp_path: Path) -> None:
-        def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, content=b"   \n\t  ")
-
-        loader = UrlLoader(tmp_path, client=_client(handler))
-        assert _load(loader, "https://example.com/blank") == []
+        with pytest.raises(IngestionError, match="no text"):
+            _load(loader, "https://example.com/empty")
+        assert list(tmp_path.rglob("*")) == []
 
     def test_injected_client_is_never_closed_by_the_loader(self, tmp_path: Path) -> None:
         """The caller owns an injected client's lifecycle -- this loader must
@@ -1206,3 +1211,46 @@ class TestUrlLoaderSnapshotWriteDoesNotFollowASymlink:
             loader._write_snapshot("doc-1", "content")
         assert not isinstance(excinfo.value, IngestionError)
         assert excinfo.value.errno == errno.EMLINK
+
+
+def test_a_blank_refetch_keeps_the_stored_document(tmp_path: Path) -> None:
+    """GK-3 F-GK3-6, end to end: real content first, then a script-only page
+    (a JS shell, an error page). The second ingest must fail loudly and leave
+    the first one's document, chunks and snapshot where they were."""
+    bodies = [
+        b"<html><body><p>real content here</p></body></html>",
+        b"<html><body><script>var x = 1;</script></body></html>",
+    ]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=bodies[0], headers={"content-type": "text/html"})
+
+    async def ingest() -> None:
+        store = await SQLiteMetadataStore.open(tmp_path, "default")
+        snap = snapshots.snapshot_dir_for(tmp_path, "default")
+        try:
+            indexer = Indexer(
+                store,
+                UrlLoader(snap, client=_client(handler)),
+                collection="default",
+                snapshot_dir=snap,
+            )
+            await indexer.index_source("https://example.com/page")
+        finally:
+            await store.close()
+
+    asyncio.run(ingest())
+    snapshot_files = sorted(snapshots.snapshot_dir_for(tmp_path, "default").rglob("*"))
+    assert snapshot_files
+
+    bodies.pop(0)
+    with pytest.raises(IngestionError, match="no text"):
+        asyncio.run(ingest())
+
+    conn = sqlite3.connect(tmp_path / "default.sqlite3")
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] >= 1
+    finally:
+        conn.close()
+    assert sorted(snapshots.snapshot_dir_for(tmp_path, "default").rglob("*")) == snapshot_files
