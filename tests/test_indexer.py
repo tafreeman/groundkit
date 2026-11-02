@@ -1780,3 +1780,21 @@ def test_loader_failure_message_does_not_echo_url_credentials(tmp_path: Path) ->
     assert "hunter2" not in message
     assert "sk-q" not in message
     assert message == "Loader failed for 'https://***@example.com/x?token=%2A%2A%2A': boom"
+
+
+def test_loader_failure_on_an_unparseable_url_is_still_wrapped(tmp_path: Path) -> None:
+    """Sanitizing the source must not itself raise: urlsplit rejects
+    malformed brackets, and a ValueError from the error path replaced the
+    IngestionError, which is the only type the CLI catches."""
+
+    async def run() -> str:
+        store = await _open(tmp_path)
+        try:
+            indexer = Indexer(store, _ValueErrorLoader())
+            with pytest.raises(IngestionError, match="Loader failed") as excinfo:
+                await indexer.index_source("https://user:hunter2@[invalid]/x")
+            return str(excinfo.value)
+        finally:
+            await store.close()
+
+    assert asyncio.run(run()) == "Loader failed for '<unparseable URL>': boom"

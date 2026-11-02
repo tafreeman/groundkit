@@ -39,9 +39,15 @@ it scored.
 - The SSRF guard resolves the host name httpx will connect to (IDNA2008),
   not the stdlib's IDNA2003 reading of it, which named a different DNS name for
   hosts such as `faß.example`. A host httpx cannot parse is refused before DNS.
-- The SSRF guard classifies 192.0.0.0/24 (except 192.0.0.9 and 192.0.0.10) and
-  3fff::/20 as private on every supported Python. On 3.11, `is_private` missed
-  most of both, so 192.0.0.192, a cloud metadata address, passed as public.
+- The SSRF guard refuses 192.0.0.0/24 (except 192.0.0.9 and 192.0.0.10) as
+  `protocol_assignment`, even for a provider allowed private endpoints, and
+  classifies 3fff::/20 as private, on every supported Python. On 3.11,
+  `is_private` missed most of both, so 192.0.0.192, a cloud metadata address,
+  passed as public.
+- `sanitize_url` no longer raises on a URL `urlsplit` cannot parse (it returns
+  `<unparseable URL>`), and URL ingest refuses one with an `IngestionError`.
+  Credential names are also found in hash-routed fragments
+  (`#/callback?access_token=…`) and `%3B`-encoded path parameters.
 
 ## [0.2.1] - 2026-09-23
 

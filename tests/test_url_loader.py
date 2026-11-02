@@ -856,6 +856,8 @@ class TestUrlLoaderRefusesQueryStringCredentials:
             "https://internal.example.com/doc#access_token=sk-live-1",
             "https://internal.example.com/doc;key=sk-live-1",
             "https://internal.example.com/doc?x=1;token=sk-live-1",
+            "https://internal.example.com/app#/callback?access_token=sk-live-1",
+            "https://internal.example.com/doc%3Btoken=sk-live-1",
         ],
     )
     def test_a_credential_bearing_url_is_refused(self, tmp_path: Path, url: str) -> None:
@@ -871,6 +873,14 @@ class TestUrlLoaderRefusesQueryStringCredentials:
         loader = UrlLoader(tmp_path, client=_client(self._boom))
         with pytest.raises(IngestionError, match="port") as excinfo:
             _load(loader, "https://user:hunter2@example.com:abc/x")
+        assert "hunter2" not in str(excinfo.value)
+
+    def test_an_unparseable_url_is_refused_as_an_ingestion_error(self, tmp_path: Path) -> None:
+        """urlsplit raises ValueError on malformed brackets; that escaped the
+        loader untyped, and the CLI catches only GroundkitError."""
+        loader = UrlLoader(tmp_path, client=_client(self._boom))
+        with pytest.raises(IngestionError, match="cannot be parsed") as excinfo:
+            _load(loader, "https://user:hunter2@[invalid]/x")
         assert "hunter2" not in str(excinfo.value)
 
     def test_the_refusal_does_not_echo_the_credential(self, tmp_path: Path) -> None:

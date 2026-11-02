@@ -184,7 +184,12 @@ def _reject_unsafe_url_shape(source: str) -> None:
             port is malformed, the URL carries userinfo, or a query, fragment
             or path parameter names a credential.
     """
-    parsed = urlsplit(source)
+    try:
+        parsed = urlsplit(source)
+    except ValueError:
+        # Malformed brackets (`https://user:pw@[invalid]/x`). The URL cannot
+        # be taken apart, so nothing of it is echoed.
+        raise IngestionError("refusing to fetch a URL that cannot be parsed") from None
     if parsed.scheme not in ("http", "https"):
         raise IngestionError(
             f"refusing to fetch {sanitize_url(source)!r}: scheme must be http or https, "

@@ -230,10 +230,30 @@ class TestClassifyAddressIsInterpreterIndependent:
     instance-metadata address."""
 
     @pytest.mark.parametrize(
-        "literal", ["192.0.0.8", "192.0.0.192", "192.0.0.255", "3fff::1", "::ffff:192.0.0.192"]
+        "literal", ["192.0.0.1", "192.0.0.8", "192.0.0.192", "192.0.0.255", "::ffff:192.0.0.192"]
     )
-    def test_refused_on_every_supported_version(self, literal: str) -> None:
-        assert classify_address(literal) == "private"
+    def test_protocol_assignments_are_refused_on_every_supported_version(
+        self, literal: str
+    ) -> None:
+        assert classify_address(literal) == "protocol_assignment"
+
+    def test_the_ipv6_documentation_range_is_private_on_every_supported_version(self) -> None:
+        assert classify_address("3fff::1") == "private"
+
+    def test_the_private_endpoint_allowance_does_not_admit_a_metadata_address(self) -> None:
+        """The allowance admits "private" for a compose-network Ollama. A
+        metadata address must stay refused even then, like 169.254.169.254."""
+
+        async def boom(_host: str) -> Sequence[str]:
+            raise AssertionError("resolver must not be called for a literal host")
+
+        async def run() -> None:
+            with pytest.raises(ConfigurationError, match="protocol_assignment"):
+                await ensure_safe_endpoint(
+                    "http://192.0.0.192/api/embed", allow_private_endpoint=True, resolver=boom
+                )
+
+        _run(run())
 
 
 class TestClassifyAddressAllowsSafeLiterals:
@@ -428,6 +448,10 @@ class TestCredentialParamsAndSanitize:
             ("https://h.example/a;v=1/b;sig=PATH/c", ("sig",)),
             ("https://h.example/doc?x=1;token=SEMI", ("token",)),
             ("https://h.example/doc?token=Q", ("token",)),
+            ("https://h.example/app#/callback?access_token=FRAG", ("access_token",)),
+            ("https://h.example/app#?access_token=FRAG", ("access_token",)),
+            ("https://h.example/doc%3Btoken=PATH", ("token",)),
+            ("https://h.example/doc%3btoken%3DPATH", ("token",)),
         ],
     )
     def test_credentials_are_found_outside_the_ampersand_query(
@@ -456,6 +480,17 @@ class TestCredentialParamsAndSanitize:
         rendered = sanitize_url("https://h.example/doc;key=PATHSECRET/x")
         assert "PATHSECRET" not in rendered
         assert rendered == "https://h.example/doc;key=***/x"
+
+    def test_sanitize_redacts_an_encoded_path_parameter(self) -> None:
+        rendered = sanitize_url("https://h.example/doc%3Btoken%3DPATHSECRET/x")
+        assert "PATHSECRET" not in rendered
+        assert rendered == "https://h.example/doc%3Btoken%3D***/x"
+
+    @pytest.mark.parametrize("url", ["https://user:hunter2@[invalid]/x", "http://[::1/x"])
+    def test_sanitize_never_raises_and_echoes_nothing_it_cannot_parse(self, url: str) -> None:
+        """It runs on error paths: raising there replaced the error being
+        reported, and a URL it cannot take apart cannot be echoed safely."""
+        assert sanitize_url(url) == "<unparseable URL>"
 
     def test_sanitize_leaves_a_filesystem_path_alone(self) -> None:
         assert sanitize_url("docs/sub;v=1/a.md") == "docs/sub;v=1/a.md"

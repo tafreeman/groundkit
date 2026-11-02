@@ -69,26 +69,30 @@ _LOOKS_LIKE_DOTTED_QUAD: Final[re.Pattern[str]] = re.compile(r"^\d+(\.\d+){3}$")
 #: target would silently classify as safe.
 _SHARED_ADDRESS_SPACE: Final[ipaddress.IPv4Network] = ipaddress.IPv4Network("100.64.0.0/10")
 
-#: Ranges CPython 3.12+ counts as ``is_private`` and 3.11 does not, checked
-#: explicitly so the verdict does not depend on the interpreter (GK-3
-#: F-GK3-5). 3.11's ``is_private`` covers only 192.0.0.0/29 and
-#: 192.0.0.170/31 of the IETF protocol-assignments block, which leaves
-#: 192.0.0.192 -- a cloud instance-metadata address -- classified as safe.
-#: 3fff::/20 is the RFC 9637 documentation range. The exceptions are the two
-#: addresses IANA marks globally reachable, which 3.12+ also excludes.
-_PRIVATE_SINCE_312: Final[tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]] = (
-    ipaddress.IPv4Network("192.0.0.0/24"),
-    ipaddress.IPv6Network("3fff::/20"),
-)
-_PRIVATE_SINCE_312_EXCEPTIONS: Final[tuple[ipaddress.IPv4Network, ...]] = (
+#: The IETF protocol-assignments block, checked explicitly so the verdict does
+#: not depend on the interpreter (GK-3 F-GK3-5). CPython 3.11's ``is_private``
+#: covers only 192.0.0.0/29 and 192.0.0.170/31 of it, which left 192.0.0.192
+#: -- a cloud instance-metadata address -- classified as safe. Its own verdict,
+#: not ``"private"``: ``allow_private_endpoint`` admits ``"private"``, and a
+#: metadata address must stay refused even for an allowed provider, exactly
+#: like 169.254.169.254. The exceptions are the two addresses IANA marks
+#: globally reachable, which 3.12+'s ``is_private`` also excludes.
+_PROTOCOL_ASSIGNMENTS: Final[ipaddress.IPv4Network] = ipaddress.IPv4Network("192.0.0.0/24")
+_PROTOCOL_ASSIGNMENTS_GLOBAL: Final[tuple[ipaddress.IPv4Network, ...]] = (
     ipaddress.IPv4Network("192.0.0.9/32"),
     ipaddress.IPv4Network("192.0.0.10/32"),
 )
 
+#: The RFC 9637 IPv6 documentation range, which CPython 3.12+ counts as
+#: ``is_private`` and 3.11 does not. ``"private"``, like every other
+#: documentation range ``ipaddress`` already covers (192.0.2.0/24, 2001:db8::/32).
+_DOCUMENTATION_SINCE_312: Final[ipaddress.IPv6Network] = ipaddress.IPv6Network("3fff::/20")
+
 #: The only :func:`classify_address` verdicts :func:`ensure_safe_endpoint`
 #: will accept when the caller has set ``allow_private_endpoint=True``.
 #: Deliberately excludes ``"link_local"``, ``"multicast"``, ``"reserved"``,
-#: ``"unspecified"`` and ``"shared_address_space"`` — the allowance exists so
+#: ``"unspecified"``, ``"shared_address_space"`` and ``"protocol_assignment"``
+#: — the allowance exists so
 #: a compose bridge-network address (RFC1918, "private") and the loopback
 #: default keep working, not so *every* non-global address becomes
 #: reachable. 169.254.169.254 (a common cloud metadata endpoint) is
@@ -285,18 +289,35 @@ def credential_query_params(url: str) -> tuple[str, ...]:
     """
     parsed = urlsplit(url)
     candidates = [_param_name(piece) for piece in re.split(r"[&;]", parsed.query) if piece]
+    # `?` too: a hash-routed SPA puts its query inside the fragment
+    # (`#/callback?access_token=…`), and without it the name read would be
+    # `/callback?access_token`.
     candidates += [
-        _param_name(piece) for piece in re.split(r"[&;]", parsed.fragment) if "=" in piece
+        _param_name(piece) for piece in re.split(r"[&;?]", parsed.fragment) if "=" in piece
     ]
+    # Decoded before the `=` test and split on an encoded `;` as well, since a
+    # server may decode `/doc%3Btoken%3D…` back into a path parameter.
     candidates += [
-        _param_name(piece)
+        _param_name(decoded)
         for segment in parsed.path.split("/")
-        for piece in segment.split(";")[1:]
-        if "=" in piece
+        for piece in _PATH_PARAM_DELIMITER.split(segment)[1:]
+        if "=" in (decoded := unquote_plus(piece))
     ]
     return tuple(
         name for name in candidates if _normalize_param_name(name) in CREDENTIAL_QUERY_PARAMS
     )
+
+
+#: A path-parameter delimiter, literal or percent-encoded.
+_PATH_PARAM_DELIMITER: Final[re.Pattern[str]] = re.compile(r";|%3[Bb]")
+
+#: One path parameter's value, after a literal or encoded `;` and `=`. The
+#: name is lazy so it stops at the first `=`; the value runs to the next
+#: segment or literal `;`, so redaction errs toward hiding more.
+_PATH_PARAM_VALUE: Final[re.Pattern[str]] = re.compile(r"(;|%3[Bb])([^;/=]*?)(=|%3[Dd])[^;/]*")
+
+#: What :func:`sanitize_url` returns for a URL ``urlsplit`` cannot parse.
+UNPARSEABLE_URL_PLACEHOLDER: Final[str] = "<unparseable URL>"
 
 
 def _param_name(piece: str) -> str:
@@ -335,9 +356,15 @@ def sanitize_url(url: str, secret: str | None = None) -> str:
             what remains, or ``None``.
 
     Returns:
-        The sanitized URL.
+        The sanitized URL, or :data:`UNPARSEABLE_URL_PLACEHOLDER` when *url*
+        cannot be parsed at all. This function runs on error paths, so it
+        never raises, and a URL it cannot take apart cannot be echoed safely.
     """
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        # e.g. `https://user:pw@[invalid]/x`: urlsplit validates brackets.
+        return UNPARSEABLE_URL_PLACEHOLDER
     redacted_query = urlencode(
         [(key, REDACTED_PLACEHOLDER) for key, _ in parse_qsl(parsed.query, keep_blank_values=True)]
     )
@@ -362,7 +389,7 @@ def sanitize_url(url: str, secret: str | None = None) -> str:
     # URL: callers also pass filesystem paths, which have no such parameters.
     path = parsed.path
     if parsed.netloc:
-        path = re.sub(r";([^;/=]*)=[^;/]*", rf";\1={REDACTED_PLACEHOLDER}", path)
+        path = _PATH_PARAM_VALUE.sub(rf"\1\2\3{REDACTED_PLACEHOLDER}", path)
 
     sanitized = urlunsplit((parsed.scheme, netloc, path, redacted_query, ""))
     if secret:
@@ -399,7 +426,7 @@ def classify_address(literal: str) -> str | None:
         ``None`` if the address is safe to connect to. Otherwise the name of
         the predicate that rejected it: one of ``"loopback"``,
         ``"link_local"``, ``"multicast"``, ``"reserved"``, ``"unspecified"``,
-        ``"shared_address_space"``, or ``"private"``.
+        ``"shared_address_space"``, ``"protocol_assignment"``, or ``"private"``.
 
         The order these are checked in is load-bearing, not cosmetic:
         ``is_private`` is checked *last* because it is a broad catch-all —
@@ -433,11 +460,13 @@ def classify_address(literal: str) -> str | None:
         return "unspecified"
     if isinstance(addr, ipaddress.IPv4Address) and addr in _SHARED_ADDRESS_SPACE:
         return "shared_address_space"
-    # A version mismatch makes `in` False rather than raising, so one loop
-    # serves both families.
-    if any(addr in net for net in _PRIVATE_SINCE_312) and not any(
-        addr in net for net in _PRIVATE_SINCE_312_EXCEPTIONS
+    if (
+        isinstance(addr, ipaddress.IPv4Address)
+        and addr in _PROTOCOL_ASSIGNMENTS
+        and not any(addr in net for net in _PROTOCOL_ASSIGNMENTS_GLOBAL)
     ):
+        return "protocol_assignment"
+    if isinstance(addr, ipaddress.IPv6Address) and addr in _DOCUMENTATION_SINCE_312:
         return "private"
     if addr.is_private:
         return "private"
