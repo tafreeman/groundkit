@@ -1779,4 +1779,4 @@ def test_loader_failure_message_does_not_echo_url_credentials(tmp_path: Path) ->
     message = asyncio.run(run())
     assert "hunter2" not in message
     assert "sk-q" not in message
-    assert "example.com" in message
+    assert message == "Loader failed for 'https://***@example.com/x?token=%2A%2A%2A': boom"

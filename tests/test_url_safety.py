@@ -450,7 +450,7 @@ class TestCredentialParamsAndSanitize:
     def test_sanitize_survives_a_malformed_port_and_drops_userinfo(self) -> None:
         rendered = sanitize_url("https://user:hunter2@example.com:abc/x")
         assert "hunter2" not in rendered
-        assert "example.com" in rendered
+        assert rendered == "https://***@example.com/x"
 
     def test_sanitize_redacts_path_parameter_values(self) -> None:
         rendered = sanitize_url("https://h.example/doc;key=PATHSECRET/x")
