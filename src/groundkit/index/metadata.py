@@ -224,8 +224,12 @@ def is_groundkit_store(db_path: Path) -> bool:
     """
     if not db_path.is_file():
         return False
+    # absolute(), not resolve(): ``as_uri()`` refuses a relative path, and the
+    # CLI's default ``--index-dir`` is the relative ``.groundkit``. resolve()
+    # would also follow links, which is not this probe's question.
+    uri = f"{db_path.absolute().as_uri()}?mode=ro&immutable=1"
     try:
-        conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro&immutable=1", uri=True)
+        conn = sqlite3.connect(uri, uri=True)
     except sqlite3.Error:
         return False
     try:

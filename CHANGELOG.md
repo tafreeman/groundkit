@@ -28,6 +28,10 @@ it scored.
   the rows in the probed partitions, so filter-then-truncate could come back
   short. No index is built today, so behavior is unchanged; this keeps the
   guarantee once one is.
+- With the default relative `--index-dir` (`.groundkit`), every command after
+  the first crashed with `ValueError: relative path can't be expressed as a
+  file URI`: the foreign-store probe built its read-only `file:` URI from the
+  relative path. It now uses the absolute path.
 - URL ingest now refuses a credential-named parameter in the fragment
   (`#access_token=…`), in a `;` path parameter, or after a `;` in the query.
   Before, only `&`-separated query pairs were checked, and the others were

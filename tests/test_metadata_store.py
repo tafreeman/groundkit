@@ -20,6 +20,7 @@ from groundkit.index.metadata import (
     BUSY_TIMEOUT_MS,
     SCHEMA_VERSION,
     SQLiteMetadataStore,
+    is_groundkit_store,
 )
 from groundkit.index.protocols import MetadataStoreProtocol
 from test_protocol_conformance import assert_signature_parity
@@ -562,6 +563,29 @@ def test_open_still_accepts_a_legacy_unstamped_groundkit_store(tmp_path: Path) -
         await store.close()
 
     asyncio.run(_reopen())
+
+
+def test_reopen_through_a_relative_index_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store under a relative ``index_dir`` must reopen, not just open once.
+
+    The CLI default is the relative ``.groundkit``, so the second ``grk``
+    command of any session reopens an existing store through a relative path.
+    The foreign-file probe builds a ``file:`` URI from that path, and
+    ``Path.as_uri()`` raises ``ValueError`` on a relative one -- the first
+    open never reaches the probe (the file is new), so only a reopen fails.
+    """
+    monkeypatch.chdir(tmp_path)
+    relative = Path(".groundkit")
+
+    async def _open_twice() -> None:
+        for _ in range(2):
+            store = await SQLiteMetadataStore.open(relative, "default")
+            await store.close()
+
+    asyncio.run(_open_twice())
+    assert is_groundkit_store(relative / "default.sqlite3")
 
 
 def test_open_rejects_parent_traversal_collection_and_creates_nothing_outside(
