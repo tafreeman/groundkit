@@ -113,6 +113,13 @@ jobs:
       - name: Tests
         run: uv run pytest --cov --cov-report=term
 
+      # Offline retrieval-quality floor: BM25 nDCG/recall over the committed
+      # golden corpus must not fall below evals/bm25-floor.json. Deterministic
+      # and credential-free, unlike eval-gated.yml, so it can sit in the
+      # release path without a network flake blocking a release.
+      - name: BM25 retrieval-quality floor
+        run: uv run python scripts/check_bm25_floor.py
+
       # Both coverage gates, matching ci.yml. Duplicated rather than skipped:
       # a release can be cut from any ref, and "CI was green on main once" is
       # not a statement about the commit being published.
