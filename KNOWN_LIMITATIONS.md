@@ -767,6 +767,20 @@ v0.1.0 scope amendment, narrowed to that one remaining gap.
   separate path: it already reuses `html_extractor()` at fetch time to strip tags from an
   HTML-shaped response, but the resulting document is `source_class="snapshot"` either way —
   the extractor identity is not recorded on it, and re-extraction never runs for it.
+- **A fetched page's HTML extraction runs outside the fetch timeout, and older CPython
+  patch releases parse hostile HTML super-quadratically.** `UrlLoader`'s
+  `asyncio.timeout` bounds the network exchange only. Decoding and `html.parser` extraction
+  run afterwards in a worker thread, which cannot be cancelled. On CPython 3.11.9 and 3.12.7,
+  a 25 KB body of `<a ` repeated took about 12 s to parse, and larger bodies take minutes.
+  On 3.13.13 the same body took 0.01 s (GK-3 F-GK3-2, measured 2026-11-02). Run URL ingest
+  on a current interpreter patch release. Bounding extraction properly needs a killable
+  worker process, which is not built.
+- **An empty URL response is refused, not treated as a deletion.** A local file that is
+  emptied loads as `[]`, and the indexer prunes its stored document (the CLI reports it as
+  "removed"). A fetched page that decodes or extracts to no text is an `IngestionError`
+  instead, and any stored copy is kept. A JS-only shell, a CDN error page or a login wall
+  answers 200 with no text far more often than a page is deliberately blanked. To drop a URL
+  document there is still no per-document delete command.
 - **A credential in a URL query string is refused by name, and the list of names is not
   exhaustive.** `_reject_unsafe_url_shape` refused userinfo (`user:pass@host`) from the start
   because this loader records the URL verbatim as `Document.source`; a `?token=…` reaches
