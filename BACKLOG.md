@@ -83,6 +83,7 @@ Declined section with the reason)
 | GK-033 | Decide whether to adopt ADR-0002's persisted postings | MED | G | L | todo | — |
 | GK-031 | Published eval figures are known-stale and need regenerating | LOW | — | S | todo | — |
 | GK-032 | Untested cleanup-on-error and URL-shape guards | MED | — | M | todo | — |
+| GK-034 | Partial vector loss is undetected; dense search returns incomplete results as success | MED | — | M | todo | — |
 
 ---
 
@@ -374,3 +375,38 @@ survive it, tie-break included.
       the insertion-order tie-break, demonstrated by test rather than asserted.
 - [ ] `KNOWN_LIMITATIONS.md` and the `acquire` section's docstring updated to match
       whichever way it goes.
+
+### GK-034 — Partial vector loss is undetected; dense search returns incomplete results as success
+
+- **Severity** MEDIUM · **Effort** M · **ADR** required (interacts with ADR-0008) ·
+  **Verified** by execution on `fada5a2` (GK-1 audit, finding GK1-06)
+- **Where** `src/groundkit/index/dense.py` (`verify_dense_side_present`),
+  `src/groundkit/indexer.py` (the unchanged-document skip gate)
+
+`verify_dense_side_present` treats one probe hit as proof that the dense side exists. When a
+manifest-bound collection loses some but not all of its vectors, re-ingest skips every
+unchanged document (so nothing is re-embedded), dense search returns the surviving subset as
+a successful result, and `index_status` reports full document and chunk counts. Reproduced
+with two documents and one document's vectors deleted: re-ingest exited 0 with
+`0 indexed, 2 skipped, 0 vectors written`; dense search exited 0 with one result; the vector
+table held one row.
+
+`KNOWN_LIMITATIONS.md` already records the same gap for the BM25-to-dense upgrade path
+("manifest-bound but only partially embedded … is still not detected"). Vector loss reaches
+it by a second route. Total loss is detected and refused; partial loss is not.
+
+It needs a decision before a patch, because the obvious check, reconciling the vector count
+with the chunk count, would also refuse the half-dense upgrade collection that ADR-0008
+deliberately tolerates (its delete reconciliation warns rather than fails for the same
+reason).
+
+**Acceptance criteria**
+
+- [ ] An ADR that chooses between, at least: refusing on a vector/chunk count mismatch
+      (and what that does to the tolerated half-dense upgrade); reporting the mismatch in
+      `index_status` without refusing; and a re-ingest mode that backfills only missing
+      vectors without the implicit full re-embed ADR-0008 declined.
+- [ ] Whatever is chosen has a regression test that deletes a subset of vectors and is
+      shown to fail against the reverted source per SPEC.md §8.
+- [ ] `KNOWN_LIMITATIONS.md` names the vector-loss route next to the upgrade route until
+      this lands, and is updated to match when it does.

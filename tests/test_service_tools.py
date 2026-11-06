@@ -22,9 +22,11 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from groundkit.contracts import Chunk, RetrievalResult, SearchResponse
+from groundkit.contracts import Chunk, EmbeddingIdentity, RetrievalResult, SearchResponse
 from groundkit.errors import ConfigurationError, RerankerNotConfiguredError
-from groundkit.index.metadata import SQLiteMetadataStore
+from groundkit.index.dense import InMemoryVectorStore
+from groundkit.index.metadata import SCHEMA_VERSION, SQLiteMetadataStore
+from groundkit.providers.embeddings import InMemoryEmbedder
 from groundkit.runtime import CollectionRegistry, CollectionRuntime, RebuildStats
 from groundkit.service import tools as tools_module
 
@@ -489,6 +491,104 @@ def test_index_status_reports_counts_without_leaking_content(tmp_path: Path) -> 
     asyncio.run(run())
 
 
+def _fresh_dir(tmp_path: Path, stamp: int | None) -> Path:
+    path = tmp_path / f"stamp-{stamp}"
+    path.mkdir()
+    return path
+
+
+async def _bind_manifest(index_dir: Path, embedder: InMemoryEmbedder) -> None:
+    store = await SQLiteMetadataStore.open(index_dir, "default")
+    try:
+        await store.write_manifest(
+            EmbeddingIdentity(
+                provider=embedder.provider,
+                model_name=embedder.model_name,
+                dimensions=embedder.dimensions,
+            )
+        )
+    finally:
+        await store.close()
+
+
+def test_index_status_dense_unavailable_when_service_has_no_dense_path(tmp_path: Path) -> None:
+    """A manifest-bound collection on a BM25-only service must not claim dense."""
+
+    async def run() -> None:
+        index_dir, corpus, _ = await _seed(tmp_path)
+        await _bind_manifest(index_dir, InMemoryEmbedder(dimensions=8))
+        ctx = _context(index_dir, corpus)  # CollectionRegistry(index_dir): no dense path
+        try:
+            status = await tools_module.handle_index_status(ctx, IndexStatusRequest())
+            assert status.embedding is not None
+            assert status.dense_search_available is False
+            with pytest.raises(ConfigurationError):
+                await tools_module.handle_search(ctx, SearchRequest(query="turbine", mode="dense"))
+        finally:
+            await ctx.registry.aclose()
+
+    asyncio.run(run())
+
+
+def test_index_status_dense_available_when_service_and_collection_are_dense(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        index_dir, corpus, _ = await _seed(tmp_path)
+        embedder = InMemoryEmbedder(dimensions=8)
+        await _bind_manifest(index_dir, embedder)
+
+        async def factory(_collection: str) -> InMemoryVectorStore:
+            return InMemoryVectorStore()
+
+        ctx = ServiceContext(
+            registry=CollectionRegistry(
+                index_dir,
+                embedder=embedder,
+                vector_store_factory=factory,
+            ),
+            index_dir=index_dir,
+            base_dir=corpus,
+        )
+        try:
+            status = await tools_module.handle_index_status(ctx, IndexStatusRequest())
+            assert status.dense_search_available is True
+        finally:
+            await ctx.registry.aclose()
+
+    asyncio.run(run())
+
+
+def test_index_status_reports_the_stores_stamped_schema_version(tmp_path: Path) -> None:
+    """``schema_version`` is the file's stamp, not this build's constant."""
+
+    async def status_for(stamp: int | None) -> int:
+        index_dir, corpus, _ = await _seed(_fresh_dir(tmp_path, stamp))
+        if stamp is not None:
+            conn = sqlite3.connect(str(index_dir / "default.sqlite3"))
+            try:
+                conn.execute("ALTER TABLE documents DROP COLUMN source_class")
+                conn.execute("ALTER TABLE documents DROP COLUMN extractor")
+                conn.execute(f"PRAGMA user_version = {stamp}")
+                conn.commit()
+            finally:
+                conn.close()
+        ctx = _context(index_dir, corpus)
+        try:
+            return (
+                await tools_module.handle_index_status(ctx, IndexStatusRequest())
+            ).schema_version
+        finally:
+            await ctx.registry.aclose()
+
+    async def run() -> None:
+        assert await status_for(None) == SCHEMA_VERSION
+        assert await status_for(2) == 2
+        assert await status_for(0) == 0
+
+    asyncio.run(run())
+
+
 def test_index_status_on_an_unknown_collection_creates_no_file(tmp_path: Path) -> None:
     """The strongest of the guards, because a naive implementation ships the bug.
 
@@ -599,6 +699,13 @@ class _FakeRuntime:
 
     async def get_generation(self) -> int:
         return 0
+
+    async def stored_schema_version(self) -> int:
+        return 0
+
+    @property
+    def dense_configured(self) -> bool:
+        return False
 
     def rebuild_stats(self) -> RebuildStats:
         """Sync, matching :meth:`CollectionRuntime.rebuild_stats` (ADR-0026).

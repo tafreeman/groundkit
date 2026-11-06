@@ -256,7 +256,12 @@ class SQLiteMetadataStore:
     """
 
     def __init__(
-        self, connection: sqlite3.Connection, db_path: Path, *, schema_current: bool
+        self,
+        connection: sqlite3.Connection,
+        db_path: Path,
+        *,
+        schema_current: bool,
+        stored_schema_version: int = SCHEMA_VERSION,
     ) -> None:
         self._conn = connection
         self._lock = asyncio.Lock()
@@ -273,6 +278,19 @@ class SQLiteMetadataStore:
         #: (ADR-0013). Such a store still works for BM25-only reads and
         #: writes; it is uncacheable and closed to dense work, not broken.
         self._schema_current = schema_current
+        self._stored_schema_version = stored_schema_version
+
+    @property
+    def stored_schema_version(self) -> int:
+        """The ``PRAGMA user_version`` this store's file carried when opened.
+
+        Not :data:`SCHEMA_VERSION`: that is what this build *expects*, this is
+        what the file *says*. They differ for a legacy collection (0 for one
+        that predates the ADR-0004 stamp, below the current version for an
+        older stamp), which is exactly the case a status report must not paper
+        over. Fixed at :meth:`open`; read-only.
+        """
+        return self._stored_schema_version
 
     @classmethod
     async def open(cls, index_dir: Path, collection: str) -> SQLiteMetadataStore:
@@ -313,7 +331,7 @@ class SQLiteMetadataStore:
         validate_collection_name(collection)
         db_path = index_dir / f"{collection}.sqlite3"
 
-        def _connect() -> tuple[sqlite3.Connection, bool]:
+        def _connect() -> tuple[sqlite3.Connection, bool, int]:
             index_dir.mkdir(parents=True, exist_ok=True)
             _chmod_best_effort(index_dir, 0o700)
             try:
@@ -384,10 +402,10 @@ class SQLiteMetadataStore:
             app_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             schema_current = app_id == APPLICATION_ID and version == SCHEMA_VERSION
-            return conn, schema_current
+            return conn, schema_current, version
 
         try:
-            connection, schema_current = await asyncio.to_thread(_connect)
+            connection, schema_current, stored_version = await asyncio.to_thread(_connect)
         except (OSError, sqlite3.Error) as exc:
             raise StorageError(f"failed to open metadata store at {db_path}") from exc
 
@@ -396,7 +414,12 @@ class SQLiteMetadataStore:
             collection,
             schema_current,
         )
-        return cls(connection, db_path, schema_current=schema_current)
+        return cls(
+            connection,
+            db_path,
+            schema_current=schema_current,
+            stored_schema_version=stored_version,
+        )
 
     async def close(self) -> None:
         """Close the underlying connection.

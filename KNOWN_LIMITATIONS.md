@@ -503,6 +503,18 @@ per SPEC.md §9:
   `index_status` — are the complete named surface, and the CLI covers
   ingest at a strictly smaller surface: a local operator's typed argument,
   not any caller reaching the port.
+- **`index_status.dense_search_available` is configuration-plus-manifest, not a
+  probe.** It is true when the collection is manifest-bound *and* the service
+  was started with a dense path (embedder and vector store). It deliberately
+  does not open the vector store, because status must stay a cheap read. So a
+  bound collection on a dense-configured service whose vector data has been
+  deleted (e.g. the `.lance` directory) still reports `true`; `search` then
+  fails closed. Only a search attempt reveals that case.
+- **`index_status.schema_version` reports the collection's stamp, and
+  does not repair it.** It is the file's `PRAGMA user_version` (0 for a store
+  that predates the ADR-0004 stamp). A value below the current schema version
+  means writes to that collection are refused until it is re-ingested into a
+  fresh one (ADR-0004 decision 5); there is no migration.
 - **A missing `chunk_id` returns 400, not 404.** `handle_fetch_chunk` raises
   `ConfigurationError` for it, and separating that case from an invalid
   collection name would need either a new exception type (forbidden by
