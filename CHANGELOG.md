@@ -28,6 +28,10 @@ it scored.
   the rows in the probed partitions, so filter-then-truncate could come back
   short. No index is built today, so behavior is unchanged; this keeps the
   guarantee once one is.
+- With the default relative `--index-dir` (`.groundkit`), every command after
+  the first crashed with `ValueError: relative path can't be expressed as a
+  file URI`: the foreign-store probe built its read-only `file:` URI from the
+  relative path. It now uses the absolute path.
 - A URL whose response decodes or extracts to no text (an empty body, or a
   script-only page) is now refused with an `IngestionError`. Before, the
   loader returned nothing, which the indexer read as "this source is now empty":
