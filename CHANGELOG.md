@@ -28,6 +28,14 @@ it scored.
   the rows in the probed partitions, so filter-then-truncate could come back
   short. No index is built today, so behavior is unchanged; this keeps the
   guarantee once one is.
+- A URL whose response decodes or extracts to no text (an empty body, or a
+  script-only page) is now refused with an `IngestionError`. Before, the
+  loader returned nothing, which the indexer read as "this source is now empty":
+  re-ingesting a page that briefly served a JS shell or an error page deleted
+  its stored document and snapshot, and exited 0.
+- `grk ingest` reports pruned documents (`N removed (source now empty or
+  gone)`) when there are any. A prune deletes indexed content, and it was not
+  mentioned before.
 
 ## [0.2.1] - 2026-09-23
 

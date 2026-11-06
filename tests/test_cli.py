@@ -1795,3 +1795,24 @@ def test_answer_builds_no_chat_provider_when_the_runtime_refuses(
     assert main(["answer", "reciprocal rank fusion", "--index-dir", str(idx)]) == 1
     assert "error: collection is unreadable" in capsys.readouterr().err
     assert built == []
+
+
+def test_ingest_reports_a_pruned_document(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """GK-3 F-GK3-6: a prune deletes indexed content, and the report line
+    never mentioned it. It appears only when nonzero, so the usual line
+    (pinned by the tests above) is unchanged."""
+    doc = tmp_path / "a.md"
+    doc.write_text("# alpha\n\nsome text\n", encoding="utf-8")
+    idx = str(tmp_path / "idx")
+    assert main(["ingest", str(doc), "--index-dir", idx]) == 0
+    capsys.readouterr()
+
+    doc.write_text("   \n", encoding="utf-8")
+    assert main(["ingest", str(doc), "--index-dir", idx]) == 0
+    out = capsys.readouterr().out
+    assert out == (
+        "ingested: 1 files seen, 0 indexed, 0 unchanged, 0 chunks written, "
+        "1 removed (source now empty or gone)\n"
+    )

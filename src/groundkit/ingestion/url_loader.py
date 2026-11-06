@@ -45,7 +45,6 @@ module exists; spec §10.1).
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import tempfile
 from pathlib import Path
@@ -67,8 +66,6 @@ from groundkit.utils.url_safety import (
     ensure_safe_endpoint,
     sanitize_url,
 )
-
-logger = logging.getLogger(__name__)
 
 #: Response byte cap. Matches ``FileLoader.DEFAULT_MAX_BYTES`` so a remote
 #: resource and a local file are bounded by the same default -- refused past
@@ -267,13 +264,14 @@ class UrlLoader:
         return self._snapshot_dir
 
     async def load(self, source: str) -> list[Document]:
-        """Fetch *source*, snapshot it, and return zero or one Document.
+        """Fetch *source*, snapshot it, and return one Document.
 
         An empty or whitespace-only fetched body (before or after HTML
-        extraction) returns ``[]`` (logged as a warning), matching
-        :class:`~groundkit.ingestion.loaders.FileLoader`'s treatment of an
-        empty file rather than letting ``Document``'s ``min_length=1``
-        content validator raise a bare :class:`~pydantic.ValidationError`.
+        extraction) is an :class:`~groundkit.errors.IngestionError`, unlike
+        :class:`~groundkit.ingestion.loaders.FileLoader`'s ``[]`` for an empty
+        file. The indexer prunes a source whose loader returns ``[]``, and a
+        blank remote response is far more often a transient failure than a
+        deliberate deletion (GK-3 F-GK3-6).
 
         Args:
             source: The URL to fetch. Its resolved address (after DNS, if it
@@ -281,7 +279,7 @@ class UrlLoader:
                 :func:`~groundkit.utils.url_safety.ensure_safe_endpoint`.
 
         Returns:
-            A list containing zero or one :class:`Document` with
+            A list containing exactly one :class:`Document` with
             ``source_class="snapshot"``, ``source=source``, ``extractor=None``,
             and ``content`` equal, character for character, to what was
             written to the local snapshot file.
@@ -294,8 +292,8 @@ class UrlLoader:
             IngestionError: The response is a redirect (3xx), an error status
                 (4xx/5xx), exceeds ``max_bytes``, took longer than
                 ``timeout_seconds`` in total, cannot be decoded under its
-                declared (or default UTF-8) charset, the transport itself
-                failed, or the resulting snapshot path would escape
+                declared (or default UTF-8) charset, yields no text, the
+                transport itself failed, or the resulting snapshot path would escape
                 ``snapshot_dir`` (or turned into a symlink after that check).
         """
         # Guard immediately before the request, not at construction -- this
@@ -334,8 +332,16 @@ class UrlLoader:
             text = await self._extract_html(text)
 
         if not text.strip():
-            logger.warning("Empty or whitespace-only URL source: %s", sanitize_url(source))
-            return []
+            # Refused, not returned as `[]` (GK-3 F-GK3-6). The indexer reads
+            # `[]` as "this source is now empty" and deletes what it stored for
+            # it -- right for a file someone emptied, wrong for a remote page,
+            # where a JS-only shell, a CDN error page or a login wall answers
+            # 200 with no text. Refusing keeps the stored copy and says why.
+            raise IngestionError(
+                f"fetching {sanitize_url(source)!r} produced no text after decoding"
+                f"{' and HTML extraction' if _is_html_media_type(content_type) else ''}; "
+                "refusing to index it, and any copy already stored is kept"
+            )
 
         document = Document(
             source=source,
