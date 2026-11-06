@@ -106,29 +106,28 @@ spec:
               mountPath: /home/groundkit
           # Startup probe first: it holds the liveness probe off until the
           # process is serving, so a slow start is not read as a hang.
+          # /healthz is a static handler: it proves the process answers HTTP
+          # and nothing else, so a wedged volume cannot fail it and cannot
+          # drive a restart loop that would not unwedge the volume anyway.
           startupProbe:
             httpGet:
-              path: /v1/collections
+              path: /healthz
               port: http
             periodSeconds: 5
             failureThreshold: 30
+          # /readyz is one stat of the index directory (no listing, no
+          # collection opened), so it goes unready when the volume is gone
+          # without the cost or the hang-risk of enumerating the PVC.
           readinessProbe:
             httpGet:
-              path: /v1/collections
+              path: /readyz
               port: http
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
-          # Deliberately slack. `/v1/collections` lists a directory on the PVC,
-          # so a wedged volume fails this probe — and restarting the pod does
-          # not unwedge a volume, it just adds a restart loop to an already
-          # broken mount. A long period and a high threshold keep this probe
-          # reacting to a stuck process rather than to storage weather. See
-          # docs/specs/phase-6-iac-observability.md §4.2 for why there is no
-          # dedicated health endpoint to point at instead.
           livenessProbe:
             httpGet:
-              path: /v1/collections
+              path: /healthz
               port: http
             periodSeconds: 30
             timeoutSeconds: 5
