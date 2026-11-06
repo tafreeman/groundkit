@@ -75,9 +75,101 @@ def test_search_json_output(
 
 
 def test_search_no_results(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    idx = str(tmp_path / "idx")
-    assert main(["search", "anything", "--index-dir", idx]) == 0
+    """An existing-but-empty collection is a real collection: success, no results."""
+    idx = tmp_path / "idx"
+    asyncio.run(_create_empty_collection(idx, "default"))
+    assert main(["search", "anything", "--index-dir", str(idx)]) == 0
     assert "no results" in capsys.readouterr().out
+    assert main(["search", "anything", "--index-dir", str(idx), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["results"] == []
+
+
+async def _create_empty_collection(idx: Path, collection: str) -> None:
+    store = await SQLiteMetadataStore.open(idx, collection)
+    await store.close()
+
+
+def _tree(root: Path) -> list[str]:
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*")) if root.exists() else []
+
+
+@pytest.mark.parametrize("command", ["search", "answer"])
+@pytest.mark.parametrize("mode", ["bm25", "dense", "hybrid"])
+def test_read_of_missing_index_dir_fails_and_creates_nothing(
+    command: str, mode: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reading a collection that was never ingested must not create it (P2).
+
+    Previously ``SQLiteMetadataStore.open`` made the directory and an empty
+    ``typo.sqlite3`` and the command exited 0 with ``results: []``. The
+    dense/hybrid and ``answer`` legs also prove the refusal precedes any
+    provider: no chat flags are given, and none is needed.
+    """
+    idx = tmp_path / "absent"
+    argv = [command, "x", "--index-dir", str(idx), "--collection", "typo", "--mode", mode]
+    if mode != "bm25":
+        argv += ["--embed-provider", "inmemory", "--embed-dimensions", "16"]
+    assert main(argv) == 1
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "'typo'" in err
+    assert str(idx) in err
+    assert "grk ingest" in err
+    assert not idx.exists()
+
+
+@pytest.mark.parametrize("command", ["search", "answer"])
+def test_read_of_missing_collection_in_existing_dir_fails_and_creates_nothing(
+    command: str, corpus: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    idx = tmp_path / "idx"
+    assert main(["ingest", str(corpus), "--index-dir", str(idx)]) == 0
+    capsys.readouterr()
+    before = _tree(idx)
+
+    assert main([command, "x", "--index-dir", str(idx), "--collection", "typo"]) == 1
+    err = capsys.readouterr().err
+    assert "'typo'" in err
+    assert "grk ingest" in err
+    assert _tree(idx) == before
+
+
+def test_ingest_still_creates_a_new_collection(corpus: Path, tmp_path: Path) -> None:
+    idx = tmp_path / "idx"
+    assert main(["ingest", str(corpus), "--index-dir", str(idx), "--collection", "fresh"]) == 0
+    assert (idx / "fresh.sqlite3").is_file()
+
+
+def test_case_only_collection_spelling_is_refused_by_ingest_and_search(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``Alpha`` then ``alpha`` must not alias one store (P1).
+
+    On Windows/macOS both spellings named the same files, so a search in one
+    returned the other's documents. Refused on every filesystem, so this
+    asserts the same thing on case-sensitive Linux CI.
+    """
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.txt").write_text("alpha only document", encoding="utf-8")
+    idx = tmp_path / "idx"
+    assert main(["ingest", str(docs), "--index-dir", str(idx), "--collection", "Alpha"]) == 0
+    capsys.readouterr()
+    before = _tree(idx)
+
+    assert main(["ingest", str(docs), "--index-dir", str(idx), "--collection", "alpha"]) == 1
+    err = capsys.readouterr().err
+    assert "'alpha'" in err
+    assert "'Alpha'" in err
+    assert str(idx) in err
+    assert main(["search", "alpha", "--index-dir", str(idx), "--collection", "alpha"]) == 1
+    capsys.readouterr()
+    assert _tree(idx) == before
+
+    # The original spelling keeps working, and a distinct name coexists.
+    assert main(["search", "alpha", "--index-dir", str(idx), "--collection", "Alpha"]) == 0
+    assert "a.txt" in capsys.readouterr().out
+    assert main(["ingest", str(docs), "--index-dir", str(idx), "--collection", "beta"]) == 0
 
 
 def test_error_paths_exit_nonzero(

@@ -303,8 +303,10 @@ class SQLiteMetadataStore:
         Raises:
             ConfigurationError: ``collection`` is empty or whitespace-only,
                 contains a null byte or a path separator, is ``.`` or
-                ``..``, contains characters outside the allowed set, or
-                otherwise resolves to a database path outside ``index_dir``.
+                ``..``, contains characters outside the allowed set,
+                otherwise resolves to a database path outside ``index_dir``,
+                or differs only in letter case from a collection already in
+                ``index_dir`` (see :func:`collection_store_exists`).
             StorageError: The directory cannot be created, the database file
                 cannot be opened, or the schema cannot be applied (e.g. a
                 corrupted file or a path occupied by something other than a
@@ -314,6 +316,11 @@ class SQLiteMetadataStore:
         db_path = index_dir / f"{collection}.sqlite3"
 
         def _connect() -> tuple[sqlite3.Connection, bool]:
+            # Before mkdir and before any path is touched: a refused spelling
+            # must create nothing, and `db_path.exists()` below is
+            # case-insensitive on Windows/macOS, so it would happily treat
+            # `alpha` as the already-existing `Alpha`.
+            collection_store_exists(index_dir, collection)
             index_dir.mkdir(parents=True, exist_ok=True)
             _chmod_best_effort(index_dir, 0o700)
             try:
@@ -1313,6 +1320,64 @@ def _identity_mismatch_message(manifest: CollectionManifest, identity: Embedding
         "re-ingest it under the new embedding configuration, never to re-embed or "
         "fall back automatically."
     )
+
+
+#: Suffixes of the per-collection entries ``index_dir`` holds: the SQLite
+#: store and the LanceDB directory. Both are checked for a case-only alias.
+_COLLECTION_ENTRY_SUFFIXES: Final[tuple[str, ...]] = (".sqlite3", ".lance")
+
+
+def collection_store_exists(index_dir: Path, collection: str) -> bool:
+    """True when ``<collection>.sqlite3`` exists in ``index_dir`` under this exact spelling.
+
+    Also the case-alias guard for :meth:`SQLiteMetadataStore.open`, which calls
+    it first. Collection names are case-sensitive in groundkit but the
+    filesystem may not be (Windows, default macOS): ``Alpha`` and ``alpha``
+    would silently open the *same* ``Alpha.sqlite3`` and ``Alpha.lance``, so a
+    search in one returns the other's documents. The refusal is made on every
+    filesystem, not only where the alias is real, so an index directory
+    behaves identically wherever it is copied to.
+
+    The directory is listed and names compared as strings, deliberately:
+    ``Path.exists()``/``is_file()`` answer through the filesystem and would
+    say yes to the wrong spelling on a case-insensitive one. The listing is a
+    single ``scandir`` and a missing ``index_dir`` is simply "no such store".
+
+    A collection already present under its exact spelling is never refused,
+    even if a differently-cased sibling also exists (possible only on a
+    case-sensitive filesystem): that is an established layout, not a new
+    collision, and refusing it would strand its data.
+
+    Raises:
+        ConfigurationError: ``collection`` is invalid, or ``index_dir`` holds
+            a ``.sqlite3``/``.lance`` entry whose stem equals ``collection``
+            under ``casefold()`` but not exactly, and no exact-spelling store
+            exists.
+    """
+    validate_collection_name(collection)
+    try:
+        with os.scandir(index_dir) as entries:
+            names = [(entry.name, entry.is_file()) for entry in entries]
+    except FileNotFoundError:
+        return False
+    except NotADirectoryError:
+        return False
+    exact = f"{collection}.sqlite3"
+    if any(name == exact and is_file for name, is_file in names):
+        return True
+    folded = collection.casefold()
+    for name, _ in names:
+        for suffix in _COLLECTION_ENTRY_SUFFIXES:
+            stem = name[: -len(suffix)]
+            if name.endswith(suffix) and stem != collection and stem.casefold() == folded:
+                raise ConfigurationError(
+                    f"collection {collection!r} differs only in letter case from "
+                    f"{stem!r}, which already exists in {index_dir}. On a "
+                    "case-insensitive filesystem the two would share one store, so "
+                    "groundkit refuses the second spelling everywhere. Use the "
+                    f"existing spelling {stem!r} or choose a different name."
+                )
+    return False
 
 
 def validate_collection_name(collection: str) -> None:

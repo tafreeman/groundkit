@@ -84,7 +84,7 @@ from groundkit.evals.echo import (
 from groundkit.evals.runner import MIN_EVAL_TOP_K, run_eval, write_report
 from groundkit.evals.schema import EvalReport, SynthesisReport
 from groundkit.index.dense import InMemoryVectorStore, LanceDBVectorStore
-from groundkit.index.metadata import SQLiteMetadataStore
+from groundkit.index.metadata import SQLiteMetadataStore, collection_store_exists
 from groundkit.indexer import Indexer, IndexReport
 from groundkit.ingestion.loaders import FileLoader
 from groundkit.ingestion.url_loader import UrlLoader
@@ -700,10 +700,21 @@ async def _open_read_runtime(
         caller's job — it owns the store handle.
 
     Raises:
-        ConfigurationError: An invalid collection name, or an unusable
-            embedding configuration.
+        ConfigurationError: An invalid collection name, a collection that
+            does not exist in the index directory, or an unusable embedding
+            configuration.
         StorageError: The collection's store could not be opened.
     """
+    # Reading must never create a collection: SQLiteMetadataStore.open would
+    # make the directory and an empty store, so a typo'd --collection would
+    # exit 0 with "no results" and leave debris. Checked before the embedder
+    # is built so a missing collection needs no provider. This also validates
+    # the name and refuses a case-only alias, as open() does.
+    if not collection_store_exists(Path(args.index_dir), args.collection):
+        raise ConfigurationError(
+            f"collection {args.collection!r} does not exist in {args.index_dir}. "
+            "Collections are created by `grk ingest`, never by reading one."
+        )
     embedder: EmbeddingProtocol | None = None
     vector_store_factory: Callable[[], Awaitable[VectorStoreProtocol]] | None = None
     if args.mode != "bm25":
