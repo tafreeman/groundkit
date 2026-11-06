@@ -32,6 +32,26 @@ it scored.
   the first crashed with `ValueError: relative path can't be expressed as a
   file URI`: the foreign-store probe built its read-only `file:` URI from the
   relative path. It now uses the absolute path.
+- URL ingest now refuses a credential-named parameter in the fragment
+  (`#access_token=…`), in a `;` path parameter, or after a `;` in the query.
+  Before, only `&`-separated query pairs were checked, and the others were
+  stored in `documents.source` and every citation.
+- A credentialed URL with a malformed port (`https://user:pw@host:abc/`) is
+  refused with a sanitized message. Before, formatting the refusal raised, and
+  the indexer echoed the raw URL, password included. The indexer's
+  loader-failure message is now sanitized like the pipeline's.
+- The SSRF guard resolves the host name httpx will connect to (IDNA2008),
+  not the stdlib's IDNA2003 reading of it, which named a different DNS name for
+  hosts such as `faß.example`. A host httpx cannot parse is refused before DNS.
+- The SSRF guard refuses 192.0.0.0/24 (except 192.0.0.9 and 192.0.0.10) as
+  `protocol_assignment`, even for a provider allowed private endpoints, and
+  classifies 3fff::/20 as private, on every supported Python. On 3.11,
+  `is_private` missed most of both, so 192.0.0.192, a cloud metadata address,
+  passed as public.
+- `sanitize_url` no longer raises on a URL `urlsplit` cannot parse (it returns
+  `<unparseable URL>`), and URL ingest refuses one with an `IngestionError`.
+  Credential names are also found in hash-routed fragments
+  (`#/callback?access_token=…`) and `%3B`-encoded path parameters.
 - A URL whose response decodes or extracts to no text (an empty body, or a
   script-only page) is now refused with an `IngestionError`. Before, the
   loader returned nothing, which the indexer read as "this source is now empty":

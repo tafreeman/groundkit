@@ -49,6 +49,7 @@ from groundkit.ingestion.chunking import RecursiveChunker
 from groundkit.ingestion.pipeline import DEFAULT_MAX_CONCURRENT, discover_files
 from groundkit.telemetry import get_tracer, span_attributes
 from groundkit.utils.path_safety import is_within_base
+from groundkit.utils.url_safety import sanitize_url
 
 if TYPE_CHECKING:
     from groundkit.contracts import Chunk, Document
@@ -879,7 +880,9 @@ class Indexer:
         except IngestionError:
             raise
         except Exception as exc:
-            raise IngestionError(f"Loader failed for {source!r}: {exc}") from exc
+            # Sanitized like IngestionPipeline's twin site: a URL source may
+            # carry a credential the loader never got far enough to refuse.
+            raise IngestionError(f"Loader failed for {sanitize_url(source)!r}: {exc}") from exc
 
         if not documents:
             pruned, vectors_deleted = await self._prune_emptied_source(source)

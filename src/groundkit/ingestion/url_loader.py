@@ -178,9 +178,15 @@ def _reject_unsafe_url_shape(source: str) -> None:
 
     Raises:
         IngestionError: The scheme is not http/https, the host is empty, the
-            URL carries userinfo, or a query parameter names a credential.
+            port is malformed, the URL carries userinfo, or a query, fragment
+            or path parameter names a credential.
     """
-    parsed = urlsplit(source)
+    try:
+        parsed = urlsplit(source)
+    except ValueError:
+        # Malformed brackets (`https://user:pw@[invalid]/x`). The URL cannot
+        # be taken apart, so nothing of it is echoed.
+        raise IngestionError("refusing to fetch a URL that cannot be parsed") from None
     if parsed.scheme not in ("http", "https"):
         raise IngestionError(
             f"refusing to fetch {sanitize_url(source)!r}: scheme must be http or https, "
@@ -188,6 +194,12 @@ def _reject_unsafe_url_shape(source: str) -> None:
         )
     if not parsed.hostname:
         raise IngestionError(f"refusing to fetch {sanitize_url(source)!r}: no host")
+    try:
+        parsed.port  # noqa: B018 -- the property raises on a malformed port
+    except ValueError:
+        raise IngestionError(
+            f"refusing to fetch {sanitize_url(source)!r}: the port is not a number in range"
+        ) from None
     if parsed.username is not None or parsed.password is not None:
         raise IngestionError(
             "refusing to fetch a URL carrying userinfo credentials "
@@ -199,8 +211,9 @@ def _reject_unsafe_url_shape(source: str) -> None:
     if offenders := credential_query_params(source):
         named = ", ".join(repr(name) for name in offenders)
         raise IngestionError(
-            f"refusing to fetch a URL carrying a credential in its query string "
-            f"({sanitize_url(source)!r}): the parameter(s) {named} name a secret, "
+            f"refusing to fetch a URL carrying a credential in its query string, "
+            f"fragment or path parameters ({sanitize_url(source)!r}): the "
+            f"parameter(s) {named} name a secret, "
             "and this loader records the URL verbatim as Document.source for "
             "provenance — so the value would be persisted to the index, returned "
             "in every citation built from it, and written to the ingest log. "
