@@ -790,6 +790,9 @@ v0.1.0 scope amendment, narrowed to that one remaining gap.
   `-`/`_`. **A credential under a name not on that list still gets persisted.** `code` and
   `state` are deliberately absent — they are OAuth credentials in one context and a country
   code or a US state in another, and refusing them would reject ordinary document URLs.
+  The names are checked in the query (split on `;` as well as `&`), the fragment
+  (`#access_token=…`) and `;` path parameters. In the fragment and the path, only a
+  `name=value` pair counts, so a bare `#signature` anchor is not refused.
   Redacting instead of refusing is not available: `documents.source` is `TEXT UNIQUE NOT
   NULL`, and `sanitize_url` redacts every query value unconditionally, so it would collapse
   `?id=42` and `?id=43` onto one identity. Supply credentials out of band.
