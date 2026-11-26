@@ -30,7 +30,7 @@ import httpx
 import pytest
 
 from groundkit import snapshots
-from groundkit.contracts import Citation
+from groundkit.contracts import Citation, Document
 from groundkit.errors import RetrievalError
 from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.indexer import Indexer
@@ -474,19 +474,43 @@ def test_pruning_a_document_removes_its_snapshot(tmp_path: Path) -> None:
     A user who deletes a document has stated an intent about *content*.
     Honouring it in SQLite while the fetched text stays in a sibling
     directory makes the retention story a false statement. Here the second
-    fetch returns an empty body, which makes `UrlLoader` yield no documents
-    and `Indexer._prune_emptied_source` delete the stored one.
+    pass's loader yields no documents for the URL, and
+    `Indexer._prune_emptied_source` deletes the stored one.
+
+    That loader is a stand-in, not `UrlLoader`: since GK-3 F-GK3-6 an empty
+    fetch is refused rather than returned as `[]`, precisely so that a blank
+    response cannot prune. The Indexer's prune path, and the snapshot cleanup
+    ADR-0023 hangs on it, remain for any loader that does yield `[]`.
     """
     index_dir = tmp_path / ".groundkit"
-    bodies = iter([b"Content that will later be pruned.", b"   "])
 
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=next(bodies))
+        return httpx.Response(200, content=b"Content that will later be pruned.")
 
     asyncio.run(_ingest_url(index_dir, "default", "https://example.com/doc", handler))
     assert len(_snapshot_files(index_dir)) == 1
 
-    asyncio.run(_ingest_url(index_dir, "default", "https://example.com/doc", handler))
+    class _NowEmptyLoader:
+        @property
+        def supported_extensions(self) -> list[str]:
+            return []
+
+        async def load(self, source: str) -> list[Document]:
+            return []
+
+    async def prune() -> None:
+        store = await SQLiteMetadataStore.open(index_dir, "default")
+        try:
+            snapshot_dir = snapshots.snapshot_dir_for(index_dir, "default")
+            indexer = Indexer(
+                store, _NowEmptyLoader(), collection="default", snapshot_dir=snapshot_dir
+            )
+            report = await indexer.index_source("https://example.com/doc")
+        finally:
+            await store.close()
+        assert report.documents_pruned == 1
+
+    asyncio.run(prune())
 
     async def check_document_is_gone() -> None:
         store = await SQLiteMetadataStore.open(index_dir, "default")

@@ -33,7 +33,7 @@ from pydantic import BaseModel
 from groundkit import snapshots
 from groundkit.contracts import Citation, SearchResponse
 from groundkit.errors import ConfigurationError, RerankerNotConfiguredError, RetrievalError
-from groundkit.index.metadata import SCHEMA_VERSION, is_groundkit_store
+from groundkit.index.metadata import is_groundkit_store
 from groundkit.retrieval.citations import resolve_citation
 from groundkit.retrieval.search import MAX_TOP_K
 from groundkit.service.schemas import (
@@ -456,6 +456,8 @@ async def handle_index_status(
         chunk_count = await runtime.chunk_count()
         manifest = await runtime.get_manifest()
         generation = await runtime.get_generation()
+        schema_version = await runtime.stored_schema_version()
+        dense_configured = runtime.dense_configured
         stats = runtime.rebuild_stats()
 
     return IndexStatusResponse(
@@ -463,13 +465,19 @@ async def handle_index_status(
         document_count=document_count,
         chunk_count=chunk_count,
         embedding=manifest,
-        # Read from the same manifest the refusal in Retriever.search reads, so
-        # a client cannot be told "available" by one path and refused by
-        # another (ADR-0008).
-        dense_search_available=manifest is not None,
+        # True only when BOTH of the things Retriever.search needs for a dense
+        # query hold: the collection is manifest-bound (the ADR-0008 refusal
+        # reads the same manifest) AND this service was started with a dense
+        # path (embedder + vector store), without which search raises
+        # ConfigurationError. Reading the manifest alone told a BM25-only
+        # service "available" for a bound collection and then refused the
+        # query. Residual: this does not open the vector store (status must
+        # stay cheap), so a bound, configured collection whose vector data is
+        # gone still reports True and fails closed on search.
+        dense_search_available=manifest is not None and dense_configured,
         generation=generation,
         cache_enabled=generation is not None,
-        schema_version=SCHEMA_VERSION,
+        schema_version=schema_version,
         retriever_acquires=stats.acquires,
         retriever_rebuilds=stats.rebuilds,
         rebuild_seconds_total=stats.rebuild_seconds_total,
