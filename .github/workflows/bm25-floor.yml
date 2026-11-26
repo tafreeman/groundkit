@@ -1,0 +1,39 @@
+# Offline BM25 retrieval-quality floor (audit finding groundkit #1).
+#
+# The only other retrieval-quality gate, eval-gated.yml, is opt-in (PR label or
+# weekly cron) and needs a live Ollama, so an ordinary PR could break BM25
+# ranking and still go green. This job closes that: deterministic, offline, no
+# model pull, no credentials, a few seconds.
+#
+# Deliberately NO `paths:` filter. A path-filtered workflow does not report a
+# status on PRs that skip it, which would make it impossible to ever mark the
+# check required without blocking unrelated PRs. Making `bm25-floor` a required
+# status check is a repository-settings change and is left to the owner.
+#
+# The same script runs as a step in release-gates.yml.
+name: bm25-floor
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bm25-floor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+      - run: uv sync --locked --group dev
+      - name: BM25 metric floor (evals/bm25-floor.json)
+        run: uv run python scripts/check_bm25_floor.py

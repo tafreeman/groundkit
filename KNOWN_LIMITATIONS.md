@@ -32,7 +32,10 @@ per SPEC.md §9:
   manual triggers — re-enabled in Phase 7, as the workflow file's own note
   anticipated — so this **is** re-measured automatically now. The result
   quoted above is still the single run described, not yet superseded by a
-  later one, but a regression would no longer go uncaught by CI. The
+  later one, but a regression would no longer go uncaught by CI. (That
+  covers the real-model path only; the offline BM25 baseline additionally has a
+  per-PR floor, `evals/bm25-floor.json`, checked by `bm25-floor.yml` and
+  `release-gates.yml` — see `evals/README.md`.) The
   CI-default `InMemoryEmbedder` produces
   hash-derived vectors with no semantic signal and, on this same corpus,
   reports both stages as regressions instead — so a delta from it is noise
