@@ -408,6 +408,21 @@ class CollectionRuntime:
         """Path to the collection's SQLite file, for diagnostics."""
         return self._store.db_path
 
+    @property
+    def dense_configured(self) -> bool:
+        """Whether this runtime was given a dense path (embedder and vector store).
+
+        Configuration only: it opens nothing and says nothing about whether the
+        vector data is actually present on disk. ``__init__`` guarantees the two
+        halves arrive together, so either one being set means both are.
+        """
+        return self._embedder is not None and self._vector_store_factory is not None
+
+    async def stored_schema_version(self) -> int:
+        """Return the ``PRAGMA user_version`` the collection's file carried at open."""
+        self._require_open()
+        return self._store.stored_schema_version
+
     def rebuild_stats(self) -> RebuildStats:
         """Return a snapshot of this runtime's rebuild counters (ADR-0026).
 
