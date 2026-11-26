@@ -46,6 +46,7 @@ only (SPEC.md §3, ADR-0014 decision 9).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -111,6 +112,23 @@ _PATH_PARAM_RE: Final[re.Pattern[str]] = re.compile(r"\{([^{}]+)\}")
 #: on the exclusion set instead of each carrying its own copy.
 DOC_PATHS: Final[frozenset[str]] = frozenset(
     {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
+)
+
+
+#: Liveness path: the process is up and the event loop answers. Does no I/O.
+HEALTHZ_PATH: Final[str] = "/healthz"
+#: Readiness path: the index directory is still a directory. One ``stat``, no
+#: listing, no collection opened.
+READYZ_PATH: Final[str] = "/readyz"
+
+#: The only ``(path, method)`` pairs served outside the registry. These are
+#: probe targets for an orchestrator, read-only and body-less; they are not
+#: tools and are not in the OpenAPI document. The parity test excludes exactly
+#: this set — by pair, so a POST to ``/healthz`` is still a parity failure — and
+#: asserts it equals these two ``GET``s and nothing else (ADR-0014 decision 2,
+#: ``docs/specs/phase-6-iac-observability.md`` §4.2).
+HEALTH_ROUTES: Final[frozenset[tuple[str, str]]] = frozenset(
+    {(HEALTHZ_PATH, "GET"), (READYZ_PATH, "GET")}
 )
 
 
@@ -234,6 +252,8 @@ def create_app(
     for spec in TOOLS:
         _register(app, spec, ctx)
 
+    _register_health(app, ctx)
+
     if mcp_mount is not None:
         # A Mount, not an APIRoute, so it does not participate in the
         # registry<->route parity comparison. That is correct rather than a
@@ -265,6 +285,53 @@ def _register(app: FastAPI, spec: ToolSpec, ctx: ServiceContext) -> None:
         summary=spec.summary,
         response_model=_response_model(spec),
     )
+
+
+def _register_health(app: FastAPI, ctx: ServiceContext) -> None:
+    """Add the two probe routes. Read-only, unauthenticated, content-free.
+
+    Neither route reads a collection, lists the index directory, or echoes
+    anything about the deployment: the bodies are fixed strings. ``/readyz`` is
+    one ``stat`` of the index directory — it answers "is the volume still
+    mounted as a directory", which is the failure the old ``/v1/collections``
+    probe could not see (an empty or missing directory listed as ``[]``).
+
+    Both carry ``X-Request-ID`` like every other response. A successful probe is
+    not access-logged (kubelet calls them every few seconds, which would drown
+    the tool lines); a ``/readyz`` 503 is logged at WARNING against its id so
+    the failed probe can be found in the server log.
+    """
+
+    async def healthz() -> JSONResponse:
+        return JSONResponse({"status": "ok"}, headers={REQUEST_ID_HEADER: uuid.uuid4().hex})
+
+    async def readyz() -> JSONResponse:
+        request_id = uuid.uuid4().hex
+        # Off the event loop: a wedged network volume blocks ``stat``, and that
+        # must stall this probe, not every in-flight search.
+        ready = await asyncio.to_thread(ctx.index_dir.is_dir)
+        if ready:
+            return JSONResponse({"status": "ready"}, headers={REQUEST_ID_HEADER: request_id})
+        logger.warning(
+            "request_id=%s method=GET route=%s status=503 reason=index_dir_not_a_directory",
+            request_id,
+            READYZ_PATH,
+            extra={
+                "request_id": request_id,
+                "method": "GET",
+                "route": READYZ_PATH,
+                "status": 503,
+                "reason": "index_dir_not_a_directory",
+            },
+        )
+        return JSONResponse(
+            {"status": "not_ready"},
+            status_code=503,
+            headers={REQUEST_ID_HEADER: request_id},
+        )
+
+    app.add_api_route(HEALTHZ_PATH, healthz, methods=["GET"], include_in_schema=False)
+    app.add_api_route(READYZ_PATH, readyz, methods=["GET"], include_in_schema=False)
 
 
 def _path_parameters(path: str) -> tuple[str, ...]:

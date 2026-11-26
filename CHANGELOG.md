@@ -13,6 +13,14 @@ it scored.
 
 ### Added
 
+- `GET /healthz` (static liveness) and `GET /readyz` (one `stat` of the index
+  directory, `503` when it is not a directory) on the service API. Read-only,
+  not in the OpenAPI document, excluded from the registry route-parity test by
+  exact `(path, method)` pair; the test fails if any other route appears.
+  `infra/k8s/deployment.yaml` probes now use them instead of listing the PVC
+  via `GET /v1/collections`. Both carry `X-Request-ID`; a successful probe is
+  not access-logged, and a `/readyz` 503 is logged at WARNING against its id.
+
 - `scripts/check_bm25_floor.py` and `evals/bm25-floor.json`: an offline,
   deterministic BM25 retrieval-quality floor (nDCG@10, recall@5, recall@10,
   MRR, no-answer abstention) over the committed golden corpus. It runs on every
