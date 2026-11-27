@@ -8,11 +8,12 @@ search against it whose results you can check against the source yourself —
 plus pointers to two optional next steps: search-by-meaning, and an automated
 way to check whether a change made search better or worse.
 
-Three commands, no credentials, no model server.
+Run this in a new working directory. No credentials or model server required.
 
 ```bash
-pip install groundkit
-grk ingest ./docs
+python -m pip install groundkit
+python -c "from pathlib import Path; Path('notes.md').write_text('GroundKit citation offsets identify exact source spans.', encoding='utf-8')"
+grk ingest notes.md
 grk search "citation offsets" --json
 ```
 
@@ -22,8 +23,7 @@ commands are `uv sync`, then `uv run grk ingest ./docs` and
 
 ## What just happened
 
-`grk ingest` walked the directory, loaded every supported file, split each
-one into chunks (passages short enough to point at precisely — long enough
+`grk ingest` loaded `notes.md` and split it into chunks (passages short enough to point at precisely — long enough
 to make sense on their own) while preserving each chunk's exact character
 offsets within the original file, and wrote documents, chunks and BM25
 statistics into a persisted collection under `.groundkit/`. BM25 is the
