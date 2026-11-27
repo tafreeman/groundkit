@@ -3,27 +3,27 @@
 This page is for anyone who wants to see groundkit actually search something,
 right now, without reading how it works first. It picks up right after
 [Installation](installation.md). No background in search or retrieval is
-assumed. By the end, you will have indexed a real folder of files and run a
+assumed. By the end, you will have indexed a small document and run a
 search against it whose results you can check against the source yourself —
 plus pointers to two optional next steps: search-by-meaning, and an automated
 way to check whether a change made search better or worse.
 
-Three commands, no credentials, no model server.
+Run this in a new working directory. No credentials or model server required.
 
 ```bash
-pip install groundkit
-grk ingest ./docs
-grk search "citation offsets" --json
+python -m pip install groundkit
+python -c "from pathlib import Path; Path('notes.md').write_text('GroundKit citation offsets identify exact source spans.', encoding='utf-8')"
+grk ingest notes.md --index-dir "$PWD/.groundkit"
+grk search "citation offsets" --index-dir "$PWD/.groundkit" --json > results.json
 ```
 
-Working from a clone instead of the published package? The same three
-commands are `uv sync`, then `uv run grk ingest ./docs` and
-`uv run grk search "citation offsets" --json`.
+Using an absolute index path avoids a relative-path issue in GroundKit 0.2.1.
+From a clone, use `uv sync` instead of installing from PyPI, and prefix each
+`grk` command with `uv run`.
 
 ## What just happened
 
-`grk ingest` walked the directory, loaded every supported file, split each
-one into chunks (passages short enough to point at precisely — long enough
+`grk ingest` loaded `notes.md` and split it into chunks (passages short enough to point at precisely — long enough
 to make sense on their own) while preserving each chunk's exact character
 offsets within the original file, and wrote documents, chunks and BM25
 statistics into a persisted collection under `.groundkit/`. BM25 is the
@@ -43,8 +43,21 @@ memory.
 The offsets are not decoration. They resolve:
 
 ```python
+import asyncio
+import json
+from pathlib import Path
+
+from groundkit.contracts import Citation
 from groundkit.retrieval import verify_citation
+
+result = json.loads(Path("results.json").read_text(encoding="utf-8"))["results"][0]
+verified = asyncio.run(
+    verify_citation(Citation(**result["citation"]), result["content"], Path.cwd())
+)
+print(verified)  # True
 ```
+
+Run this with the same Python environment and from the same directory as the quickstart.
 
 `verify_citation` re-reads the source file and confirms the cited span still
 contains what the citation claims. That is what "citations are verifiable"

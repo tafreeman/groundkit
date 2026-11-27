@@ -57,12 +57,14 @@ development — see the Quickstart below.
 ## Quickstart
 
 ```bash
-pip install groundkit
-grk ingest ./docs
-grk search "your query" --json
+python -m pip install groundkit
+python -c "from pathlib import Path; Path('notes.md').write_text('GroundKit citation offsets identify exact source spans.', encoding='utf-8')"
+grk ingest notes.md --index-dir "$PWD/.groundkit"
+grk search "citation offsets" --index-dir "$PWD/.groundkit" --json
 ```
 
-For development from a clone, use `uv sync` and prefix each command with
+The explicit absolute index path avoids a relative-path issue in GroundKit
+0.2.1. For development from a clone, use `uv sync` and prefix each `grk` command with
 `uv run` instead.
 
 Ingestion is incremental (unchanged files are skipped by content hash), the
