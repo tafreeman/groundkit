@@ -57,9 +57,10 @@ development — see the Quickstart below.
 ## Quickstart
 
 ```bash
-pip install groundkit
-grk ingest ./docs
-grk search "your query" --json
+python -m pip install groundkit
+python -c "from pathlib import Path; Path('notes.md').write_text('GroundKit citation offsets identify exact source spans.', encoding='utf-8')"
+grk ingest notes.md
+grk search "citation offsets" --json
 ```
 
 For development from a clone, use `uv sync` and prefix each command with
