@@ -786,6 +786,10 @@ def _format_ingest_report(report: IndexReport, *, dense: bool) -> str:
         f"{report.documents_skipped} unchanged, "
         f"{report.chunks_written} chunks written"
     )
+    # Only when nonzero, so the common line is unchanged. A prune deletes
+    # indexed content, and it used to happen without a word (GK-3 F-GK3-6).
+    if report.documents_pruned:
+        line += f", {report.documents_pruned} removed (source now empty or gone)"
     if dense:
         line += (
             f", {report.vectors_written} vectors written, {report.vectors_deleted} vectors deleted"

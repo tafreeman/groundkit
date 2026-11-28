@@ -33,7 +33,13 @@ from groundkit.index.metadata import SQLiteMetadataStore
 from groundkit.retrieval.search import MAX_QUERY_LEN, MAX_TOP_K
 from groundkit.runtime import CollectionRegistry
 from groundkit.service import api as api_module
-from groundkit.service.api import DOC_PATHS, REQUEST_ID_HEADER, McpMount, create_app
+from groundkit.service.api import (
+    DOC_PATHS,
+    HEALTH_ROUTES,
+    REQUEST_ID_HEADER,
+    McpMount,
+    create_app,
+)
 from groundkit.service.binding import UNRESTRICTED_HOST_ALLOW_LIST
 from groundkit.service.errors import GENERIC_DETAIL
 from groundkit.service.schemas import ChunkFetchResponse, IndexStatusResponse, SearchRequest
@@ -138,6 +144,7 @@ def _route_pairs(app: FastAPI) -> set[tuple[str, str]]:
         for route in app.routes
         if isinstance(route, APIRoute) and route.path not in DOC_PATHS
         for method in route.methods or ()
+        if (route.path, method) not in HEALTH_ROUTES
     }
 
 
@@ -211,6 +218,113 @@ def test_a_hand_added_route_breaks_parity(tmp_path: Path) -> None:
 
     with pytest.raises(AssertionError):
         _assert_registry_route_parity(app)
+
+
+def test_probe_exclusion_is_exactly_two_gets() -> None:
+    """The parity exclusion for probes is these two pairs and nothing wider."""
+    assert {("/healthz", "GET"), ("/readyz", "GET")} == HEALTH_ROUTES
+
+
+def test_probe_routes_are_registered_but_excluded_from_parity(tmp_path: Path) -> None:
+    app = create_app(
+        _empty_context(tmp_path / "index"), host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST
+    )
+    served = {
+        (route.path, method)
+        for route in app.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods or ()
+    }
+    assert served >= HEALTH_ROUTES
+    assert served - HEALTH_ROUTES - {(p, "GET") for p in DOC_PATHS} == _registry_pairs()
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("post", "/healthz"),  # right path, wrong method: pair exclusion, not path
+        ("get", "/healthz/extra"),
+        ("get", "/livez"),
+        ("delete", "/readyz"),
+    ],
+)
+def test_any_other_probe_shaped_route_breaks_parity(tmp_path: Path, method: str, path: str) -> None:
+    app = create_app(
+        _empty_context(tmp_path / "index"), host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST
+    )
+    _assert_registry_route_parity(app)
+
+    async def _smuggled() -> list[str]:
+        return []
+
+    app.add_api_route(path, _smuggled, methods=[method.upper()])
+
+    with pytest.raises(AssertionError):
+        _assert_registry_route_parity(app)
+
+
+# -- Probes ----------------------------------------------------------------
+
+
+def test_healthz_does_no_io_and_always_answers(tmp_path: Path) -> None:
+    index_dir = tmp_path / "index"
+    app = create_app(_empty_context(index_dir), host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST)
+    index_dir.rmdir()  # liveness must not care about the volume
+    with TestClient(app) as client:
+        response = client.get("/healthz")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_readyz_reflects_the_index_directory_without_listing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index_dir = tmp_path / "index"
+    app = create_app(_empty_context(index_dir), host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST)
+
+    def _no_listing(self: Path) -> Any:
+        raise AssertionError(f"readiness listed {self}")
+
+    monkeypatch.setattr(Path, "iterdir", _no_listing)
+    monkeypatch.setattr(Path, "glob", _no_listing)
+    with TestClient(app) as client:
+        assert client.get("/readyz").status_code == 200
+        index_dir.rmdir()
+        not_ready = client.get("/readyz")
+    assert not_ready.status_code == 503
+    assert not_ready.json() == {"status": "not_ready"}
+
+
+def _service_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    # TestClient's httpx logs each request at INFO; only the service's own lines count.
+    return [r for r in caplog.records if r.name.startswith("groundkit.service")]
+
+
+def test_probes_carry_a_request_id_and_a_readiness_failure_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    index_dir = tmp_path / "index"
+    app = create_app(_empty_context(index_dir), host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST)
+    with TestClient(app) as client, caplog.at_level(logging.INFO, logger="groundkit.service"):
+        live = client.get("/healthz")
+        ready = client.get("/readyz")
+        assert not _service_records(caplog)  # routine probes stay out of the log
+        index_dir.rmdir()
+        not_ready = client.get("/readyz")
+    for response in (live, ready, not_ready):
+        assert len(response.headers["X-Request-ID"]) == 32
+    request_id = not_ready.headers["X-Request-ID"]
+    [record] = _service_records(caplog)
+    assert record.levelno == logging.WARNING
+    assert f"request_id={request_id}" in record.getMessage()
+    assert "status=503" in record.getMessage()
+
+
+def test_probe_routes_are_not_in_the_openapi_document(tmp_path: Path) -> None:
+    app = create_app(
+        _empty_context(tmp_path / "index"), host_allow_list=UNRESTRICTED_HOST_ALLOW_LIST
+    )
+    assert {"/healthz", "/readyz"}.isdisjoint(app.openapi()["paths"])
 
 
 # -- Behaviour over HTTP ---------------------------------------------------

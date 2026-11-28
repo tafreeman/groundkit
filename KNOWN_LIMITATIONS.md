@@ -32,7 +32,10 @@ per SPEC.md §9:
   manual triggers — re-enabled in Phase 7, as the workflow file's own note
   anticipated — so this **is** re-measured automatically now. The result
   quoted above is still the single run described, not yet superseded by a
-  later one, but a regression would no longer go uncaught by CI. The
+  later one, but a regression would no longer go uncaught by CI. (That
+  covers the real-model path only; the offline BM25 baseline additionally has a
+  per-PR floor, `evals/bm25-floor.json`, checked by `bm25-floor.yml` and
+  `release-gates.yml` — see `evals/README.md`.) The
   CI-default `InMemoryEmbedder` produces
   hash-derived vectors with no semantic signal and, on this same corpus,
   reports both stages as regressions instead — so a delta from it is noise
@@ -503,6 +506,18 @@ per SPEC.md §9:
   `index_status` — are the complete named surface, and the CLI covers
   ingest at a strictly smaller surface: a local operator's typed argument,
   not any caller reaching the port.
+- **`index_status.dense_search_available` is configuration-plus-manifest, not a
+  probe.** It is true when the collection is manifest-bound *and* the service
+  was started with a dense path (embedder and vector store). It deliberately
+  does not open the vector store, because status must stay a cheap read. So a
+  bound collection on a dense-configured service whose vector data has been
+  deleted (e.g. the `.lance` directory) still reports `true`; `search` then
+  fails closed. Only a search attempt reveals that case.
+- **`index_status.schema_version` reports the collection's stamp, and
+  does not repair it.** It is the file's `PRAGMA user_version` (0 for a store
+  that predates the ADR-0004 stamp). A value below the current schema version
+  means writes to that collection are refused until it is re-ingested into a
+  fresh one (ADR-0004 decision 5); there is no migration.
 - **A missing `chunk_id` returns 400, not 404.** `handle_fetch_chunk` raises
   `ConfigurationError` for it, and separating that case from an invalid
   collection name would need either a new exception type (forbidden by
@@ -767,6 +782,20 @@ v0.1.0 scope amendment, narrowed to that one remaining gap.
   separate path: it already reuses `html_extractor()` at fetch time to strip tags from an
   HTML-shaped response, but the resulting document is `source_class="snapshot"` either way —
   the extractor identity is not recorded on it, and re-extraction never runs for it.
+- **A fetched page's HTML extraction runs outside the fetch timeout, and older CPython
+  patch releases parse hostile HTML super-quadratically.** `UrlLoader`'s
+  `asyncio.timeout` bounds the network exchange only. Decoding and `html.parser` extraction
+  run afterwards in a worker thread, which cannot be cancelled. On CPython 3.11.9 and 3.12.7,
+  a 25 KB body of `<a ` repeated took about 12 s to parse, and larger bodies take minutes.
+  On 3.13.13 the same body took 0.01 s (GK-3 F-GK3-2, measured 2026-11-02). Run URL ingest
+  on a current interpreter patch release. Bounding extraction properly needs a killable
+  worker process, which is not built.
+- **An empty URL response is refused, not treated as a deletion.** A local file that is
+  emptied loads as `[]`, and the indexer prunes its stored document (the CLI reports it as
+  "removed"). A fetched page that decodes or extracts to no text is an `IngestionError`
+  instead, and any stored copy is kept. A JS-only shell, a CDN error page or a login wall
+  answers 200 with no text far more often than a page is deliberately blanked. To drop a URL
+  document there is still no per-document delete command.
 - **A credential in a URL query string is refused by name, and the list of names is not
   exhaustive.** `_reject_unsafe_url_shape` refused userinfo (`user:pass@host`) from the start
   because this loader records the URL verbatim as `Document.source`; a `?token=…` reaches
@@ -776,6 +805,9 @@ v0.1.0 scope amendment, narrowed to that one remaining gap.
   `-`/`_`. **A credential under a name not on that list still gets persisted.** `code` and
   `state` are deliberately absent — they are OAuth credentials in one context and a country
   code or a US state in another, and refusing them would reject ordinary document URLs.
+  The names are checked in the query (split on `;` as well as `&`), the fragment
+  (`#access_token=…`) and `;` path parameters. In the fragment and the path, only a
+  `name=value` pair counts, so a bare `#signature` anchor is not refused.
   Redacting instead of refusing is not available: `documents.source` is `TEXT UNIQUE NOT
   NULL`, and `sanitize_url` redacts every query value unconditionally, so it would collapse
   `?id=42` and `?id=43` onto one identity. Supply credentials out of band.
@@ -970,15 +1002,14 @@ was executed.
   unauthenticated, content-bearing surface on every interface of the host, and
   the image cannot tell those cases from the safe one. What was a refusal in
   Phase 4 is a warning in a container.
-- **The Kubernetes probes target a real operation because there is no health
-  endpoint.** `GET /v1/collections` proves the process is serving HTTP and the
-  index directory is listable; it does **not** prove any collection is usable,
-  because `handle_list_collections` returns `[]` for a missing or empty index
-  directory rather than failing. A pod with an unmounted volume therefore
-  reports ready. Adding `/healthz` means widening ADR-0014 decision 2's
-  route-parity exclusion set — a security-relevant `src/` change deliberately
-  not taken in a change that touches no `src/` file
-  (`docs/specs/phase-6-iac-observability.md` §4.2, Q1).
+- **The Kubernetes probes use dedicated `/healthz` and `/readyz` routes, which
+  prove less than a search would.** `/healthz` proves only that the process
+  answers HTTP; `/readyz` proves the index directory still exists as a
+  directory (one `stat`, no listing). Neither proves any collection is
+  usable, and the Dockerfile `HEALTHCHECK` still targets `GET /v1/collections`.
+  The two routes are excluded from ADR-0014 decision 2's route-parity set by
+  exact `(path, method)` pair, and a test fails if the exclusion is any wider
+  (`docs/specs/phase-6-iac-observability.md` §4.2).
 - **The Kubernetes in-cluster boundary rests on a NetworkPolicy, which can be
   silently inert.** A `ClusterIP` Service closes the cluster's edge and nothing
   else — every pod in every namespace can dial one directly — so

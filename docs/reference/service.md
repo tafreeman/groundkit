@@ -3,10 +3,9 @@
 The read-only surface: a FastAPI app, an MCP server over stdio and streamable
 HTTP, and the registry both dispatch through (ADR-0014).
 
-Neither transport defines an operation of its own. Both render `TOOLS`, and a
-parity test on each asserts its registered operations are exactly that tuple —
-so an operation added directly to
-a router or an MCP server, bypassing the registry, fails rather than ships. That
+Both transports render the same registered application operations from `TOOLS`.
+Parity tests catch a new operation that bypasses the registry. The two
+operational REST probes below are the explicit exception. That
 is the mechanism by which "Phase 4 is read-only" is *enforced* rather than
 asserted: `ToolSpec.side_effect` is a closed `Literal` with one member, and
 widening it is a change `mypy --strict` blocks until someone makes it visibly.
@@ -22,6 +21,15 @@ Neither is authentication, and a deliberately published bind
 that leaves open, [the deployment guide](../guides/deployment.md) for choosing
 a bind, and [the MCP client guide](../guides/mcp-clients.md) for how to connect
 a client.
+
+## Operational probes (unreleased)
+
+- `GET /healthz` checks that the HTTP process responds. It does not read the index.
+- `GET /readyz` returns 200 when the configured index path is a directory and
+  503 otherwise. It does not check for data or verify retrieval health.
+
+These routes are REST-only and intentionally absent from the OpenAPI schema
+and MCP tool list. See [deployment](../guides/deployment.md) for probe setup.
 
 ## Operations
 
