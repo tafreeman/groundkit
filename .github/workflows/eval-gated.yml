@@ -172,14 +172,14 @@ jobs:
             --chat-timeout-seconds "$GROUNDKIT_EVAL_CHAT_TIMEOUT_SECONDS"
 
       - name: Upload the eval report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: eval-report-real-model
           path: evals/results/latest.json
           if-no-files-found: error
 
       - name: Upload the echo report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: eval-report-echo
           path: evals/results/echo-latest.json
