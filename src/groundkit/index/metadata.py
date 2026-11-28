@@ -338,6 +338,11 @@ class SQLiteMetadataStore:
         db_path = index_dir / f"{collection}.sqlite3"
 
         def _connect() -> tuple[sqlite3.Connection, bool, int]:
+            # Before mkdir and before any path is touched: a refused spelling
+            # must create nothing, and `db_path.exists()` below is
+            # case-insensitive on Windows/macOS, so it would happily treat
+            # `alpha` as the already-existing `Alpha`.
+            collection_store_exists(index_dir, collection)
             index_dir.mkdir(parents=True, exist_ok=True)
             _chmod_best_effort(index_dir, 0o700)
             try:
